@@ -1,5 +1,5 @@
 # Runtime tray/menu support and packaging dependencies.
-pynput>=1.7.6
+pynput>=1.8.2
 pystray>=0.19.5
 Pillow>=10.0.0
 pyobjc-framework-Quartz>=10.0; sys_platform == "darwin"
