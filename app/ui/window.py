@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSlider,
     QSpinBox,
     QStackedWidget,
@@ -613,7 +614,13 @@ class MainWindow(QWidget):
         self.calibrate = CalibratePage(controller, self.palette_tokens)
         self.settings_page = SettingsPage(controller)
         for page in (self.overview, self.calibrate, self.settings_page):
-            self.stack.addWidget(page)
+            # Scroll rather than squash when the window is short.
+            area = QScrollArea()
+            area.setWidgetResizable(True)
+            area.setFrameShape(QFrame.Shape.NoFrame)
+            area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            area.setWidget(page)
+            self.stack.addWidget(area)
         layout.addWidget(self.stack, 1)
 
         self.calibrate.threshold_chosen.connect(self._apply_calibration)

@@ -2,7 +2,12 @@
 # Build DoubleClickFixer.app and a DMG from macOS.
 set -euo pipefail
 
-python3 -m pip install -r requirements.txt pyinstaller
+# Skip the install step when the environment already has what it needs
+# (a uv-managed virtualenv has no pip of its own, for example).
+if ! python3 -c "import PyInstaller, PySide6" 2>/dev/null; then
+  python3 -m pip install -r requirements.txt pyinstaller
+fi
+
 python3 -m PyInstaller --clean --noconfirm doubleclick-fixer.spec
 test -d dist/DoubleClickFixer.app
 
