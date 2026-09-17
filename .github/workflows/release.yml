@@ -1,0 +1,53 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Build portable Windows executable
+        shell: pwsh
+        run: .\installer\build_windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DoubleClickFixer-windows
+          path: dist/DoubleClickFixer.exe
+
+  macos:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build macOS app and DMG
+        run: bash installer/build_macos.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DoubleClickFixer-macos
+          path: |
+            dist/DoubleClickFixer.app
+            dist/DoubleClickFixer.dmg
+
+  publish:
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release-assets/DoubleClickFixer-windows/DoubleClickFixer.exe
+            release-assets/DoubleClickFixer-macos/DoubleClickFixer.dmg

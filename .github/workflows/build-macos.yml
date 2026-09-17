@@ -1,0 +1,23 @@
+name: Build macOS
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Build app and DMG
+        run: bash installer/build_macos.sh
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DoubleClickFixer-macos
+          path: |
+            dist/DoubleClickFixer.app
+            dist/DoubleClickFixer.dmg
