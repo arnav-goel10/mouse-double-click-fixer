@@ -15,6 +15,8 @@ The fix is disabled during first-run setup and must be enabled explicitly after 
 
 ## Windows
 
+For most users, download `DoubleClickFixer-Setup.exe` from the latest GitHub Release. See [docs/INSTALLATION.md](docs/INSTALLATION.md) for the installer and portable options.
+
 Run the portable build:
 
 ```text
@@ -50,6 +52,8 @@ Grant Accessibility permission before enabling the system-wide fix. Remove the a
 
 The filter targets duplicate switch events, not ordinary human double-clicks. Values around 80-120 ms are common, but hardware varies.
 
+See the complete [first-run demo](docs/DEMO.md) and [troubleshooting guide](docs/TROUBLESHOOTING.md).
+
 ## Tests
 
 ```text
@@ -65,4 +69,4 @@ python -m compileall -q app run.py
 
 CI tests Windows and macOS across supported Python versions. Pushing a tag such as `v0.1.0` builds both platform artifacts and publishes a GitHub Release with generated notes.
 
-See [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), [CHANGELOG.md](CHANGELOG.md), and [installer/README.md](installer/README.md).
+See [docs/INSTALLATION.md](docs/INSTALLATION.md), [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md), [CHANGELOG.md](CHANGELOG.md), [docs/RELEASING.md](docs/RELEASING.md), and [installer/README.md](installer/README.md).
