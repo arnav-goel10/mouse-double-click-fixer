@@ -1,6 +1,10 @@
+#ifndef AppVersion
+#define AppVersion "0.1.0"
+#endif
+
 [Setup]
 AppName=DoubleClick Fixer
-AppVersion=1.0.0
+AppVersion={#AppVersion}
 DefaultDirName={autopf}\DoubleClick Fixer
 DefaultGroupName=DoubleClick Fixer
 OutputBaseFilename=DoubleClickFixer-Setup
