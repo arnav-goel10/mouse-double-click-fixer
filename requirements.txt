@@ -1,5 +1,3 @@
-# Runtime tray/menu support and packaging dependencies.
-pynput>=1.7.6
-pystray>=0.19.5
-Pillow>=10.0.0
+# Qt user interface, tray icon and native event access.
+PySide6-Essentials>=6.7
 pyobjc-framework-Quartz>=10.0; sys_platform == "darwin"

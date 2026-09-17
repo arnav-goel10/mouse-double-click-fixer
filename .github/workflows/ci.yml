@@ -2,8 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, modern-ui]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -24,5 +25,22 @@ jobs:
           cache: pip
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -r requirements.txt
-      - run: python -m unittest discover -s tests -v
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
+        env:
+          QT_QPA_PLATFORM: offscreen
       - run: python -m compileall -q app run.py
+
+  windows-hook:
+    name: Windows hook end-to-end
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install -r requirements.txt
+      - name: Inject clicks through the real low-level hook
+        run: python -m unittest tests.test_windows_hook -v
+        env:
+          DCF_E2E: "1"

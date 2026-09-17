@@ -7,31 +7,50 @@ import sys
 from pathlib import Path
 
 APP_NAME = "DoubleClickFixer"
+LAUNCH_AGENT_LABEL = "com.doubleclickfixer.app"
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 
-def _mac_plist_path() -> Path:
-    return Path.home() / "Library" / "LaunchAgents" / "com.doubleclickfixer.app.plist"
+def _launch_agent_path() -> Path:
+    return Path.home() / "Library" / "LaunchAgents" / f"{LAUNCH_AGENT_LABEL}.plist"
 
 
-def _launch_arguments() -> list[str]:
+def launch_arguments() -> list[str]:
+    """The command that starts the app quietly in the background."""
     if getattr(sys, "frozen", False):
         return [sys.executable, "--minimized"]
     return [sys.executable, str(Path(__file__).resolve().parents[1] / "run.py"), "--minimized"]
 
 
-def set_enabled(enabled: bool) -> None:
-    if platform.system() == "Windows":
+def is_supported() -> bool:
+    return platform.system() in ("Windows", "Darwin")
+
+
+def is_enabled() -> bool:
+    system = platform.system()
+    if system == "Windows":
         import winreg
 
-        with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            r"Software\Microsoft\Windows\CurrentVersion\Run",
-            0,
-            winreg.KEY_SET_VALUE,
-        ) as key:
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_READ) as key:
+                winreg.QueryValueEx(key, APP_NAME)
+                return True
+        except OSError:
+            return False
+    if system == "Darwin":
+        return _launch_agent_path().exists()
+    return False
+
+
+def set_enabled(enabled: bool) -> None:
+    system = platform.system()
+    if system == "Windows":
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
             if enabled:
-                arguments = _launch_arguments()
-                winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, " ".join(f'"{argument}"' for argument in arguments))
+                command = " ".join(f'"{argument}"' for argument in launch_arguments())
+                winreg.SetValueEx(key, APP_NAME, 0, winreg.REG_SZ, command)
             else:
                 try:
                     winreg.DeleteValue(key, APP_NAME)
@@ -39,18 +58,19 @@ def set_enabled(enabled: bool) -> None:
                     pass
         return
 
-    if platform.system() == "Darwin":
-        plist = _mac_plist_path()
+    if system == "Darwin":
+        import plistlib
+
+        plist = _launch_agent_path()
         if enabled:
             plist.parent.mkdir(parents=True, exist_ok=True)
-            import plistlib
-
             plist.write_bytes(
                 plistlib.dumps(
                     {
-                        "Label": "com.doubleclickfixer.app",
-                        "ProgramArguments": _launch_arguments(),
+                        "Label": LAUNCH_AGENT_LABEL,
+                        "ProgramArguments": launch_arguments(),
                         "RunAtLoad": True,
+                        "ProcessType": "Interactive",
                     }
                 )
             )
@@ -62,4 +82,5 @@ def set_enabled(enabled: bool) -> None:
 
 
 def remove() -> None:
-    set_enabled(False)
+    if is_supported():
+        set_enabled(False)
