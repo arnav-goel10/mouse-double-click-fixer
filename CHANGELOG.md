@@ -38,6 +38,9 @@
   and event timestamps come from the OS rather than from when Python woke up.
 - Statistics are no longer written to disk from inside the hook callback, which
   Windows can drop for taking too long.
+- The Windows installer script declared the startup registry value in a section
+  that does not accept one, so the installer never compiled. The release build
+  can now be run on demand to catch this without cutting a tag.
 
 ## 0.1.0
 
