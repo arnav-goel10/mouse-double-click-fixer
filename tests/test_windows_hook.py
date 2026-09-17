@@ -56,7 +56,27 @@ class WindowsHookTests(unittest.TestCase):
         HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
         self.user32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, ctypes.c_void_p, wintypes.DWORD]
         self.user32.SetWindowsHookExW.restype = ctypes.c_void_p
+        # Without argtypes, ctypes rejects the 64-bit LPARAM it is handed.
+        self.user32.CallNextHookEx.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_int,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        ]
         self.user32.CallNextHookEx.restype = LRESULT
+        self.user32.GetMessageW.argtypes = [
+            ctypes.POINTER(wintypes.MSG),
+            ctypes.c_void_p,
+            wintypes.UINT,
+            wintypes.UINT,
+        ]
+        self.user32.GetMessageW.restype = ctypes.c_int
+        self.user32.PostThreadMessageW.argtypes = [
+            wintypes.DWORD,
+            wintypes.UINT,
+            wintypes.WPARAM,
+            wintypes.LPARAM,
+        ]
 
         def run() -> None:
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
