@@ -1,5 +1,5 @@
-# Runtime tray/menu support and packaging dependencies.
-pynput>=1.7.6
-pystray>=0.19.5
-Pillow>=10.0.0
+# Qt user interface, tray icon and native event access.
+PySide6-Essentials>=6.9
+# macOS: the event tap (Quartz) and native window materials and symbols (AppKit).
 pyobjc-framework-Quartz>=10.0; sys_platform == "darwin"
+pyobjc-framework-Cocoa>=10.0; sys_platform == "darwin"

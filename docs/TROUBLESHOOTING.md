@@ -1,31 +1,52 @@
 # Troubleshooting
 
-## The fix button is disabled
+## Bounce still gets through
 
-Calibration is incomplete. Finish the isolated-click phase and at least three intentional double-click pairs first.
+Raise the filter window on the **Bounce Filter** pane by 10–20 ms and test again on the **Test**
+pad. Chatter is intermittent, so a calibration run can miss the worst of it.
+Watch the bars: anything below the dashed line would be filtered.
 
-## The status stays `FIX ON` but nothing is filtered
+## A real double-click was swallowed
 
-Use the latest release executable. Click once outside the app and confirm the status changes to `FIX ON - ACTIVE`. If it does not, disable and re-enable the fix. On macOS, verify Accessibility permission.
+Lower the filter. If you double-click unusually fast, calibration caps the
+suggestion at half your fastest measured gap, but you can always set the value
+by hand. Below 40 ms the filter is effectively free of that risk.
 
-## Legitimate double-clicks are blocked
+## macOS: the filter will not turn on
 
-Lower the Bounce filter value, then select **Apply**. Values around 80-120 ms are common, but the correct value depends on the mouse switch.
+macOS only allows an event tap that can block events for a trusted app. Open
+**System Settings > Privacy & Security > Accessibility**, add DoubleClick Fixer
+and switch it on, then try again. Rebuilding the app from source changes its
+signature, so macOS treats it as a new app and permission has to be granted
+again — remove the old entry with the minus button first.
 
-## Settings do not appear after reopening
+## macOS: it worked, then stopped
 
-Use the tray/menu-bar **Quit** action or the window close button from the latest build. Settings are stored in:
+macOS disables an event tap that stalls, and after waking from sleep. The app
+re-arms the tap automatically. If the menu bar icon still shows the filter on
+but nothing is blocked, toggle it off and on.
 
-- Windows/macOS: `~/.doubleclick-fixer.json`
+## Windows: nothing is filtered in one specific app
 
-## The app is hidden
+A low-level hook cannot filter input for a window running at a higher privilege
+level than DoubleClick Fixer. Run it as administrator if you need the filter
+inside an elevated application.
 
-Open it from the notification area on Windows or menu bar on macOS. The window close button hides rather than exits.
+## The window disappeared
 
-## macOS cannot enable the fix
+Closing the window hides it; the filter keeps running. Reopen it from the menu
+bar (macOS) or the notification area (Windows) — on Windows it may be under the
+"^" overflow arrow. **Quit** there stops the filter and exits.
 
-Open **System Settings > Privacy & Security > Accessibility**, allow DoubleClick Fixer, then restart the app.
+## Settings
 
-## Collecting a bug report
+Stored at `%APPDATA%\DoubleClickFixer\settings.json` on Windows and
+`~/Library/Application Support/DoubleClickFixer/settings.json` on macOS.
+Delete the file to start over. Settings from version 0.1 are migrated, except
+the old threshold: it measured press-to-press time, which is a different
+quantity, so recalibrate after upgrading.
 
-Include the app version, operating system version, mouse model, calibration threshold, and steps to reproduce. Never include the settings file if it contains information you do not want to share.
+## Reporting a bug
+
+Include the app version (bottom of **General**), your OS version, the mouse model,
+your filter window, and what the **Test** pane shows when the fault happens.

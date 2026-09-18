@@ -1,6 +1,10 @@
 name: Release
 
+# Push a tag like v0.3.0 (matching app/__init__.py) to build, sign and publish.
+# Installed copies of the app find the release through the GitHub API and
+# update themselves. A manual run only builds, as a packaging check.
 on:
+  workflow_dispatch:
   push:
     tags:
       - "v*.*.*"
@@ -18,8 +22,17 @@ jobs:
           python-version: "3.13"
       - name: Install dependencies
         run: python -m pip install -r requirements.txt
+      - name: Check the tag matches the app version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart("v")
+          $app = (python -c "import app; print(app.__version__)")
+          if ($tag -ne $app) { throw "Tag $tag does not match app version $app" }
       - name: Run tests
         run: python -m unittest discover -s tests -v
+        env:
+          QT_QPA_PLATFORM: offscreen
       - name: Build portable Windows executable
         shell: pwsh
         run: .\installer\build_windows.ps1
@@ -27,7 +40,7 @@ jobs:
         shell: pwsh
         run: |
           choco install innosetup --no-progress -y
-          $version = "${{ github.ref_name }}".TrimStart("v")
+          $version = (python -c "import app; print(app.__version__)")
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" "installer\windows.iss"
       - uses: actions/upload-artifact@v4
         with:
@@ -40,29 +53,84 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
       - name: Run tests
-        run: python3 -m unittest discover -s tests -v
-      - name: Build macOS app and DMG
+        run: |
+          python -m pip install -r requirements.txt pyinstaller dmgbuild
+          python -m unittest discover -s tests -v
+        env:
+          QT_QPA_PLATFORM: offscreen
+      - name: Load the signing certificate
+        # macOS keeps the Accessibility permission only while updates are
+        # signed with the same certificate, so a release must never go out
+        # without it.
+        env:
+          P12: ${{ secrets.MACOS_SIGNING_P12 }}
+          P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
+        run: |
+          if [ -z "$P12" ]; then
+            if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+              echo "::error::MACOS_SIGNING_P12 is not set; refusing to publish an unsigned release"; exit 1
+            fi
+            echo "No signing certificate; this packaging check will be ad-hoc signed."; exit 0
+          fi
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password="$(openssl rand -hex 16)"
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/signing.p12"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$RUNNER_TEMP/signing.p12" -k "$keychain" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$password" "$keychain" >/dev/null
+          # codesign looks up the private key through the search list.
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/signing.p12"
+          identity="$(security find-identity -p codesigning "$keychain" | awk '/DoubleClick Fixer Signing/ {print $2; exit}')"
+          echo "DCF_SIGN_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          echo "DCF_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+      - name: Build macOS app, DMG and update archive
         run: bash installer/build_macos.sh
+      - name: Confirm a release is signed with the stable certificate
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          codesign -d -r- "dist/DoubleClick Fixer.app" 2>&1 | tee /dev/stderr | grep -q "certificate root"
       - uses: actions/upload-artifact@v4
         with:
           name: DoubleClickFixer-macos
           path: |
-            dist/DoubleClickFixer.app
             dist/DoubleClickFixer.dmg
+            dist/DoubleClickFixer-macos.zip
 
   publish:
     needs: [windows, macos]
     runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          path: release-assets
+          path: artifacts
+          merge-multiple: true
+      - name: Collect release files and checksums
+        # The updater installs a download only if it matches this list.
+        run: |
+          mkdir release
+          find artifacts -type f \( -name '*.exe' -o -name '*.dmg' -o -name '*.zip' \) -exec cp {} release/ \;
+          cd release && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - name: Write the release page
+        # Downloads first, then the generated list of changes.
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          sed -e "s|__VERSION__|$version|g" -e "s|__REPO__|$GITHUB_REPOSITORY|g" \
+            installer/release_notes.md > release-notes.md
+          echo "VERSION=$version" >> "$GITHUB_ENV"
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2
         with:
+          name: DoubleClick Fixer ${{ env.VERSION }}
+          body_path: release-notes.md
           generate_release_notes: true
-          files: |
-            release-assets/DoubleClickFixer-windows/DoubleClickFixer.exe
-            release-assets/DoubleClickFixer-windows/DoubleClickFixer-Setup.exe
-            release-assets/DoubleClickFixer-macos/DoubleClickFixer.dmg
+          make_latest: true
+          files: release/*

@@ -1,28 +1,31 @@
-# First-run demo
+# First run
 
-## Calibrate
+## 1. Look at the fault
 
-1. Open DoubleClick Fixer. The fix is off during setup.
-2. In **Isolated clicks**, click the test area once, wait, and repeat until `10/10`.
-3. Select **Next: double-clicks**.
-4. Perform at least three natural double-click pairs. Extra pairs improve the estimate.
-5. Select **Apply calibration**.
+Open the app and choose **Test** in the sidebar. Click the pad the way you normally would.
+Each bar is the pause between releasing the button and the next press. A worn
+switch produces occasional tiny bars — those are the presses you never made.
 
-Calibration learns from two labeled behaviors. It does not treat every fast click as an intentional double-click.
+## 2. Calibrate
 
-## Verify diagnosis
+Go to **Calibrate**. The system-wide filter pauses so the raw mouse is visible.
 
-Use the test area and watch **Clicks**, **Double-clicks**, and **Last interval**. This local test does not affect other applications.
+- **Step 1 — single clicks.** Click once, pause about a second, repeat, twelve
+  times. Every extra press is recorded as bounce and called out on screen.
+- **Step 2 — double-clicks.** Double-click five times at your natural speed.
+  This is what the filter is told never to block.
+- The result names a threshold and explains the headroom it leaves. Apply it.
 
-## Verify the fix
+## 3. Turn it on
 
-1. Select **Enable fix**.
-2. Confirm the status changes to `FIX ON`.
-3. Click once on a file in File Explorer, then click again quickly.
-4. A legitimate normal double-click should continue to work; only the learned bounce range is filtered.
-5. The status changes to `FIX ON - FILTERED` when a duplicate is intercepted.
-6. Select **Disable fix** to restore normal system behavior.
+On the **Bounce Filter** pane, turn on the switch next to the app icon. The
+Activity section counts how many bounces have been blocked.
 
-## Tray behavior
+Try it: click once on a file in Explorer or Finder. The double-open should stop
+happening, while a deliberate double-click still opens the file.
 
-Clicking the window close button hides the app to the tray and preserves settings. Use **Quit** from the tray/menu bar to stop the hook and exit fully.
+## 4. Leave it running
+
+Close the window and the app keeps filtering from the menu bar or notification
+area. Turn on **Open at Login** and **Start Hidden** under **General** to make
+that automatic.
