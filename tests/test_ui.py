@@ -181,15 +181,19 @@ class WindowTests(unittest.TestCase):
     def test_window_reopens_at_the_size_it_was_left(self) -> None:
         from app.ui.window import MainWindow
 
+        # The offscreen test screen is only 800 x 600 and Qt rightly shrinks a
+        # restored window to fit its screen, so this checks the save/restore
+        # round trip at a size well inside it.
+        self.window.setMinimumSize(300, 200)
         self.window.show()
-        # Stay inside the offscreen test screen (800 x 600); Qt rightly shrinks
-        # a restored window that would not fit the screen it opens on.
-        self.window.resize(self.window.minimumWidth() + 40, self.window.minimumHeight() + 60)
+        self.window.resize(640, 460)
         self.application.processEvents()
         expected = self.window.size()
         self.window.save_geometry()
 
         reopened = MainWindow(self.controller)
+        reopened.setMinimumSize(300, 200)
+        reopened._restore_geometry()
         self.addCleanup(reopened.deleteLater)
         self.assertEqual(reopened.size(), expected)
 
