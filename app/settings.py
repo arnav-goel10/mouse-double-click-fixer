@@ -22,6 +22,8 @@ DEFAULTS: dict[str, Any] = {
     "calibrated": False,
     "filtered_total": 0,
     "window_geometry": "",
+    "auto_update": True,
+    "last_update_check": 0.0,
 }
 
 LEGACY_PATH = Path.home() / ".doubleclick-fixer.json"
@@ -47,12 +49,16 @@ def _coerce(values: dict[str, Any]) -> dict[str, Any]:
     buttons = merged.get("buttons") or [Button.LEFT.value]
     valid = {button.value for button in Button}
     merged["buttons"] = [name for name in buttons if name in valid] or [Button.LEFT.value]
-    for flag in ("fix_enabled", "start_at_login", "start_minimized", "calibrated"):
+    for flag in ("fix_enabled", "start_at_login", "start_minimized", "calibrated", "auto_update"):
         merged[flag] = bool(merged.get(flag))
     try:
         merged["filtered_total"] = max(0, int(merged.get("filtered_total", 0)))
     except (TypeError, ValueError):
         merged["filtered_total"] = 0
+    try:
+        merged["last_update_check"] = float(merged.get("last_update_check") or 0.0)
+    except (TypeError, ValueError):
+        merged["last_update_check"] = 0.0
     if not isinstance(merged.get("window_geometry"), str):
         merged["window_geometry"] = ""
     merged["version"] = SCHEMA_VERSION

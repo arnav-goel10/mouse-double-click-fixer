@@ -21,6 +21,14 @@
 
 ### Added
 
+- Automatic updates from GitHub Releases, verified by checksum and, on macOS,
+  by code signature; the app installs the update and reopens by itself.
+  Releases are signed with a stable certificate so the Accessibility
+  permission carries over to every update.
+- The Accessibility request goes through macOS itself, so the entry in System
+  Settings always matches the installed copy.
+- A designed disk image window, and an app icon for both platforms.
+- The window reopens at its last size and position.
 - Right and middle buttons can be protected as well as the left one.
 - Start hidden in the tray, in addition to start at login.
 - Single-instance launch: opening the app again reveals the running window.

@@ -1,8 +1,17 @@
-#!/usr/bin/env bash
-# Build "DoubleClick Fixer.app" and a DMG from macOS.
+#!/bin/bash
+# Build "DoubleClick Fixer.app", the DMG people install from, and the zip the
+# in-app updater downloads.
+#
+# Signing: macOS remembers the Accessibility permission against the app's
+# signing certificate. Releases must therefore always be signed with the same
+# certificate, or every update would ask for permission again. The identity is
+# taken from DCF_SIGN_IDENTITY / DCF_SIGN_KEYCHAIN (CI), or from the local
+# signing keychain in ~/.doubleclick-fixer-signing; without either the build
+# is ad-hoc signed, which is fine for trying things out but not for releases.
 set -euo pipefail
 
 APP="dist/DoubleClick Fixer.app"
+LOCAL_SIGNING="$HOME/.doubleclick-fixer-signing"
 
 # Skip the install step when the environment already has what it needs
 # (a uv-managed virtualenv has no pip of its own, for example).
@@ -13,15 +22,43 @@ fi
 python3 -m PyInstaller --clean --noconfirm doubleclick-fixer.spec
 test -d "$APP"
 
-# Ad-hoc signing keeps the Accessibility grant stable across launches of the
-# same build. A release still needs a Developer ID signature and notarization.
-# Extended attributes (Finder info, provenance) make codesign refuse the bundle.
-xattr -cr "$APP"
-codesign --force --deep --sign - "$APP"
+# Sign and package outside the project folder. Synced folders (iCloud Drive's
+# Desktop & Documents, for example) keep adding extended attributes to files,
+# and codesign refuses a bundle that carries them.
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+signed="$work/DoubleClick Fixer.app"
+ditto --norsrc --noextattr "$APP" "$signed"
+xattr -cr "$signed"
+
+identity="${DCF_SIGN_IDENTITY:-}"
+keychain="${DCF_SIGN_KEYCHAIN:-}"
+if [[ -z "$identity" && -f "$LOCAL_SIGNING/signing.keychain-db" ]]; then
+  keychain="$LOCAL_SIGNING/signing.keychain-db"
+  security unlock-keychain -p "$(cat "$LOCAL_SIGNING/keychain.password")" "$keychain"
+  identity="$(security find-identity -p codesigning "$keychain" | awk '/DoubleClick Fixer Signing/ {print $2; exit}')"
+fi
+if [[ -n "$identity" ]]; then
+  codesign --force --deep --timestamp=none --keychain "$keychain" --sign "$identity" "$signed"
+  printf 'Signed with %s\n' "$identity"
+else
+  codesign --force --deep --sign - "$signed"
+  printf 'warning: ad-hoc signed; Accessibility permission will not carry over to updates\n' >&2
+fi
+codesign --verify --deep --strict "$signed"
 
 # The disk image opens to a designed window: the app, an arrow and the
 # Applications folder, so installing is one drag. dmgbuild writes Finder's
 # layout file directly, so this needs no Finder scripting or permissions.
-python3 -m dmgbuild -s installer/dmg_settings.py -D app="$APP" \
+rm -f dist/DoubleClickFixer.dmg dist/DoubleClickFixer-macos.zip
+python3 -m dmgbuild -s installer/dmg_settings.py -D app="$signed" \
   "DoubleClick Fixer" dist/DoubleClickFixer.dmg
-printf 'Built %s and dist/DoubleClickFixer.dmg\n' "$APP"
+
+# What the in-app updater downloads: the signed bundle, zipped with ditto so
+# the signature and symlinks survive.
+ditto -c -k --norsrc --noextattr --keepParent "$signed" dist/DoubleClickFixer-macos.zip
+
+# Keep a copy of the signed app in dist for trying it out locally.
+rm -rf "$APP"
+ditto "$signed" "$APP"
+printf 'Built %s, dist/DoubleClickFixer.dmg and dist/DoubleClickFixer-macos.zip\n' "$APP"

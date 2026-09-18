@@ -153,6 +153,14 @@ class AppController(QObject):
         if encoded != self.settings.get("window_geometry"):
             self._store(window_geometry=encoded)
 
+    def set_auto_update(self, enabled: bool) -> None:
+        self._store(auto_update=bool(enabled))
+
+    def set_last_update_check(self) -> None:
+        import time
+
+        self._store(last_update_check=time.time())
+
     def reset_statistics(self) -> None:
         self.session_filtered = 0
         self._store(filtered_total=0)

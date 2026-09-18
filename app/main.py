@@ -13,6 +13,7 @@ from PySide6.QtWidgets import QApplication, QMenuBar, QMessageBox, QSystemTrayIc
 
 from . import __version__
 from .controller import AppController
+from .updater import Updater
 from .ui import icons
 from .ui.tray import Tray
 from .ui.window import MainWindow
@@ -50,7 +51,10 @@ class Application:
         self.qt.setQuitOnLastWindowClosed(False)
 
         self.controller = AppController()
-        self.window = MainWindow(self.controller)
+        self.updater = Updater(self.controller)
+        self.window = MainWindow(self.controller, self.updater)
+        self.updater.window_visible = self.window.isVisible
+        self.updater.quit_requested.connect(self.quit)
         self.tray: Optional[Tray] = None
         if QSystemTrayIcon.isSystemTrayAvailable():
             self.tray = Tray(
@@ -59,6 +63,8 @@ class Application:
                 on_calibrate=self.show_calibration,
                 on_quit=self.quit,
                 on_toggle=self.window.request_filter,
+                updater=self.updater,
+                on_check_updates=self.check_for_updates,
                 parent=self.window,
             )
             self.tray.show()
@@ -87,6 +93,10 @@ class Application:
         about = QAction("About DoubleClick Fixer", menu)
         about.setMenuRole(QAction.MenuRole.AboutRole)
         about.triggered.connect(self._about)
+        updates = QAction("Check for Updates…", menu)
+        updates.setMenuRole(QAction.MenuRole.ApplicationSpecificRole)
+        updates.triggered.connect(self.check_for_updates)
+        updates.setVisible(self.updater.supported)
         settings = QAction("Settings…", menu)
         settings.setMenuRole(QAction.MenuRole.PreferencesRole)
         settings.setShortcut(QKeySequence.StandardKey.Preferences)
@@ -94,13 +104,18 @@ class Application:
         quit_action = QAction("Quit DoubleClick Fixer", menu)
         quit_action.setMenuRole(QAction.MenuRole.QuitRole)
         quit_action.triggered.connect(self.quit)
-        menu.addActions([about, settings, quit_action])
+        menu.addActions([about, updates, settings, quit_action])
         window_menu = bar.addMenu("Window")
         close = QAction("Close", window_menu)
         close.setShortcut(QKeySequence.StandardKey.Close)
         close.triggered.connect(self.window.close)
         window_menu.addAction(close)
         return bar
+
+    def check_for_updates(self) -> None:
+        self.show_window()
+        self.window.show_page("general")
+        self.updater.check(user_initiated=True)
 
     def _about(self) -> None:
         QMessageBox.about(
@@ -153,6 +168,7 @@ class Application:
         elif not self.controller.supported():
             QTimer.singleShot(0, self._warn_unsupported)
 
+        self.updater.start()
         return self.qt.exec()
 
     def _warn_unsupported(self) -> None:

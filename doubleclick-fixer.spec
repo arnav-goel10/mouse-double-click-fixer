@@ -1,7 +1,11 @@
 # PyInstaller build recipe for both platforms.
 import sys
 
-VERSION = "0.2.0"
+import re
+from pathlib import Path
+
+# One source of truth for the version: app/__init__.py.
+VERSION = re.search(r'__version__ = "([^"]+)"', Path("app/__init__.py").read_text()).group(1)
 
 # Qt ships far more than this app uses; leaving the rest out keeps the
 # download small and the startup fast.

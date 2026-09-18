@@ -3,6 +3,8 @@
 #endif
 
 [Setup]
+; Fixed forever: this is how an update finds and replaces the installed copy.
+AppId={{6B0E2F4C-3D7A-4E51-9A0B-DC1F1C5E7A21}
 AppName=DoubleClick Fixer
 AppVersion={#AppVersion}
 DefaultDirName={autopf}\DoubleClick Fixer
@@ -33,6 +35,14 @@ Name: "startup"; Description: "Start DoubleClick Fixer when I sign in"; Flags: u
 
 [Run]
 Filename: "{app}\DoubleClickFixer.exe"; Description: "Open DoubleClick Fixer"; Flags: nowait postinstall skipifsilent
+; The in-app updater installs silently and asks for the app to come back.
+Filename: "{app}\DoubleClickFixer.exe"; Parameters: "--updated"; Flags: nowait runasoriginaluser; Check: RelaunchRequested
+
+[Code]
+function RelaunchRequested: Boolean;
+begin
+  Result := ExpandConstant('{param:RELAUNCH|0}') = '1';
+end;
 
 [Registry]
 ; The app writes this itself when "start at login" is ticked; clear it on uninstall.

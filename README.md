@@ -39,6 +39,15 @@ double-clicking and dragging untouched.
   filter keeps running. Quit from there to stop it.
 - Left, right and middle buttons can be protected independently.
 
+## Updates
+
+The app keeps itself up to date from this repository's releases: it checks
+shortly after launch and every six hours, verifies the download, installs it
+and reopens, usually within a few seconds. On macOS, releases are always
+signed with the same certificate, so the Accessibility permission carries
+over and never has to be granted again. Turn automatic installs off in
+**General › Software update** to update with **Check Now** instead.
+
 ## Install
 
 Download the latest [release](https://github.com/arnav-goel10/doubleclick-fixer/releases):

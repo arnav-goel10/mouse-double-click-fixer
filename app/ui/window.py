@@ -488,9 +488,10 @@ class CalibratePage(Page):
 
 
 class GeneralPage(Page):
-    def __init__(self, controller: AppController, parent: Optional[QWidget] = None) -> None:
+    def __init__(self, controller: AppController, updater=None, parent: Optional[QWidget] = None) -> None:
         super().__init__("General", parent)
         self.controller = controller
+        self.updater = updater
         self._loading = False
 
         startup = self.section()
@@ -510,6 +511,20 @@ class GeneralPage(Page):
             button = _button("Open Settings…")
             button.clicked.connect(permissions.open_accessibility_settings)
             self.permission_row = section.add(Row("Accessibility", "", button, self.permission_icon))
+
+        self.update_header = self.header("Software update")
+        self.update_section = self.section()
+        self.auto_update_switch = Switch(accessible_name="Install updates automatically")
+        self.auto_update_switch.toggled.connect(self._on_auto_update)
+        self.update_section.add(Row("Install updates automatically", "", self.auto_update_switch))
+        self.update_button = _button("Check Now")
+        self.update_button.clicked.connect(self._on_update_button)
+        self.update_row = self.update_section.add(Row(f"DoubleClick Fixer {__version__}", "", self.update_button))
+        supported = updater is not None and updater.supported
+        self.update_header.setVisible(supported)
+        self.update_section.setVisible(supported)
+        if supported:
+            updater.changed.connect(self.refresh_update)
 
         self.header("Statistics")
         stats = self.section()
@@ -534,6 +549,41 @@ class GeneralPage(Page):
             self.permission_row.set_detail("Allowed" if granted else "Not allowed")
         total = self.controller.filtered_total
         self.stats_row.set_detail(f"{total:,} total")
+        self._loading = True
+        self.auto_update_switch.setChecked(bool(self.controller.settings.get("auto_update", True)), animate=False)
+        self._loading = False
+        self.refresh_update()
+
+    def refresh_update(self) -> None:
+        updater = self.updater
+        if updater is None or not updater.supported:
+            return
+        release = updater.release
+        states = {
+            updater.CHECKING: ("Checking for updates…", "Check Now", False),
+            updater.CURRENT: ("Up to date", "Check Now", True),
+            updater.AVAILABLE: (f"Version {release.version} is available" if release else "", "Update Now", True),
+            updater.DOWNLOADING: (f"Downloading… {int(updater.progress * 100)}%", "Update Now", False),
+            updater.INSTALLING: ("Installing. DoubleClick Fixer will reopen.", "Update Now", False),
+            updater.FAILED: (updater.message, "Try Again", True),
+        }
+        detail, label, enabled = states.get(updater.state, ("", "Check Now", True))
+        self.update_row.set_detail(detail)
+        self.update_button.setText(label)
+        self.update_button.setEnabled(enabled)
+        self.update_button.setDefault(updater.state == updater.AVAILABLE)
+
+    def _on_update_button(self) -> None:
+        if self.updater is None:
+            return
+        if self.updater.state == self.updater.AVAILABLE:
+            self.updater.install()
+        else:
+            self.updater.check(user_initiated=True)
+
+    def _on_auto_update(self, checked: bool) -> None:
+        if not self._loading:
+            self.controller.set_auto_update(checked)
 
     def _on_login(self, checked: bool) -> None:
         if self._loading:
@@ -566,9 +616,10 @@ class MainWindow(QWidget):
 
     closed_to_tray = Signal()
 
-    def __init__(self, controller: AppController) -> None:
+    def __init__(self, controller: AppController, updater=None) -> None:
         super().__init__()
         self.controller = controller
+        self.updater = updater
         set_look(current_look())
         self.setWindowTitle("DoubleClick Fixer")
         self.setWindowIcon(icons.app_icon())
@@ -609,7 +660,7 @@ class MainWindow(QWidget):
         self.filter_page = FilterPage(controller)
         self.test_page = TestPage(controller)
         self.calibrate = CalibratePage(controller)
-        self.general = GeneralPage(controller)
+        self.general = GeneralPage(controller, updater)
         self.pages = [self.filter_page, self.test_page, self.calibrate, self.general]
         self.stack = QStackedWidget()
         for page in self.pages:

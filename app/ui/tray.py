@@ -20,6 +20,8 @@ class Tray(QSystemTrayIcon):
         on_calibrate: Callable[[], None],
         on_quit: Callable[[], None],
         on_toggle: Optional[Callable[[bool], None]] = None,
+        updater=None,
+        on_check_updates: Optional[Callable[[], None]] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -44,6 +46,13 @@ class Tray(QSystemTrayIcon):
         calibrate_action = QAction("Calibrate…", menu)
         calibrate_action.triggered.connect(lambda: on_calibrate())
         menu.addAction(calibrate_action)
+        self.updater = updater
+        self.update_action = QAction("Check for Updates…", menu)
+        self.update_action.triggered.connect(self._on_update_action)
+        self._on_check_updates = on_check_updates
+        if updater is not None and updater.supported:
+            menu.addAction(self.update_action)
+            updater.changed.connect(self.refresh)
         menu.addSeparator()
 
         quit_action = QAction("Quit DoubleClick Fixer" if IS_MAC else "Exit", menu)
@@ -67,7 +76,17 @@ class Tray(QSystemTrayIcon):
         ):
             self._on_open()
 
+    def _on_update_action(self) -> None:
+        if self.updater is not None and self.updater.state == self.updater.AVAILABLE:
+            self.updater.install()
+        elif self._on_check_updates is not None:
+            self._on_check_updates()
+
     def refresh(self) -> None:
+        if self.updater is not None and self.updater.state == self.updater.AVAILABLE and self.updater.release:
+            self.update_action.setText(f"Update to {self.updater.release.version}")
+        else:
+            self.update_action.setText("Check for Updates…")
         active = self.controller.active
         self.setIcon(icons.tray_icon(active))
         self.toggle_action.setChecked(active)
