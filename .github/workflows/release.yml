@@ -42,7 +42,7 @@ jobs:
           choco install innosetup --no-progress -y
           $version = (python -c "import app; print(app.__version__)")
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" "installer\windows.iss"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: DoubleClickFixer-windows
           path: |
@@ -96,7 +96,7 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         run: |
           codesign -d -r- "dist/DoubleClick Fixer.app" 2>&1 | tee /dev/stderr | grep -q "certificate root"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: DoubleClickFixer-macos
           path: |

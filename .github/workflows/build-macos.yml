@@ -16,7 +16,7 @@ jobs:
           python-version: "3.13"
       - name: Build app and DMG
         run: bash installer/build_macos.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: DoubleClickFixer-macos
           path: dist/DoubleClickFixer.dmg
