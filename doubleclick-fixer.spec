@@ -33,7 +33,9 @@ if sys.platform == "darwin":
     # The event tap is reached through PyObjC at runtime.
     from PyInstaller.utils.hooks import collect_submodules
 
-    hiddenimports += collect_submodules("Quartz") + collect_submodules("AppKit")
+    hiddenimports += (
+        collect_submodules("Quartz") + collect_submodules("AppKit") + collect_submodules("Foundation")
+    )
 
 analysis = Analysis(
     ["run.py"],

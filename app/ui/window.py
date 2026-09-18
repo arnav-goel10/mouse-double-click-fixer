@@ -762,10 +762,12 @@ class MainWindow(QWidget):
         if not checked:
             self._enable_when_granted = False
         elif permissions.needs_accessibility() and not self._permission_granted:
-            # Say what is missing instead of failing with an error dialog; the
-            # filter starts by itself once access is granted.
+            # Ask macOS for access (it lists this app under Accessibility)
+            # instead of failing with an error; the filter starts by itself
+            # once the switch there is turned on.
             self._enable_when_granted = True
             self.refresh()
+            permissions.open_accessibility_settings()
             return
         self.controller.set_active(checked)
         self.refresh()

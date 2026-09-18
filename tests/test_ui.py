@@ -156,10 +156,12 @@ class WindowTests(unittest.TestCase):
     def test_filter_requested_before_permission_starts_once_granted(self) -> None:
         with mock.patch("app.permissions.needs_accessibility", return_value=True), mock.patch(
             "app.permissions.has_accessibility", return_value=False
-        ), mock.patch.object(self.controller, "set_active", return_value=False) as set_active:
+        ), mock.patch.object(self.controller, "set_active", return_value=False) as set_active, \
+                mock.patch("app.permissions.open_accessibility_settings") as ask:
             self.window._permission_granted = False
             self.window.request_filter(True)
             set_active.assert_not_called()
+            ask.assert_called_once()
             self.assertTrue(self.window.filter_page.switch.isChecked(), "switch shows the request")
             self.assertIn("Waiting", self.window.filter_page.status_row.detail.text())
 
