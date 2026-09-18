@@ -90,7 +90,7 @@ while deliberate double-clicks survive.
 ## Packaging
 
 ```bash
-bash installer/build_macos.sh       # DoubleClickFixer.app + DMG
+bash installer/build_macos.sh       # DoubleClick Fixer.app + DMG
 .\installer\build_windows.ps1       # portable exe; then compile installer\windows.iss
 ```
 

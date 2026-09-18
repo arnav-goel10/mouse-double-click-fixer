@@ -63,7 +63,7 @@ if sys.platform == "darwin":
     collected = COLLECT(exe, analysis.binaries, analysis.datas, name="DoubleClickFixer")
     app = BUNDLE(
         collected,
-        name="DoubleClickFixer.app",
+        name="DoubleClick Fixer.app",
         icon="installer/assets/icon.icns",
         bundle_identifier="com.doubleclickfixer.app",
         info_plist={

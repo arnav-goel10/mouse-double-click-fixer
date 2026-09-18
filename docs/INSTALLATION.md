@@ -12,7 +12,7 @@
 
 ## macOS
 
-1. Download `DoubleClickFixer.dmg`, open it, and drag the app to Applications.
+1. Download `DoubleClickFixer.dmg`, open it, and drag DoubleClick Fixer onto Applications.
 2. The build is not notarized yet, so the first launch needs
    **right-click > Open**, or **System Settings > Privacy & Security > Open
    Anyway**.

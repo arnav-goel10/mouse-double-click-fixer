@@ -116,9 +116,8 @@ class FilterPage(Page):
         self.permission_button.clicked.connect(permissions.open_accessibility_settings)
         self.permission_row = self.permission.add(
             Row(
-                "Allow DoubleClick Fixer to filter clicks",
-                "Turn it on in Privacy & Security › Accessibility. "
-                "This notice goes away as soon as you do.",
+                "Accessibility access required",
+                "Allow DoubleClick Fixer in Privacy & Security.",
                 self.permission_button,
                 SymbolView("warning", 22, "symbol"),
             )
@@ -131,7 +130,7 @@ class FilterPage(Page):
         self.switch = Switch(accessible_name="Bounce filter")
         self.status_row = main.add(Row("Bounce Filter", "", self.switch, AppIconView(34 if IS_MAC else 32)))
 
-        self.header("Filter Window")
+        self.header("Filter window")
         window = self.section()
         slider_box = QWidget()
         slider_layout = QHBoxLayout(slider_box)
@@ -147,10 +146,7 @@ class FilterPage(Page):
         slider_layout.addWidget(self.slider)
         slider_layout.addWidget(self.value)
         window.add(Row("Ignore presses within", "", slider_box))
-        self.footnote(
-            "Measured from the moment the button is released. Worn switches usually bounce "
-            "within 30 ms; Calibrate measures yours."
-        )
+        self.footnote("Most worn switches bounce within 30 ms.")
 
         self.header("Buttons")
         buttons = self.section()
@@ -159,7 +155,7 @@ class FilterPage(Page):
             switch = Switch(accessible_name=f"Filter the {button.label.lower()} button")
             switch.toggled.connect(self._on_buttons)
             self.button_switches[button] = switch
-            buttons.add(Row(f"{button.label} Button", "", switch))
+            buttons.add(Row(f"{button.label} button", "", switch))
 
         self.header("Activity")
         activity = self.section()
@@ -177,13 +173,11 @@ class FilterPage(Page):
         threshold = self.controller.threshold_ms
         self.switch.setChecked(active or waiting_for_permission, animate=self.isVisible())
         if self.controller.suspended:
-            self.status_row.set_detail("Paused while you calibrate.")
+            self.status_row.set_detail("Paused during calibration.")
         elif waiting_for_permission:
-            self.status_row.set_detail("Waiting for Accessibility access. Starts as soon as it’s allowed.")
-        elif active:
-            self.status_row.set_detail(f"On. Presses within {threshold} ms of a release are ignored.")
+            self.status_row.set_detail("Waiting for Accessibility access.")
         else:
-            self.status_row.set_detail("Off. Your mouse behaves exactly as it does without the app.")
+            self.status_row.set_detail("Ignores the extra click a worn switch adds.")
         self.slider.setValue(threshold)
         self.value.setText(f"{threshold} ms")
         for button, switch in self.button_switches.items():
@@ -234,10 +228,7 @@ class TestPage(Page):
         self.timeline = GapTimeline()
         holder_layout.addWidget(self.timeline)
         chart.add(holder)
-        self.footnote(
-            "Each bar is the pause between releasing and pressing again. "
-            "Red bars fall inside the filter window."
-        )
+        self.footnote("Red bars fall within the filter window.")
 
         self.header("Measurements")
         values = self.section()
@@ -327,8 +318,8 @@ class CalibratePage(Page):
         self.recommended_value = ValueLabel()
         self.bounce_value = ValueLabel()
         self.double_value = ValueLabel()
-        self.result.add(Row("Recommended filter window", "", self.recommended_value))
-        self.result.add(Row("Longest bounce measured", "", self.bounce_value))
+        self.result.add(Row("Recommended window", "", self.recommended_value))
+        self.result.add(Row("Longest bounce", "", self.bounce_value))
         self.result.add(Row("Fastest double-click", "", self.double_value))
         self.summary = self.footnote("")
 
@@ -383,7 +374,7 @@ class CalibratePage(Page):
             counted = self.calibrator.add_single_click(gap_ms)
             self.pad.flash(not counted)
             if not counted:
-                note = f"Bounce detected: an extra press {gap_ms:.0f} ms after release."
+                note = f"Bounce detected ({gap_ms:.0f} ms)."
             if self.calibrator.has_enough_singles:
                 self.phase = "double"
                 self.pad.reset()
@@ -393,7 +384,7 @@ class CalibratePage(Page):
                 recorded = self.calibrator.add_double_click(gap_ms)
                 self.pad.flash(not recorded)
                 if not recorded:
-                    note = f"Bounce detected inside a double-click ({gap_ms:.0f} ms)."
+                    note = f"Bounce detected ({gap_ms:.0f} ms)."
             else:
                 self.pad.flash(False)
             if self.calibrator.has_enough_doubles:
@@ -415,32 +406,28 @@ class CalibratePage(Page):
         self.pad.setVisible(not done)
 
         if self.phase == "intro":
-            self.step_row.title.setText("Measure your mouse")
-            self.step_row.set_detail(
-                "Takes about a minute. Single clicks first, so any extra press the switch adds "
-                "can be measured, then double-clicks, which set the limit the filter must stay "
-                "under. Filtering pauses while you calibrate."
-            )
+            self.step_row.title.setText("Calibrate your mouse")
+            self.step_row.set_detail("Click once at a time, then double-click. Filtering pauses until you finish.")
             self.count_label.setText("")
-            self.pad.set_text("Ready", "Choose Begin to start.")
+            self.pad.set_text("Ready", "")
             self.primary_button.setText("Begin")
             self.primary_button.setEnabled(True)
         elif self.phase == "single":
             count = self.calibrator.single_clicks
-            self.step_row.title.setText("Step 1 of 2: Single Clicks")
-            self.step_row.set_detail(note or "Click once, pause for a second, then click again. Don’t double-click.")
+            self.step_row.title.setText("Single clicks")
+            self.step_row.set_detail(note or "Click once, then pause.")
             self.count_label.setText(f"{count} of {REQUIRED_SINGLE_CLICKS}")
             self.progress.setValue(int(self.calibrator.single_progress * 100))
-            self.pad.set_text("Click Once", "Then wait a moment.")
+            self.pad.set_text("Click Once", "")
             self.primary_button.setText("Skip")
             self.primary_button.setEnabled(True)
         elif self.phase == "double":
             count = self.calibrator.double_clicks
-            self.step_row.title.setText("Step 2 of 2: Double-Clicks")
-            self.step_row.set_detail(note or "Double-click at your normal speed, as if opening a file.")
+            self.step_row.title.setText("Double-clicks")
+            self.step_row.set_detail(note or "Double-click at your usual speed.")
             self.count_label.setText(f"{count} of {REQUIRED_DOUBLE_CLICKS}")
             self.progress.setValue(int(self.calibrator.double_progress * 100))
-            self.pad.set_text("Double-Click", "At your usual speed.")
+            self.pad.set_text("Double-Click", "")
             self.primary_button.setText("Finish")
             self.primary_button.setEnabled(self.calibrator.double_clicks > 0)
         else:
@@ -448,21 +435,25 @@ class CalibratePage(Page):
             self.count_label.setText("")
             if suggestion is None:
                 self.step_row.title.setText("Not enough double-clicks")
-                self.step_row.set_detail(
-                    f"At least {REQUIRED_DOUBLE_CLICKS} double-clicks are needed to know what must "
-                    "not be blocked. Choose Start Over to try again."
-                )
+                self.step_row.set_detail(f"Start over and double-click at least {REQUIRED_DOUBLE_CLICKS} times.")
                 self.primary_button.setText("Apply")
                 self.primary_button.setEnabled(False)
                 return
-            self.step_row.title.setText("Calibration Complete")
-            self.step_row.set_detail("Apply the recommendation to use it for the filter.")
+            self.step_row.title.setText("Calibration complete")
+            self.step_row.set_detail("")
             self.recommended_value.setText(f"{suggestion.threshold_ms} ms")
             self.bounce_value.setText(
                 "None" if suggestion.worst_bounce_ms is None else f"{suggestion.worst_bounce_ms:.0f} ms"
             )
             self.double_value.setText(f"{suggestion.fastest_double_click_ms:.0f} ms")
-            self.summary.setText(suggestion.summary)
+            # Only speak up when the result needs a caveat.
+            self.summary.setText(
+                ""
+                if suggestion.confident
+                else "Little margin between bounce and your double-clicks. "
+                "Raise the window if bounce still gets through."
+            )
+            self.summary.setVisible(not suggestion.confident)
             self.primary_button.setText("Apply")
             self.primary_button.setEnabled(True)
 
@@ -476,11 +467,9 @@ class GeneralPage(Page):
         startup = self.section()
         self.login_switch = Switch(accessible_name="Open at login")
         self.hidden_switch = Switch(accessible_name="Start hidden")
-        startup.add(Row("Open at Login", "", self.login_switch))
+        startup.add(Row("Open at login", "", self.login_switch))
         where = "menu bar" if IS_MAC else "notification area"
-        startup.add(
-            Row("Start Hidden", f"Launch straight to the {where} without opening this window.", self.hidden_switch)
-        )
+        startup.add(Row(f"Start in {where}", "", self.hidden_switch))
         self.login_switch.toggled.connect(self._on_login)
         self.hidden_switch.toggled.connect(self._on_hidden)
 
@@ -513,13 +502,9 @@ class GeneralPage(Page):
         if self.permission_row is not None:
             self.permission_icon.name = "ok" if granted else "warning"
             self.permission_icon.update()
-            self.permission_row.set_detail(
-                "Allowed. The filter can block bounced clicks."
-                if granted
-                else "Not allowed yet. The filter can’t block anything until it is."
-            )
+            self.permission_row.set_detail("Allowed" if granted else "Not allowed")
         total = self.controller.filtered_total
-        self.stats_row.set_detail(f"{total:,} in total, {self.controller.session_filtered:,} since launch.")
+        self.stats_row.set_detail(f"{total:,} total")
 
     def _on_login(self, checked: bool) -> None:
         if self._loading:
@@ -536,8 +521,8 @@ class GeneralPage(Page):
     def _confirm_reset(self) -> None:
         answer = QMessageBox.question(
             self,
-            "Reset the blocked-bounce count?",
-            "The count starts again from zero. Your settings stay as they are.",
+            "Reset the count?",
+            "Blocked bounces will start again from zero.",
             QMessageBox.StandardButton.Reset | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
         )

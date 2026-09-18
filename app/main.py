@@ -106,8 +106,7 @@ class Application:
         QMessageBox.about(
             self.window,
             "About DoubleClick Fixer",
-            f"DoubleClick Fixer {__version__}\n\n"
-            "Filters the extra click a worn mouse switch adds, without touching real double-clicks.",
+            f"DoubleClick Fixer {__version__}",
         )
 
     # -- window ------------------------------------------------------------
@@ -128,8 +127,8 @@ class Application:
         self._told_about_tray = True
         where = "the menu bar" if platform.system() == "Darwin" else "the notification area"
         self.tray.showMessage(
-            "Still running",
-            f"DoubleClick Fixer keeps filtering from {where}. Use Quit there to stop it.",
+            "DoubleClick Fixer is still running",
+            f"It keeps filtering from the {where.removeprefix('the ')}.",
             icons.tray_icon(self.controller.active),
             4000,
         )

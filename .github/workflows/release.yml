@@ -62,7 +62,6 @@ jobs:
         with:
           name: DoubleClickFixer-macos
           path: |
-            dist/DoubleClickFixer.app
             dist/DoubleClickFixer.dmg
 
   publish:

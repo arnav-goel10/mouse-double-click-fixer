@@ -456,7 +456,7 @@ class ClickPad(QWidget):
         self._flash = 0.0
         self._flash_bounce = False
         self._headline = "Click Here"
-        self._caption = "Clicks here stay inside DoubleClick Fixer."
+        self._caption = ""
 
     def set_text(self, headline: str, caption: str) -> None:
         self._headline = headline
@@ -513,12 +513,15 @@ class ClickPad(QWidget):
         painter.setPen(QPen(lk.section_border, 1))
         painter.drawPath(path)
 
-        painter.setPen(lk.text)
-        painter.setFont(font("large"))
-        painter.drawText(rect.adjusted(0, -14, 0, -14), Qt.AlignmentFlag.AlignCenter, self._headline)
+        # A quiet label, not a call to action: secondary colour, no caption
+        # unless there is something to add.
+        offset = 10 if self._caption else 0
         painter.setPen(lk.secondary)
-        painter.setFont(font("caption"))
-        painter.drawText(rect.adjusted(0, 22, 0, 22), Qt.AlignmentFlag.AlignCenter, self._caption)
+        painter.setFont(font("large"))
+        painter.drawText(rect.adjusted(0, -offset, 0, -offset), Qt.AlignmentFlag.AlignCenter, self._headline)
+        if self._caption:
+            painter.setFont(font("caption"))
+            painter.drawText(rect.adjusted(0, 24, 0, 24), Qt.AlignmentFlag.AlignCenter, self._caption)
 
 
 class GapTimeline(QWidget):
@@ -555,7 +558,7 @@ class GapTimeline(QWidget):
 
         if not self._gaps:
             painter.setPen(lk.secondary)
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "Your clicks will appear here.")
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No clicks yet")
             return
 
         label = f"{self._threshold:.0f} ms"
