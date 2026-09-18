@@ -4,6 +4,10 @@ A desktop utility for a mouse that registers two clicks when you pressed once.
 It measures the fault, learns a safe threshold, and filters the duplicate
 system-wide on Windows and macOS — without disabling real double-clicks.
 
+**[Download for Mac](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest/download/DoubleClickFixer.dmg)** ·
+**[Download for Windows](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest/download/DoubleClickFixer-Setup.exe)** ·
+[All releases](https://github.com/arnav-goel10/doubleclick-fixer/releases)
+
 | macOS | Windows 11 |
 | --- | --- |
 | ![DoubleClick Fixer on macOS](docs/images/macos.png) | ![DoubleClick Fixer on Windows 11](docs/images/windows.png) |
@@ -50,12 +54,11 @@ over and never has to be granted again. Turn automatic installs off in
 
 ## Install
 
-Download the latest [release](https://github.com/arnav-goel10/doubleclick-fixer/releases):
-
-- **Windows** — `DoubleClickFixer-Setup.exe`, or the portable `DoubleClickFixer.exe`.
-- **macOS** — `DoubleClickFixer.dmg`. Drag the app to Applications, open it, and
-  grant Accessibility permission when asked: macOS only allows a filtering
-  event tap for a trusted app.
+- **macOS** — [DoubleClickFixer.dmg](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest/download/DoubleClickFixer.dmg).
+  Drag the app onto Applications, open it, and allow it under Accessibility
+  when asked: macOS only lets a trusted app filter input.
+- **Windows** — [DoubleClickFixer-Setup.exe](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest/download/DoubleClickFixer-Setup.exe),
+  or the portable [DoubleClickFixer.exe](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest/download/DoubleClickFixer.exe).
 
 See [docs/INSTALLATION.md](docs/INSTALLATION.md) for details and uninstall steps.
 
