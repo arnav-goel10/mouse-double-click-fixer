@@ -2,7 +2,7 @@
 
 ## 1. Look at the fault
 
-Open the app. On **Overview**, click the test pad the way you normally would.
+Open the app and choose **Test** in the sidebar. Click the pad the way you normally would.
 Each bar is the pause between releasing the button and the next press. A worn
 switch produces occasional tiny bars — those are the presses you never made.
 
@@ -18,14 +18,14 @@ Go to **Calibrate**. The system-wide filter pauses so the raw mouse is visible.
 
 ## 3. Turn it on
 
-Use the switch at the top right. The subtitle shows what is protected, and the
-Overview counters show how many bounces have been blocked.
+On the **Bounce Filter** pane, turn on the switch next to the app icon. The
+Activity section counts how many bounces have been blocked.
 
 Try it: click once on a file in Explorer or Finder. The double-open should stop
 happening, while a deliberate double-click still opens the file.
 
 ## 4. Leave it running
 
-Close the window — the app keeps filtering from the menu bar or notification
-area. Turn on **Start when I sign in** and **Start hidden** in Settings to make
+Close the window and the app keeps filtering from the menu bar or notification
+area. Turn on **Open at Login** and **Start Hidden** under **General** to make
 that automatic.

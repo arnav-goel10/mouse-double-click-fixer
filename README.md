@@ -4,7 +4,9 @@ A desktop utility for a mouse that registers two clicks when you pressed once.
 It measures the fault, learns a safe threshold, and filters the duplicate
 system-wide on Windows and macOS — without disabling real double-clicks.
 
-![Overview](docs/images/overview.png)
+| macOS | Windows 11 |
+| --- | --- |
+| ![DoubleClick Fixer on macOS](docs/images/macos.png) | ![DoubleClick Fixer on Windows 11](docs/images/windows.png) |
 
 ## What switch bounce is
 
@@ -21,8 +23,11 @@ double-clicking and dragging untouched.
 
 ## How it works
 
-- **Test pad** — click normally and watch each gap plotted against the current
-  filter, so you can see the fault instead of guessing.
+- **Native on both platforms** — a System Settings-style window on macOS
+  (translucent sidebar, SF Symbols, your accent colour) and a Windows 11
+  Settings-style window on Windows (Mica, Fluent icons, settings cards).
+- **Test** — click the pad normally and watch each gap plotted against the
+  current filter, so you can see the fault instead of guessing.
 - **Calibration** — two labeled phases (single clicks, then double-clicks) that
   measure your bounce and your own double-click speed, then suggest a threshold
   that clears the first and stays well under the second.
@@ -58,15 +63,16 @@ python run.py
 
 ## Using it
 
-1. Open the app and go to **Calibrate**. The system-wide filter pauses
-   automatically so it can measure the raw mouse.
+1. Open the app and choose **Calibrate** in the sidebar. The system-wide
+   filter pauses automatically so it can measure the raw mouse.
 2. Step 1: click once, wait, repeat. Any extra press the mouse invents is
    recorded as bounce.
 3. Step 2: double-click normally. This sets the limit the filter must never
    reach.
-4. Apply the suggestion, then turn the filter on with the switch at the top.
+4. Apply the suggestion, then turn on **Bounce Filter**.
 
-If bounce still gets through, raise the threshold slightly in **Settings**; if a
+If bounce still gets through, raise the filter window slightly on the
+**Bounce Filter** pane; if a
 fast double-click ever gets swallowed, lower it. Values between 40 and 90 ms
 suit most worn switches.
 

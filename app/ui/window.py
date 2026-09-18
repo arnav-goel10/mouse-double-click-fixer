@@ -297,20 +297,26 @@ class CalibratePage(Page):
         self.phase = "intro"
         self.suggestion = None
 
+        # The step and its progress bar are one row, so they share one box
+        # (macOS) or one card (Windows).
         step = self.section()
+        holder = QWidget()
+        holder_layout = QVBoxLayout(holder)
+        holder_layout.setContentsMargins(0, 0, 0, 0)
+        holder_layout.setSpacing(0)
         self.count_label = ValueLabel()
-        self.step_row = step.add(Row("", "", self.count_label))
-        progress_holder = QWidget()
-        progress_layout = QVBoxLayout(progress_holder)
-        progress_layout.setContentsMargins(12 if IS_MAC else 16, 0, 12 if IS_MAC else 16, 12)
+        self.step_row = Row("", "", self.count_label)
+        holder_layout.addWidget(self.step_row)
+        self.progress_row = QWidget()
+        progress_layout = QVBoxLayout(self.progress_row)
+        progress_layout.setContentsMargins(12 if IS_MAC else 16, 0, 12 if IS_MAC else 16, 12 if IS_MAC else 16)
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setTextVisible(False)
         self.progress.setAccessibleName("Calibration progress")
         progress_layout.addWidget(self.progress)
-        self.progress_row = step.add(progress_holder)
-        self.progress_row.separator_inset = 10_000  # no hairline above the bar
-        self.step_row.separator_inset = 10_000
+        holder_layout.addWidget(self.progress_row)
+        step.add(holder)
         self.gap(12)
 
         self.pad = ClickPad()

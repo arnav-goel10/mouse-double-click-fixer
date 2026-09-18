@@ -2,7 +2,7 @@
 
 ## Bounce still gets through
 
-Raise the filter in **Settings** by 10–20 ms and test again on the Overview
+Raise the filter window on the **Bounce Filter** pane by 10–20 ms and test again on the **Test**
 pad. Chatter is intermittent, so a calibration run can miss the worst of it.
 Watch the bars: anything below the dashed line would be filtered.
 
@@ -48,5 +48,5 @@ quantity, so recalibrate after upgrading.
 
 ## Reporting a bug
 
-Include the app version (Settings page), your OS version, the mouse model, your
-threshold, and what the Overview pad shows when the fault happens.
+Include the app version (bottom of **General**), your OS version, the mouse model,
+your filter window, and what the **Test** pane shows when the fault happens.
