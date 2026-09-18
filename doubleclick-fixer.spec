@@ -33,7 +33,7 @@ if sys.platform == "darwin":
     # The event tap is reached through PyObjC at runtime.
     from PyInstaller.utils.hooks import collect_submodules
 
-    hiddenimports += collect_submodules("Quartz")
+    hiddenimports += collect_submodules("Quartz") + collect_submodules("AppKit")
 
 analysis = Analysis(
     ["run.py"],
@@ -55,13 +55,14 @@ exe = EXE(
     [],
     name="DoubleClickFixer",
     console=False,
-    version_info=None,
+    icon="installer/assets/icon.ico" if sys.platform == "win32" else None,
 )
 
 if sys.platform == "darwin":
     app = BUNDLE(
         exe,
         name="DoubleClickFixer.app",
+        icon="installer/assets/icon.icns",
         bundle_identifier="com.doubleclickfixer.app",
         info_plist={
             "CFBundleName": "DoubleClick Fixer",

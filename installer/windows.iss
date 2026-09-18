@@ -14,6 +14,7 @@ AppSupportURL=https://github.com/arnav-goel10/doubleclick-fixer
 UninstallDisplayIcon={app}\DoubleClickFixer.exe
 VersionInfoVersion={#AppVersion}
 WizardStyle=modern
+SetupIconFile=assets\icon.ico
 PrivilegesRequired=lowest
 ; Ask the running copy to close, so the file is never locked during an update.
 CloseApplications=yes
@@ -23,9 +24,11 @@ Source: "..\dist\DoubleClickFixer.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\DoubleClick Fixer"; Filename: "{app}\DoubleClickFixer.exe"
+Name: "{autodesktop}\DoubleClick Fixer"; Filename: "{app}\DoubleClickFixer.exe"; Tasks: desktopicon
 Name: "{userstartup}\DoubleClick Fixer"; Filename: "{app}\DoubleClickFixer.exe"; Parameters: "--minimized"; Tasks: startup
 
 [Tasks]
+Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
 Name: "startup"; Description: "Start DoubleClick Fixer when I sign in"; Flags: unchecked
 
 [Run]

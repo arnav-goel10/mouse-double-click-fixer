@@ -1,29 +1,25 @@
-"""The main window: overview, calibration and settings."""
+"""The main window: a sidebar and four panes, in the platform's own idiom."""
 
 from __future__ import annotations
 
-import platform
 from typing import Optional
 
-from PySide6.QtCore import QTimer, Qt, Signal
-from PySide6.QtGui import QDesktopServices
+from PySide6.QtCore import QEvent, QRect, QTimer, Qt, Signal
+from PySide6.QtGui import QPainter
 from PySide6.QtWidgets import (
-    QButtonGroup,
-    QCheckBox,
     QFrame,
     QHBoxLayout,
-    QLabel,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QScrollArea,
     QSlider,
-    QSpinBox,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from .. import permissions
+from .. import __version__, permissions
 from ..controller import AppController
 from ..core import (
     MAX_THRESHOLD_MS,
@@ -34,229 +30,324 @@ from ..core import (
     Calibrator,
     ClickEvent,
 )
-from . import icons
-from .theme import Palette, stylesheet, system_palette
-from .widgets import Card, ClickPad, GapTimeline, ProgressRing, StatTile, ToggleSwitch
+from . import icons, native
+from .theme import IS_MAC, current_look
+from .widgets import (
+    AppIconView,
+    ClickPad,
+    GapTimeline,
+    Row,
+    Section,
+    Sidebar,
+    Switch,
+    SymbolView,
+    TextLabel,
+    ValueLabel,
+    look,
+    set_look,
+)
 
 #: A pause longer than this starts a new pair while calibrating double-clicks.
 PAIR_WINDOW_MS = 600.0
 
-
-def _row(*widgets: QWidget, spacing: int = 10) -> QHBoxLayout:
-    layout = QHBoxLayout()
-    layout.setContentsMargins(0, 0, 0, 0)
-    layout.setSpacing(spacing)
-    for widget in widgets:
-        layout.addWidget(widget)
-    return layout
+PAGES = [
+    ("filter", "Bounce Filter"),
+    ("test", "Test"),
+    ("calibrate", "Calibrate"),
+    ("general", "General"),
+]
 
 
-class OverviewPage(QWidget):
-    """Status, live statistics and a local test pad."""
+def _button(text: str, default: bool = False) -> QPushButton:
+    button = QPushButton(text)
+    button.setDefault(default)
+    button.setAutoDefault(default)
+    return button
 
-    def __init__(self, controller: AppController, palette: Palette, parent: Optional[QWidget] = None) -> None:
+
+class Page(QWidget):
+    """A pane: stacked sections with headers and footnotes."""
+
+    def __init__(self, title: str, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
+        self.page_title = title
+        self.body = QVBoxLayout(self)
+        self.body.setSpacing(0)
+        if IS_MAC:
+            self.body.setContentsMargins(20, 4, 20, 20)
+        else:
+            self.body.setContentsMargins(36, 0, 36, 28)
+            heading = TextLabel(title, "title")
+            heading.setContentsMargins(0, 24, 0, 20)
+            self.body.addWidget(heading)
+
+    def header(self, text: str) -> TextLabel:
+        label = TextLabel(text, "headline")
+        label.setContentsMargins(2 if IS_MAC else 0, 18, 0, 6 if IS_MAC else 8)
+        self.body.addWidget(label)
+        return label
+
+    def section(self) -> Section:
+        section = Section()
+        self.body.addWidget(section)
+        return section
+
+    def footnote(self, text: str) -> TextLabel:
+        label = TextLabel(text, "caption", "secondary")
+        label.setWordWrap(True)
+        label.setContentsMargins(2 if IS_MAC else 0, 6, 0, 0)
+        self.body.addWidget(label)
+        return label
+
+    def gap(self, height: int = 20) -> None:
+        self.body.addSpacing(height)
+
+
+# -- panes -----------------------------------------------------------------------
+
+class FilterPage(Page):
+    def __init__(self, controller: AppController, parent: Optional[QWidget] = None) -> None:
+        super().__init__("Bounce Filter", parent)
         self.controller = controller
-        self.palette_tokens = palette
+        self._loading = False
+
+        self.permission = self.section()
+        self.permission_button = _button("Open Settings…")
+        self.permission_button.clicked.connect(permissions.open_accessibility_settings)
+        self.permission_row = self.permission.add(
+            Row(
+                "Allow DoubleClick Fixer to filter clicks",
+                "Turn it on in Privacy & Security › Accessibility. "
+                "This notice goes away as soon as you do.",
+                self.permission_button,
+                SymbolView("warning", 22, "symbol"),
+            )
+        )
+        self.permission_gap = QWidget()
+        self.permission_gap.setFixedHeight(20)
+        self.body.addWidget(self.permission_gap)
+
+        main = self.section()
+        self.switch = Switch(accessible_name="Bounce filter")
+        self.status_row = main.add(Row("Bounce Filter", "", self.switch, AppIconView(34 if IS_MAC else 32)))
+
+        self.header("Filter Window")
+        window = self.section()
+        slider_box = QWidget()
+        slider_layout = QHBoxLayout(slider_box)
+        slider_layout.setContentsMargins(0, 0, 0, 0)
+        slider_layout.setSpacing(10)
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setRange(MIN_THRESHOLD_MS, MAX_THRESHOLD_MS)
+        self.slider.setPageStep(5)
+        self.slider.setFixedWidth(200 if IS_MAC else 220)
+        self.slider.setAccessibleName("Filter window in milliseconds")
+        self.value = ValueLabel()
+        self.value.setMinimumWidth(52)
+        slider_layout.addWidget(self.slider)
+        slider_layout.addWidget(self.value)
+        window.add(Row("Ignore presses within", "", slider_box))
+        self.footnote(
+            "Measured from the moment the button is released. Worn switches usually bounce "
+            "within 30 ms; Calibrate measures yours."
+        )
+
+        self.header("Buttons")
+        buttons = self.section()
+        self.button_switches: dict[Button, Switch] = {}
+        for button in Button:
+            switch = Switch(accessible_name=f"Filter the {button.label.lower()} button")
+            switch.toggled.connect(self._on_buttons)
+            self.button_switches[button] = switch
+            buttons.add(Row(f"{button.label} Button", "", switch))
+
+        self.header("Activity")
+        activity = self.section()
+        self.total_value = ValueLabel()
+        self.session_value = ValueLabel()
+        activity.add(Row("Blocked in total", "", self.total_value))
+        activity.add(Row("Blocked since launch", "", self.session_value))
+        self.body.addStretch(1)
+
+        self.slider.valueChanged.connect(self._on_slider)
+
+    def refresh(self, granted: bool, waiting_for_permission: bool = False) -> None:
+        self._loading = True
+        active = self.controller.active
+        threshold = self.controller.threshold_ms
+        self.switch.setChecked(active or waiting_for_permission, animate=self.isVisible())
+        if self.controller.suspended:
+            self.status_row.set_detail("Paused while you calibrate.")
+        elif waiting_for_permission:
+            self.status_row.set_detail("Waiting for Accessibility access. Starts as soon as it’s allowed.")
+        elif active:
+            self.status_row.set_detail(f"On. Presses within {threshold} ms of a release are ignored.")
+        else:
+            self.status_row.set_detail("Off. Your mouse behaves exactly as it does without the app.")
+        self.slider.setValue(threshold)
+        self.value.setText(f"{threshold} ms")
+        for button, switch in self.button_switches.items():
+            switch.setChecked(button in self.controller.buttons, animate=False)
+        self.total_value.setText(f"{self.controller.filtered_total:,}")
+        self.session_value.setText(f"{self.controller.session_filtered:,}")
+        show = permissions.needs_accessibility() and not granted
+        self.permission.setVisible(show)
+        self.permission_gap.setVisible(show)
+        self._loading = False
+
+    def note_global_event(self, event: ClickEvent) -> None:
+        if event.is_bounce:
+            self.total_value.setText(f"{self.controller.filtered_total:,}")
+            self.session_value.setText(f"{self.controller.session_filtered:,}")
+
+    def _on_slider(self, value: int) -> None:
+        self.value.setText(f"{value} ms")
+        if not self._loading:
+            self.controller.set_threshold(value)
+
+    def _on_buttons(self, _checked: bool) -> None:
+        if self._loading:
+            return
+        selected = [button for button, switch in self.button_switches.items() if switch.isChecked()]
+        if not selected:
+            # Something has to stay protected; keep the left button on.
+            self.button_switches[Button.LEFT].setChecked(True)
+            selected = [Button.LEFT]
+        self.controller.set_buttons(selected)
+
+
+class TestPage(Page):
+    def __init__(self, controller: AppController, parent: Optional[QWidget] = None) -> None:
+        super().__init__("Test", parent)
+        self.controller = controller
         self.clicks = 0
         self.shortest_gap: Optional[float] = None
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(14)
+        self.pad = ClickPad()
+        self.body.addWidget(self.pad, 1)
+        self.gap(12)
 
-        self.banner = QFrame()
-        self.banner.setObjectName("banner")
-        banner_layout = QHBoxLayout(self.banner)
-        banner_layout.setContentsMargins(14, 12, 14, 12)
-        self.banner_text = QLabel()
-        self.banner_text.setWordWrap(True)
-        self.banner_button = QPushButton("Open System Settings")
-        self.banner_button.clicked.connect(permissions.open_accessibility_settings)
-        banner_layout.addWidget(self.banner_text, 1)
-        banner_layout.addWidget(self.banner_button)
-        self.banner.hide()
-        layout.addWidget(self.banner)
-
-        status = Card()
-        self.status_headline = QLabel("Filter is off")
-        self.status_headline.setObjectName("statusHeadline")
-        self.status_detail = QLabel()
-        self.status_detail.setObjectName("hint")
-        self.status_detail.setWordWrap(True)
-        status.body.addWidget(self.status_headline)
-        status.body.addWidget(self.status_detail)
-
-        self.tile_total = StatTile("Bounces blocked", "0")
-        self.tile_session = StatTile("This session", "0")
-        self.tile_threshold = StatTile("Filter", "60", "ms")
-        status.body.addLayout(_row(self.tile_total, self.tile_session, self.tile_threshold))
-        layout.addWidget(status)
-
-        test = Card()
-        heading = QLabel("Test your mouse")
-        heading.setObjectName("sectionTitle")
-        test.body.addWidget(heading)
-        caption = QLabel(
-            "Click the pad the way you normally would. Each bar is the pause between releasing "
-            "and pressing again — bounce shows up as a bar below the dashed line."
+        chart = self.section()
+        holder = QWidget()
+        holder_layout = QVBoxLayout(holder)
+        holder_layout.setContentsMargins(14, 10, 14, 8)
+        self.timeline = GapTimeline()
+        holder_layout.addWidget(self.timeline)
+        chart.add(holder)
+        self.footnote(
+            "Each bar is the pause between releasing and pressing again. "
+            "Red bars fall inside the filter window."
         )
-        caption.setObjectName("hint")
-        caption.setWordWrap(True)
-        test.body.addWidget(caption)
 
-        self.pad = ClickPad(palette)
-        test.body.addWidget(self.pad, 1)
-        self.timeline = GapTimeline(palette)
-        test.body.addWidget(self.timeline)
+        self.header("Measurements")
+        values = self.section()
+        self.last_value = ValueLabel("—")
+        self.shortest_value = ValueLabel("—")
+        self.count_value = ValueLabel("0")
+        values.add(Row("Last gap", "", self.last_value))
+        values.add(Row("Shortest gap", "", self.shortest_value))
+        values.add(Row("Clicks", "", self.count_value))
 
-        self.tile_last = StatTile("Last gap", "--", "ms")
-        self.tile_shortest = StatTile("Shortest gap", "--", "ms")
-        self.tile_clicks = StatTile("Clicks measured", "0")
-        self.reset_button = QPushButton("Clear")
-        self.reset_button.clicked.connect(self.reset)
-        row = _row(self.tile_last, self.tile_shortest, self.tile_clicks)
-        row.addStretch(1)
-        row.addWidget(self.reset_button, alignment=Qt.AlignmentFlag.AlignBottom)
-        test.body.addLayout(row)
-        layout.addWidget(test, 1)
+        actions = QHBoxLayout()
+        actions.setContentsMargins(0, 14, 0, 0)
+        actions.addStretch(1)
+        self.clear_button = _button("Clear")
+        self.clear_button.clicked.connect(self.reset)
+        actions.addWidget(self.clear_button)
+        self.body.addLayout(actions)
 
         self.pad.pressed_with_gap.connect(self._on_pad_press)
 
-    def apply_palette(self, palette: Palette) -> None:
-        self.palette_tokens = palette
-        self.pad.apply_palette(palette)
-        self.timeline.apply_palette(palette)
+    def refresh(self) -> None:
+        self.timeline.set_threshold(self.controller.threshold_ms)
 
     def reset(self) -> None:
         self.clicks = 0
         self.shortest_gap = None
         self.timeline.clear()
         self.pad.reset()
-        self.tile_last.set_value("--")
-        self.tile_shortest.set_value("--")
-        self.tile_clicks.set_value("0")
+        self.last_value.setText("—")
+        self.shortest_value.setText("—")
+        self.count_value.setText("0")
 
     def _on_pad_press(self, gap_ms: Optional[float], _interval_ms: Optional[float]) -> None:
         self.clicks += 1
-        self.tile_clicks.set_value(str(self.clicks))
+        self.count_value.setText(str(self.clicks))
         if gap_ms is None:
             self.pad.flash(False)
             return
         bounce = gap_ms <= self.controller.threshold_ms
         self.timeline.add(gap_ms, bounce)
-        self.tile_last.set_value(f"{gap_ms:.0f}")
+        self.last_value.setText(f"{gap_ms:.0f} ms")
         if self.shortest_gap is None or gap_ms < self.shortest_gap:
             self.shortest_gap = gap_ms
-            self.tile_shortest.set_value(f"{gap_ms:.0f}")
+            self.shortest_value.setText(f"{gap_ms:.0f} ms")
         self.pad.flash(bounce)
 
-    def refresh(self) -> None:
-        active = self.controller.active
-        threshold = self.controller.threshold_ms
-        names = ", ".join(button.label.lower() for button in self.controller.buttons)
-        self.timeline.set_threshold(threshold)
-        self.tile_total.set_value(f"{self.controller.filtered_total:,}")
-        self.tile_session.set_value(f"{self.controller.session_filtered:,}")
-        self.tile_threshold.set_value(str(threshold))
 
-        if active:
-            self.status_headline.setText("Filter is on")
-            self.status_detail.setText(
-                f"A second {names} press arriving within {threshold} ms of the release is "
-                "treated as switch bounce and never reaches your apps. Deliberate "
-                "double-clicks are untouched."
-            )
-        else:
-            self.status_headline.setText("Filter is off")
-            self.status_detail.setText(
-                "Your mouse behaves normally. Turn the filter on with the switch in the "
-                "top-right corner."
-            )
-
-        if permissions.needs_accessibility() and not permissions.has_accessibility():
-            self.banner_text.setText(
-                "macOS needs Accessibility permission before the filter can block anything. "
-                "Add DoubleClick Fixer under Privacy & Security > Accessibility; this message "
-                "clears by itself once it is switched on."
-            )
-            self.banner.show()
-        else:
-            self.banner.hide()
-
-    def note_global_event(self, event: ClickEvent) -> None:
-        if event.is_bounce:
-            self.tile_session.set_value(f"{self.controller.session_filtered:,}")
-            self.tile_total.set_value(f"{self.controller.filtered_total:,}")
-
-
-class CalibratePage(QWidget):
-    """A two-phase wizard that measures the mouse and suggests a threshold."""
+class CalibratePage(Page):
+    """Two measured phases, then a recommendation."""
 
     threshold_chosen = Signal(int)
 
-    def __init__(self, controller: AppController, palette: Palette, parent: Optional[QWidget] = None) -> None:
-        super().__init__(parent)
+    def __init__(self, controller: AppController, parent: Optional[QWidget] = None) -> None:
+        super().__init__("Calibrate", parent)
         self.controller = controller
         self.calibrator = Calibrator()
         self.phase = "intro"
         self.suggestion = None
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(14)
+        step = self.section()
+        self.count_label = ValueLabel()
+        self.step_row = step.add(Row("", "", self.count_label))
+        progress_holder = QWidget()
+        progress_layout = QVBoxLayout(progress_holder)
+        progress_layout.setContentsMargins(12 if IS_MAC else 16, 0, 12 if IS_MAC else 16, 12)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setTextVisible(False)
+        self.progress.setAccessibleName("Calibration progress")
+        progress_layout.addWidget(self.progress)
+        self.progress_row = step.add(progress_holder)
+        self.progress_row.separator_inset = 10_000  # no hairline above the bar
+        self.step_row.separator_inset = 10_000
+        self.gap(12)
 
-        card = Card()
-        header = QHBoxLayout()
-        header.setSpacing(18)
-        self.ring = ProgressRing(palette)
-        header.addWidget(self.ring)
-        text = QVBoxLayout()
-        text.setSpacing(6)
-        self.headline = QLabel()
-        self.headline.setObjectName("sectionTitle")
-        self.instructions = QLabel()
-        self.instructions.setObjectName("hint")
-        self.instructions.setWordWrap(True)
-        self.feedback = QLabel()
-        self.feedback.setWordWrap(True)
-        text.addWidget(self.headline)
-        text.addWidget(self.instructions)
-        text.addWidget(self.feedback)
-        text.addStretch(1)
-        header.addLayout(text, 1)
-        card.body.addLayout(header)
+        self.pad = ClickPad()
+        self.body.addWidget(self.pad, 1)
 
-        self.pad = ClickPad(palette)
-        card.body.addWidget(self.pad, 1)
+        self.result_header = self.header("Result")
+        self.result = self.section()
+        self.recommended_value = ValueLabel()
+        self.bounce_value = ValueLabel()
+        self.double_value = ValueLabel()
+        self.result.add(Row("Recommended filter window", "", self.recommended_value))
+        self.result.add(Row("Longest bounce measured", "", self.bounce_value))
+        self.result.add(Row("Fastest double-click", "", self.double_value))
+        self.summary = self.footnote("")
 
-        buttons = QHBoxLayout()
-        buttons.setSpacing(10)
-        self.restart_button = QPushButton("Start over")
+        self.body.addStretch(0)
+        actions = QHBoxLayout()
+        actions.setContentsMargins(0, 16, 0, 0)
+        actions.setSpacing(8)
+        actions.addStretch(1)
+        self.restart_button = _button("Start Over")
         self.restart_button.clicked.connect(self.restart)
-        self.primary_button = QPushButton("Start calibration")
-        self.primary_button.setObjectName("primary")
+        self.primary_button = _button("Begin", default=True)
         self.primary_button.clicked.connect(self._advance)
-        buttons.addStretch(1)
-        buttons.addWidget(self.restart_button)
-        buttons.addWidget(self.primary_button)
-        card.body.addLayout(buttons)
-        layout.addWidget(card, 1)
+        actions.addWidget(self.restart_button)
+        actions.addWidget(self.primary_button)
+        self.body.addLayout(actions)
 
         self.pad.pressed_with_gap.connect(self._on_pad_press)
         self.restart()
 
-    def apply_palette(self, palette: Palette) -> None:
-        self.pad.apply_palette(palette)
-        self.ring.apply_palette(palette)
-
-    # -- flow --------------------------------------------------------------
+    # -- flow ------------------------------------------------------------------
     def restart(self) -> None:
         self.calibrator = Calibrator()
         self.phase = "intro"
         self.suggestion = None
         self.pad.reset()
-        self.feedback.setText("")
         self._render()
 
     def _advance(self) -> None:
@@ -281,355 +372,246 @@ class CalibratePage(QWidget):
         self._render()
 
     def _on_pad_press(self, gap_ms: Optional[float], _interval_ms: Optional[float]) -> None:
+        note = ""
         if self.phase == "single":
             counted = self.calibrator.add_single_click(gap_ms)
-            if counted:
-                self.feedback.setText("")
-                self.pad.flash(False)
-            else:
-                self.feedback.setText(
-                    f"Bounce detected: the button reported a second press {gap_ms:.0f} ms after "
-                    "you released it. That is the fault this app filters."
-                )
-                self.pad.flash(True)
+            self.pad.flash(not counted)
+            if not counted:
+                note = f"Bounce detected: an extra press {gap_ms:.0f} ms after release."
             if self.calibrator.has_enough_singles:
                 self.phase = "double"
                 self.pad.reset()
-                self.feedback.setText("")
+                note = ""
         elif self.phase == "double":
             if gap_ms is not None and gap_ms <= PAIR_WINDOW_MS:
                 recorded = self.calibrator.add_double_click(gap_ms)
                 self.pad.flash(not recorded)
                 if not recorded:
-                    self.feedback.setText(
-                        f"That press came {gap_ms:.0f} ms after the release — too fast to be a "
-                        "finger, so it was recorded as bounce. Keep double-clicking normally."
-                    )
-                else:
-                    self.feedback.setText("")
+                    note = f"Bounce detected inside a double-click ({gap_ms:.0f} ms)."
             else:
                 self.pad.flash(False)
             if self.calibrator.has_enough_doubles:
                 self._finish()
                 return
-        self._render()
+        else:
+            return
+        self._render(note)
 
-    # -- rendering ---------------------------------------------------------
-    def _render(self) -> None:
+    # -- rendering ---------------------------------------------------------------
+    def _render(self, note: str = "") -> None:
+        done = self.phase == "done"
+        has_result = done and self.suggestion is not None
+        self.result_header.setVisible(has_result)
+        self.result.setVisible(has_result)
+        self.summary.setVisible(has_result)
         self.restart_button.setVisible(self.phase != "intro")
+        self.progress_row.setVisible(self.phase in ("single", "double"))
+        self.pad.setVisible(not done)
+
         if self.phase == "intro":
-            self.ring.set_progress(0.0, "1 / 2")
-            self.headline.setText("Measure your mouse")
-            self.instructions.setText(
-                "Calibration takes about a minute. First you click once at a time, so any extra "
-                "press the mouse invents can be measured. Then you double-click normally, which "
-                "sets the limit the filter must stay under. The system-wide filter pauses while "
-                "you calibrate so the raw clicks are visible."
+            self.step_row.title.setText("Measure your mouse")
+            self.step_row.set_detail(
+                "Takes about a minute. Single clicks first, so any extra press the switch adds "
+                "can be measured, then double-clicks, which set the limit the filter must stay "
+                "under. Filtering pauses while you calibrate."
             )
-            self.pad.set_text("Ready when you are", "Press Start calibration")
-            self.primary_button.setText("Start calibration")
+            self.count_label.setText("")
+            self.pad.set_text("Ready", "Choose Begin to start.")
+            self.primary_button.setText("Begin")
             self.primary_button.setEnabled(True)
         elif self.phase == "single":
-            done = self.calibrator.single_clicks
-            self.ring.set_progress(self.calibrator.single_progress, f"{done}/{REQUIRED_SINGLE_CLICKS}")
-            self.headline.setText("Step 1 of 2 — single clicks")
-            self.instructions.setText(
-                "Click the pad once, pause for about a second, then click again. Do not "
-                "double-click. Every extra press the mouse produces is recorded as bounce."
-            )
-            self.pad.set_text("Click once, then wait", f"{done} of {REQUIRED_SINGLE_CLICKS} counted")
-            self.primary_button.setText("Skip to double-clicks")
+            count = self.calibrator.single_clicks
+            self.step_row.title.setText("Step 1 of 2: Single Clicks")
+            self.step_row.set_detail(note or "Click once, pause for a second, then click again. Don’t double-click.")
+            self.count_label.setText(f"{count} of {REQUIRED_SINGLE_CLICKS}")
+            self.progress.setValue(int(self.calibrator.single_progress * 100))
+            self.pad.set_text("Click Once", "Then wait a moment.")
+            self.primary_button.setText("Skip")
             self.primary_button.setEnabled(True)
         elif self.phase == "double":
-            done = self.calibrator.double_clicks
-            self.ring.set_progress(self.calibrator.double_progress, f"{done}/{REQUIRED_DOUBLE_CLICKS}")
-            self.headline.setText("Step 2 of 2 — double clicks")
-            self.instructions.setText(
-                "Double-click the pad the way you would open a file. Go at your natural speed: "
-                "this is what the filter is told never to block."
-            )
-            self.pad.set_text("Double-click here", f"{done} of {REQUIRED_DOUBLE_CLICKS} pairs")
+            count = self.calibrator.double_clicks
+            self.step_row.title.setText("Step 2 of 2: Double-Clicks")
+            self.step_row.set_detail(note or "Double-click at your normal speed, as if opening a file.")
+            self.count_label.setText(f"{count} of {REQUIRED_DOUBLE_CLICKS}")
+            self.progress.setValue(int(self.calibrator.double_progress * 100))
+            self.pad.set_text("Double-Click", "At your usual speed.")
             self.primary_button.setText("Finish")
             self.primary_button.setEnabled(self.calibrator.double_clicks > 0)
         else:
-            if self.suggestion is None:
-                self.ring.set_progress(0.0, "—")
-                self.headline.setText("Not enough double-clicks")
-                self.instructions.setText(
-                    f"At least {REQUIRED_DOUBLE_CLICKS} deliberate double-click pairs are needed "
-                    "to know what must not be blocked. Start over and double-click the pad."
+            suggestion = self.suggestion
+            self.count_label.setText("")
+            if suggestion is None:
+                self.step_row.title.setText("Not enough double-clicks")
+                self.step_row.set_detail(
+                    f"At least {REQUIRED_DOUBLE_CLICKS} double-clicks are needed to know what must "
+                    "not be blocked. Choose Start Over to try again."
                 )
-                self.pad.set_text("Calibration incomplete", "Press Start over")
                 self.primary_button.setText("Apply")
                 self.primary_button.setEnabled(False)
                 return
-            self.ring.set_progress(1.0, f"{self.suggestion.threshold_ms}")
-            self.headline.setText(f"Recommended filter: {self.suggestion.threshold_ms} ms")
-            self.instructions.setText(self.suggestion.summary)
-            self.pad.set_text(
-                "Calibration complete",
-                f"{self.suggestion.headroom_ms:.0f} ms of headroom below your fastest double-click",
+            self.step_row.title.setText("Calibration Complete")
+            self.step_row.set_detail("Apply the recommendation to use it for the filter.")
+            self.recommended_value.setText(f"{suggestion.threshold_ms} ms")
+            self.bounce_value.setText(
+                "None" if suggestion.worst_bounce_ms is None else f"{suggestion.worst_bounce_ms:.0f} ms"
             )
-            self.primary_button.setText("Apply this setting")
+            self.double_value.setText(f"{suggestion.fastest_double_click_ms:.0f} ms")
+            self.summary.setText(suggestion.summary)
+            self.primary_button.setText("Apply")
             self.primary_button.setEnabled(True)
 
 
-class SettingsPage(QWidget):
-    """Threshold, buttons, startup behaviour and housekeeping."""
-
-    threshold_changed = Signal(int)
-    buttons_changed = Signal(list)
-
+class GeneralPage(Page):
     def __init__(self, controller: AppController, parent: Optional[QWidget] = None) -> None:
-        super().__init__(parent)
+        super().__init__("General", parent)
         self.controller = controller
         self._loading = False
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(14)
-
-        filter_card = Card()
-        heading = QLabel("Bounce filter")
-        heading.setObjectName("sectionTitle")
-        filter_card.body.addWidget(heading)
-        hint = QLabel(
-            "A press that arrives within this many milliseconds of the previous release is "
-            "discarded. Most faulty switches bounce under 30 ms; calibration measures yours."
+        startup = self.section()
+        self.login_switch = Switch(accessible_name="Open at login")
+        self.hidden_switch = Switch(accessible_name="Start hidden")
+        startup.add(Row("Open at Login", "", self.login_switch))
+        where = "menu bar" if IS_MAC else "notification area"
+        startup.add(
+            Row("Start Hidden", f"Launch straight to the {where} without opening this window.", self.hidden_switch)
         )
-        hint.setObjectName("hint")
-        hint.setWordWrap(True)
-        filter_card.body.addWidget(hint)
+        self.login_switch.toggled.connect(self._on_login)
+        self.hidden_switch.toggled.connect(self._on_hidden)
 
-        self.slider = QSlider(Qt.Orientation.Horizontal)
-        self.slider.setRange(MIN_THRESHOLD_MS, MAX_THRESHOLD_MS)
-        self.slider.setPageStep(5)
-        self.spin = QSpinBox()
-        self.spin.setRange(MIN_THRESHOLD_MS, MAX_THRESHOLD_MS)
-        self.spin.setSuffix(" ms")
-        self.slider.valueChanged.connect(self._on_slider)
-        self.spin.valueChanged.connect(self._on_spin)
-        filter_card.body.addLayout(_row(self.slider, self.spin))
-        self.risk_label = QLabel()
-        self.risk_label.setObjectName("hint")
-        self.risk_label.setWordWrap(True)
-        filter_card.body.addWidget(self.risk_label)
-        layout.addWidget(filter_card)
-
-        button_card = Card()
-        heading = QLabel("Buttons to protect")
-        heading.setObjectName("sectionTitle")
-        button_card.body.addWidget(heading)
-        self.button_boxes: dict[Button, QCheckBox] = {}
-        row = QHBoxLayout()
-        row.setSpacing(18)
-        for button in Button:
-            box = QCheckBox(f"{button.label} button")
-            box.toggled.connect(self._on_buttons)
-            self.button_boxes[button] = box
-            row.addWidget(box)
-        row.addStretch(1)
-        button_card.body.addLayout(row)
-        layout.addWidget(button_card)
-
-        system_card = Card()
-        heading = QLabel("System")
-        heading.setObjectName("sectionTitle")
-        system_card.body.addWidget(heading)
-        self.login_box = QCheckBox("Start DoubleClick Fixer when I sign in")
-        self.login_box.toggled.connect(self._on_login)
-        self.minimized_box = QCheckBox("Start hidden in the menu bar / notification area")
-        self.minimized_box.toggled.connect(self._on_minimized)
-        system_card.body.addWidget(self.login_box)
-        system_card.body.addWidget(self.minimized_box)
-
+        self.permission_row: Optional[Row] = None
         if permissions.needs_accessibility():
-            permission_row = QHBoxLayout()
-            self.permission_label = QLabel()
-            self.permission_label.setObjectName("hint")
-            self.permission_label.setWordWrap(True)
-            permission_button = QPushButton("Open Accessibility settings")
-            permission_button.clicked.connect(permissions.open_accessibility_settings)
-            permission_row.addWidget(self.permission_label, 1)
-            permission_row.addWidget(permission_button)
-            system_card.body.addLayout(permission_row)
-        else:
-            self.permission_label = None
+            self.header("Permissions")
+            section = self.section()
+            self.permission_icon = SymbolView("ok", 20, "symbol")
+            button = _button("Open Settings…")
+            button.clicked.connect(permissions.open_accessibility_settings)
+            self.permission_row = section.add(Row("Accessibility", "", button, self.permission_icon))
 
-        reset_row = QHBoxLayout()
-        self.stats_label = QLabel()
-        self.stats_label.setObjectName("hint")
-        reset_button = QPushButton("Reset counter")
-        reset_button.clicked.connect(self.controller.reset_statistics)
-        reset_row.addWidget(self.stats_label, 1)
-        reset_row.addWidget(reset_button)
-        system_card.body.addLayout(reset_row)
-        layout.addWidget(system_card)
+        self.header("Statistics")
+        stats = self.section()
+        reset = _button("Reset…")
+        reset.clicked.connect(self._confirm_reset)
+        self.stats_row = stats.add(Row("Blocked bounces", "", reset))
 
-        self.about = QLabel()
-        self.about.setObjectName("hint")
-        self.about.setWordWrap(True)
-        self.about.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
-        self.about.setOpenExternalLinks(True)
-        layout.addWidget(self.about)
-        layout.addStretch(1)
+        self.body.addStretch(1)
+        version = TextLabel(f"DoubleClick Fixer {__version__}", "caption", "tertiary")
+        version.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        version.setContentsMargins(0, 24, 0, 0)
+        self.body.addWidget(version)
 
-    def refresh(self) -> None:
-        from .. import __version__
-        from .. import settings as settings_store
-
+    def refresh(self, granted: bool) -> None:
         self._loading = True
-        self.slider.setValue(self.controller.threshold_ms)
-        self.spin.setValue(self.controller.threshold_ms)
-        for button, box in self.button_boxes.items():
-            box.setChecked(button in self.controller.buttons)
-        self.login_box.setChecked(bool(self.controller.settings["start_at_login"]))
-        self.minimized_box.setChecked(bool(self.controller.settings["start_minimized"]))
+        self.login_switch.setChecked(bool(self.controller.settings["start_at_login"]), animate=False)
+        self.hidden_switch.setChecked(bool(self.controller.settings["start_minimized"]), animate=False)
         self._loading = False
-
-        self._update_risk(self.controller.threshold_ms)
-        self.stats_label.setText(
-            f"{self.controller.filtered_total:,} bounces blocked in total, "
-            f"{self.controller.session_filtered:,} since this app started."
-        )
-        if self.permission_label is not None:
-            granted = permissions.has_accessibility()
-            self.permission_label.setText(
-                "Accessibility permission is granted."
+        if self.permission_row is not None:
+            self.permission_icon.name = "ok" if granted else "warning"
+            self.permission_icon.update()
+            self.permission_row.set_detail(
+                "Allowed. The filter can block bounced clicks."
                 if granted
-                else "Accessibility permission is missing, so the filter cannot block anything yet."
+                else "Not allowed yet. The filter can’t block anything until it is."
             )
-        self.about.setText(
-            f"Version {__version__} · Settings are stored at {settings_store.settings_path()}"
-        )
-
-    def _update_risk(self, value: int) -> None:
-        if value <= 40:
-            self.risk_label.setText("Very safe: shorter than any deliberate click, but may miss slow bounce.")
-        elif value <= 90:
-            self.risk_label.setText("Recommended range: catches switch bounce and leaves double-clicks alone.")
-        elif value <= 140:
-            self.risk_label.setText("Aggressive: fast double-clicks may start to be swallowed.")
-        else:
-            self.risk_label.setText(
-                "Very aggressive: this is long enough to block real double-clicks. Use only if "
-                "bounce still gets through at a lower setting."
-            )
-
-    def _on_slider(self, value: int) -> None:
-        if self._loading:
-            return
-        self.spin.setValue(value)
-
-    def _on_spin(self, value: int) -> None:
-        self._update_risk(value)
-        if self._loading:
-            return
-        self.slider.setValue(value)
-        self.threshold_changed.emit(value)
-
-    def _on_buttons(self, _checked: bool) -> None:
-        if self._loading:
-            return
-        selected = [button for button, box in self.button_boxes.items() if box.isChecked()]
-        if not selected:
-            self._loading = True
-            self.button_boxes[Button.LEFT].setChecked(True)
-            self._loading = False
-            selected = [Button.LEFT]
-        self.buttons_changed.emit(selected)
+        total = self.controller.filtered_total
+        self.stats_row.set_detail(f"{total:,} in total, {self.controller.session_filtered:,} since launch.")
 
     def _on_login(self, checked: bool) -> None:
         if self._loading:
             return
         error = self.controller.set_start_at_login(checked)
         if error:
-            self._loading = True
-            self.login_box.setChecked(False)
-            self._loading = False
-            QMessageBox.warning(self, "Could not change startup", error)
+            self.login_switch.setChecked(False)
+            QMessageBox.warning(self, "Couldn’t change the login item", error)
 
-    def _on_minimized(self, checked: bool) -> None:
-        if self._loading:
-            return
-        self.controller.set_start_minimized(checked)
+    def _on_hidden(self, checked: bool) -> None:
+        if not self._loading:
+            self.controller.set_start_minimized(checked)
 
+    def _confirm_reset(self) -> None:
+        answer = QMessageBox.question(
+            self,
+            "Reset the blocked-bounce count?",
+            "The count starts again from zero. Your settings stay as they are.",
+            QMessageBox.StandardButton.Reset | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,
+        )
+        if answer == QMessageBox.StandardButton.Reset:
+            self.controller.reset_statistics()
+
+
+# -- window ----------------------------------------------------------------------
 
 class MainWindow(QWidget):
-    """The single window, with a header switch and three pages."""
+    """Sidebar navigation over four panes."""
 
     closed_to_tray = Signal()
 
     def __init__(self, controller: AppController) -> None:
         super().__init__()
         self.controller = controller
-        self.palette_tokens = system_palette()
-        self.setObjectName("root")
+        set_look(current_look())
         self.setWindowTitle("DoubleClick Fixer")
         self.setWindowIcon(icons.app_icon())
-        self.resize(820, 720)
-        self.setMinimumSize(640, 600)
+        self.translucent = native.prepare(self)
+        self._material = False
+        self.resize(780, 620 if IS_MAC else 660)
+        self.setMinimumSize(660, 480)
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(22, 20, 22, 20)
-        layout.setSpacing(16)
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        header = QHBoxLayout()
-        titles = QVBoxLayout()
-        titles.setSpacing(2)
-        title = QLabel("DoubleClick Fixer")
-        title.setObjectName("title")
-        self.subtitle = QLabel()
-        self.subtitle.setObjectName("subtitle")
-        titles.addWidget(title)
-        titles.addWidget(self.subtitle)
-        header.addLayout(titles)
-        header.addStretch(1)
-        self.switch_label = QLabel("Filter off")
-        self.switch_label.setObjectName("statusHeadline")
-        self.switch = ToggleSwitch(self.palette_tokens)
-        self.switch.toggled.connect(self._on_switch)
-        header.addWidget(self.switch_label)
-        header.addWidget(self.switch)
-        layout.addLayout(header)
+        self.title_bar_height = 52 if IS_MAC else 0
+        self.sidebar = Sidebar(list(PAGES), top_inset=self.title_bar_height)
+        root.addWidget(self.sidebar)
 
-        nav_frame = QFrame()
-        nav_frame.setObjectName("navBar")
-        nav_layout = QHBoxLayout(nav_frame)
-        nav_layout.setContentsMargins(5, 5, 5, 5)
-        nav_layout.setSpacing(4)
-        self.nav_group = QButtonGroup(self)
-        for index, name in enumerate(("Overview", "Calibrate", "Settings")):
-            button = QPushButton(name)
-            button.setObjectName("navButton")
-            button.setCheckable(True)
-            button.setCursor(Qt.CursorShape.PointingHandCursor)
-            self.nav_group.addButton(button, index)
-            nav_layout.addWidget(button)
-        nav_layout.addStretch(1)
-        self.nav_group.idClicked.connect(self._show_page)
-        layout.addWidget(nav_frame)
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(0)
+        self.title_label = TextLabel("", "title")
+        if IS_MAC:
+            # The pane title sits in the (transparent) toolbar, level with the
+            # window controls, as in System Settings.
+            bar = QWidget()
+            bar.setFixedHeight(self.title_bar_height)
+            bar_layout = QHBoxLayout(bar)
+            bar_layout.setContentsMargins(20, 0, 20, 0)
+            bar_layout.addWidget(self.title_label, 0, Qt.AlignmentFlag.AlignVCenter)
+            bar_layout.addStretch(1)
+            content_layout.addWidget(bar)
 
+        self.filter_page = FilterPage(controller)
+        self.test_page = TestPage(controller)
+        self.calibrate = CalibratePage(controller)
+        self.general = GeneralPage(controller)
+        self.pages = [self.filter_page, self.test_page, self.calibrate, self.general]
         self.stack = QStackedWidget()
-        self.overview = OverviewPage(controller, self.palette_tokens)
-        self.calibrate = CalibratePage(controller, self.palette_tokens)
-        self.settings_page = SettingsPage(controller)
-        for page in (self.overview, self.calibrate, self.settings_page):
-            # Scroll rather than squash when the window is short.
+        for page in self.pages:
             area = QScrollArea()
             area.setWidgetResizable(True)
             area.setFrameShape(QFrame.Shape.NoFrame)
             area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            # The pane colour is painted once by the window; the scroll area,
+            # its viewport and the page must not paint over it. The rules use
+            # object names so they never reach native controls further down.
+            area.setObjectName("paneArea")
+            area.viewport().setObjectName("paneViewport")
+            page.setObjectName("pane")
+            area.setStyleSheet(
+                "#paneArea, #paneViewport, #pane { background: transparent; border: none; }"
+            )
             area.setWidget(page)
             self.stack.addWidget(area)
-        layout.addWidget(self.stack, 1)
+        content_layout.addWidget(self.stack, 1)
+        root.addWidget(content, 1)
 
+        self.sidebar.current_changed.connect(self._show_page)
+        self.filter_page.switch.toggled.connect(self._on_switch)
         self.calibrate.threshold_chosen.connect(self._apply_calibration)
-        self.settings_page.threshold_changed.connect(controller.set_threshold)
-        self.settings_page.buttons_changed.connect(controller.set_buttons)
         controller.filter_state_changed.connect(self._on_filter_state)
         controller.settings_changed.connect(self.refresh)
-        controller.global_event.connect(self.overview.note_global_event)
+        controller.global_event.connect(self.filter_page.note_global_event)
         controller.hook_failed.connect(self._on_hook_failed)
 
         self._save_timer = QTimer(self)
@@ -637,8 +619,8 @@ class MainWindow(QWidget):
         self._save_timer.timeout.connect(controller.flush_stats)
         self._save_timer.start()
 
-        # macOS gives no notification when Accessibility is granted or taken
-        # away, so poll it. The check is a cheap local query.
+        # macOS sends no notification when Accessibility is granted or revoked,
+        # so poll it. The check is a cheap local query.
         self._permission_granted = permissions.has_accessibility()
         self._enable_when_granted = False
         self._permission_timer = QTimer(self)
@@ -647,58 +629,77 @@ class MainWindow(QWidget):
         if permissions.needs_accessibility():
             self._permission_timer.start()
 
-        self.apply_palette(self.palette_tokens)
         self._show_page(0)
-        self.refresh()
 
-    # -- theming -----------------------------------------------------------
-    def apply_palette(self, palette: Palette) -> None:
-        from .. import settings as settings_store
+    # -- native chrome ---------------------------------------------------------------
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        if self.translucent and not self._material:
+            self._material = native.apply(self, self.sidebar.width(), look().dark)
+        self.sidebar.paint_background = not (self.translucent and self._material)
+        self.update()
 
-        self.palette_tokens = palette
-        try:
-            check = icons.checkmark_file(settings_store.config_dir(), palette.accent_text)
-        except OSError:
-            check = ""
-        self.setStyleSheet(stylesheet(palette, check))
-        self.switch.apply_palette(palette)
-        self.overview.apply_palette(palette)
-        self.calibrate.apply_palette(palette)
+    def paintEvent(self, _event) -> None:  # noqa: N802
+        lk = look()
+        painter = QPainter(self)
+        if self.translucent and self._material:
+            if IS_MAC:
+                # The sidebar shows the vibrant material; the pane is solid.
+                painter.fillRect(
+                    QRect(self.sidebar.width(), 0, self.width() - self.sidebar.width(), self.height()),
+                    lk.pane,
+                )
+            # Windows: Mica fills the whole window, as in Windows Settings.
+            return
+        painter.fillRect(self.rect(), lk.pane)
+        if IS_MAC:
+            painter.fillRect(QRect(0, 0, self.sidebar.width(), self.height()), lk.sidebar)
 
-    # -- navigation --------------------------------------------------------
+    def changeEvent(self, event) -> None:  # noqa: N802
+        if event.type() == QEvent.Type.ActivationChange:
+            self.sidebar.window_active = self.isActiveWindow()
+            self.sidebar.update()
+        super().changeEvent(event)
+
+    def apply_look(self) -> None:
+        """Pick up a light/dark or accent change from the system."""
+        set_look(current_look())
+        native.set_dark_title_bar(self, look().dark)
+        for label in self.findChildren(TextLabel):
+            label.restyle()
+        for widget in self.findChildren(QWidget):
+            widget.update()
+        self.update()
+
+    # Older name, kept for callers.
+    apply_palette = apply_look
+
+    # -- navigation --------------------------------------------------------------
     def _show_page(self, index: int) -> None:
-        button = self.nav_group.button(index)
-        if button is not None:
-            button.setChecked(True)
+        self.sidebar.set_current(index, emit=False)
         self.stack.setCurrentIndex(index)
-        if index == 1:
-            # Calibration must see the real clicks, so pause the filter.
+        self.title_label.setText(PAGES[index][1])
+        if PAGES[index][0] == "calibrate":
+            # Calibration has to see the raw clicks, so filtering pauses.
             self.controller.suspend()
         else:
             self.controller.resume()
         self.refresh()
 
-    def show_calibration(self) -> None:
-        self._show_page(1)
+    def show_page(self, key: str) -> None:
+        for index, (name, _title) in enumerate(PAGES):
+            if name == key:
+                self._show_page(index)
 
-    # -- state -------------------------------------------------------------
+    def show_calibration(self) -> None:
+        self.show_page("calibrate")
+
+    # -- state -------------------------------------------------------------------
     def refresh(self) -> None:
-        active = self.controller.active
-        self.switch.setChecked(active)
-        self.switch_label.setText("Filter on" if active else "Filter off")
-        if self.controller.suspended:
-            self.subtitle.setText("Paused during calibration")
-        elif not self.controller.supported():
-            self.subtitle.setText(f"System-wide filtering is unavailable on {platform.system()}")
-        elif active:
-            self.subtitle.setText(
-                f"Protecting the {', '.join(b.label.lower() for b in self.controller.buttons)} "
-                f"button below {self.controller.threshold_ms} ms"
-            )
-        else:
-            self.subtitle.setText("Switch bounce filter for a mouse that clicks twice")
-        self.overview.refresh()
-        self.settings_page.refresh()
+        granted = self._permission_granted
+        self.filter_page.refresh(granted, self._enable_when_granted and not self.controller.active)
+        self.test_page.refresh()
+        self.general.refresh(granted)
 
     def _check_permission(self) -> None:
         granted = permissions.has_accessibility()
@@ -710,59 +711,45 @@ class MainWindow(QWidget):
             self._enable_when_granted = False
             self.controller.set_active(True)
         elif not granted and self.controller.active:
-            # Without permission the tap can no longer block anything, so an
-            # "on" switch would be lying.
+            # Without permission the tap cannot block anything, so an "on"
+            # switch would be lying.
             self.controller.set_active(False)
             self._enable_when_granted = True
         self.refresh()
 
+    def request_filter(self, checked: bool) -> None:
+        """Turn the filter on or off from anywhere: the switch, the menu, launch."""
+        self._on_switch(checked)
+
     def _on_switch(self, checked: bool) -> None:
-        if checked and self.stack.currentIndex() == 1:
-            self._show_page(0)
         if not checked:
             self._enable_when_granted = False
-        elif not self._permission_granted:
+        elif permissions.needs_accessibility() and not self._permission_granted:
+            # Say what is missing instead of failing with an error dialog; the
+            # filter starts by itself once access is granted.
             self._enable_when_granted = True
+            self.refresh()
+            return
         self.controller.set_active(checked)
         self.refresh()
 
-    def _on_filter_state(self, active: bool, error: str) -> None:
-        self.switch.setChecked(active)
+    def _on_filter_state(self, _active: bool, error: str) -> None:
         self.refresh()
         if error:
-            box = QMessageBox(self)
-            box.setIcon(QMessageBox.Icon.Warning)
-            box.setWindowTitle("Could not turn the filter on")
-            box.setText(error)
-            if permissions.needs_accessibility() and not permissions.has_accessibility():
-                open_button = box.addButton("Open Settings", QMessageBox.ButtonRole.AcceptRole)
-                box.addButton(QMessageBox.StandardButton.Close)
-                box.exec()
-                if box.clickedButton() is open_button:
-                    permissions.open_accessibility_settings()
-                return
-            box.exec()
+            QMessageBox.warning(self, "The filter couldn’t start", error)
 
     def _on_hook_failed(self, message: str) -> None:
         self.controller.set_active(False)
         self.refresh()
-        QMessageBox.warning(self, "Filter stopped", message)
+        QMessageBox.warning(self, "The filter stopped", message)
 
     def _apply_calibration(self, threshold_ms: int) -> None:
         self.controller.set_threshold(threshold_ms)
+        self.calibrate.restart()
         self._show_page(0)
-        QMessageBox.information(
-            self,
-            "Calibration applied",
-            f"The bounce filter is now set to {threshold_ms} ms. Turn the filter on to start "
-            "blocking bounce system-wide.",
-        )
 
     def closeEvent(self, event) -> None:  # noqa: N802
         event.ignore()
         self.controller.flush_stats()
         self.hide()
         self.closed_to_tray.emit()
-
-    def open_documentation(self) -> None:
-        QDesktopServices.openUrl("https://github.com/arnav-goel10/doubleclick-fixer")

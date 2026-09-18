@@ -1,3 +1,5 @@
 # Qt user interface, tray icon and native event access.
-PySide6-Essentials>=6.7
+PySide6-Essentials>=6.9
+# macOS: the event tap (Quartz) and native window materials and symbols (AppKit).
 pyobjc-framework-Quartz>=10.0; sys_platform == "darwin"
+pyobjc-framework-Cocoa>=10.0; sys_platform == "darwin"

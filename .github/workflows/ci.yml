@@ -44,3 +44,9 @@ jobs:
         run: python -m unittest tests.test_windows_hook -v
         env:
           DCF_E2E: "1"
+      - name: Capture the real window
+        run: python tools/screenshots.py screenshots --live
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-screenshots
+          path: screenshots/

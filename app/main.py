@@ -7,13 +7,13 @@ import sys
 from typing import Optional
 
 from PySide6.QtCore import QTimer, Qt
+from PySide6.QtGui import QAction, QFont, QKeySequence
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtWidgets import QApplication, QMessageBox, QSystemTrayIcon
+from PySide6.QtWidgets import QApplication, QMenuBar, QMessageBox, QSystemTrayIcon
 
 from . import __version__
 from .controller import AppController
 from .ui import icons
-from .ui.theme import system_palette
 from .ui.tray import Tray
 from .ui.window import MainWindow
 
@@ -40,6 +40,12 @@ class Application:
         self.qt.setApplicationVersion(__version__)
         self.qt.setOrganizationName("DoubleClick Fixer")
         self.qt.setWindowIcon(icons.app_icon())
+        if platform.system() == "Windows":
+            # Windows 11's own UI font and body size (14 px).
+            body = QFont()
+            body.setFamilies(["Segoe UI Variable Text", "Segoe UI"])
+            body.setPixelSize(14)
+            self.qt.setFont(body)
         # Closing the window leaves the filter running in the tray.
         self.qt.setQuitOnLastWindowClosed(False)
 
@@ -52,6 +58,7 @@ class Application:
                 on_open=self.show_window,
                 on_calibrate=self.show_calibration,
                 on_quit=self.quit,
+                on_toggle=self.window.request_filter,
                 parent=self.window,
             )
             self.tray.show()
@@ -66,7 +73,42 @@ class Application:
 
         hints = self.qt.styleHints()
         if hasattr(hints, "colorSchemeChanged"):
-            hints.colorSchemeChanged.connect(lambda _scheme: self.window.apply_palette(system_palette()))
+            hints.colorSchemeChanged.connect(lambda _scheme: self.window.apply_look())
+        # Quitting from anywhere (Dock, app menu, logout) stops the hook cleanly.
+        self.qt.aboutToQuit.connect(self.controller.shutdown)
+        self.menu_bar = self._build_menu_bar()
+
+    def _build_menu_bar(self) -> Optional[QMenuBar]:
+        """macOS app menu: About, Settings… (⌘,) and Quit, where users expect them."""
+        if platform.system() != "Darwin":
+            return None
+        bar = QMenuBar()
+        menu = bar.addMenu("DoubleClick Fixer")
+        about = QAction("About DoubleClick Fixer", menu)
+        about.setMenuRole(QAction.MenuRole.AboutRole)
+        about.triggered.connect(self._about)
+        settings = QAction("Settings…", menu)
+        settings.setMenuRole(QAction.MenuRole.PreferencesRole)
+        settings.setShortcut(QKeySequence.StandardKey.Preferences)
+        settings.triggered.connect(lambda: (self.show_window(), self.window.show_page("general")))
+        quit_action = QAction("Quit DoubleClick Fixer", menu)
+        quit_action.setMenuRole(QAction.MenuRole.QuitRole)
+        quit_action.triggered.connect(self.quit)
+        menu.addActions([about, settings, quit_action])
+        window_menu = bar.addMenu("Window")
+        close = QAction("Close", window_menu)
+        close.setShortcut(QKeySequence.StandardKey.Close)
+        close.triggered.connect(self.window.close)
+        window_menu.addAction(close)
+        return bar
+
+    def _about(self) -> None:
+        QMessageBox.about(
+            self.window,
+            "About DoubleClick Fixer",
+            f"DoubleClick Fixer {__version__}\n\n"
+            "Filters the extra click a worn mouse switch adds, without touching real double-clicks.",
+        )
 
     # -- window ------------------------------------------------------------
     def show_window(self) -> None:
@@ -79,7 +121,9 @@ class Application:
         self.window.show_calibration()
 
     def _note_hidden(self) -> None:
-        if self.tray is None or self._told_about_tray:
+        # A one-time hint on Windows, where tray icons hide in the overflow.
+        # macOS apps don't announce this; the menu bar icon speaks for itself.
+        if self.tray is None or self._told_about_tray or platform.system() == "Darwin":
             return
         self._told_about_tray = True
         where = "the menu bar" if platform.system() == "Darwin" else "the notification area"
@@ -106,7 +150,7 @@ class Application:
         if self.controller.settings["fix_enabled"] and self.controller.supported():
             # Restore the filter after the UI is up, so any failure has a
             # window to be reported in.
-            QTimer.singleShot(0, lambda: self.controller.set_active(True))
+            QTimer.singleShot(0, lambda: self.window.request_filter(True))
         elif not self.controller.supported():
             QTimer.singleShot(0, self._warn_unsupported)
 

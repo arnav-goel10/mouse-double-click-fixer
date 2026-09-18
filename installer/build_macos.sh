@@ -15,7 +15,14 @@ test -d dist/DoubleClickFixer.app
 # same build. A release still needs a Developer ID signature and notarization.
 codesign --force --deep --sign - dist/DoubleClickFixer.app
 
+# Lay the disk image out like every other Mac installer: the app next to a
+# shortcut to Applications, so installing is a single drag.
+staging="$(mktemp -d)/DoubleClick Fixer"
+mkdir -p "$staging"
+cp -R dist/DoubleClickFixer.app "$staging/"
+ln -s /Applications "$staging/Applications"
 rm -f dist/DoubleClickFixer.dmg
-hdiutil create -volname "DoubleClick Fixer" -srcfolder dist/DoubleClickFixer.app \
+hdiutil create -volname "DoubleClick Fixer" -srcfolder "$staging" \
   -ov -format UDZO dist/DoubleClickFixer.dmg
+rm -rf "$(dirname "$staging")"
 printf 'Built dist/DoubleClickFixer.app and dist/DoubleClickFixer.dmg\n'
