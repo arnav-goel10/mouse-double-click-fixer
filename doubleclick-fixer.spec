@@ -47,20 +47,22 @@ analysis = Analysis(
 )
 
 pyz = PYZ(analysis.pure)
-exe = EXE(
-    pyz,
-    analysis.scripts,
-    analysis.binaries,
-    analysis.datas,
-    [],
-    name="DoubleClickFixer",
-    console=False,
-    icon="installer/assets/icon.ico" if sys.platform == "win32" else None,
-)
 
 if sys.platform == "darwin":
+    # A real .app is a folder: the executable and its libraries sit inside
+    # the bundle, so launching needs no unpacking and code signing covers
+    # every file.
+    exe = EXE(
+        pyz,
+        analysis.scripts,
+        [],
+        exclude_binaries=True,
+        name="DoubleClickFixer",
+        console=False,
+    )
+    collected = COLLECT(exe, analysis.binaries, analysis.datas, name="DoubleClickFixer")
     app = BUNDLE(
-        exe,
+        collected,
         name="DoubleClickFixer.app",
         icon="installer/assets/icon.icns",
         bundle_identifier="com.doubleclickfixer.app",
@@ -70,8 +72,20 @@ if sys.platform == "darwin":
             "CFBundleShortVersionString": VERSION,
             "CFBundleVersion": VERSION,
             "NSHighResolutionCapable": True,
+            "NSRequiresAquaSystemAppearance": False,
             "LSMinimumSystemVersion": "11.0",
-            # The app keeps working from the menu bar with no window open.
-            "LSUIElement": False,
+            "LSApplicationCategoryType": "public.app-category.utilities",
         },
+    )
+else:
+    # Windows: one portable executable; the installer copies it as is.
+    exe = EXE(
+        pyz,
+        analysis.scripts,
+        analysis.binaries,
+        analysis.datas,
+        [],
+        name="DoubleClickFixer",
+        console=False,
+        icon="installer/assets/icon.ico",
     )

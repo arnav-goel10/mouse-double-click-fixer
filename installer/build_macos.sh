@@ -13,6 +13,8 @@ test -d dist/DoubleClickFixer.app
 
 # Ad-hoc signing keeps the Accessibility grant stable across launches of the
 # same build. A release still needs a Developer ID signature and notarization.
+# Extended attributes (Finder info, provenance) make codesign refuse the bundle.
+xattr -cr dist/DoubleClickFixer.app
 codesign --force --deep --sign - dist/DoubleClickFixer.app
 
 # Lay the disk image out like every other Mac installer: the app next to a
