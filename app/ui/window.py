@@ -177,7 +177,8 @@ class OverviewPage(QWidget):
         if permissions.needs_accessibility() and not permissions.has_accessibility():
             self.banner_text.setText(
                 "macOS needs Accessibility permission before the filter can block anything. "
-                "Add DoubleClick Fixer under Privacy & Security > Accessibility."
+                "Add DoubleClick Fixer under Privacy & Security > Accessibility; this message "
+                "clears by itself once it is switched on."
             )
             self.banner.show()
         else:
@@ -636,6 +637,16 @@ class MainWindow(QWidget):
         self._save_timer.timeout.connect(controller.flush_stats)
         self._save_timer.start()
 
+        # macOS gives no notification when Accessibility is granted or taken
+        # away, so poll it. The check is a cheap local query.
+        self._permission_granted = permissions.has_accessibility()
+        self._enable_when_granted = False
+        self._permission_timer = QTimer(self)
+        self._permission_timer.setInterval(1000)
+        self._permission_timer.timeout.connect(self._check_permission)
+        if permissions.needs_accessibility():
+            self._permission_timer.start()
+
         self.apply_palette(self.palette_tokens)
         self._show_page(0)
         self.refresh()
@@ -689,9 +700,29 @@ class MainWindow(QWidget):
         self.overview.refresh()
         self.settings_page.refresh()
 
+    def _check_permission(self) -> None:
+        granted = permissions.has_accessibility()
+        if granted == self._permission_granted:
+            return
+        self._permission_granted = granted
+        if granted and self._enable_when_granted:
+            # The user already asked for the filter; finish the job.
+            self._enable_when_granted = False
+            self.controller.set_active(True)
+        elif not granted and self.controller.active:
+            # Without permission the tap can no longer block anything, so an
+            # "on" switch would be lying.
+            self.controller.set_active(False)
+            self._enable_when_granted = True
+        self.refresh()
+
     def _on_switch(self, checked: bool) -> None:
         if checked and self.stack.currentIndex() == 1:
             self._show_page(0)
+        if not checked:
+            self._enable_when_granted = False
+        elif not self._permission_granted:
+            self._enable_when_granted = True
         self.controller.set_active(checked)
         self.refresh()
 

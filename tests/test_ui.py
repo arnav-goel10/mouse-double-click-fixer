@@ -8,6 +8,10 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from run import _unhide_qt_plugins
+
+_unhide_qt_plugins()
+
 try:
     from PySide6.QtWidgets import QApplication
 except ImportError:  # pragma: no cover - PySide6 is a hard dependency
@@ -111,6 +115,35 @@ class WindowTests(unittest.TestCase):
         page.button_boxes[Button.RIGHT].setChecked(False)
         page.button_boxes[Button.LEFT].setChecked(False)
         self.assertTrue(self.controller.buttons)
+
+    def test_permission_banner_follows_the_live_setting(self) -> None:
+        banner = self.window.overview.banner
+        with mock.patch("app.permissions.needs_accessibility", return_value=True), mock.patch(
+            "app.permissions.has_accessibility", return_value=False
+        ):
+            self.window._permission_granted = True
+            self.window._check_permission()
+            self.assertFalse(banner.isHidden(), "missing permission must be announced")
+
+        with mock.patch("app.permissions.needs_accessibility", return_value=True), mock.patch(
+            "app.permissions.has_accessibility", return_value=True
+        ):
+            self.window._check_permission()
+            self.assertTrue(banner.isHidden(), "the banner must go once permission is granted")
+
+    def test_filter_requested_before_permission_starts_once_granted(self) -> None:
+        with mock.patch("app.permissions.needs_accessibility", return_value=True), mock.patch(
+            "app.permissions.has_accessibility", return_value=False
+        ), mock.patch.object(self.controller, "set_active", return_value=False) as refused:
+            self.window._permission_granted = False
+            self.window._on_switch(True)
+            refused.assert_called_with(True)
+
+        with mock.patch("app.permissions.needs_accessibility", return_value=True), mock.patch(
+            "app.permissions.has_accessibility", return_value=True
+        ), mock.patch.object(self.controller, "set_active", return_value=True) as started:
+            self.window._check_permission()
+            started.assert_called_once_with(True)
 
     def test_closing_hides_instead_of_quitting(self) -> None:
         from PySide6.QtCore import QEvent
