@@ -149,6 +149,10 @@ class AppController(QObject):
     def set_start_minimized(self, enabled: bool) -> None:
         self._store(start_minimized=bool(enabled))
 
+    def set_window_geometry(self, encoded: str) -> None:
+        if encoded != self.settings.get("window_geometry"):
+            self._store(window_geometry=encoded)
+
     def reset_statistics(self) -> None:
         self.session_filtered = 0
         self._store(filtered_total=0)

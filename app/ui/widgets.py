@@ -278,6 +278,7 @@ class Row(QWidget):
         text.setContentsMargins(0, 0, 0, 0)
         text.setSpacing(1 if IS_MAC else 2)
         self.title = TextLabel(title, "body", "text")
+        self.title.setWordWrap(True)  # wrap rather than push the control off-screen
         self.detail = TextLabel(detail, "caption", "secondary")
         self.detail.setWordWrap(True)
         self.detail.setVisible(bool(detail))
@@ -532,6 +533,7 @@ class GapTimeline(QWidget):
         self._gaps: list[tuple[float, bool]] = []
         self._threshold = 60.0
         self.setMinimumHeight(96)
+        self.setMaximumHeight(120)
         self.setAccessibleName("Recent click gaps")
 
     def set_threshold(self, threshold_ms: float) -> None:

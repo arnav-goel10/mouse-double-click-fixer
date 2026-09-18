@@ -120,6 +120,15 @@ def main() -> None:
                 )
             else:
                 main_window.grab().save(str(out / name))
+    if LIVE:
+        # The narrowest the window can get, to check nothing is clipped.
+        main_window._show_page(0)
+        main_window.resize(main_window.minimumSize())
+        wait(app, 800)
+        frame = main_window.frameGeometry()
+        main_window.screen().grabWindow(0, frame.x(), frame.y(), frame.width(), frame.height()).save(
+            str(out / "filter-minimum-live.png")
+        )
     print(f"Wrote screenshots to {out}")
 
 

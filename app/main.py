@@ -164,6 +164,8 @@ class Application:
         )
 
     def quit(self) -> None:
+        if self.window.isVisible():
+            self.window.save_geometry()
         self.controller.shutdown()
         if self.tray is not None:
             self.tray.hide()

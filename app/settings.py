@@ -21,6 +21,7 @@ DEFAULTS: dict[str, Any] = {
     "start_minimized": False,
     "calibrated": False,
     "filtered_total": 0,
+    "window_geometry": "",
 }
 
 LEGACY_PATH = Path.home() / ".doubleclick-fixer.json"
@@ -52,6 +53,8 @@ def _coerce(values: dict[str, Any]) -> dict[str, Any]:
         merged["filtered_total"] = max(0, int(merged.get("filtered_total", 0)))
     except (TypeError, ValueError):
         merged["filtered_total"] = 0
+    if not isinstance(merged.get("window_geometry"), str):
+        merged["window_geometry"] = ""
     merged["version"] = SCHEMA_VERSION
     return merged
 

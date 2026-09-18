@@ -178,6 +178,35 @@ class WindowTests(unittest.TestCase):
             self.window._check_permission()
             set_active.assert_called_once_with(False)
 
+    def test_window_reopens_at_the_size_it_was_left(self) -> None:
+        from app.ui.window import MainWindow
+
+        self.window.show()
+        # Stay inside the offscreen test screen (800 x 600); Qt rightly shrinks
+        # a restored window that would not fit the screen it opens on.
+        self.window.resize(self.window.minimumWidth() + 40, self.window.minimumHeight() + 60)
+        self.application.processEvents()
+        expected = self.window.size()
+        self.window.save_geometry()
+
+        reopened = MainWindow(self.controller)
+        self.addCleanup(reopened.deleteLater)
+        self.assertEqual(reopened.size(), expected)
+
+    def test_content_stays_readable_when_wide_and_fits_when_narrow(self) -> None:
+        from app.ui.window import COLUMN_MAX
+
+        self.window.show()
+        self.window.resize(1600, 900)
+        self.application.processEvents()
+        self.assertLessEqual(self.window.filter_page.column.width(), COLUMN_MAX)
+
+        self.window.resize(self.window.minimumSize())
+        self.application.processEvents()
+        page = self.window.filter_page
+        viewport = page.parentWidget()
+        self.assertLessEqual(page.column.geometry().right(), viewport.width(), "nothing is clipped")
+
     def test_closing_hides_instead_of_quitting(self) -> None:
         from PySide6.QtCore import QEvent
 

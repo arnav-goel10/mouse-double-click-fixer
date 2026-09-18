@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PySide6.QtCore import QEvent, QRect, QTimer, Qt, Signal
+from PySide6.QtCore import QByteArray, QEvent, QRect, QTimer, Qt, Signal
 from PySide6.QtGui import QPainter
 from PySide6.QtWidgets import (
     QFrame,
@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSlider,
     QStackedWidget,
     QVBoxLayout,
@@ -50,6 +51,12 @@ from .widgets import (
 #: A pause longer than this starts a new pair while calibrating double-clicks.
 PAIR_WINDOW_MS = 600.0
 
+#: Content never stretches wider than this; extra window width becomes margin,
+#: so a label always stays within reach of its control.
+COLUMN_MAX = 640 if IS_MAC else 1000
+#: The narrowest the content column may get before the window stops shrinking.
+COLUMN_MIN = 440
+
 PAGES = [
     ("filter", "Bounce Filter"),
     ("test", "Test"),
@@ -65,13 +72,27 @@ def _button(text: str, default: bool = False) -> QPushButton:
     return button
 
 
+def centred_column(parent: QWidget, maximum: int = COLUMN_MAX) -> QWidget:
+    """Give `parent` a column capped at `maximum` wide, centred in any extra space."""
+    outer = QHBoxLayout(parent)
+    outer.setContentsMargins(0, 0, 0, 0)
+    outer.setSpacing(0)
+    column = QWidget()
+    column.setMaximumWidth(maximum)
+    outer.addStretch(1)
+    outer.addWidget(column, 100)
+    outer.addStretch(1)
+    return column
+
+
 class Page(QWidget):
     """A pane: stacked sections with headers and footnotes."""
 
     def __init__(self, title: str, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.page_title = title
-        self.body = QVBoxLayout(self)
+        self.column = centred_column(self)
+        self.body = QVBoxLayout(self.column)
         self.body.setSpacing(0)
         if IS_MAC:
             self.body.setContentsMargins(20, 4, 20, 20)
@@ -139,7 +160,10 @@ class FilterPage(Page):
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(MIN_THRESHOLD_MS, MAX_THRESHOLD_MS)
         self.slider.setPageStep(5)
-        self.slider.setFixedWidth(200 if IS_MAC else 220)
+        # Flexes with the window instead of forcing it wider.
+        self.slider.setMinimumWidth(110)
+        self.slider.setMaximumWidth(240)
+        self.slider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.slider.setAccessibleName("Filter window in milliseconds")
         self.value = ValueLabel()
         self.value.setMinimumWidth(52)
@@ -218,6 +242,7 @@ class TestPage(Page):
         self.shortest_gap: Optional[float] = None
 
         self.pad = ClickPad()
+        self.pad.setMaximumHeight(320)
         self.body.addWidget(self.pad, 1)
         self.gap(12)
 
@@ -246,6 +271,9 @@ class TestPage(Page):
         self.clear_button.clicked.connect(self.reset)
         actions.addWidget(self.clear_button)
         self.body.addLayout(actions)
+        # Once the pad reaches its full height, spare space collects at the
+        # bottom instead of opening gaps between sections.
+        self.body.addStretch(1)
 
         self.pad.pressed_with_gap.connect(self._on_pad_press)
 
@@ -311,6 +339,7 @@ class CalibratePage(Page):
         self.gap(12)
 
         self.pad = ClickPad()
+        self.pad.setMaximumHeight(360)
         self.body.addWidget(self.pad, 1)
 
         self.result_header = self.header("Result")
@@ -323,7 +352,6 @@ class CalibratePage(Page):
         self.result.add(Row("Fastest double-click", "", self.double_value))
         self.summary = self.footnote("")
 
-        self.body.addStretch(0)
         actions = QHBoxLayout()
         actions.setContentsMargins(0, 16, 0, 0)
         actions.setSpacing(8)
@@ -335,6 +363,7 @@ class CalibratePage(Page):
         actions.addWidget(self.restart_button)
         actions.addWidget(self.primary_button)
         self.body.addLayout(actions)
+        self.body.addStretch(1)
 
         self.pad.pressed_with_gap.connect(self._on_pad_press)
         self.restart()
@@ -545,8 +574,10 @@ class MainWindow(QWidget):
         self.setWindowIcon(icons.app_icon())
         self.translucent = native.prepare(self)
         self._material = False
-        self.resize(780, 620 if IS_MAC else 660)
-        self.setMinimumSize(660, 480)
+        side = look().sidebar_width
+        page_margins = 40 if IS_MAC else 72
+        self.setMinimumSize(side + page_margins + COLUMN_MIN + 16, 480 if IS_MAC else 540)
+        self.resize(side + page_margins + COLUMN_MAX // (1 if IS_MAC else 2) + 60, 640 if IS_MAC else 700)
 
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -566,7 +597,10 @@ class MainWindow(QWidget):
             # window controls, as in System Settings.
             bar = QWidget()
             bar.setFixedHeight(self.title_bar_height)
-            bar_layout = QHBoxLayout(bar)
+            # Same centred column as the pages, so the title lines up with the
+            # content at any window width.
+            bar_column = centred_column(bar)
+            bar_layout = QHBoxLayout(bar_column)
             bar_layout.setContentsMargins(20, 0, 20, 0)
             bar_layout.addWidget(self.title_label, 0, Qt.AlignmentFlag.AlignVCenter)
             bar_layout.addStretch(1)
@@ -621,6 +655,18 @@ class MainWindow(QWidget):
             self._permission_timer.start()
 
         self._show_page(0)
+        self._restore_geometry()
+
+    # -- size and position -------------------------------------------------------
+    def _restore_geometry(self) -> None:
+        """Reopen where the window was left, as Mac and Windows apps do."""
+        saved = self.controller.settings.get("window_geometry") or ""
+        if saved:
+            self.restoreGeometry(QByteArray.fromBase64(saved.encode("ascii")))
+
+    def save_geometry(self) -> None:
+        encoded = bytes(self.saveGeometry().toBase64()).decode("ascii")
+        self.controller.set_window_geometry(encoded)
 
     # -- native chrome ---------------------------------------------------------------
     def showEvent(self, event) -> None:  # noqa: N802
@@ -741,6 +787,7 @@ class MainWindow(QWidget):
 
     def closeEvent(self, event) -> None:  # noqa: N802
         event.ignore()
+        self.save_geometry()
         self.controller.flush_stats()
         self.hide()
         self.closed_to_tray.emit()
