@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.1 — 2026-09-22
+
+- macOS: DoubleClick Fixer runs as a menu bar app. It has no Dock icon while
+  its window is closed; opening the window brings back the Dock icon and app
+  menu, and opening the app from Launchpad or Spotlight shows the window.
+- macOS: the installer disk image is ejected once the installed app launches,
+  and moved to the Trash if it is in Downloads.
+
 ## 0.2.0 — 2026-09-19
 
 ### Changed

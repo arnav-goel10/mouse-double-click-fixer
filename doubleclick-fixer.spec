@@ -81,6 +81,9 @@ if sys.platform == "darwin":
             "NSRequiresAquaSystemAppearance": False,
             "LSMinimumSystemVersion": "11.0",
             "LSApplicationCategoryType": "public.app-category.utilities",
+            # A menu bar app: no Dock icon at launch. The app shows one only
+            # while its window is open (app/ui/dock.py).
+            "LSUIElement": True,
         },
     )
 else:

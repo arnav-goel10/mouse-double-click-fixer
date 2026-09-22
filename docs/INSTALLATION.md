@@ -20,6 +20,13 @@
    **Privacy & Security > Accessibility**; the app links straight to that pane.
 4. Calibrate, then turn the filter on again.
 
+When launched from Applications, the app automatically ejects a mounted
+installer containing the same build, which also closes its Finder window.
+If that disk image is in Downloads, it moves the DMG to Trash. The installed
+app stays open. Cleanup waits until you launch the installed app; dragging
+alone does not run it. Busy disks are left mounted, and images stored outside
+Downloads are kept.
+
 ## From source
 
 Python 3.11 or newer, on either platform.

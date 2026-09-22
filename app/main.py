@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import platform
 import sys
+from time import monotonic
 from typing import Optional
 
 from PySide6.QtCore import QTimer, Qt
@@ -14,7 +15,7 @@ from PySide6.QtWidgets import QApplication, QMenuBar, QMessageBox, QSystemTrayIc
 from . import __version__
 from .controller import AppController
 from .updater import Updater
-from .ui import icons
+from .ui import dock, icons
 from .ui.tray import Tray
 from .ui.window import MainWindow
 
@@ -71,6 +72,7 @@ class Application:
 
         self.window.closed_to_tray.connect(self._note_hidden)
         self._told_about_tray = False
+        self._quiet_until = 0.0
 
         self.server = QLocalServer()
         QLocalServer.removeServer(SERVER_NAME)
@@ -83,6 +85,9 @@ class Application:
         # Quitting from anywhere (Dock, app menu, logout) stops the hook cleanly.
         self.qt.aboutToQuit.connect(self.controller.shutdown)
         self.menu_bar = self._build_menu_bar()
+        # Opening the app again (Launchpad, Spotlight, Finder) while it runs
+        # from the menu bar only activates it; answer by showing the window.
+        self.qt.applicationStateChanged.connect(self._on_application_state)
 
     def _build_menu_bar(self) -> Optional[QMenuBar]:
         """macOS app menu: About, Settings… (⌘,) and Quit, where users expect them."""
@@ -126,6 +131,7 @@ class Application:
 
     # -- window ------------------------------------------------------------
     def show_window(self) -> None:
+        dock.set_visible(True)
         self.window.showNormal()
         self.window.raise_()
         self.window.activateWindow()
@@ -134,7 +140,18 @@ class Application:
         self.show_window()
         self.window.show_calibration()
 
+    def _on_application_state(self, state: Qt.ApplicationState) -> None:
+        if (
+            state == Qt.ApplicationState.ApplicationActive
+            and platform.system() == "Darwin"
+            and not self.window.isVisible()
+            and monotonic() > self._quiet_until
+        ):
+            self.show_window()
+
     def _note_hidden(self) -> None:
+        # The window is closed; the app carries on from the menu bar alone.
+        dock.set_visible(False)
         # A one-time hint on Windows, where tray icons hide in the overflow.
         # macOS apps don't announce this; the menu bar icon speaks for itself.
         if self.tray is None or self._told_about_tray or platform.system() == "Darwin":
@@ -160,6 +177,11 @@ class Application:
             minimized = True
         if not minimized:
             self.show_window()
+        else:
+            dock.set_visible(False)
+            # A background launch (login item, relaunch after an update) can
+            # still activate the app; that is not a request for the window.
+            self._quiet_until = monotonic() + 3.0
 
         if self.controller.settings["fix_enabled"] and self.controller.supported():
             # Restore the filter after the UI is up, so any failure has a
@@ -169,6 +191,9 @@ class Application:
             QTimer.singleShot(0, self._warn_unsupported)
 
         self.updater.start()
+        from . import install_cleanup
+
+        install_cleanup.start()
         return self.qt.exec()
 
     def _warn_unsupported(self) -> None:
