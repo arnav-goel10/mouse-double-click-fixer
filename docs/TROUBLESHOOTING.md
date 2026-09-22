@@ -20,6 +20,32 @@ and switch it on, then try again. Rebuilding the app from source changes its
 signature, so macOS treats it as a new app and permission has to be granted
 again — remove the old entry with the minus button first.
 
+### Permission is on, but the app still says access is required
+
+macOS can retain an enabled entry whose saved code requirement belongs to an
+older build. The switch remains on, but the current app fails that requirement
+and `AXIsProcessTrusted()` returns false. Restarting the app does not repair
+the saved entry.
+
+Remove only **DoubleClick Fixer** from the permission list, then add
+`/Applications/DoubleClick Fixer.app` and enable it again. On macOS 27, this
+list is named **Device Control and Data Access** under **Privacy & Security**.
+The running app checks permission every second; its banner should disappear
+when macOS grants access to the current build.
+
+For diagnosis, compare the installed code hash from
+`codesign -dvvv '/Applications/DoubleClick Fixer.app'` with the requirement
+reported by the permission service:
+
+```sh
+/usr/bin/log show --last 10m --info --debug --style compact \
+  --predicate 'process == "tccd" AND eventMessage CONTAINS[c] "doubleclick"'
+```
+
+A `matchesCodeRequirement` failure against a different `cdhash` identifies
+an obsolete saved requirement. Do not bypass the permission check or report
+access as allowed just because the System Settings switch is enabled.
+
 ## macOS: it worked, then stopped
 
 macOS disables an event tap that stalls, and after waking from sleep. The app

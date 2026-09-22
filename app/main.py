@@ -169,6 +169,9 @@ class Application:
             QTimer.singleShot(0, self._warn_unsupported)
 
         self.updater.start()
+        from . import install_cleanup
+
+        install_cleanup.start()
         return self.qt.exec()
 
     def _warn_unsupported(self) -> None:
