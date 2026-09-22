@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import platform
 import sys
-from time import monotonic
 from typing import Optional
 
 from PySide6.QtCore import QTimer, Qt
@@ -72,7 +71,6 @@ class Application:
 
         self.window.closed_to_tray.connect(self._note_hidden)
         self._told_about_tray = False
-        self._quiet_until = 0.0
 
         self.server = QLocalServer()
         QLocalServer.removeServer(SERVER_NAME)
@@ -85,9 +83,10 @@ class Application:
         # Quitting from anywhere (Dock, app menu, logout) stops the hook cleanly.
         self.qt.aboutToQuit.connect(self.controller.shutdown)
         self.menu_bar = self._build_menu_bar()
-        # Opening the app again (Launchpad, Spotlight, Finder) while it runs
-        # from the menu bar only activates it; answer by showing the window.
-        self.qt.applicationStateChanged.connect(self._on_application_state)
+        # Opening the app again (Launchpad, Spotlight, Finder, Dock) while it
+        # runs from the menu bar shows the window. Installed once the event
+        # loop runs, after AppKit has registered its own handler.
+        QTimer.singleShot(0, lambda: dock.on_reopen(self.show_window))
 
     def _build_menu_bar(self) -> Optional[QMenuBar]:
         """macOS app menu: About, Settings… (⌘,) and Quit, where users expect them."""
@@ -140,15 +139,6 @@ class Application:
         self.show_window()
         self.window.show_calibration()
 
-    def _on_application_state(self, state: Qt.ApplicationState) -> None:
-        if (
-            state == Qt.ApplicationState.ApplicationActive
-            and platform.system() == "Darwin"
-            and not self.window.isVisible()
-            and monotonic() > self._quiet_until
-        ):
-            self.show_window()
-
     def _note_hidden(self) -> None:
         # The window is closed; the app carries on from the menu bar alone.
         dock.set_visible(False)
@@ -179,9 +169,6 @@ class Application:
             self.show_window()
         else:
             dock.set_visible(False)
-            # A background launch (login item, relaunch after an update) can
-            # still activate the app; that is not a request for the window.
-            self._quiet_until = monotonic() + 3.0
 
         if self.controller.settings["fix_enabled"] and self.controller.supported():
             # Restore the filter after the UI is up, so any failure has a
