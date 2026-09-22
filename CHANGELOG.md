@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.2 — 2026-09-23
+
+- macOS: clicking the menu bar icon opens its menu again. In 0.2.1 the window
+  opened on any activation, including the one a menu bar click causes, which
+  dismissed the menu. The window now opens on the reopen event macOS sends
+  when a running app is opened from Launchpad, Spotlight, Finder or the Dock.
+
 ## 0.2.1 — 2026-09-22
 
 - macOS: DoubleClick Fixer runs as a menu bar app. It has no Dock icon while
