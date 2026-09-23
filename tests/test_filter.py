@@ -102,3 +102,45 @@ class LifecycleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class HeldReleaseTests(unittest.TestCase):
+    """The hook re-injects what the core holds back, in the right order."""
+
+    def setUp(self) -> None:
+        self.injected = []
+        self.filter = GlobalClickFilter(40, [Button.LEFT])
+        self.filter._use_os_time = True
+        self.filter._inject = lambda button, pressed, template: self.injected.append((pressed, template))
+
+    def test_dropout_is_swallowed_and_nothing_is_injected(self) -> None:
+        from time import sleep
+
+        self.assertTrue(self.filter._handle(Button.LEFT, True, 0.0, "down").accepted)
+        self.assertFalse(self.filter._handle(Button.LEFT, False, 0.5, "up").accepted)
+        self.assertFalse(self.filter._handle(Button.LEFT, True, 0.51, "down2").accepted)
+        sleep(0.1)  # past the 40 ms window
+        self.assertEqual(self.injected, [])
+
+    def test_real_release_is_delivered_after_the_window(self) -> None:
+        from time import sleep
+
+        self.filter._handle(Button.LEFT, True, 0.0, "down")
+        self.filter._handle(Button.LEFT, False, 0.5, "up")
+        sleep(0.15)
+        self.assertEqual(self.injected, [(False, "up")])
+
+    def test_late_press_replays_release_then_press(self) -> None:
+        self.filter._handle(Button.LEFT, True, 0.0, "down")
+        self.filter._handle(Button.LEFT, False, 0.5, "up")
+        # Arrives after the window but before the timer fires.
+        self.filter._filters[Button.LEFT].threshold_ms = 40
+        event = self.filter._handle(Button.LEFT, True, 0.6, "down2")
+        self.assertFalse(event.accepted)
+        self.assertEqual(self.injected, [(False, "up"), (True, "down2")])
+
+    def test_stopping_delivers_a_held_release(self) -> None:
+        self.filter._handle(Button.LEFT, True, 0.0, "down")
+        self.filter._handle(Button.LEFT, False, 0.5, "up")
+        self.filter.stop()
+        self.assertEqual(self.injected, [(False, "up")], "apps must not think the button is stuck")

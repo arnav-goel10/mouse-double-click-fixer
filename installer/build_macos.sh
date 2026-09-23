@@ -39,7 +39,8 @@ if [[ -z "$identity" && -f "$LOCAL_SIGNING/signing.keychain-db" ]]; then
   identity="$(security find-identity -p codesigning "$keychain" | awk '/DoubleClick Fixer Signing/ {print $2; exit}')"
 fi
 if [[ -n "$identity" ]]; then
-  codesign --force --deep --timestamp=none --keychain "$keychain" --sign "$identity" "$signed"
+  # --keychain only when one is named; otherwise the default search list.
+  codesign --force --deep --timestamp=none ${keychain:+--keychain "$keychain"} --sign "$identity" "$signed"
   printf 'Signed with %s\n' "$identity"
 else
   codesign --force --deep --sign - "$signed"

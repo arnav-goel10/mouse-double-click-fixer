@@ -113,6 +113,29 @@ class SwapScriptTests(unittest.TestCase):
         self.assertFalse(current.with_name(current.name + ".previous").exists())
         self.assertTrue(marker.exists(), "the app is reopened")
 
+    def test_script_removes_only_the_updaters_own_folder(self) -> None:
+        root = Path(tempfile.mkdtemp())
+        workdir = root / (updater.WORKDIR_PREFIX + "abc")
+        workdir.mkdir()
+        (workdir / "download.zip").write_text("x")
+        current = root / "App.app"
+        staged = root / ".App update.app"
+        current.mkdir()
+        staged.mkdir()
+        finished = subprocess.Popen(["true"])
+        finished.wait()
+        script = workdir / "apply.sh"
+        script.write_text(mac_swap_script(finished.pid, current, staged, [], opener="true", workdir=workdir))
+        subprocess.run(["/bin/bash", str(script)], check=True)
+        self.assertFalse(workdir.exists(), "the download folder is cleaned up")
+        self.assertTrue(current.exists(), "the app next to it is untouched")
+
+        # A folder without the updater's prefix is never deleted.
+        other = root / "Applications"
+        other.mkdir()
+        text = mac_swap_script(finished.pid, current, staged, [], opener="true", workdir=other)
+        self.assertNotIn("rm -rf '" + str(other), text)
+
 
 class _Server(http.server.ThreadingHTTPServer):
     daemon_threads = True

@@ -47,6 +47,10 @@ CHECKSUM_ASSET = "SHA256SUMS.txt"
 
 CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000
 FIRST_CHECK_DELAY_MS = 20 * 1000
+#: A request that transfers nothing for this long is abandoned, so a stalled
+#: connection ends in "Try Again" rather than a spinner that never stops.
+STALL_TIMEOUT_MS = 30 * 1000
+WORKDIR_PREFIX = "dcf-update-"
 
 
 # -- pure helpers (unit tested) ---------------------------------------------------
@@ -163,7 +167,12 @@ def requirement_is_stable(requirement: str) -> bool:
 
 
 def mac_swap_script(
-    pid: int, current: Path, staged: Path, relaunch_args: list[str], opener: str = "open"
+    pid: int,
+    current: Path,
+    staged: Path,
+    relaunch_args: list[str],
+    opener: str = "open",
+    workdir: Optional[Path] = None,
 ) -> str:
     """Wait for the app to exit, move the new bundle into place, reopen it.
 
@@ -173,6 +182,12 @@ def mac_swap_script(
     quoted = lambda value: "'" + str(value).replace("'", "'\\''") + "'"  # noqa: E731
     args = " ".join(quoted(argument) for argument in relaunch_args)
     backup = current.with_name(current.name + ".previous")
+    # Only ever delete the updater's own download folder, never whatever
+    # folder the script happens to sit in.
+    if workdir is not None and workdir.name.startswith(WORKDIR_PREFIX):
+        cleanup = f"rm -rf {quoted(workdir)}"
+    else:
+        cleanup = 'rm -f "$0"'
     return f"""#!/bin/bash
 for _ in $(seq 1 150); do kill -0 {pid} 2>/dev/null || break; sleep 0.2; done
 rm -rf {quoted(backup)}
@@ -183,17 +198,33 @@ else
 fi
 xattr -dr com.apple.quarantine {quoted(current)} 2>/dev/null
 {opener} {quoted(current)} --args {args}
-rm -f "$0"
+{cleanup}
 """
 
 
 def windows_portable_script(pid: int, current: Path, downloaded: Path, relaunch_args: list[str]) -> str:
+    """Swap the portable executable once the app has quit, then reopen it.
+
+    The move is retried: in a one-file build the launcher process holds the
+    executable for a moment after the app itself has exited. `ping` is the
+    delay because `timeout` refuses to run without a console. After 30 failed
+    tries the old copy is reopened rather than leaving the user with nothing.
+    """
+    batch = lambda value: str(value).replace("%", "%%")  # noqa: E731
     args = " ".join(relaunch_args)
     return f"""@echo off
+setlocal
+set tries=0
 :wait
-tasklist /FI "PID eq {pid}" | find "{pid}" >nul && (timeout /t 1 /nobreak >nul & goto wait)
-move /Y "{downloaded}" "{current}" >nul
-start "" "{current}" {args}
+tasklist /FI "PID eq {pid}" 2>nul | find "{pid}" >nul && (ping -n 2 127.0.0.1 >nul & goto wait)
+:move
+move /Y "{batch(downloaded)}" "{batch(current)}" >nul 2>&1 && goto done
+set /a tries+=1
+if %tries% GEQ 30 goto done
+ping -n 2 127.0.0.1 >nul
+goto move
+:done
+start "" "{batch(current)}" {args}
 del "%~f0"
 """
 
@@ -235,6 +266,7 @@ class Updater(QObject):
         """Begin the background schedule."""
         if not self.supported:
             return
+        remove_stale_workdirs()
         QTimer.singleShot(FIRST_CHECK_DELAY_MS, lambda: self.check(user_initiated=False))
         self._timer.start()
 
@@ -247,6 +279,7 @@ class Updater(QObject):
         request = QNetworkRequest(QUrl(os.environ.get(URL_OVERRIDE_ENV) or LATEST_URL))
         request.setRawHeader(b"Accept", b"application/vnd.github+json")
         request.setRawHeader(b"User-Agent", f"DoubleClickFixer/{__version__}".encode())
+        request.setTransferTimeout(STALL_TIMEOUT_MS)
         self._reply = self._network.get(request)
         self._reply.finished.connect(lambda: self._on_checked(user_initiated))
 
@@ -254,7 +287,7 @@ class Updater(QObject):
         """Download the available update and apply it."""
         if self.release is None or self.state in (self.DOWNLOADING, self.INSTALLING):
             return
-        self._workdir = Path(tempfile.mkdtemp(prefix="dcf-update-"))
+        self._workdir = Path(tempfile.mkdtemp(prefix=WORKDIR_PREFIX))
         self._set(self.DOWNLOADING, "")
         self._download(self.release.checksum_url, self._workdir / CHECKSUM_ASSET, self._on_checksums)
 
@@ -296,9 +329,14 @@ class Updater(QObject):
             QNetworkRequest.Attribute.RedirectPolicyAttribute,
             QNetworkRequest.RedirectPolicy.NoLessSafeRedirectPolicy,
         )
+        request.setTransferTimeout(STALL_TIMEOUT_MS)
+        try:
+            handle = open(target, "wb")
+        except OSError:
+            self._fail("Couldn’t save the update.")
+            return
         reply = self._network.get(request)
         self._reply = reply
-        handle = open(target, "wb")
 
         def on_ready() -> None:
             handle.write(bytes(reply.readAll()))
@@ -323,8 +361,14 @@ class Updater(QObject):
         reply.finished.connect(on_finished)
 
     def _on_checksums(self, path: Path) -> None:
-        self._checksums = parse_checksums(path.read_text(encoding="utf-8", errors="replace"))
-        assert self.release is not None and self._workdir is not None
+        try:
+            self._checksums = parse_checksums(path.read_text(encoding="utf-8", errors="replace"))
+        except OSError:
+            self._fail("Couldn’t read the update’s checksums.")
+            return
+        if self.release is None or self._workdir is None:
+            self._fail("The update was cancelled.")
+            return
         self._download(self.release.asset_url, self._workdir / self.release.asset_name, self._on_asset)
 
     def _on_asset(self, path: Path) -> None:
@@ -385,18 +429,28 @@ class Updater(QObject):
             shutil.rmtree(staged, ignore_errors=True)
             raise UpdateError(f"No permission to replace the app in {current.parent}.")
         script = archive.parent / "apply-update.sh"
-        script.write_text(mac_swap_script(os.getpid(), current, staged, self._relaunch_args()))
+        script.write_text(
+            mac_swap_script(os.getpid(), current, staged, self._relaunch_args(), workdir=self._workdir)
+        )
         subprocess.Popen(["/bin/bash", str(script)], start_new_session=True,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def _install_windows_installer(self, installer: Path) -> None:
-        flags = ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS", "/RELAUNCH=1"]
+        relaunch = "/RELAUNCH=1" if self.window_visible() else "/RELAUNCH=2"
+        flags = ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS", relaunch]
         subprocess.Popen([str(installer), *flags], creationflags=_detached_flags())
 
     def _install_windows_portable(self, downloaded: Path) -> None:
         current = Path(sys.executable)
         script = downloaded.parent / "apply-update.cmd"
-        script.write_text(windows_portable_script(os.getpid(), current, downloaded, self._relaunch_args()))
+        # cmd.exe reads batch files in the OEM code page, not the ANSI one
+        # Python writes by default; non-ASCII paths would otherwise break.
+        encoding = "oem" if platform.system() == "Windows" else "utf-8"
+        script.write_text(
+            windows_portable_script(os.getpid(), current, downloaded, self._relaunch_args()),
+            encoding=encoding,
+            errors="replace",
+        )
         subprocess.Popen(["cmd", "/c", str(script)], creationflags=_detached_flags())
 
     # -- state ------------------------------------------------------------------------
@@ -421,4 +475,23 @@ class UpdateError(RuntimeError):
 def _detached_flags() -> int:
     if platform.system() != "Windows":
         return 0
-    return subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+    # CREATE_NO_WINDOW, not DETACHED_PROCESS: a detached cmd.exe would open a
+    # fresh console window for every program it runs.
+    return subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+
+
+def remove_stale_workdirs(max_age_s: float = 24 * 60 * 60) -> None:
+    """Delete update downloads left behind by earlier successful updates.
+
+    The installer, or the swap script, still needs its files while the update
+    is applied, so they cannot be removed at the time; the next launch does.
+    """
+    import time
+
+    root = Path(tempfile.gettempdir())
+    for folder in root.glob(WORKDIR_PREFIX + "*"):
+        try:
+            if time.time() - folder.stat().st_mtime > max_age_s:
+                shutil.rmtree(folder, ignore_errors=True)
+        except OSError:
+            pass

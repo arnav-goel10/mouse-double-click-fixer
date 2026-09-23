@@ -21,6 +21,10 @@ from .core import BounceFilter, Button, ClickEvent, clamp_threshold
 #: automated end-to-end tests, which have no other way to produce input.
 FILTER_INJECTED_ENV = "DCF_FILTER_INJECTED"
 
+#: Marks events this app re-injects (a held release delivered late, or a
+#: press re-ordered after it), so the hook passes them straight through.
+INJECTED_MARK = 0x44434658  # "DCFX"
+
 
 class HookError(RuntimeError):
     """The global hook could not be installed, or stopped unexpectedly."""
@@ -60,6 +64,12 @@ class GlobalClickFilter:
         self._tap = None
         self._run_loop = None
         self._use_os_time: Optional[bool] = None
+        self._started = False
+        # Per button: the event kept for a release that is being held back.
+        self._held_templates: dict = {}
+        self._timers: list[threading.Timer] = []
+        # Set by the platform runner: re-posts an event the hook suppressed.
+        self._inject: Callable[[Button, bool, object], None] = lambda _b, _p, _t: None
         self.filtered_count = 0
 
     # -- lifecycle ---------------------------------------------------------
@@ -78,6 +88,8 @@ class GlobalClickFilter:
         self._ready.clear()
         self._startup_error = None
         self._use_os_time = None
+        self._started = False
+        self._held_templates.clear()
         self._thread = threading.Thread(target=self._run, name="dcf-hook", daemon=True)
         self._thread.start()
         if not self._ready.wait(timeout=5):
@@ -89,7 +101,34 @@ class GlobalClickFilter:
             raise HookError(str(error)) from error
 
     def stop(self) -> None:
+        # A release still held back must reach applications, or they would
+        # believe the button is stuck down.
+        for timer in self._timers:
+            timer.cancel()
+        self._timers.clear()
+        for button in Button:
+            self._commit_held(button)
         self._stop_event.set()
+        thread = self._thread
+        if thread is None or thread is threading.current_thread():
+            return
+        # Keep asking the thread to stop until it has. Its message queue (on
+        # Windows) may not exist yet the first time, or its run loop may be
+        # between iterations; a single request can be lost either way.
+        deadline = monotonic() + 3.0
+        while thread.is_alive() and monotonic() < deadline:
+            self._request_thread_stop()
+            thread.join(timeout=0.05)
+        if thread.is_alive():
+            # Never drop the handle to a live hook: `running` stays true, so
+            # nothing starts a second hook on top of it, and a later stop()
+            # can still reach it.
+            return
+        self._thread = None
+        self._thread_id = None
+        self._run_loop = None
+
+    def _request_thread_stop(self) -> None:
         if platform.system() == "Windows" and self._thread_id is not None:
             import ctypes
 
@@ -98,12 +137,6 @@ class GlobalClickFilter:
             import Quartz
 
             Quartz.CFRunLoopStop(self._run_loop)
-        thread = self._thread
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=2)
-        self._thread = None
-        self._thread_id = None
-        self._run_loop = None
 
     def update(self, threshold_ms: Optional[int] = None, buttons: Optional[Iterable[Button]] = None) -> None:
         """Change settings while the hook keeps running."""
@@ -116,19 +149,51 @@ class GlobalClickFilter:
                 self._active = set(buttons)
 
     # -- shared event handling --------------------------------------------
-    def _handle(self, button: Button, pressed: bool, timestamp: Optional[float]) -> ClickEvent:
+    def _handle(
+        self, button: Button, pressed: bool, timestamp: Optional[float], template: object = None
+    ) -> ClickEvent:
+        """Decide one event. `template` is a copy of it, kept in case it has to
+        be re-injected later; the caller suppresses whatever is not accepted."""
         timestamp = self._normalise_time(timestamp)
+        replay = []
         with self._lock:
             click_filter = self._filters[button]
             click_filter.enabled = button in self._active
             event = click_filter.press(timestamp) if pressed else click_filter.release(timestamp)
             if event.is_bounce:
                 self.filtered_count += 1
+            if event.held:
+                self._held_templates[button] = template
+                timer = threading.Timer(click_filter.threshold_ms / 1000.0, self._commit_held, (button,))
+                timer.daemon = True
+                self._timers = [t for t in self._timers if t.is_alive()] + [timer]
+                timer.start()
+            elif event.cancels_held:
+                self._held_templates.pop(button, None)
+            elif event.flush_held:
+                # The held release was real after all: deliver it, then this.
+                replay = [(False, self._held_templates.pop(button, None)), (True, template)]
+        for replay_pressed, replay_template in replay:
+            self._safe_inject(button, replay_pressed, replay_template)
         try:
             self._on_event(event)
         except Exception:  # a UI callback must never break the hook
             pass
         return event
+
+    def _commit_held(self, button: Button) -> None:
+        """The threshold passed with no press: the held release was real."""
+        with self._lock:
+            if not self._filters[button].commit_held():
+                return
+            template = self._held_templates.pop(button, None)
+        self._safe_inject(button, False, template)
+
+    def _safe_inject(self, button: Button, pressed: bool, template: object) -> None:
+        try:
+            self._inject(button, pressed, template)
+        except Exception:  # noqa: BLE001 - never break the event stream
+            pass
 
     def _normalise_time(self, timestamp: Optional[float]) -> float:
         """Use the operating system's event time only if it shares our clock.
@@ -153,9 +218,12 @@ class GlobalClickFilter:
             else:
                 self._run_macos()
         except BaseException as error:  # noqa: BLE001 - surfaced to the UI
-            self._startup_error = error
-            self._ready.set()
-            if not self._stop_event.is_set():
+            if not self._started:
+                # start() is still waiting and reports this itself; reporting
+                # it here as well would show two dialogs for one failure.
+                self._startup_error = error
+                self._ready.set()
+            elif not self._stop_event.is_set():
                 self._on_error(str(error))
 
     # -- Windows -----------------------------------------------------------
@@ -184,8 +252,29 @@ class GlobalClickFilter:
                 ("mouseData", wintypes.DWORD),
                 ("flags", wintypes.DWORD),
                 ("time", wintypes.DWORD),
-                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+                ("dwExtraInfo", ctypes.c_size_t),  # ULONG_PTR
             ]
+
+        class MOUSEINPUT(ctypes.Structure):
+            _fields_ = [
+                ("dx", wintypes.LONG),
+                ("dy", wintypes.LONG),
+                ("mouseData", wintypes.DWORD),
+                ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.c_size_t),
+            ]
+
+        class INPUT(ctypes.Structure):
+            # Only the mouse member of the union is used; it is the largest.
+            _fields_ = [("type", wintypes.DWORD), ("mi", MOUSEINPUT)]
+
+        INPUT_MOUSE = 0
+        SEND_FLAGS = {
+            (Button.LEFT, True): 0x0002, (Button.LEFT, False): 0x0004,
+            (Button.RIGHT, True): 0x0008, (Button.RIGHT, False): 0x0010,
+            (Button.MIDDLE, True): 0x0020, (Button.MIDDLE, False): 0x0040,
+        }
 
         LRESULT = ctypes.c_ssize_t
         HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
@@ -200,6 +289,16 @@ class GlobalClickFilter:
         user32.GetMessageW.restype = ctypes.c_int
         user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
         kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+        user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+        user32.SendInput.restype = wintypes.UINT
+
+        def inject(button: Button, pressed: bool, _template: object) -> None:
+            # Re-post a suppressed press or release at the current pointer
+            # position, tagged so this hook lets it through.
+            event = INPUT(INPUT_MOUSE, MOUSEINPUT(0, 0, 0, SEND_FLAGS[(button, pressed)], 0, INJECTED_MARK))
+            user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(INPUT))
+
+        self._inject = inject
 
         self._thread_id = kernel32.GetCurrentThreadId()
         filter_injected = _filter_injected()
@@ -211,7 +310,8 @@ class GlobalClickFilter:
                 if entry is not None:
                     info = ctypes.cast(data, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
                     injected = bool(info.flags & LLMHF_INJECTED)
-                    if not injected or filter_injected:
+                    ours = info.dwExtraInfo == INJECTED_MARK
+                    if not ours and (not injected or filter_injected):
                         button, pressed = entry
                         # `time` is the tick count, in milliseconds, recorded
                         # when the driver produced the event.
@@ -225,6 +325,7 @@ class GlobalClickFilter:
             self._startup_error = ctypes.WinError(ctypes.get_last_error())
             self._ready.set()
             return
+        self._started = True
         self._ready.set()
         message = wintypes.MSG()
         try:
@@ -255,6 +356,20 @@ class GlobalClickFilter:
         to_seconds = _mach_timebase()
         filter_injected = _filter_injected()
 
+        def inject(_button: Button, pressed: bool, template: object) -> None:
+            # Re-post the kept copy of a suppressed event, stamped now and, for
+            # a release, at the pointer's current position (a drag has moved
+            # on since), tagged so this tap lets it through.
+            if template is None:
+                return
+            Quartz.CGEventSetIntegerValueField(template, Quartz.kCGEventSourceUserData, INJECTED_MARK)
+            Quartz.CGEventSetTimestamp(template, _mach_now())
+            if not pressed:
+                Quartz.CGEventSetLocation(template, Quartz.CGEventGetLocation(Quartz.CGEventCreate(None)))
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, template)
+
+        self._inject = inject
+
         def callback(_proxy: object, event_type: int, event: object, _refcon: object) -> object:
             # macOS disables a tap that takes too long, or when the user
             # revokes permission. Re-arm it instead of dying silently.
@@ -266,6 +381,8 @@ class GlobalClickFilter:
             entry = BUTTONS.get(event_type)
             if entry is None:
                 return event
+            if Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventSourceUserData) == INJECTED_MARK:
+                return event  # re-posted by this app; already decided
             source = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventSourceStateID)
             if source != Quartz.kCGEventSourceStateHIDSystemState and not filter_injected:
                 return event  # synthetic click from another app; leave it alone
@@ -276,7 +393,9 @@ class GlobalClickFilter:
                 if number != 2:
                     return event  # a side button, not the middle one
 
-            result = self._handle(button, pressed, to_seconds(Quartz.CGEventGetTimestamp(event)))
+            result = self._handle(
+                button, pressed, to_seconds(Quartz.CGEventGetTimestamp(event)), Quartz.CGEventCreateCopy(event)
+            )
             if not result.accepted:
                 return None
             if result.suppressed_run:
@@ -308,6 +427,7 @@ class GlobalClickFilter:
         self._run_loop = Quartz.CFRunLoopGetCurrent()
         Quartz.CFRunLoopAddSource(self._run_loop, source, Quartz.kCFRunLoopCommonModes)
         Quartz.CGEventTapEnable(tap, True)
+        self._started = True
         self._ready.set()
         try:
             while not self._stop_event.is_set():
@@ -335,6 +455,14 @@ def _rewrite_click_state(Quartz, event: object, suppressed: int) -> None:
             )
     except Exception:  # pragma: no cover - never break the event stream
         pass
+
+
+def _mach_now() -> int:
+    import ctypes
+
+    libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+    libc.mach_absolute_time.restype = ctypes.c_uint64
+    return int(libc.mach_absolute_time())
 
 
 def _mach_timebase() -> Callable[[int], float]:
