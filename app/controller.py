@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from typing import Optional
 
 from PySide6.QtCore import QObject, Signal
@@ -27,9 +28,22 @@ class AppController(QObject):
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
         self.settings = settings_store.load()
+        # The login item can be changed outside the app (the Windows
+        # installer, System Settings), so the system is the source of truth.
+        if startup.is_supported():
+            try:
+                actual = startup.is_enabled()
+            except OSError:
+                actual = self.settings["start_at_login"]
+            if actual != self.settings["start_at_login"]:
+                self._store(start_at_login=actual)
         self._filter: Optional[GlobalClickFilter] = None
         self._suspended = False
-        self._unsaved_filtered = False
+        # Bounces counted on the hook thread since the last flush. Kept apart
+        # from `settings`, which every settings write replaces with what is on
+        # disk, so an unrelated write can never lose them.
+        self._count_lock = threading.Lock()
+        self._pending_filtered = 0
         self.session_filtered = 0
 
     # -- state -------------------------------------------------------------
@@ -51,7 +65,8 @@ class AppController(QObject):
 
     @property
     def filtered_total(self) -> int:
-        return int(self.settings["filtered_total"])
+        with self._count_lock:
+            return int(self.settings["filtered_total"]) + self._pending_filtered
 
     def supported(self) -> bool:
         return is_supported()
@@ -59,9 +74,14 @@ class AppController(QObject):
     # -- filter lifecycle --------------------------------------------------
     def set_active(self, active: bool) -> bool:
         """Turn the system-wide filter on or off. Returns the resulting state."""
-        if active == self.active:
+        if active == self.active and (active or self._filter is None):
+            # Nothing to do. A filter whose hook thread has died reads as
+            # inactive but still needs releasing, so that case falls through.
             return self.active
         if active:
+            # Turning the filter on (from the menu bar, say) ends a pause.
+            self._suspended = False
+            self._stop_filter()  # release a filter whose hook thread died
             try:
                 self._filter = GlobalClickFilter(
                     self.threshold_ms,
@@ -162,7 +182,9 @@ class AppController(QObject):
         self._store(last_update_check=time.time())
 
     def reset_statistics(self) -> None:
-        self.session_filtered = 0
+        with self._count_lock:
+            self._pending_filtered = 0
+            self.session_filtered = 0
         self._store(filtered_total=0)
         self.settings_changed.emit()
 
@@ -171,9 +193,10 @@ class AppController(QObject):
 
     def flush_stats(self) -> None:
         """Write the running count to disk. Called from the UI thread only."""
-        if self._unsaved_filtered:
-            self._unsaved_filtered = False
-            self._store(filtered_total=self.filtered_total)
+        with self._count_lock:
+            pending, self._pending_filtered = self._pending_filtered, 0
+        if pending:
+            self._store(filtered_total=int(self.settings["filtered_total"]) + pending)
 
     # -- events ------------------------------------------------------------
     def _on_global_event(self, event: ClickEvent) -> None:
@@ -181,7 +204,8 @@ class AppController(QObject):
         # too long, so this does nothing but count and emit; the signal hops
         # to the UI thread, which owns all disk writes.
         if event.is_bounce:
-            self.session_filtered += 1
-            self.settings["filtered_total"] = self.filtered_total + 1
-            self._unsaved_filtered = True
-        self.global_event.emit(event)
+            with self._count_lock:
+                self.session_filtered += 1
+                self._pending_filtered += 1
+            # The UI only reacts to bounces, so only those cross threads.
+            self.global_event.emit(event)

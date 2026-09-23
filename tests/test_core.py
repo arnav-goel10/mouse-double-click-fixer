@@ -161,3 +161,62 @@ class ButtonTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DragDropoutTests(unittest.TestCase):
+    """A worn switch can drop contact for a few ms while the button is held."""
+
+    def test_dropout_mid_drag_is_invisible(self) -> None:
+        f = BounceFilter(60)
+        self.assertTrue(f.press(timestamp=0.0).accepted)          # start dragging
+        release = f.release(timestamp=0.5)                        # contact drops
+        self.assertTrue(release.held, "a release after a long hold is held back")
+        self.assertFalse(release.accepted)
+        press = f.press(timestamp=0.508)                          # contact returns
+        self.assertTrue(press.cancels_held)
+        self.assertFalse(press.accepted)
+        self.assertFalse(f.commit_held(), "nothing left to deliver")
+        final = f.release(timestamp=2.0)                          # the real lift
+        self.assertTrue(final.held)
+        self.assertTrue(f.commit_held(), "the real lift is delivered after the window")
+
+    def test_ordinary_clicks_gain_no_delay(self) -> None:
+        f = BounceFilter(60)
+        f.press(timestamp=0.0)
+        release = f.release(timestamp=0.08)  # an 80 ms click
+        self.assertTrue(release.accepted)
+        self.assertFalse(release.held)
+
+    def test_release_is_delivered_when_no_press_follows(self) -> None:
+        f = BounceFilter(60)
+        f.press(timestamp=0.0)
+        self.assertTrue(f.release(timestamp=0.3).held)
+        self.assertTrue(f.commit_held())
+        # A later press is measured from that release, as usual.
+        press = f.press(timestamp=1.0)
+        self.assertTrue(press.accepted)
+        self.assertAlmostEqual(press.gap_ms or 0, 700, places=6)
+
+    def test_press_after_the_window_flushes_the_release_first(self) -> None:
+        f = BounceFilter(60)
+        f.press(timestamp=0.0)
+        f.release(timestamp=0.3)
+        press = f.press(timestamp=0.5)  # before the timer ran, after the window
+        self.assertTrue(press.flush_held, "the held release must go out first")
+        self.assertFalse(press.is_bounce)
+
+    def test_disabled_button_never_holds(self) -> None:
+        f = BounceFilter(60, enabled=False)
+        f.press(timestamp=0.0)
+        self.assertTrue(f.release(timestamp=0.5).accepted)
+
+    def test_click_count_repair_reaches_the_release_too(self) -> None:
+        f = BounceFilter(60)
+        f.press(timestamp=0.0)
+        f.release(timestamp=0.05)
+        f.press(timestamp=0.06)              # bounce
+        f.release(timestamp=0.065)
+        press = f.press(timestamp=0.25)      # real second click
+        release = f.release(timestamp=0.3)
+        self.assertEqual(press.suppressed_run, 1)
+        self.assertEqual(release.suppressed_run, 1, "mouse-up needs the same repair")

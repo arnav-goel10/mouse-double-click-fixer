@@ -140,6 +140,23 @@ class WindowsHookTests(unittest.TestCase):
         self.assertEqual(releases, 4, "a suppressed press must take its release with it")
         self.assertEqual(self.filter.filtered_count, 1)
 
+    def test_contact_dropout_mid_drag_keeps_the_drag(self) -> None:
+        self.observed.clear()
+        self._click(True)           # start a drag
+        time.sleep(0.3)
+        self._click(False)          # contact drops out for ~10 ms
+        time.sleep(0.01)
+        self._click(True)           # and comes back
+        time.sleep(0.3)
+        self._click(False)          # the real lift
+        time.sleep(0.4)             # past the filter window: the lift is re-sent
+
+        self.assertEqual(
+            self.observed,
+            [WM_LBUTTONDOWN, WM_LBUTTONUP],
+            f"expected one unbroken drag, saw {self.observed}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

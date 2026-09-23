@@ -27,6 +27,14 @@ def _fingerprint(bundle: Path) -> tuple[bytes, str]:
     return metadata, digest
 
 
+def _identity(path: Path) -> tuple:
+    # Which file this is and whether its contents changed. Not the whole stat
+    # record: reading the image (the detach, Spotlight) updates its access
+    # time, which says nothing about whether it was replaced.
+    info = path.stat()
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+
+
 def _trash(path: Path) -> None:
     # Use macOS Trash semantics, including collision handling and other volumes.
     import objc
@@ -73,12 +81,12 @@ def cleanup(installed: Path, downloads: Path, volumes: Path = Path('/Volumes')) 
                         continue
                     # Remember the image identity before unmounting. Never trash a
                     # replacement file or follow a symlink out of Downloads.
-                    before = image_path.stat()
+                    before = _identity(image_path)
                     trashable = (not image_path.is_symlink()
                                  and image_path.resolve().is_relative_to(downloads.resolve()))
                     subprocess.run(['/usr/bin/hdiutil', 'detach', str(mount)],
                                    capture_output=True, check=True, timeout=15)
-                    if trashable and image_path.stat() == before:
+                    if trashable and _identity(image_path) == before:
                         _trash(image_path)
                     return
                 except (OSError, ValueError, KeyError, subprocess.SubprocessError):

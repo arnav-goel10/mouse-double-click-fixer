@@ -12,6 +12,19 @@ from . import icons
 from .theme import IS_MAC
 
 
+def create(controller: AppController, **actions):
+    """The menu bar item on macOS, the notification area icon on Windows.
+
+    macOS gets a native status item because Qt's own crashes the app there
+    (see menu_bar_mac.py); everywhere else Qt's tray icon is used.
+    """
+    if IS_MAC:
+        from .menu_bar_mac import MacMenuBarItem
+
+        return MacMenuBarItem(controller, **actions)
+    return Tray(controller, **actions)
+
+
 class Tray(QSystemTrayIcon):
     def __init__(
         self,
@@ -64,6 +77,7 @@ class Tray(QSystemTrayIcon):
         self.activated.connect(self._on_activated)
         controller.filter_state_changed.connect(lambda *_: self.refresh())
         controller.settings_changed.connect(self.refresh)
+        controller.global_event.connect(lambda *_: self.refresh())
         self.refresh()
 
     def _on_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:

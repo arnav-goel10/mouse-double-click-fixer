@@ -15,18 +15,22 @@ from . import __version__
 from .controller import AppController
 from .updater import Updater
 from .ui import dock, icons
-from .ui.tray import Tray
+from .ui import tray as tray_module
 from .ui.window import MainWindow
 
 SERVER_NAME = "doubleclick-fixer-single-instance"
 
 
-def _hand_over_to_running_instance() -> bool:
-    """Ask an already-running copy to show itself. True if one answered."""
+def _hand_over_to_running_instance(quiet: bool = False) -> bool:
+    """Hand over to an already-running copy. True if one answered.
+
+    A quiet hand-over (a background launch such as a login item or an update
+    relaunch) leaves the running copy as it is; otherwise it shows its window.
+    """
     socket = QLocalSocket()
     socket.connectToServer(SERVER_NAME)
     if socket.waitForConnected(300):
-        socket.write(b"show")
+        socket.write(b"quiet" if quiet else b"show")
         socket.flush()
         socket.waitForBytesWritten(300)
         socket.disconnectFromServer()
@@ -55,9 +59,9 @@ class Application:
         self.window = MainWindow(self.controller, self.updater)
         self.updater.window_visible = self.window.isVisible
         self.updater.quit_requested.connect(self.quit)
-        self.tray: Optional[Tray] = None
+        self.tray = None
         if QSystemTrayIcon.isSystemTrayAvailable():
-            self.tray = Tray(
+            self.tray = tray_module.create(
                 self.controller,
                 on_open=self.show_window,
                 on_calibrate=self.show_calibration,
@@ -157,9 +161,20 @@ class Application:
 
     def _on_second_instance(self) -> None:
         connection = self.server.nextPendingConnection()
-        if connection is not None:
-            connection.readyRead.connect(connection.deleteLater)
-        self.show_window()
+        if connection is None:
+            return
+
+        def on_ready() -> None:
+            request = bytes(connection.readAll())
+            connection.deleteLater()
+            if request != b"quiet":
+                self.show_window()
+
+        # The request may already be waiting by the time this runs.
+        if connection.bytesAvailable():
+            on_ready()
+        else:
+            connection.readyRead.connect(on_ready)
 
     # -- lifecycle ---------------------------------------------------------
     def start(self, minimized: bool) -> int:
@@ -173,7 +188,7 @@ class Application:
         if self.controller.settings["fix_enabled"] and self.controller.supported():
             # Restore the filter after the UI is up, so any failure has a
             # window to be reported in.
-            QTimer.singleShot(0, lambda: self.window.request_filter(True))
+            QTimer.singleShot(0, lambda: self.window.request_filter(True, prompt=not minimized))
         elif not self.controller.supported():
             QTimer.singleShot(0, self._warn_unsupported)
 
@@ -207,7 +222,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     if hasattr(Qt, "AA_DontShowIconsInMenus"):  # keep menus clean on macOS
         QApplication.setAttribute(Qt.ApplicationAttribute.AA_DontShowIconsInMenus, False)
 
-    if _hand_over_to_running_instance():
+    if _hand_over_to_running_instance(quiet=minimized):
         return 0
 
     application = Application(arguments)

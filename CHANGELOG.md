@@ -1,5 +1,31 @@
 # Changelog
 
+## 0.2.3 — 2026-09-24
+
+- Dragging survives a worn switch. While the button is held, a contact
+  dropout used to end the drag and swallow the re-press; releases after a
+  long hold are now held for the filter window and dropped together with a
+  press that follows, so the drag carries on. Ordinary clicks gain no delay.
+- macOS: clicking the menu bar icon no longer quits the app. Qt's tray icon
+  crashes on macOS 27 (fixed upstream after Qt 6.11.2), so the menu bar item
+  is now built on NSStatusItem, and uses the SF Symbols mouse glyph.
+- Closing the window on the Calibrate pane no longer leaves filtering paused.
+- The blocked-bounce count is no longer rolled back by settings changes, and
+  the menu bar shows it live.
+- A hook that stops on its own now switches the filter off everywhere instead
+  of leaving the menu bar showing "On".
+- A real double-click is no longer seen as a triple-click on mouse-up after a
+  blocked bounce (macOS).
+- One error dialog per failure, not two; a failed login-item change restores
+  the previous state; background launches no longer raise the permission
+  prompt with no window on screen.
+- Updates: stalled downloads time out, errors surface instead of hanging, and
+  downloads are cleaned up afterwards. Windows: the portable updater retries
+  the file swap, no console windows flash, silent updates return to the
+  notification area, and the installer's startup option matches the app's.
+- Installer cleanup compares file identity rather than access time; the build
+  script no longer passes an empty keychain to codesign.
+
 ## 0.2.2 — 2026-09-23
 
 - macOS: clicking the menu bar icon opens its menu again. In 0.2.1 the window

@@ -590,7 +590,7 @@ class GeneralPage(Page):
             return
         error = self.controller.set_start_at_login(checked)
         if error:
-            self.login_switch.setChecked(False)
+            self.login_switch.setChecked(not checked)
             QMessageBox.warning(self, "Couldn’t change the login item", error)
 
     def _on_hidden(self, checked: bool) -> None:
@@ -725,6 +725,10 @@ class MainWindow(QWidget):
         if self.translucent and not self._material:
             self._material = native.apply(self, self.sidebar.width(), look().dark)
         self.sidebar.paint_background = not (self.translucent and self._material)
+        # Reopening on the Calibrate pane pauses filtering again; closing the
+        # window resumed it (see closeEvent).
+        if PAGES[self.stack.currentIndex()][0] == "calibrate":
+            self.controller.suspend()
         self.update()
 
     def paintEvent(self, _event) -> None:  # noqa: N802
@@ -805,11 +809,15 @@ class MainWindow(QWidget):
             self._enable_when_granted = True
         self.refresh()
 
-    def request_filter(self, checked: bool) -> None:
-        """Turn the filter on or off from anywhere: the switch, the menu, launch."""
-        self._on_switch(checked)
+    def request_filter(self, checked: bool, prompt: bool = True) -> None:
+        """Turn the filter on or off from anywhere: the switch, the menu, launch.
 
-    def _on_switch(self, checked: bool) -> None:
+        `prompt=False` is for background launches: with no window on screen,
+        a missing permission waits quietly instead of raising System Settings.
+        """
+        self._on_switch(checked, prompt)
+
+    def _on_switch(self, checked: bool, prompt: bool = True) -> None:
         if not checked:
             self._enable_when_granted = False
         elif permissions.needs_accessibility() and not self._permission_granted:
@@ -818,7 +826,8 @@ class MainWindow(QWidget):
             # once the switch there is turned on.
             self._enable_when_granted = True
             self.refresh()
-            permissions.open_accessibility_settings()
+            if prompt:
+                permissions.open_accessibility_settings()
             return
         self.controller.set_active(checked)
         self.refresh()
@@ -840,6 +849,8 @@ class MainWindow(QWidget):
 
     def closeEvent(self, event) -> None:  # noqa: N802
         event.ignore()
+        # Calibration pauses filtering only while its pane is on screen.
+        self.controller.resume()
         self.save_geometry()
         self.controller.flush_stats()
         self.hide()

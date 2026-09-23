@@ -223,3 +223,100 @@ class WindowTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MenuBarItemTests(unittest.TestCase):
+    """macOS uses a native status item; Qt's own crashes on macOS 27."""
+
+    def test_macos_uses_the_native_menu_bar_item(self) -> None:
+        from app.ui import tray as tray_module
+
+        with mock.patch.object(tray_module, "IS_MAC", True), mock.patch(
+            "app.ui.menu_bar_mac.MacMenuBarItem"
+        ) as native:
+            tray_module.create(mock.Mock(), on_open=None, on_calibrate=None, on_quit=None)
+            native.assert_called_once()
+
+    def test_other_platforms_use_the_qt_tray_icon(self) -> None:
+        from app.ui import tray as tray_module
+
+        with mock.patch.object(tray_module, "IS_MAC", False), mock.patch.object(
+            tray_module, "Tray"
+        ) as qt_tray:
+            tray_module.create(mock.Mock(), on_open=None, on_calibrate=None, on_quit=None)
+            qt_tray.assert_called_once()
+
+
+class ControllerFixTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from app import settings
+
+        directory = Path(tempfile.mkdtemp())
+        for target, value in (("config_dir", mock.Mock(return_value=directory)), ("LEGACY_PATH", directory / "x")):
+            patcher = mock.patch.object(settings, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        from app.controller import AppController
+
+        self.controller = AppController()
+
+    def bounce(self) -> None:
+        from app.core import Button, ClickEvent
+
+        self.controller._on_global_event(ClickEvent(Button.LEFT, True, False, 5.0, None))
+
+    def test_settings_writes_keep_unflushed_bounces(self) -> None:
+        for _ in range(40):
+            self.bounce()
+        self.controller.set_threshold(70)            # an unrelated write
+        self.assertEqual(self.controller.filtered_total, 40)
+        self.controller.flush_stats()
+        from app import settings
+
+        self.assertEqual(settings.load()["filtered_total"], 40)
+
+    def test_dead_hook_is_released_and_reported(self) -> None:
+        dead = mock.Mock(running=False)
+        self.controller._filter = dead
+        self.controller._store(fix_enabled=True)
+        states = []
+        self.controller.filter_state_changed.connect(lambda active, _error: states.append(active))
+        self.controller.set_active(False)
+        dead.stop.assert_called_once()
+        self.assertIsNone(self.controller._filter)
+        self.assertFalse(self.controller.settings["fix_enabled"])
+        self.assertEqual(states, [False], "the menu bar hears about it")
+
+
+class WindowFixTests(WindowTests):
+    def test_closing_on_calibrate_resumes_filtering(self) -> None:
+        from PySide6.QtCore import QEvent
+
+        with mock.patch.object(self.controller, "resume") as resume:
+            self.window._show_page(self.page_index("calibrate"))
+            self.window.closeEvent(QEvent(QEvent.Type.Close))
+            resume.assert_called()
+
+    def test_failed_login_change_restores_the_previous_state(self) -> None:
+        page = self.window.general
+        page.login_switch.setChecked(False, animate=False)
+        with mock.patch.object(self.controller, "set_start_at_login", return_value="denied"), mock.patch(
+            "app.ui.window.QMessageBox.warning"
+        ):
+            page._on_login(True)
+        self.assertFalse(page.login_switch.isChecked())
+        page.login_switch.setChecked(True, animate=False)
+        with mock.patch.object(self.controller, "set_start_at_login", return_value="denied"), mock.patch(
+            "app.ui.window.QMessageBox.warning"
+        ):
+            page._on_login(False)
+        self.assertTrue(page.login_switch.isChecked(), "a failed turn-off leaves it on")
+
+    def test_background_launch_does_not_raise_the_permission_prompt(self) -> None:
+        with mock.patch("app.permissions.needs_accessibility", return_value=True), mock.patch(
+            "app.permissions.open_accessibility_settings"
+        ) as ask:
+            self.window._permission_granted = False
+            self.window.request_filter(True, prompt=False)
+            ask.assert_not_called()
+            self.assertTrue(self.window._enable_when_granted, "still starts once allowed")

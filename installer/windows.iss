@@ -27,7 +27,6 @@ Source: "..\dist\DoubleClickFixer.exe"; DestDir: "{app}"; Flags: ignoreversion
 [Icons]
 Name: "{group}\DoubleClick Fixer"; Filename: "{app}\DoubleClickFixer.exe"
 Name: "{autodesktop}\DoubleClick Fixer"; Filename: "{app}\DoubleClickFixer.exe"; Tasks: desktopicon
-Name: "{userstartup}\DoubleClick Fixer"; Filename: "{app}\DoubleClickFixer.exe"; Parameters: "--minimized"; Tasks: startup
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
@@ -36,15 +35,27 @@ Name: "startup"; Description: "Start DoubleClick Fixer when I sign in"; Flags: u
 [Run]
 Filename: "{app}\DoubleClickFixer.exe"; Description: "Open DoubleClick Fixer"; Flags: nowait postinstall skipifsilent
 ; The in-app updater installs silently and asks for the app to come back.
-Filename: "{app}\DoubleClickFixer.exe"; Parameters: "--updated"; Flags: nowait runasoriginaluser; Check: RelaunchRequested
+Filename: "{app}\DoubleClickFixer.exe"; Parameters: "--updated {code:RelaunchArguments}"; Flags: nowait runasoriginaluser; Check: RelaunchRequested
 
 [Code]
+// /RELAUNCH=1 reopens the window; /RELAUNCH=2 comes back in the
+// notification area only, as the app was before the update.
 function RelaunchRequested: Boolean;
 begin
-  Result := ExpandConstant('{param:RELAUNCH|0}') = '1';
+  Result := ExpandConstant('{param:RELAUNCH|0}') <> '0';
+end;
+
+function RelaunchArguments(Param: String): String;
+begin
+  if ExpandConstant('{param:RELAUNCH|0}') = '2' then
+    Result := '--minimized'
+  else
+    Result := '';
 end;
 
 [Registry]
+; The same value the app's "Open at login" switch manages, so the two agree.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "DoubleClickFixer"; ValueData: """{app}\DoubleClickFixer.exe"" ""--minimized"""; Tasks: startup
 ; The app writes this itself when "start at login" is ticked; clear it on uninstall.
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueName: "DoubleClickFixer"; Flags: dontcreatekey uninsdeletevalue
 
