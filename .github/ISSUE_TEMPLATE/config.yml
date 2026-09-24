@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Troubleshooting guide
+    url: https://github.com/arnav-goel10/doubleclick-fixer/blob/main/docs/TROUBLESHOOTING.md
+    about: Most setup problems are answered here.
+  - name: Report a security issue
+    url: https://github.com/arnav-goel10/doubleclick-fixer/security/advisories/new
+    about: Please report vulnerabilities privately, not as an issue.

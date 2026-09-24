@@ -2,77 +2,77 @@
 
 ## Bounce still gets through
 
-Raise the filter window on the **Bounce Filter** pane by 10–20 ms and test again on the **Test**
-pad. Chatter is intermittent, so a calibration run can miss the worst of it.
-Watch the bars: anything below the dashed line would be filtered.
+Raise the filter window on the **Bounce Filter** pane by 10–20 ms and try the
+**Test** pane again: any bar below the dashed line would now be filtered.
+Bounce is intermittent, so a calibration run can miss the worst of it.
 
-## A real double-click was swallowed
+## A real double-click was dropped
 
-Lower the filter. If you double-click unusually fast, calibration caps the
-suggestion at half your fastest measured gap, but you can always set the value
-by hand. Below 40 ms the filter is effectively free of that risk.
+Lower the filter window. Calibration keeps it at no more than half of your
+fastest measured double-click, but it can be set by hand; below about 40 ms
+double-clicks are not at risk.
 
-## macOS: the filter will not turn on
+## Drags still let go
 
-macOS only allows an event tap that can block events for a trusted app. Open
-**System Settings > Privacy & Security > Accessibility**, add DoubleClick Fixer
-and switch it on, then try again. Rebuilding the app from source changes its
-signature, so macOS treats it as a new app and permission has to be granted
-again — remove the old entry with the minus button first.
+Drags are protected once the button has been held for about a tenth of a
+second. If the switch loses contact for longer than your filter window, the
+drag still ends; raise the window a little. If drops are long and frequent,
+the switch is close to failing and replacing it (or the mouse) is the real fix.
 
-### Permission is on, but the app still says access is required
+## macOS: the filter won't turn on
 
-macOS can retain an enabled entry whose saved code requirement belongs to an
-older build. The switch remains on, but the current app fails that requirement
-and `AXIsProcessTrusted()` returns false. Restarting the app does not repair
-the saved entry.
+macOS only lets an approved app block input. Turn on **Bounce Filter**, choose
+**Open System Settings** when asked, and switch **DoubleClick Fixer** on under
+**Privacy & Security › Accessibility**. The app notices within a second.
 
-Remove only **DoubleClick Fixer** from the permission list, then add
-`/Applications/DoubleClick Fixer.app` and enable it again. On macOS 27, this
-list is named **Device Control and Data Access** under **Privacy & Security**.
-The running app checks permission every second; its banner should disappear
-when macOS grants access to the current build.
+### The switch in System Settings is on, but the app still asks
 
-For diagnosis, compare the installed code hash from
-`codesign -dvvv '/Applications/DoubleClick Fixer.app'` with the requirement
-reported by the permission service:
+The entry belongs to a different copy of the app, for example one built from
+source or installed before 0.2.0, which was signed differently. Select every
+**DoubleClick Fixer** entry in the list and remove it with **−**, then choose
+**Open Settings…** in the app so macOS lists the copy you are running, and
+switch it on. Releases from 0.2.0 on are signed with the same certificate, so
+this only needs doing once.
 
-```sh
-/usr/bin/log show --last 10m --info --debug --style compact \
-  --predicate 'process == "tccd" AND eventMessage CONTAINS[c] "doubleclick"'
-```
+## macOS: the app quit when I clicked the menu bar icon
 
-A `matchesCodeRequirement` failure against a different `cdhash` identifies
-an obsolete saved requirement. Do not bypass the permission check or report
-access as allowed just because the System Settings switch is enabled.
+That was a crash in the Qt toolkit on macOS 27, fixed in DoubleClick Fixer
+0.2.3. Update to the latest release.
 
 ## macOS: it worked, then stopped
 
-macOS disables an event tap that stalls, and after waking from sleep. The app
-re-arms the tap automatically. If the menu bar icon still shows the filter on
-but nothing is blocked, toggle it off and on.
+macOS pauses event taps that stall and after waking from sleep; the app
+re-arms its tap automatically. If filtering stops anyway, the menu bar item
+switches to off; turn the filter back on.
 
-## Windows: nothing is filtered in one specific app
+## Windows: nothing is filtered in one particular app
 
-A low-level hook cannot filter input for a window running at a higher privilege
-level than DoubleClick Fixer. Run it as administrator if you need the filter
-inside an elevated application.
+A low-level mouse hook cannot filter input for windows running as
+administrator unless DoubleClick Fixer also runs as administrator.
 
-## The window disappeared
+## Games
 
-Closing the window hides it; the filter keeps running. Reopen it from the menu
-bar (macOS) or the notification area (Windows) — on Windows it may be under the
-"^" overflow arrow. **Quit** there stops the filter and exits.
+Clicks are only ever blocked, never generated, except the release at the end
+of a long hold (a drag), which the app re-sends. Some anti-cheat systems watch
+for software-sent input; turn the filter off before playing those games.
 
-## Settings
+## I can't find the window
 
-Stored at `%APPDATA%\DoubleClickFixer\settings.json` on Windows and
-`~/Library/Application Support/DoubleClickFixer/settings.json` on macOS.
-Delete the file to start over. Settings from version 0.1 are migrated, except
-the old threshold: it measured press-to-press time, which is a different
-quantity, so recalibrate after upgrading.
+Closing the window hides it; the filter keeps running. Open it from the menu
+bar icon (macOS) or the notification area icon (Windows), or open the app
+again from Launchpad, Spotlight or the Start menu. **Quit** in that menu stops
+the filter and exits.
+
+## Settings file
+
+- **macOS:** `~/Library/Application Support/DoubleClickFixer/settings.json`
+- **Windows:** `%APPDATA%\DoubleClickFixer\settings.json`
+
+Quit the app and delete the file to start from defaults.
 
 ## Reporting a bug
 
-Include the app version (bottom of **General**), your OS version, the mouse model,
-your filter window, and what the **Test** pane shows when the fault happens.
+[Open an issue](https://github.com/arnav-goel10/doubleclick-fixer/issues/new/choose)
+with the app version (bottom of **General**), your OS version, your mouse
+model, your filter window and what the **Test** pane shows. On macOS, crash
+reports are in `~/Library/Logs/DiagnosticReports/DoubleClickFixer-*.ips`.

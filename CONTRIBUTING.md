@@ -1,19 +1,51 @@
 # Contributing
 
-## Development
+Thanks for helping. Bug reports, fixes and improvements are all welcome.
 
-Use Python 3.11 or newer.
+## Reporting bugs
 
-```text
-python -m venv .venv
-.venv\Scripts\activate        # Windows
-source .venv/bin/activate       # macOS
-python -m pip install -r requirements.txt
-python -m unittest discover -s tests -v
+[Open an issue](https://github.com/arnav-goel10/doubleclick-fixer/issues/new/choose)
+using the bug template. The app version, OS version, mouse model and filter
+window make most problems quick to track down. Security issues go through
+[SECURITY.md](SECURITY.md) instead.
+
+## Development setup
+
+Python 3.11 or newer.
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+python run.py                      # run the app
+python -m unittest discover -s tests
 ```
 
-Keep click classification platform-neutral in `app/core.py`. Keep native hooks, startup integration and permission checks isolated in `app/platform.py`, `app/startup.py` and `app/permissions.py`. UI code talks to `app/controller.py`, never to the hook directly. Changes affecting global input capture must include focused tests and manual platform notes.
+UI tests run offscreen (`QT_QPA_PLATFORM=offscreen`, set by the tests). The
+Windows hook test only runs with `DCF_E2E=1`, because it injects real clicks;
+CI runs it on a Windows machine.
+
+## How the code is laid out
+
+| Path | Role |
+| --- | --- |
+| `app/core.py` | Click classification and calibration. Platform-neutral and fully unit-tested. |
+| `app/platform.py` | The system-wide hooks (Windows and macOS). Keep the hook callback fast: no disk or UI work. |
+| `app/controller.py` | App state; the UI talks to this, never to the hook directly. |
+| `app/ui/` | The window, menu bar and tray, and platform styling. |
+| `app/updater.py` | Updates from GitHub Releases. |
+| `installer/` | Build scripts, the Inno Setup script and the DMG layout. |
+
+Filtering is defined by the gap between a release and the next press; please
+don't reintroduce press-to-press timing, which cannot tell bounce from a fast
+double-click.
 
 ## Pull requests
 
-Describe behavior changes, platform coverage, permission requirements, and how you tested them. Do not include personal settings files, generated `build/` or `dist/` output, or credentials.
+- Keep each pull request to one change, and describe what changed, why, and
+  how you tested it (the template asks).
+- Changes to click handling need tests in `tests/`.
+- Don't commit build output (`build/`, `dist/`), settings files or credentials.
+
+By contributing, you agree that your contributions are licensed under the
+[MIT License](LICENSE). Please follow the [Code of Conduct](CODE_OF_CONDUCT.md).
