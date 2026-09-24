@@ -6,3 +6,4 @@ build/
 dist/
 installer/Output/
 *.spec.bak
+.DS_Store

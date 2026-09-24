@@ -1,113 +1,132 @@
+<div align="center">
+
+<img src="docs/images/icon.png" width="128" height="128" alt="DoubleClick Fixer icon">
+
 # DoubleClick Fixer
 
-A desktop utility for a mouse that registers two clicks when you pressed once.
-It measures the fault, learns a safe threshold, and filters the duplicate
-system-wide on Windows and macOS — without disabling real double-clicks.
+**Fix a mouse that double-clicks when you click once.**<br>
+A small menu bar and tray app for macOS and Windows that filters the extra clicks a worn mouse switch produces, without touching your real double-clicks.
 
-**[Download for Mac](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest/download/DoubleClickFixer.dmg)** ·
-**[Download for Windows](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest/download/DoubleClickFixer-Setup.exe)** ·
+[![Latest release](https://img.shields.io/github/v/release/arnav-goel10/doubleclick-fixer?label=release&color=3055ee)](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/arnav-goel10/doubleclick-fixer/total?color=3055ee)](https://github.com/arnav-goel10/doubleclick-fixer/releases)
+[![CI](https://github.com/arnav-goel10/doubleclick-fixer/actions/workflows/ci.yml/badge.svg)](https://github.com/arnav-goel10/doubleclick-fixer/actions/workflows/ci.yml)
+[![Platforms](https://img.shields.io/badge/platform-macOS%2011%2B%20(Apple%20silicon)%20%7C%20Windows%2010%2F11-lightgrey)](#download)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![Sponsor](https://img.shields.io/badge/sponsor-%E2%9D%A4-ea4aaa?logo=githubsponsors)](https://github.com/sponsors/arnav-goel10)
+
+**[Download for Mac](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest/download/DoubleClickFixer.dmg)** &nbsp;·&nbsp;
+**[Download for Windows](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest/download/DoubleClickFixer-Setup.exe)** &nbsp;·&nbsp;
 [All releases](https://github.com/arnav-goel10/doubleclick-fixer/releases)
+
+</div>
 
 | macOS | Windows 11 |
 | --- | --- |
 | ![DoubleClick Fixer on macOS](docs/images/macos.png) | ![DoubleClick Fixer on Windows 11](docs/images/windows.png) |
 
-## What switch bounce is
+## The problem
 
-The metal contact inside a mouse button wears out. On release it vibrates, and
-the controller reports a press the finger never made. The giveaway is *when*
-that press arrives: a few milliseconds after the release, far faster than a
-human can lift and press again.
-
-DoubleClick Fixer therefore measures the gap **between a release and the next
-press**, which is the same measurement mouse firmware calls debounce time. A
-deliberate double-click leaves 100 ms or more in that gap; bounce is usually
-under 30 ms. Filtering there removes the fault and leaves ordinary clicking,
-double-clicking and dragging untouched.
+Mouse buttons wear out. The metal contact inside starts to bounce, so a single click arrives twice: files open when you meant to select them, links open in two tabs, and drag-and-drop lets go halfway. Replacing the switch fixes it for good; DoubleClick Fixer fixes it in software today.
 
 ## How it works
 
-- **Native on both platforms** — a System Settings-style window on macOS
-  (translucent sidebar, SF Symbols, your accent colour) and a Windows 11
-  Settings-style window on Windows (Mica, Fluent icons, settings cards).
-- **Test** — click the pad normally and watch each gap plotted against the
-  current filter, so you can see the fault instead of guessing.
-- **Calibration** — two labeled phases (single clicks, then double-clicks) that
-  measure your bounce and your own double-click speed, then suggest a threshold
-  that clears the first and stays well under the second.
-- **System-wide filter** — a low-level mouse hook on Windows, a Core Graphics
-  event tap on macOS. Rejected presses are dropped before any application sees
-  them, and the matching release is dropped with them so no app ever receives
-  half a click.
-- **Menu bar / notification area** — the window closes to the tray and the
-  filter keeps running. Quit from there to stop it.
-- Left, right and middle buttons can be protected independently.
+A bounce has a tell-tale signature: the extra press arrives a few milliseconds after the button was released, far faster than a finger can lift and press again. A deliberate double-click leaves 100 ms or more.
 
-## Updates
+- **Clicks.** A press that comes within your filter window (typically 25–60 ms) of the last release is dropped, along with its release, so apps never see half a click.
+- **Drags.** A worn switch can also lose contact for an instant while you hold it, which would end a drag. After a long hold, a release is held back for the filter window; if the contact comes straight back, the drag simply continues.
+- **Your double-clicks are untouched.** Calibration measures your own double-click speed and keeps the filter well below it.
 
-The app keeps itself up to date from this repository's releases: it checks
-shortly after launch and every six hours, verifies the download, installs it
-and reopens, usually within a few seconds. On macOS, releases are always
-signed with the same certificate, so the Accessibility permission carries
-over and never has to be granted again. Turn automatic installs off in
-**General › Software update** to update with **Check Now** instead.
+The filter works system-wide, at the same level as the mouse driver's own events, and all of it happens on your computer.
 
-## Install
+## Features
 
-- **macOS** — [DoubleClickFixer.dmg](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest/download/DoubleClickFixer.dmg).
-  Drag the app onto Applications, open it, and allow it under Accessibility
-  when asked: macOS only lets a trusted app filter input.
-- **Windows** — [DoubleClickFixer-Setup.exe](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest/download/DoubleClickFixer-Setup.exe),
-  or the portable [DoubleClickFixer.exe](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest/download/DoubleClickFixer.exe).
+- **System-wide filtering** for the left, right and middle buttons, each one optional.
+- **Calibration** that measures your mouse's bounce and your double-click speed, then recommends a setting.
+- **Test pane** that shows every click's release-to-press gap, with bounces highlighted.
+- **Native on both platforms:** a System Settings-style window and menu bar item on macOS, a Windows 11 Settings-style window and tray icon on Windows. Light and dark mode follow the system.
+- **Runs quietly:** lives in the menu bar or notification area, opens at login if you want, and has no Dock icon while its window is closed.
+- **Automatic updates** from this repository's releases, checksum-verified. On macOS they are signature-checked too, so your Accessibility permission carries over.
 
-See [docs/INSTALLATION.md](docs/INSTALLATION.md) for details and uninstall steps.
+## Download
 
-## Run from source
+| Platform | Get it | Notes |
+| --- | --- | --- |
+| **macOS 11 or later** (Apple silicon) | [DoubleClickFixer.dmg](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest/download/DoubleClickFixer.dmg) | Open it and drag DoubleClick Fixer onto Applications. |
+| **Windows 10 or 11** | [DoubleClickFixer-Setup.exe](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest/download/DoubleClickFixer-Setup.exe) | Or the [portable exe](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest/download/DoubleClickFixer.exe), no installation needed. |
+
+The builds are not yet signed with an Apple or Microsoft developer certificate, so the first launch needs one extra step:
+
+- **macOS:** right-click the app and choose **Open**. Then allow DoubleClick Fixer under **System Settings › Privacy & Security › Accessibility** when it asks; macOS only lets trusted apps filter input.
+- **Windows:** if SmartScreen appears, choose **More info › Run anyway**.
+
+Full instructions, including uninstalling: [docs/INSTALLATION.md](docs/INSTALLATION.md).
+
+## Getting started
+
+1. Open DoubleClick Fixer and choose **Calibrate** in the sidebar.
+2. Click once at a time until it has counted twelve clicks, then double-click five times at your usual speed.
+3. Apply the recommendation, and turn on **Bounce Filter**.
+
+Close the window and the app keeps filtering from the menu bar or notification area. More detail in [docs/GETTING_STARTED.md](docs/GETTING_STARTED.md), and help in [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
+
+## FAQ
+
+<details>
+<summary><b>Will it block my real double-clicks?</b></summary>
+
+No. It only drops a press that arrives within the filter window of the previous release, and calibration keeps that window at no more than half of your fastest measured double-click.
+</details>
+
+<details>
+<summary><b>Does it add input lag?</b></summary>
+
+Not to clicks: presses and ordinary releases pass straight through. Only the release at the end of a long hold (a drag) waits for the filter window, typically 25–60 ms.
+</details>
+
+<details>
+<summary><b>Why does it need Accessibility permission on macOS?</b></summary>
+
+Blocking a click before other apps see it requires an event tap, and macOS only allows that for apps you have approved. The app cannot read keystrokes; it only listens to mouse buttons.
+</details>
+
+<details>
+<summary><b>Does it send any data anywhere?</b></summary>
+
+No. The only network request is the update check to this repository's GitHub releases, which you can turn off in **General**. No analytics, no accounts.
+</details>
+
+<details>
+<summary><b>Will it get me flagged in games?</b></summary>
+
+Clicks are only ever blocked, never generated. The one exception is the delayed release at the end of a long hold, which is re-sent by the app. Most games don't care, but some anti-cheat systems watch for software-sent input; turn the filter off before playing those.
+</details>
+
+## Build from source
 
 Python 3.11 or newer.
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate        # Windows: .\.venv\Scripts\Activate.ps1
-python -m pip install -r requirements.txt
+git clone https://github.com/arnav-goel10/doubleclick-fixer
+cd doubleclick-fixer
+python3 -m venv .venv && source .venv/bin/activate   # Windows: .\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
 python run.py
 ```
 
-## Using it
+Run the tests with `python -m unittest discover -s tests`. Packaging and releases are covered in [docs/RELEASING.md](docs/RELEASING.md).
 
-1. Open the app and choose **Calibrate** in the sidebar. The system-wide
-   filter pauses automatically so it can measure the raw mouse.
-2. Step 1: click once, wait, repeat. Any extra press the mouse invents is
-   recorded as bounce.
-3. Step 2: double-click normally. This sets the limit the filter must never
-   reach.
-4. Apply the suggestion, then turn on **Bounce Filter**.
+## Contributing
 
-If bounce still gets through, raise the filter window slightly on the
-**Bounce Filter** pane; if a
-fast double-click ever gets swallowed, lower it. Values between 40 and 90 ms
-suit most worn switches.
+Bug reports and pull requests are welcome; start with [CONTRIBUTING.md](CONTRIBUTING.md). Please report security issues privately as described in [SECURITY.md](SECURITY.md).
 
-## Tests
+## Support the project
 
-```bash
-python -m unittest discover -s tests -v
-```
+DoubleClick Fixer is free. If it saved you from buying a new mouse, you can [sponsor it on GitHub](https://github.com/sponsors/arnav-goel10), or just star the repository.
 
-The suite covers the filter, calibration, settings migration and the window
-(rendered offscreen). On Windows, CI additionally installs a real low-level
-hook, injects clicks, and asserts through a second hook that bounce is blocked
-while deliberate double-clicks survive.
+## Star history
 
-## Packaging
+[![Star History Chart](https://api.star-history.com/svg?repos=arnav-goel10/doubleclick-fixer&type=Date)](https://star-history.com/#arnav-goel10/doubleclick-fixer&Date)
 
-```bash
-bash installer/build_macos.sh       # DoubleClick Fixer.app + DMG
-.\installer\build_windows.ps1       # portable exe; then compile installer\windows.iss
-```
+## License
 
-Pushing a `v*.*.*` tag builds both platforms and publishes a release.
-
-More: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) ·
-[docs/DEMO.md](docs/DEMO.md) · [CONTRIBUTING.md](CONTRIBUTING.md) ·
-[SECURITY.md](SECURITY.md) · [CHANGELOG.md](CHANGELOG.md)
+[MIT](LICENSE) © 2026 Arnav Goel
