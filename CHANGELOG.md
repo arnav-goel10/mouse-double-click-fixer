@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.4 — 2026-09-25
+
+- Drags are consistent. 0.2.3 only protected a drag once the button had been
+  held for 120 ms, but worn switches drop contact as early as 60 ms in, which
+  still ended the drag. Releases are now held once the button has been down
+  for 30 ms; a bouncy click comes through as one clean click.
+- macOS: a cancelled dropout no longer makes the next click count as a
+  double-click, and re-sent events carry the corrected click count.
+
 ## 0.2.3 — 2026-09-24
 
 - Dragging survives a worn switch. While the button is held, a contact

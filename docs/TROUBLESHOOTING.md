@@ -14,8 +14,8 @@ double-clicks are not at risk.
 
 ## Drags still let go
 
-Drags are protected once the button has been held for about a tenth of a
-second. If the switch loses contact for longer than your filter window, the
+Drags are protected once the button has been held for about 30 ms, a
+fraction of a click. If the switch loses contact for longer than your filter window, the
 drag still ends; raise the window a little. If drops are long and frequent,
 the switch is close to failing and replacing it (or the mouse) is the real fix.
 
@@ -52,8 +52,8 @@ administrator unless DoubleClick Fixer also runs as administrator.
 
 ## Games
 
-Clicks are only ever blocked, never generated, except the release at the end
-of a long hold (a drag), which the app re-sends. Some anti-cheat systems watch
+Clicks are only ever blocked, never generated, except releases, which the app
+holds for the filter window and re-sends. Some anti-cheat systems watch
 for software-sent input; turn the filter off before playing those games.
 
 ## I can't find the window

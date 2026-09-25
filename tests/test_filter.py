@@ -43,8 +43,8 @@ class HandlerTests(unittest.TestCase):
 
     def test_threshold_updates_while_running(self) -> None:
         self.filter.update(threshold_ms=10)
-        self.click(Button.LEFT, 1.0, 1.05)
-        press, _ = self.click(Button.LEFT, 1.08, 1.09)  # 30 ms gap
+        self.click(Button.LEFT, 1.0, 1.02)
+        press, _ = self.click(Button.LEFT, 1.05, 1.06)  # 30 ms gap
         self.assertTrue(press.accepted)
 
     def test_every_event_is_reported_to_the_ui(self) -> None:
@@ -138,6 +138,16 @@ class HeldReleaseTests(unittest.TestCase):
         event = self.filter._handle(Button.LEFT, True, 0.6, "down2")
         self.assertFalse(event.accepted)
         self.assertEqual(self.injected, [(False, "up"), (True, "down2")])
+
+    def test_held_copy_gets_its_click_count_repaired(self) -> None:
+        repaired = []
+        self.filter._repair_template = lambda template, run: repaired.append((template, run))
+        self.filter._handle(Button.LEFT, True, 0.0, "down")
+        self.filter._handle(Button.LEFT, False, 0.08, "up")
+        self.filter._handle(Button.LEFT, True, 0.087, "bounce")   # cancels the held up
+        self.filter._handle(Button.LEFT, False, 0.095, "up2")     # held again
+        self.assertEqual(repaired, [("up2", 1)])
+        self.filter.stop()
 
     def test_stopping_delivers_a_held_release(self) -> None:
         self.filter._handle(Button.LEFT, True, 0.0, "down")

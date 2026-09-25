@@ -79,10 +79,10 @@ class ClickEvent:
         return self.pressed and not self.accepted and not self.flush_held
 
 
-#: Releases are held back only once the button has been down this long. A
-#: click is shorter, so clicking gains no delay; drags and long presses are
-#: longer, and those are what a mid-hold contact dropout breaks.
-HOLD_AFTER_MS = 120.0
+#: Releases are held back once the button has been down this long. Worn
+#: switches drop contact as early as 60 ms into a drag, which overlaps the
+#: length of an ordinary click, so only the briefest taps skip the hold.
+HOLD_AFTER_MS = 30.0
 
 
 class BounceFilter:
@@ -143,6 +143,10 @@ class BounceFilter:
                 self._held_release_at = None
                 self._swallow_release = False
                 self.filtered_count += 1
+                # The OS still counted the swallowed press as a click, so the
+                # rest of this hold and the next click need their count repaired.
+                self._release_run += 1
+                self._suppressed_run += 1
                 return ClickEvent(self.button, True, False, held_gap, None, 0, cancels_held=True)
             # The held release was real; it has to be delivered before this.
             self._last_release_at = self._held_release_at

@@ -67,6 +67,9 @@ class GlobalClickFilter:
         self._started = False
         # Per button: the event kept for a release that is being held back.
         self._held_templates: dict = {}
+        # Repairs a kept copy's click count before it is re-sent (macOS only).
+        self._repair_template = None
+        self.tap_resets = 0  # times macOS disabled the tap and it was re-armed
         self._timers: list[threading.Timer] = []
         # Set by the platform runner: re-posts an event the hook suppressed.
         self._inject: Callable[[Button, bool, object], None] = lambda _b, _p, _t: None
@@ -162,6 +165,8 @@ class GlobalClickFilter:
             event = click_filter.press(timestamp) if pressed else click_filter.release(timestamp)
             if event.is_bounce:
                 self.filtered_count += 1
+            if event.suppressed_run and template is not None and self._repair_template:
+                self._repair_template(template, event.suppressed_run)
             if event.held:
                 self._held_templates[button] = template
                 timer = threading.Timer(click_filter.threshold_ms / 1000.0, self._commit_held, (button,))
@@ -369,11 +374,13 @@ class GlobalClickFilter:
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, template)
 
         self._inject = inject
+        self._repair_template = lambda template, run: _rewrite_click_state(Quartz, template, run)
 
         def callback(_proxy: object, event_type: int, event: object, _refcon: object) -> object:
             # macOS disables a tap that takes too long, or when the user
             # revokes permission. Re-arm it instead of dying silently.
             if event_type in (Quartz.kCGEventTapDisabledByTimeout, Quartz.kCGEventTapDisabledByUserInput):
+                self.tap_resets += 1
                 if self._tap is not None:
                     Quartz.CGEventTapEnable(self._tap, True)
                 return event

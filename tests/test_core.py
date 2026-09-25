@@ -32,7 +32,7 @@ class BounceFilterTests(unittest.TestCase):
         self.assertAlmostEqual(press.gap_ms or 0, 10, places=6)
 
     def test_deliberate_double_click_survives(self) -> None:
-        click_filter = BounceFilter(60)
+        click_filter = BounceFilter(60, hold_releases=False)
         self.click(click_filter, 1.0, 1.06)
         # 120 ms between release and the second press: a human double-click.
         press, _ = self.click(click_filter, 1.18, 1.24)
@@ -40,7 +40,7 @@ class BounceFilterTests(unittest.TestCase):
 
     def test_fast_repeated_clicking_is_not_filtered(self) -> None:
         # Six clicks per second, which a fast clicker can reach on purpose.
-        click_filter = BounceFilter(60)
+        click_filter = BounceFilter(60, hold_releases=False)
         accepted = 0
         moment = 1.0
         for _ in range(6):
@@ -58,7 +58,7 @@ class BounceFilterTests(unittest.TestCase):
         self.assertFalse(release.accepted, "half a click must never reach an application")
 
     def test_bounce_chain_is_measured_from_the_swallowed_release(self) -> None:
-        click_filter = BounceFilter(60)
+        click_filter = BounceFilter(60, hold_releases=False)
         self.click(click_filter, 1.0, 1.05)
         for offset in (0.06, 0.07, 0.08):  # a burst of chatter
             press = click_filter.press(timestamp=1.0 + offset)
@@ -68,7 +68,7 @@ class BounceFilterTests(unittest.TestCase):
         self.assertTrue(click_filter.press(timestamp=1.5).accepted)
 
     def test_suppressed_run_is_reported_for_click_state_repair(self) -> None:
-        click_filter = BounceFilter(60)
+        click_filter = BounceFilter(60, hold_releases=False)
         self.click(click_filter, 1.0, 1.05)
         self.click(click_filter, 1.06, 1.07)  # bounce, suppressed
         press = click_filter.press(timestamp=1.30)
@@ -180,12 +180,33 @@ class DragDropoutTests(unittest.TestCase):
         self.assertTrue(final.held)
         self.assertTrue(f.commit_held(), "the real lift is delivered after the window")
 
-    def test_ordinary_clicks_gain_no_delay(self) -> None:
+    def test_brief_taps_gain_no_delay(self) -> None:
         f = BounceFilter(60)
         f.press(timestamp=0.0)
-        release = f.release(timestamp=0.08)  # an 80 ms click
+        release = f.release(timestamp=0.02)  # a 20 ms tap
         self.assertTrue(release.accepted)
         self.assertFalse(release.held)
+
+    def test_early_dropout_keeps_the_drag(self) -> None:
+        # Captured on a real worn switch: contact lost 60 ms into a drag.
+        f = BounceFilter(46)
+        f.press(timestamp=0.0)
+        self.assertTrue(f.release(timestamp=0.060).held)
+        self.assertTrue(f.press(timestamp=0.075).cancels_held)
+        self.assertTrue(f.release(timestamp=0.5).held)
+        self.assertTrue(f.commit_held())
+
+    def test_bouncy_click_becomes_one_click(self) -> None:
+        f = BounceFilter(46)
+        f.press(timestamp=0.0)
+        self.assertTrue(f.release(timestamp=0.080).held)
+        self.assertTrue(f.press(timestamp=0.087).cancels_held)
+        final = f.release(timestamp=0.095)
+        self.assertTrue(final.held)
+        self.assertEqual(final.suppressed_run, 1, "macOS counted the bounce; the release needs repair")
+        self.assertTrue(f.commit_held())
+        self.assertFalse(f.commit_held())
+        self.assertEqual(f.press(timestamp=0.4).suppressed_run, 1)
 
     def test_release_is_delivered_when_no_press_follows(self) -> None:
         f = BounceFilter(60)
@@ -211,7 +232,7 @@ class DragDropoutTests(unittest.TestCase):
         self.assertTrue(f.release(timestamp=0.5).accepted)
 
     def test_click_count_repair_reaches_the_release_too(self) -> None:
-        f = BounceFilter(60)
+        f = BounceFilter(60, hold_releases=False)
         f.press(timestamp=0.0)
         f.release(timestamp=0.05)
         f.press(timestamp=0.06)              # bounce

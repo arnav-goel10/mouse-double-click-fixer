@@ -33,7 +33,7 @@ Mouse buttons wear out. The metal contact inside starts to bounce, so a single c
 A bounce has a tell-tale signature: the extra press arrives a few milliseconds after the button was released, far faster than a finger can lift and press again. A deliberate double-click leaves 100 ms or more.
 
 - **Clicks.** A press that comes within your filter window (typically 25–60 ms) of the last release is dropped, along with its release, so apps never see half a click.
-- **Drags.** A worn switch can also lose contact for an instant while you hold it, which would end a drag. After a long hold, a release is held back for the filter window; if the contact comes straight back, the drag simply continues.
+- **Drags.** A worn switch can also lose contact for an instant while you hold it, which would end a drag. Once the button has been down for a moment, its release is held back for the filter window; if the contact comes straight back, the drag simply continues.
 - **Your double-clicks are untouched.** Calibration measures your own double-click speed and keeps the filter well below it.
 
 The filter works system-wide, at the same level as the mouse driver's own events, and all of it happens on your computer.
@@ -80,7 +80,7 @@ No. It only drops a press that arrives within the filter window of the previous 
 <details>
 <summary><b>Does it add input lag?</b></summary>
 
-Not to clicks: presses and ordinary releases pass straight through. Only the release at the end of a long hold (a drag) waits for the filter window, typically 25–60 ms.
+Presses pass straight through. A release waits for the filter window (typically 25–60 ms) so a contact dropout can't end a drag; only the briefest taps skip that wait.
 </details>
 
 <details>
@@ -98,7 +98,7 @@ No. The only network request is the update check to this repository's GitHub rel
 <details>
 <summary><b>Will it get me flagged in games?</b></summary>
 
-Clicks are only ever blocked, never generated. The one exception is the delayed release at the end of a long hold, which is re-sent by the app. Most games don't care, but some anti-cheat systems watch for software-sent input; turn the filter off before playing those.
+Clicks are only ever blocked, never generated. The one exception is the delayed release, which is re-sent by the app. Most games don't care, but some anti-cheat systems watch for software-sent input; turn the filter off before playing those.
 </details>
 
 ## Build from source
