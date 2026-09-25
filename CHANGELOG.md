@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.6 — 2026-09-26
+
+- Windows: the window follows Windows 11 Settings more closely. Toggles show
+  On or Off, every setting card has a Fluent icon, the main action is an
+  accent button, and without Mica the title bar matches the window.
+- The tray icon is only redrawn when the filter turns on or off.
+
 ## 0.2.5 — 2026-09-26
 
 - Windows: minimizing the window sends it to the notification area, like
