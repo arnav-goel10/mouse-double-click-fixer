@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.5 — 2026-09-26
+
+- Windows: minimizing the window sends it to the notification area, like
+  closing, instead of leaving a button on the taskbar.
+
 ## 0.2.4 — 2026-09-25
 
 - Drags are consistent. 0.2.3 only protected a drag once the button had been

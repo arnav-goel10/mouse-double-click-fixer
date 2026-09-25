@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSlider,
     QStackedWidget,
+    QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
 )
@@ -751,6 +752,15 @@ class MainWindow(QWidget):
         if event.type() == QEvent.Type.ActivationChange:
             self.sidebar.window_active = self.isActiveWindow()
             self.sidebar.update()
+        elif (
+            event.type() == QEvent.Type.WindowStateChange
+            and not IS_MAC
+            and self.isMinimized()
+            and QSystemTrayIcon.isSystemTrayAvailable()
+        ):
+            # Windows: minimizing goes to the notification area, like closing,
+            # instead of leaving a taskbar button behind.
+            QTimer.singleShot(0, self.close)
         super().changeEvent(event)
 
     def apply_look(self) -> None:
