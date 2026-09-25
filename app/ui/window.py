@@ -68,9 +68,39 @@ PAGES = [
 
 def _button(text: str, default: bool = False) -> QPushButton:
     button = QPushButton(text)
-    button.setDefault(default)
-    button.setAutoDefault(default)
+    set_primary(button, default)
     return button
+
+
+def set_primary(button: QPushButton, primary: bool) -> None:
+    """Make `button` the default one. Windows 11 fills it with the accent
+    colour (WinUI's AccentButton); macOS draws its own default button."""
+    button.setDefault(primary)
+    button.setAutoDefault(primary)
+    if IS_MAC:
+        return
+    if not primary:
+        button.setStyleSheet("")
+        return
+    lk = look()
+    accent = lk.accent
+    text = "#000000" if lk.dark else "#ffffff"
+    hover = accent.lighter(110) if lk.dark else accent.darker(110)
+    button.setStyleSheet(
+        "QPushButton {"
+        f" background: {accent.name()}; color: {text};"
+        " border: 1px solid rgba(0, 0, 0, 20); border-radius: 4px;"
+        " padding: 5px 16px; min-height: 20px; }"
+        f"QPushButton:hover {{ background: {hover.name()}; }}"
+        f"QPushButton:pressed {{ background: {accent.name()}; color: rgba({'0,0,0' if lk.dark else '255,255,255'},180); }}"
+        "QPushButton:disabled { background: rgba(128,128,128,70); color: rgba(128,128,128,200); border: none; }"
+    )
+
+
+def card_icon(name: str) -> Optional[SymbolView]:
+    """Windows 11 Settings leads every card with a Fluent icon; macOS rows
+    inside a grouped box carry none."""
+    return None if IS_MAC else SymbolView(name, 20, "text")
 
 
 def centred_column(parent: QWidget, maximum: int = COLUMN_MAX) -> QWidget:
@@ -170,7 +200,7 @@ class FilterPage(Page):
         self.value.setMinimumWidth(52)
         slider_layout.addWidget(self.slider)
         slider_layout.addWidget(self.value)
-        window.add(Row("Ignore presses within", "", slider_box))
+        window.add(Row("Ignore presses within", "", slider_box, card_icon("stopwatch")))
         self.footnote("Most worn switches bounce within 30 ms.")
 
         self.header("Buttons")
@@ -180,14 +210,14 @@ class FilterPage(Page):
             switch = Switch(accessible_name=f"Filter the {button.label.lower()} button")
             switch.toggled.connect(self._on_buttons)
             self.button_switches[button] = switch
-            buttons.add(Row(f"{button.label} button", "", switch))
+            buttons.add(Row(f"{button.label} button", "", switch, card_icon("mouse")))
 
         self.header("Activity")
         activity = self.section()
         self.total_value = ValueLabel()
         self.session_value = ValueLabel()
-        activity.add(Row("Blocked in total", "", self.total_value))
-        activity.add(Row("Blocked since launch", "", self.session_value))
+        activity.add(Row("Blocked in total", "", self.total_value, card_icon("chart")))
+        activity.add(Row("Blocked since launch", "", self.session_value, card_icon("chart")))
         self.body.addStretch(1)
 
         self.slider.valueChanged.connect(self._on_slider)
@@ -498,9 +528,9 @@ class GeneralPage(Page):
         startup = self.section()
         self.login_switch = Switch(accessible_name="Open at login")
         self.hidden_switch = Switch(accessible_name="Start hidden")
-        startup.add(Row("Open at login", "", self.login_switch))
+        startup.add(Row("Open at login", "", self.login_switch, card_icon("power")))
         where = "menu bar" if IS_MAC else "notification area"
-        startup.add(Row(f"Start in {where}", "", self.hidden_switch))
+        startup.add(Row(f"Start in {where}", "", self.hidden_switch, card_icon("minimize")))
         self.login_switch.toggled.connect(self._on_login)
         self.hidden_switch.toggled.connect(self._on_hidden)
 
@@ -517,10 +547,12 @@ class GeneralPage(Page):
         self.update_section = self.section()
         self.auto_update_switch = Switch(accessible_name="Install updates automatically")
         self.auto_update_switch.toggled.connect(self._on_auto_update)
-        self.update_section.add(Row("Install updates automatically", "", self.auto_update_switch))
+        self.update_section.add(Row("Install updates automatically", "", self.auto_update_switch, card_icon("sync")))
         self.update_button = _button("Check Now")
         self.update_button.clicked.connect(self._on_update_button)
-        self.update_row = self.update_section.add(Row(f"DoubleClick Fixer {__version__}", "", self.update_button))
+        self.update_row = self.update_section.add(
+            Row(f"DoubleClick Fixer {__version__}", "", self.update_button, card_icon("sync"))
+        )
         supported = updater is not None and updater.supported
         self.update_header.setVisible(supported)
         self.update_section.setVisible(supported)
@@ -531,7 +563,7 @@ class GeneralPage(Page):
         stats = self.section()
         reset = _button("Reset…")
         reset.clicked.connect(self._confirm_reset)
-        self.stats_row = stats.add(Row("Blocked bounces", "", reset))
+        self.stats_row = stats.add(Row("Blocked bounces", "", reset, card_icon("chart")))
 
         self.body.addStretch(1)
         version = TextLabel(f"DoubleClick Fixer {__version__}", "caption", "tertiary")
@@ -572,7 +604,7 @@ class GeneralPage(Page):
         self.update_row.set_detail(detail)
         self.update_button.setText(label)
         self.update_button.setEnabled(enabled)
-        self.update_button.setDefault(updater.state == updater.AVAILABLE)
+        set_primary(self.update_button, updater.state == updater.AVAILABLE)
 
     def _on_update_button(self) -> None:
         if self.updater is None:
@@ -726,6 +758,7 @@ class MainWindow(QWidget):
         if self.translucent and not self._material:
             self._material = native.apply(self, self.sidebar.width(), look().dark)
         self.sidebar.paint_background = not (self.translucent and self._material)
+        self._tint_title_bar()
         # Reopening on the Calibrate pane pauses filtering again; closing the
         # window resumed it (see closeEvent).
         if PAGES[self.stack.currentIndex()][0] == "calibrate":
@@ -766,12 +799,19 @@ class MainWindow(QWidget):
     def apply_look(self) -> None:
         """Pick up a light/dark or accent change from the system."""
         set_look(current_look())
-        native.set_dark_title_bar(self, look().dark)
+        self._tint_title_bar()
         for label in self.findChildren(TextLabel):
             label.restyle()
+        for button in self.findChildren(QPushButton):
+            if button.isDefault():
+                set_primary(button, True)
         for widget in self.findChildren(QWidget):
             widget.update()
         self.update()
+
+    def _tint_title_bar(self) -> None:
+        # Mica already runs through the title bar; a solid window tints it.
+        native.set_dark_title_bar(self, look().dark, None if self._material else look().pane)
 
     # Older name, kept for callers.
     apply_palette = apply_look

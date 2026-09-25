@@ -24,6 +24,13 @@ SYMBOLS = {
     "general": ("gearshape.fill", "", "#8e8e93"),
     "warning": ("exclamationmark.triangle.fill", "", "#ff9f0a"),
     "ok": ("checkmark.circle.fill", "", "#30b158"),
+    # Card icons, used on Windows only (Windows 11 Settings gives every card one).
+    "mouse": ("computermouse", "", "#8e8e93"),
+    "stopwatch": ("stopwatch", "", "#8e8e93"),
+    "power": ("power", "", "#8e8e93"),
+    "minimize": ("minus.rectangle", "", "#8e8e93"),
+    "chart": ("chart.bar", "", "#8e8e93"),
+    "sync": ("arrow.triangle.2.circlepath", "", "#8e8e93"),
 }
 
 

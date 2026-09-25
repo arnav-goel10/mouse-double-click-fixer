@@ -70,16 +70,21 @@ def apply(window: QWidget, sidebar_width: int, dark: bool) -> bool:
     return False
 
 
-def set_dark_title_bar(window: QWidget, dark: bool) -> None:
+def set_dark_title_bar(window: QWidget, dark: bool, caption=None) -> None:
+    """Match the Windows title bar to the theme. Without Mica, `caption`
+    (the window colour) also tints it, so bar and window read as one surface."""
     if not IS_WINDOWS or not _native_backend():
         return
     try:
         import ctypes
 
+        hwnd = int(window.winId())
         value = ctypes.c_int(1 if dark else 0)
-        ctypes.windll.dwmapi.DwmSetWindowAttribute(
-            int(window.winId()), 20, ctypes.byref(value), ctypes.sizeof(value)
-        )
+        ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(value), ctypes.sizeof(value))
+        if caption is not None and _windows_build() >= 22000:
+            # DWMWA_CAPTION_COLOR takes a COLORREF (0x00BBGGRR).
+            colour = ctypes.c_uint(caption.red() | caption.green() << 8 | caption.blue() << 16)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 35, ctypes.byref(colour), ctypes.sizeof(colour))
     except Exception:  # noqa: BLE001
         pass
 

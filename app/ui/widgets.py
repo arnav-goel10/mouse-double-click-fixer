@@ -67,6 +67,10 @@ class TextLabel(QLabel):
 
 # -- switch --------------------------------------------------------------------
 
+#: Room for the "On"/"Off" text before a Windows toggle, gap included.
+WIN_STATE_WIDTH = 40
+
+
 class Switch(QWidget):
     """NSSwitch on macOS, the WinUI ToggleSwitch on Windows."""
 
@@ -80,7 +84,8 @@ class Switch(QWidget):
         self._keyboard_focus = False
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.setFixedSize(QSize(38, 22) if IS_MAC else QSize(40, 20))
+        # Windows puts the state ("On"/"Off") before the toggle, as WinUI does.
+        self.setFixedSize(QSize(38, 22) if IS_MAC else QSize(40 + WIN_STATE_WIDTH, 20))
         self.setAccessibleName(accessible_name)
         self._animation = QPropertyAnimation(self, b"position", self)
         self._animation.setDuration(150)
@@ -143,6 +148,12 @@ class Switch(QWidget):
         if not self.isEnabled():
             painter.setOpacity(0.4)
         rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        if not IS_MAC:
+            painter.setFont(font("body"))
+            painter.setPen(lk.text)
+            state = QRectF(0, 0, WIN_STATE_WIDTH - 12, self.height())
+            painter.drawText(state, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, "On" if self._checked else "Off")
+            rect.setLeft(rect.left() + WIN_STATE_WIDTH)
         radius = rect.height() / 2
         p = self._position
 
