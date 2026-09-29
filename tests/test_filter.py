@@ -160,24 +160,50 @@ class TimerTokenTests(unittest.TestCase):
     """A timer settles only the release it was started for."""
 
     def test_second_dropout_keeps_its_own_window(self) -> None:
-        from time import sleep
+        from unittest import mock
 
         injected = []
+        timers = []
+
+        class FakeTimer:
+            """Records the timer instead of starting it, so the test decides
+            exactly when each one fires."""
+
+            def __init__(self, _interval, function, args):
+                self.function, self.args = function, args
+                timers.append(self)
+
+            daemon = True
+
+            def start(self):
+                pass
+
+            def is_alive(self):
+                return False
+
+            def cancel(self):
+                pass
+
+            def fire(self):
+                self.function(*self.args)
+
         click_filter = GlobalClickFilter(40, [Button.LEFT])
         click_filter._use_os_time = True
         click_filter._inject = lambda button, pressed, template: injected.append((pressed, template))
-        base = monotonic()
-        click_filter._handle(Button.LEFT, True, base, "down")
-        click_filter._handle(Button.LEFT, False, base + 0.30, "up1")    # dropout one: timer A
-        click_filter._handle(Button.LEFT, True, base + 0.31, "back1")   # cancels it
-        sleep(0.03)
-        click_filter._handle(Button.LEFT, False, base + 0.33, "up2")    # dropout two: timer B
-        sleep(0.02)  # timer A fires in here; it must not deliver up2
-        self.assertEqual(injected, [], "the first timer delivered the second release early")
-        click_filter._handle(Button.LEFT, True, base + 0.36, "back2")   # still inside B's window
-        sleep(0.1)
-        self.assertEqual(injected, [], "the drag should carry on through both dropouts")
-        click_filter.stop()
+        with mock.patch("app.platform.threading.Timer", FakeTimer):
+            click_filter._handle(Button.LEFT, True, 1.000, "down")
+            click_filter._handle(Button.LEFT, False, 1.300, "up1")    # dropout one: timer A
+            click_filter._handle(Button.LEFT, True, 1.305, "back1")   # cancels it
+            click_filter._handle(Button.LEFT, False, 1.310, "up2")    # dropout two: timer B
+            timer_a, timer_b = timers
+            timer_a.fire()  # A's window is over, but B's is not
+            self.assertEqual(injected, [], "the first timer delivered the second release early")
+            click_filter._handle(Button.LEFT, True, 1.315, "back2")   # inside B's window
+            timer_b.fire()
+            self.assertEqual(injected, [], "the drag should carry on through both dropouts")
+            click_filter._handle(Button.LEFT, False, 2.000, "lift")   # the real lift: timer C
+            timers[-1].fire()
+            self.assertEqual(injected, [(False, "lift")])
 
 
 class TickClockTests(unittest.TestCase):
