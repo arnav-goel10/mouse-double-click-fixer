@@ -175,7 +175,10 @@ class BounceFilter:
             return ClickEvent(self.button, True, False, gap_ms, interval_ms, suppressed_run, flush_held=True)
         return ClickEvent(self.button, True, accepted, gap_ms, interval_ms, suppressed_run)
 
-    def release(self, timestamp: Optional[float] = None) -> ClickEvent:
+    def release(self, timestamp: Optional[float] = None, allow_hold: bool = True) -> ClickEvent:
+        """`allow_hold=False` delivers the release at once, for when the caller
+        could not re-send it later (Windows blocks sending input to apps
+        running as administrator)."""
         now = monotonic() if timestamp is None else float(timestamp)
         if self._swallow_release:
             self._swallow_release = False
@@ -184,18 +187,29 @@ class BounceFilter:
         run = self._release_run
         self._release_run = 0
         held_ms = 0.0 if self._last_press_at is None else (now - self._last_press_at) * 1000
-        if self.enabled and self.hold_releases and held_ms >= HOLD_AFTER_MS:
+        if self.enabled and self.hold_releases and allow_hold and held_ms >= HOLD_AFTER_MS:
             self._held_release_at = now
             return ClickEvent(self.button, False, False, None, None, run, held=True)
         self._last_release_at = now
         return ClickEvent(self.button, False, True, None, None, run)
 
-    def commit_held(self) -> bool:
+    @property
+    def held_since(self) -> Optional[float]:
+        """When the release being held back happened; identifies that release."""
+        return self._held_release_at
+
+    def commit_held(self, expected: Optional[float] = None) -> bool:
         """Settle a held release once the threshold has passed.
 
         Returns True when the release was real and must now be delivered.
+        `expected` (from `held_since`) makes a timer settle only the release it
+        was started for: after a dropout is cancelled, a later release can be
+        held while the first timer is still pending, and that one needs its
+        own full window.
         """
         if self._held_release_at is None:
+            return False
+        if expected is not None and self._held_release_at != expected:
             return False
         self._last_release_at = self._held_release_at
         self._held_release_at = None

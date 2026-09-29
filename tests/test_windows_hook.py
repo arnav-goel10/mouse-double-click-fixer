@@ -157,6 +157,53 @@ class WindowsHookTests(unittest.TestCase):
             f"expected one unbroken drag, saw {self.observed}",
         )
 
+    def test_two_quick_dropouts_keep_the_drag(self) -> None:
+        # A badly worn switch can drop out twice within one filter window.
+        self.observed.clear()
+        self._click(True)
+        time.sleep(0.3)
+        self._click(False)          # dropout one
+        time.sleep(0.005)
+        self._click(True)
+        time.sleep(0.005)
+        self._click(False)          # dropout two, while the first timer is pending
+        time.sleep(0.005)
+        self._click(True)
+        time.sleep(0.3)
+        self._click(False)          # the real lift
+        time.sleep(0.4)
+        self.assertEqual(
+            self.observed,
+            [WM_LBUTTONDOWN, WM_LBUTTONUP],
+            f"expected one unbroken drag, saw {self.observed}",
+        )
+
+
+@unittest.skipUnless(platform.system() == "Windows", "Windows only")
+class InjectableWindowsTests(unittest.TestCase):
+    """The check that decides whether a release may be held back."""
+
+    def test_own_and_ordinary_windows_accept_injection(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        from app.platform import InjectableWindows
+
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        targets = InjectableWindows(user32, kernel32)
+        # The desktop belongs to Explorer (or nothing on a server runner),
+        # which runs as the same user: a re-sent release reaches it.
+        self.assertTrue(targets.accepts_injection(wintypes.POINT(5, 5)))
+
+    def test_a_process_that_cannot_be_opened_is_refused(self) -> None:
+        import ctypes
+
+        from app.platform import InjectableWindows
+
+        targets = InjectableWindows(ctypes.WinDLL("user32"), ctypes.WinDLL("kernel32"))
+        self.assertFalse(targets._process_ok(4), "PID 4 is the System process")
+
 
 if __name__ == "__main__":
     unittest.main()

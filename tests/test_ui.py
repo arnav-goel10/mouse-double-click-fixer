@@ -320,3 +320,14 @@ class WindowFixTests(WindowTests):
             self.window.request_filter(True, prompt=False)
             ask.assert_not_called()
             self.assertTrue(self.window._enable_when_granted, "still starts once allowed")
+
+
+class QuitCommandTests(unittest.TestCase):
+    def test_quit_never_starts_a_copy(self) -> None:
+        from time import monotonic
+
+        from app import main as main_module
+
+        started = monotonic()
+        self.assertEqual(main_module.main(["DoubleClickFixer", "--quit"]), 0)
+        self.assertLess(monotonic() - started, 3.0)

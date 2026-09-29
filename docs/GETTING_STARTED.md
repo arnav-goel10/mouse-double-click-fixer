@@ -32,8 +32,8 @@ the drag should hold all the way.
 ## 4. Leave it running
 
 Close the window and the app keeps filtering from the menu bar (macOS) or the
-notification area (Windows). Under **General**, turn on **Open at login** and
-**Start in menu bar** to make that automatic.
+notification area (Windows). Under **General**, turn on **Open at login** to
+make that automatic: at login it starts there quietly, with no window.
 
 ## Choosing a filter window
 

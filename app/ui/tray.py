@@ -102,9 +102,11 @@ class Tray(QSystemTrayIcon):
         else:
             self.update_action.setText("Check for Updates…")
         active = self.controller.active
-        if active != getattr(self, "_icon_state", None):
-            # Refreshed on every blocked bounce; the icon only changes with state.
-            self._icon_state = active
+        state = (active, icons.taskbar_is_light())
+        if state != getattr(self, "_icon_state", None):
+            # Refreshed on every blocked bounce; the icon only changes with the
+            # filter state or the taskbar theme.
+            self._icon_state = state
             self.setIcon(icons.tray_icon(active))
         self.toggle_action.setChecked(active)
         if active:

@@ -221,6 +221,8 @@ class FilterPage(Page):
         self.body.addStretch(1)
 
         self.slider.valueChanged.connect(self._on_slider)
+        # While dragging, only the label follows; the value is saved on release.
+        self.slider.sliderReleased.connect(lambda: self._on_slider(self.slider.value()))
 
     def refresh(self, granted: bool, waiting_for_permission: bool = False) -> None:
         self._loading = True
@@ -251,7 +253,7 @@ class FilterPage(Page):
 
     def _on_slider(self, value: int) -> None:
         self.value.setText(f"{value} ms")
-        if not self._loading:
+        if not self._loading and not self.slider.isSliderDown():
             self.controller.set_threshold(value)
 
     def _on_buttons(self, _checked: bool) -> None:
@@ -284,7 +286,7 @@ class TestPage(Page):
         self.timeline = GapTimeline()
         holder_layout.addWidget(self.timeline)
         chart.add(holder)
-        self.footnote("Red bars fall within the filter window.")
+        self.chart_note = self.footnote("")
 
         self.header("Measurements")
         values = self.section()
@@ -310,6 +312,13 @@ class TestPage(Page):
 
     def refresh(self) -> None:
         self.timeline.set_threshold(self.controller.threshold_ms)
+        # With the filter on, bounces are removed before this pad sees them,
+        # so an all-green chart would otherwise read as a healthy mouse.
+        self.chart_note.setText(
+            "Bounce Filter is on, so blocked bounces don’t appear here."
+            if self.controller.active
+            else "Red bars fall within the filter window."
+        )
 
     def reset(self) -> None:
         self.clicks = 0
@@ -527,12 +536,11 @@ class GeneralPage(Page):
 
         startup = self.section()
         self.login_switch = Switch(accessible_name="Open at login")
-        self.hidden_switch = Switch(accessible_name="Start hidden")
-        startup.add(Row("Open at login", "", self.login_switch, card_icon("power")))
         where = "menu bar" if IS_MAC else "notification area"
-        startup.add(Row(f"Start in {where}", "", self.hidden_switch, card_icon("minimize")))
+        self.login_row = startup.add(
+            Row("Open at login", f"Starts in the {where}.", self.login_switch, card_icon("power"))
+        )
         self.login_switch.toggled.connect(self._on_login)
-        self.hidden_switch.toggled.connect(self._on_hidden)
 
         self.permission_row: Optional[Row] = None
         if permissions.needs_accessibility():
@@ -574,7 +582,6 @@ class GeneralPage(Page):
     def refresh(self, granted: bool) -> None:
         self._loading = True
         self.login_switch.setChecked(bool(self.controller.settings["start_at_login"]), animate=False)
-        self.hidden_switch.setChecked(bool(self.controller.settings["start_minimized"]), animate=False)
         self._loading = False
         if self.permission_row is not None:
             self.permission_icon.name = "ok" if granted else "warning"
@@ -625,10 +632,6 @@ class GeneralPage(Page):
         if error:
             self.login_switch.setChecked(not checked)
             QMessageBox.warning(self, "Couldn’t change the login item", error)
-
-    def _on_hidden(self, checked: bool) -> None:
-        if not self._loading:
-            self.controller.set_start_minimized(checked)
 
     def _confirm_reset(self) -> None:
         answer = QMessageBox.question(

@@ -153,23 +153,31 @@ class GlobalClickFilter:
 
     # -- shared event handling --------------------------------------------
     def _handle(
-        self, button: Button, pressed: bool, timestamp: Optional[float], template: object = None
+        self,
+        button: Button,
+        pressed: bool,
+        timestamp: Optional[float],
+        template: object = None,
+        allow_hold: bool = True,
     ) -> ClickEvent:
         """Decide one event. `template` is a copy of it, kept in case it has to
-        be re-injected later; the caller suppresses whatever is not accepted."""
+        be re-injected later; the caller suppresses whatever is not accepted.
+        `allow_hold=False` says a release could not be re-injected later."""
         timestamp = self._normalise_time(timestamp)
         replay = []
         with self._lock:
             click_filter = self._filters[button]
             click_filter.enabled = button in self._active
-            event = click_filter.press(timestamp) if pressed else click_filter.release(timestamp)
+            event = click_filter.press(timestamp) if pressed else click_filter.release(timestamp, allow_hold)
             if event.is_bounce:
                 self.filtered_count += 1
             if event.suppressed_run and template is not None and self._repair_template:
                 self._repair_template(template, event.suppressed_run)
             if event.held:
                 self._held_templates[button] = template
-                timer = threading.Timer(click_filter.threshold_ms / 1000.0, self._commit_held, (button,))
+                timer = threading.Timer(
+                    click_filter.threshold_ms / 1000.0, self._commit_held, (button, click_filter.held_since)
+                )
                 timer.daemon = True
                 self._timers = [t for t in self._timers if t.is_alive()] + [timer]
                 timer.start()
@@ -186,10 +194,11 @@ class GlobalClickFilter:
             pass
         return event
 
-    def _commit_held(self, button: Button) -> None:
-        """The threshold passed with no press: the held release was real."""
+    def _commit_held(self, button: Button, expected: Optional[float] = None) -> None:
+        """The threshold passed with no press: the held release was real.
+        A timer passes the release it was started for; stop() passes none."""
         with self._lock:
-            if not self._filters[button].commit_held():
+            if not self._filters[button].commit_held(expected):
                 return
             template = self._held_templates.pop(button, None)
         self._safe_inject(button, False, template)
@@ -307,6 +316,9 @@ class GlobalClickFilter:
 
         self._thread_id = kernel32.GetCurrentThreadId()
         filter_injected = _filter_injected()
+        kernel32.GetTickCount.restype = wintypes.DWORD
+        ticks = TickClock(kernel32.GetTickCount)
+        targets = InjectableWindows(user32, kernel32)
 
         @HOOKPROC
         def callback(code: int, message: int, data: int) -> int:
@@ -318,9 +330,12 @@ class GlobalClickFilter:
                     ours = info.dwExtraInfo == INJECTED_MARK
                     if not ours and (not injected or filter_injected):
                         button, pressed = entry
+                        # A release is only held back if it can be re-sent to
+                        # the window that will receive it.
+                        allow_hold = pressed or targets.accepts_injection(info.pt)
                         # `time` is the tick count, in milliseconds, recorded
                         # when the driver produced the event.
-                        event = self._handle(button, pressed, info.time / 1000.0)
+                        event = self._handle(button, pressed, ticks.seconds(info.time), allow_hold=allow_hold)
                         if not event.accepted:
                             return 1
             return user32.CallNextHookEx(None, code, message, data)
@@ -376,7 +391,15 @@ class GlobalClickFilter:
         self._inject = inject
         self._repair_template = lambda template, run: _rewrite_click_state(Quartz, template, run)
 
-        def callback(_proxy: object, event_type: int, event: object, _refcon: object) -> object:
+        def callback(proxy: object, event_type: int, event: object, refcon: object) -> object:
+            # An exception here would make PyObjC return nothing, which drops
+            # the click. Whatever goes wrong, the event goes through untouched.
+            try:
+                return decide(event_type, event)
+            except Exception:  # noqa: BLE001
+                return event
+
+        def decide(event_type: int, event: object) -> object:
             # macOS disables a tap that takes too long, or when the user
             # revokes permission. Re-arm it instead of dying silently.
             if event_type in (Quartz.kCGEventTapDisabledByTimeout, Quartz.kCGEventTapDisabledByUserInput):
@@ -445,6 +468,161 @@ class GlobalClickFilter:
             Quartz.CGEventTapEnable(tap, False)
             Quartz.CFRunLoopRemoveSource(self._run_loop, source, Quartz.kCFRunLoopCommonModes)
             self._tap = None
+
+
+class TickClock:
+    """Windows event times as seconds that never jump backwards.
+
+    Event records carry GetTickCount(): milliseconds since boot in 32 bits,
+    which wrap to zero every 49.7 days. Measured naively, the first click
+    after a wrap would be a huge negative gap, read as zero, and dropped as
+    bounce. Differences taken modulo 2**32 stay correct across the wrap.
+    """
+
+    def __init__(self, current_tick: Optional[Callable[[], int]] = None) -> None:
+        # GetTickCount, to place the first event on this process's own clock.
+        self._current_tick = current_tick
+        self._last_tick: Optional[int] = None
+        self._seconds = 0.0
+
+    def seconds(self, tick: int) -> Optional[float]:
+        tick = int(tick) & 0xFFFFFFFF
+        if tick == 0:
+            return None  # synthetic input with no timestamp
+        if self._last_tick is None:
+            # Start on `monotonic()`, whichever clock Python uses for it, so
+            # these times and the app's own agree.
+            age = 0.0
+            if self._current_tick is not None:
+                age = ((int(self._current_tick()) - tick) & 0xFFFFFFFF) / 1000.0
+            self._seconds = monotonic() - (age if age < 10 else 0.0)
+        else:
+            delta = (tick - self._last_tick) & 0xFFFFFFFF
+            if delta >= 0x80000000:
+                delta -= 0x100000000  # a slightly older event, not a wrap
+            self._seconds += delta / 1000.0
+        self._last_tick = tick
+        return self._seconds
+
+
+class InjectableWindows:
+    """Whether a re-sent click would reach the window under the pointer.
+
+    Windows silently drops input an app sends to a window running with
+    higher rights (User Interface Privilege Isolation): Task Manager, an
+    administrator terminal, an installer. A release held back over such a
+    window could never be delivered, and the button would look stuck, so
+    there the release goes straight through instead. Answers are cached
+    briefly per process; the hook must stay fast.
+    """
+
+    CACHE_SECONDS = 5.0
+
+    def __init__(self, user32, kernel32) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        self._ctypes = ctypes
+        self._wintypes = wintypes
+        self._user32 = user32
+        self._kernel32 = kernel32
+        self._advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+        user32.WindowFromPoint.argtypes = [wintypes.POINT]
+        user32.WindowFromPoint.restype = wintypes.HWND
+        user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+        user32.GetAncestor.restype = wintypes.HWND
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        self._advapi32.OpenProcessToken.argtypes = [
+            wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)
+        ]
+        self._advapi32.GetTokenInformation.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)
+        ]
+
+        class GUITHREADINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("flags", wintypes.DWORD),
+                ("hwndActive", wintypes.HWND),
+                ("hwndFocus", wintypes.HWND),
+                ("hwndCapture", wintypes.HWND),
+                ("hwndMenuOwner", wintypes.HWND),
+                ("hwndMoveSize", wintypes.HWND),
+                ("hwndCaret", wintypes.HWND),
+                ("rcCaret", wintypes.RECT),
+            ]
+
+        self._GUITHREADINFO = GUITHREADINFO
+        user32.GetGUIThreadInfo.argtypes = [wintypes.DWORD, ctypes.POINTER(GUITHREADINFO)]
+        self._own_pid = kernel32.GetCurrentProcessId()
+        # An app running as administrator may send input anywhere that matters.
+        self._elevated = self._token_elevated(kernel32.GetCurrentProcess()) is True
+        self._cache: dict[int, tuple[float, bool]] = {}
+
+    def accepts_injection(self, point) -> bool:
+        if self._elevated:
+            return True
+        try:
+            windows = [self._user32.WindowFromPoint(point)]
+            # A drag sends its release to the window that captured the mouse,
+            # wherever the pointer is.
+            info = self._GUITHREADINFO()
+            info.cbSize = self._ctypes.sizeof(info)
+            if self._user32.GetGUIThreadInfo(0, self._ctypes.byref(info)) and info.hwndCapture:
+                windows.append(info.hwndCapture)
+            return all(self._window_ok(hwnd) for hwnd in windows if hwnd)
+        except Exception:  # noqa: BLE001 - unsure: deliver at once, as before holding existed
+            return False
+
+    def _window_ok(self, hwnd) -> bool:
+        pid = self._wintypes.DWORD()
+        self._user32.GetWindowThreadProcessId(hwnd, self._ctypes.byref(pid))
+        if not pid.value or pid.value == self._own_pid:
+            return True
+        now = monotonic()
+        cached = self._cache.get(pid.value)
+        if cached is not None and now - cached[0] < self.CACHE_SECONDS:
+            return cached[1]
+        answer = self._process_ok(pid.value)
+        if len(self._cache) > 64:
+            self._cache.clear()
+        self._cache[pid.value] = (now, answer)
+        return answer
+
+    def _process_ok(self, pid: int) -> bool:
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        process = self._kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not process:
+            return False  # protected or another user's: assume input can't reach it
+        try:
+            return self._token_elevated(process) is False
+        finally:
+            self._kernel32.CloseHandle(process)
+
+    def _token_elevated(self, process) -> Optional[bool]:
+        """True or False, or None when the token can't be read (which, for
+        another process, means it runs with higher rights than this one)."""
+        ctypes, wintypes = self._ctypes, self._wintypes
+        TOKEN_QUERY = 0x0008
+        TOKEN_ELEVATION = 20
+        token = wintypes.HANDLE()
+        if not self._advapi32.OpenProcessToken(process, TOKEN_QUERY, ctypes.byref(token)):
+            return None
+        try:
+            elevated = wintypes.DWORD()
+            size = wintypes.DWORD()
+            if not self._advapi32.GetTokenInformation(
+                token, TOKEN_ELEVATION, ctypes.byref(elevated), ctypes.sizeof(elevated), ctypes.byref(size)
+            ):
+                return None
+            return bool(elevated.value)
+        finally:
+            self._kernel32.CloseHandle(token)
 
 
 def _rewrite_click_state(Quartz, event: object, suppressed: int) -> None:

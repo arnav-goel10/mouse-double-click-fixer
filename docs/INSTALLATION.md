@@ -48,12 +48,13 @@ hand instead, turn off **General › Install updates automatically** and use
 
 - **macOS:** quit the app from its menu bar icon, then drag it from
   Applications to the Trash. To remove its settings and login item as well,
-  run `bash installer/uninstall_macos.sh` from a checkout of this repository.
-  Remove **DoubleClick Fixer** from **Privacy & Security › Accessibility**
-  with the **−** button.
+  run `bash installer/uninstall_macos.sh` from a checkout of this repository;
+  it also clears the Accessibility permission. Otherwise remove
+  **DoubleClick Fixer** from **Privacy & Security › Accessibility** with the
+  **−** button.
 - **Windows:** **Settings › Apps › Installed apps › DoubleClick Fixer ›
-  Uninstall**. This removes the app, its shortcuts, the startup entry and
-  saved settings.
+  Uninstall**. This closes the app if it is running, then removes it, its
+  shortcuts, the startup entry and saved settings.
 
 ## From source
 

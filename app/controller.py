@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 import threading
 from typing import Optional
 
@@ -37,6 +38,14 @@ class AppController(QObject):
                 actual = self.settings["start_at_login"]
             if actual != self.settings["start_at_login"]:
                 self._store(start_at_login=actual)
+            if actual and getattr(sys, "frozen", False):
+                # Rewrite the entry so it points at this copy of the app and
+                # carries the current format (an older one may lack the app's
+                # name and icon in Login Items).
+                try:
+                    startup.set_enabled(True)
+                except (OSError, RuntimeError):
+                    pass
         self._filter: Optional[GlobalClickFilter] = None
         self._suspended = False
         # Bounces counted on the hook thread since the last flush. Kept apart
@@ -165,9 +174,6 @@ class AppController(QObject):
             return str(error)
         self._store(start_at_login=bool(enabled))
         return ""
-
-    def set_start_minimized(self, enabled: bool) -> None:
-        self._store(start_minimized=bool(enabled))
 
     def set_window_geometry(self, encoded: str) -> None:
         if encoded != self.settings.get("window_geometry"):

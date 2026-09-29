@@ -38,6 +38,35 @@ Filename: "{app}\DoubleClickFixer.exe"; Description: "Open DoubleClick Fixer"; F
 Filename: "{app}\DoubleClickFixer.exe"; Parameters: "--updated {code:RelaunchArguments}"; Flags: nowait runasoriginaluser; Check: RelaunchRequested
 
 [Code]
+// A running copy lives in the notification area and ignores window-close
+// requests (closing only hides it), so ask it to quit through its own
+// single-instance channel before files are replaced or removed. "--quit"
+// never starts a copy of its own.
+procedure AskRunningCopyToQuit(const Exe: String);
+var
+  ResultCode: Integer;
+begin
+  if FileExists(Exe) then
+  begin
+    Exec(Exe, '--quit', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    Sleep(800);
+  end;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  // The copy being replaced may predate "--quit", so use the new one.
+  ExtractTemporaryFile('DoubleClickFixer.exe');
+  AskRunningCopyToQuit(ExpandConstant('{tmp}\DoubleClickFixer.exe'));
+  Result := '';
+end;
+
+function InitializeUninstall(): Boolean;
+begin
+  AskRunningCopyToQuit(ExpandConstant('{app}\DoubleClickFixer.exe'));
+  Result := True;
+end;
+
 // /RELAUNCH=1 reopens the window; /RELAUNCH=2 comes back in the
 // notification area only, as the app was before the update.
 function RelaunchRequested: Boolean;

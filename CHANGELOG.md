@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.2.7 — 2026-09-29
+
+- Windows: clicking in an app running as administrator (Task Manager, an
+  admin terminal) no longer leaves the button stuck down. Windows blocks
+  re-sent input to such windows, so releases there go straight through.
+- A switch that drops out twice in quick succession no longer ends the drag:
+  each held release now gets its own full filter window.
+- Windows: a click right after the 49.7-day tick-count wrap is no longer
+  mistaken for bounce, and event times line up on every Python version.
+- macOS: an unexpected error in the event tap passes the click through
+  instead of dropping it.
+- Opening the app always shows its window. The "Start in menu bar" switch,
+  which hid it even when opened by hand, is gone; login launches stay quiet.
+- The Windows installer and uninstaller close a running copy first, so no
+  file is left in use.
+- Windows: the notification area icon is a monochrome glyph that follows
+  the taskbar theme, visible on the default dark taskbar.
+- Calibration and the Test pane time clicks from the events themselves.
+- The filter window is saved when the slider is released, not at every step.
+- The Test pane says when the filter is hiding bounces from it.
+- macOS: Login Items lists the app under its own name and icon.
+
 ## 0.2.6 — 2026-09-26
 
 - Windows: the window follows Windows 11 Settings more closely. Toggles show

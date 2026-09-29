@@ -71,6 +71,9 @@ def set_enabled(enabled: bool) -> None:
                         "ProgramArguments": launch_arguments(),
                         "RunAtLoad": True,
                         "ProcessType": "Interactive",
+                        # System Settings › Login Items then lists it under the
+                        # app's own name and icon, not as an unknown item.
+                        "AssociatedBundleIdentifiers": [LAUNCH_AGENT_LABEL],
                     }
                 )
             )

@@ -161,8 +161,27 @@ def tray_icon(active: bool) -> QIcon:
         icon.setIsMask(True)
         return icon
 
-    accent = QColor("#0f9d58") if active else QColor("#98a2b3")
+    # Windows 11: a monochrome glyph like the system's own tray icons, white
+    # on a dark taskbar and black on a light one; filled while filtering.
+    ink = QColor("#000000") if taskbar_is_light() else QColor("#ffffff")
+    fill = ink if active else QColor(0, 0, 0, 0)
     icon = QIcon()
-    for size in (16, 24, 32, 64):
-        icon.addPixmap(_mouse_pixmap(size, accent, QColor("#1f2430"), None))
+    for size in (16, 20, 24, 32, 48, 64):
+        icon.addPixmap(_mouse_pixmap(size, fill, ink, None))
     return icon
+
+
+def taskbar_is_light() -> bool:
+    """Whether the Windows taskbar uses the light theme (it is dark by default,
+    even when apps are light)."""
+    if platform.system() != "Windows":
+        return False
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+        ) as key:
+            return bool(winreg.QueryValueEx(key, "SystemUsesLightTheme")[0])
+    except OSError:
+        return False

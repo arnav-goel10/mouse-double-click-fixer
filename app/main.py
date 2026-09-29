@@ -21,16 +21,19 @@ from .ui.window import MainWindow
 SERVER_NAME = "doubleclick-fixer-single-instance"
 
 
-def _hand_over_to_running_instance(quiet: bool = False) -> bool:
+def _hand_over_to_running_instance(request: bytes = b"show") -> bool:
     """Hand over to an already-running copy. True if one answered.
 
-    A quiet hand-over (a background launch such as a login item or an update
-    relaunch) leaves the running copy as it is; otherwise it shows its window.
+    b"show" brings up its window; b"quiet" (a background launch such as a
+    login item or an update relaunch) leaves it as it is; b"quit" asks it to
+    exit, which the Windows installer uses before replacing or removing it.
     """
     socket = QLocalSocket()
     socket.connectToServer(SERVER_NAME)
-    if socket.waitForConnected(300):
-        socket.write(b"quiet" if quiet else b"show")
+    # Generous: a copy still starting up answers late, and giving up early
+    # would start a second copy with a second mouse hook.
+    if socket.waitForConnected(1000):
+        socket.write(request)
         socket.flush()
         socket.waitForBytesWritten(300)
         socket.disconnectFromServer()
@@ -83,7 +86,7 @@ class Application:
 
         hints = self.qt.styleHints()
         if hasattr(hints, "colorSchemeChanged"):
-            hints.colorSchemeChanged.connect(lambda _scheme: self.window.apply_look())
+            hints.colorSchemeChanged.connect(lambda _scheme: self._on_theme_changed())
         # Quitting from anywhere (Dock, app menu, logout) stops the hook cleanly.
         self.qt.aboutToQuit.connect(self.controller.shutdown)
         self.menu_bar = self._build_menu_bar()
@@ -119,6 +122,11 @@ class Application:
         close.triggered.connect(self.window.close)
         window_menu.addAction(close)
         return bar
+
+    def _on_theme_changed(self) -> None:
+        self.window.apply_look()
+        if self.tray is not None:
+            self.tray.refresh()  # the Windows tray glyph follows the taskbar
 
     def check_for_updates(self) -> None:
         self.show_window()
@@ -167,7 +175,9 @@ class Application:
         def on_ready() -> None:
             request = bytes(connection.readAll())
             connection.deleteLater()
-            if request != b"quiet":
+            if request == b"quit":
+                self.quit()
+            elif request != b"quiet":
                 self.show_window()
 
         # The request may already be waiting by the time this runs.
@@ -178,8 +188,11 @@ class Application:
 
     # -- lifecycle ---------------------------------------------------------
     def start(self, minimized: bool) -> int:
-        if self.controller.settings["start_minimized"] and self.tray is not None:
-            minimized = True
+        # Background launches (login, update relaunch) stay in the menu bar or
+        # notification area; opening the app yourself always shows the window.
+        # Without a tray icon there would be no way back in, so show it anyway.
+        if self.tray is None:
+            minimized = False
         if not minimized:
             self.show_window()
         else:
@@ -219,10 +232,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     arguments = list(sys.argv if argv is None else argv)
     minimized = "--minimized" in arguments
 
+    if "--quit" in arguments:
+        # Never starts a copy: it only asks a running one to exit.
+        _hand_over_to_running_instance(b"quit")
+        return 0
+
     if hasattr(Qt, "AA_DontShowIconsInMenus"):  # keep menus clean on macOS
         QApplication.setAttribute(Qt.ApplicationAttribute.AA_DontShowIconsInMenus, False)
 
-    if _hand_over_to_running_instance(quiet=minimized):
+    if _hand_over_to_running_instance(b"quiet" if minimized else b"show"):
         return 0
 
     application = Application(arguments)

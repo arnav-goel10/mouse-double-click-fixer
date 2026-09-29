@@ -498,18 +498,27 @@ class ClickPad(QWidget):
 
     flash_level = Property(float, get_flash_level, set_flash_level)
 
+    @staticmethod
+    def _event_time(event) -> float:
+        """When the click happened, from the event itself: a busy moment
+        before it is processed must not stretch the gap being measured."""
+        stamp = event.timestamp()
+        return stamp / 1000.0 if stamp else monotonic()
+
     def mousePressEvent(self, event) -> None:  # noqa: N802
         if event.button() != Qt.MouseButton.LeftButton:
             return
-        now = monotonic()
+        now = self._event_time(event)
         gap = None if self._last_release is None else (now - self._last_release) * 1000
         interval = None if self._last_press is None else (now - self._last_press) * 1000
+        if gap is not None and gap < 0:
+            gap = interval = None  # the event clock wrapped; start afresh
         self._last_press = now
         self.pressed_with_gap.emit(gap, interval)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
         if event.button() == Qt.MouseButton.LeftButton:
-            self._last_release = monotonic()
+            self._last_release = self._event_time(event)
 
     def paintEvent(self, _event) -> None:  # noqa: N802
         lk = look()

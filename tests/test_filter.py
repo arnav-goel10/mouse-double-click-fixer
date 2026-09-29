@@ -154,3 +154,66 @@ class HeldReleaseTests(unittest.TestCase):
         self.filter._handle(Button.LEFT, False, 0.5, "up")
         self.filter.stop()
         self.assertEqual(self.injected, [(False, "up")], "apps must not think the button is stuck")
+
+
+class TimerTokenTests(unittest.TestCase):
+    """A timer settles only the release it was started for."""
+
+    def test_second_dropout_keeps_its_own_window(self) -> None:
+        from time import sleep
+
+        injected = []
+        click_filter = GlobalClickFilter(40, [Button.LEFT])
+        click_filter._use_os_time = True
+        click_filter._inject = lambda button, pressed, template: injected.append((pressed, template))
+        base = monotonic()
+        click_filter._handle(Button.LEFT, True, base, "down")
+        click_filter._handle(Button.LEFT, False, base + 0.30, "up1")    # dropout one: timer A
+        click_filter._handle(Button.LEFT, True, base + 0.31, "back1")   # cancels it
+        sleep(0.03)
+        click_filter._handle(Button.LEFT, False, base + 0.33, "up2")    # dropout two: timer B
+        sleep(0.02)  # timer A fires in here; it must not deliver up2
+        self.assertEqual(injected, [], "the first timer delivered the second release early")
+        click_filter._handle(Button.LEFT, True, base + 0.36, "back2")   # still inside B's window
+        sleep(0.1)
+        self.assertEqual(injected, [], "the drag should carry on through both dropouts")
+        click_filter.stop()
+
+
+class TickClockTests(unittest.TestCase):
+    def test_wrap_does_not_make_a_negative_gap(self) -> None:
+        from app.platform import TickClock
+
+        clock = TickClock()
+        before = clock.seconds(0xFFFFFFF0)        # 16 ms before the wrap
+        after = clock.seconds(0x00000010)         # 16 ms after it
+        self.assertAlmostEqual((after - before) * 1000, 32, places=6)
+
+    def test_slightly_older_event_is_not_a_wrap(self) -> None:
+        from app.platform import TickClock
+
+        clock = TickClock()
+        first = clock.seconds(1_000_000)
+        second = clock.seconds(999_990)
+        self.assertAlmostEqual((second - first) * 1000, -10, places=6)
+
+    def test_first_event_lands_on_the_monotonic_clock(self) -> None:
+        from app.platform import TickClock
+
+        clock = TickClock(lambda: 5_000_020)
+        self.assertAlmostEqual(clock.seconds(5_000_000), monotonic() - 0.02, delta=0.05)
+
+    def test_missing_stamp_falls_back(self) -> None:
+        from app.platform import TickClock
+
+        self.assertIsNone(TickClock().seconds(0))
+
+
+class AllowHoldTests(unittest.TestCase):
+    def test_release_goes_straight_through_when_it_cannot_be_resent(self) -> None:
+        click_filter = GlobalClickFilter(40, [Button.LEFT])
+        click_filter._use_os_time = True
+        click_filter._handle(Button.LEFT, True, 0.0, "down")
+        release = click_filter._handle(Button.LEFT, False, 0.5, "up", allow_hold=False)
+        self.assertTrue(release.accepted)
+        self.assertFalse(release.held)
