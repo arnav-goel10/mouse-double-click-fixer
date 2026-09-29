@@ -12,7 +12,6 @@ A small menu bar and tray app for macOS and Windows that filters the extra click
 [![CI](https://github.com/arnav-goel10/doubleclick-fixer/actions/workflows/ci.yml/badge.svg)](https://github.com/arnav-goel10/doubleclick-fixer/actions/workflows/ci.yml)
 [![Platforms](https://img.shields.io/badge/platform-macOS%2011%2B%20(Apple%20silicon)%20%7C%20Windows%2010%2F11-lightgrey)](#download)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
-[![Sponsor](https://img.shields.io/badge/sponsor-%E2%9D%A4-ea4aaa?logo=githubsponsors)](https://github.com/sponsors/arnav-goel10)
 
 **[Download for Mac](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest/download/DoubleClickFixer.dmg)** &nbsp;·&nbsp;
 **[Download for Windows](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest/download/DoubleClickFixer-Setup.exe)** &nbsp;·&nbsp;
@@ -121,7 +120,7 @@ Bug reports and pull requests are welcome; start with [CONTRIBUTING.md](CONTRIBU
 
 ## Support the project
 
-DoubleClick Fixer is free. If it saved you from buying a new mouse, you can [sponsor it on GitHub](https://github.com/sponsors/arnav-goel10), or just star the repository.
+DoubleClick Fixer is free. If it saved you from buying a new mouse, star the repository.
 
 ## Star history
 
