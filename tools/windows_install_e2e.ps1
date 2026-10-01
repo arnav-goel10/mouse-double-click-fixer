@@ -49,6 +49,12 @@ if (Select-String -Path "$env:TEMP\dcf-new.log" -Pattern "in use|DeleteFile fail
 $expected = (Get-FileHash "dist\DoubleClickFixer.exe").Hash
 if ((Get-FileHash $app).Hash -ne $expected) { Fail "the installed exe is not the new build" }
 Write-Host "upgrade replaced the running copy cleanly"
+$version = (python -c "import app; print(app.__version__)").Trim()
+$fileVersion = (Get-Item $app).VersionInfo.ProductVersion
+$listed = (Get-ItemProperty $UninstallKey).DisplayVersion
+if ($fileVersion -ne $version) { Fail "the exe says version '$fileVersion', expected $version" }
+if ($listed -ne $version) { Fail "Installed apps lists version '$listed', expected $version" }
+Write-Host "exe and Installed apps both say $version"
 
 Step "Opening the app twice in a row leaves one copy"
 Start-Process $app -ArgumentList "--minimized"

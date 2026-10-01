@@ -89,7 +89,38 @@ if sys.platform == "darwin":
         },
     )
 else:
-    # Windows: one portable executable; the installer copies it as is.
+    # Windows: stamp the version into the exe, so Properties › Details and the
+    # installed-apps list show the same version as macOS's About and Finder.
+    from PyInstaller.utils.win32.versioninfo import (
+        FixedFileInfo,
+        StringFileInfo,
+        StringStruct,
+        StringTable,
+        VarFileInfo,
+        VarStruct,
+        VSVersionInfo,
+    )
+
+    numbers = tuple(int(part) for part in VERSION.split(".")) + (0,) * 4
+    version_info = VSVersionInfo(
+        ffi=FixedFileInfo(filevers=numbers[:4], prodvers=numbers[:4]),
+        kids=[
+            StringFileInfo([
+                StringTable("040904B0", [
+                    StringStruct("CompanyName", "DoubleClick Fixer"),
+                    StringStruct("FileDescription", "DoubleClick Fixer"),
+                    StringStruct("FileVersion", VERSION),
+                    StringStruct("InternalName", "DoubleClickFixer"),
+                    StringStruct("LegalCopyright", "© 2026 Arnav Goel. MIT License."),
+                    StringStruct("OriginalFilename", "DoubleClickFixer.exe"),
+                    StringStruct("ProductName", "DoubleClick Fixer"),
+                    StringStruct("ProductVersion", VERSION),
+                ])
+            ]),
+            VarFileInfo([VarStruct("Translation", [0x0409, 1200])]),
+        ],
+    )
+    # One portable executable; the installer copies it as is.
     exe = EXE(
         pyz,
         analysis.scripts,
@@ -99,4 +130,5 @@ else:
         name="DoubleClickFixer",
         console=False,
         icon="installer/assets/icon.ico",
+        version=version_info,
     )

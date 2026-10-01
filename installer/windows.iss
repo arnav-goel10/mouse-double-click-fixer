@@ -1,5 +1,5 @@
 #ifndef AppVersion
-#define AppVersion "0.2.0"
+#define AppVersion "0.0.0"
 #endif
 
 [Setup]
@@ -15,6 +15,9 @@ AppPublisher=DoubleClick Fixer
 AppSupportURL=https://github.com/arnav-goel10/doubleclick-fixer
 UninstallDisplayIcon={app}\DoubleClickFixer.exe
 VersionInfoVersion={#AppVersion}
+AppVerName=DoubleClick Fixer {#AppVersion}
+AppPublisherURL=https://github.com/arnav-goel10/doubleclick-fixer
+AppUpdatesURL=https://github.com/arnav-goel10/doubleclick-fixer/releases/latest
 WizardStyle=modern
 SetupIconFile=assets\icon.ico
 PrivilegesRequired=lowest

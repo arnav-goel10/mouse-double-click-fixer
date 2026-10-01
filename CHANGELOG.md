@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.5.0 — 2026-10-01
+
+One version for both platforms, and the release that rolls up everything since
+0.2.0. If you are on any 0.2 release, this is the one to install.
+
+- **Filtering:** blocks the extra click a worn switch adds, measured as the gap
+  between a release and the next press, so real double-clicks are untouched.
+  Drags survive contact dropouts, including bounce at the moment you press and
+  several dropouts in quick succession, and re-sent clicks keep their real
+  time and order.
+- **Native on both platforms:** a System Settings-style window and menu bar
+  item on macOS, with a layered Liquid Glass icon on macOS 26 and later; a
+  Windows 11 Settings-style window and notification area icon on Windows.
+- **Calibration and testing:** a guided calibration that recommends a filter
+  window, and a Test pane that shows the bounces the filter blocks.
+- **Updates:** automatic, checksum-verified, signature-checked on macOS, and
+  they wait while the window is open.
+- **Windows:** the installer and uninstaller close a running copy, even one
+  still starting up; the exe now carries its version (Properties › Details).
+- Requires macOS 13 or later (Apple silicon), or Windows 10 or 11.
+
 ## 0.2.12 — 2026-10-01
 
 - Release pages now show what changed in each version, taken from this
