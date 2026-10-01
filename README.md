@@ -5,7 +5,7 @@
 # DoubleClick Fixer
 
 **Fix a mouse that double-clicks when you click once.**<br>
-A small menu bar and tray app for macOS and Windows that filters the extra clicks a worn mouse switch produces, without touching your real double-clicks.
+A free, open-source app for Windows and macOS that stops mouse double-clicking caused by a worn switch. It filters the extra clicks (switch bounce, or "chatter") and leaves your real double-clicks alone.
 
 [![Latest release](https://img.shields.io/github/v/release/arnav-goel10/doubleclick-fixer?label=release&color=3055ee)](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/arnav-goel10/doubleclick-fixer/total?color=3055ee)](https://github.com/arnav-goel10/doubleclick-fixer/releases)
@@ -19,13 +19,21 @@ A small menu bar and tray app for macOS and Windows that filters the extra click
 
 </div>
 
-| macOS | Windows 11 |
-| --- | --- |
-| ![DoubleClick Fixer on macOS](docs/images/macos.png) | ![DoubleClick Fixer on Windows 11](docs/images/windows.png) |
+<p align="center">
+  <img src="docs/images/macos.png" width="49%" alt="DoubleClick Fixer on macOS: the Bounce Filter settings, with the filter on at 46 ms">
+  <img src="docs/images/windows.png" width="49%" alt="DoubleClick Fixer on Windows 11: the Bounce Filter settings, with the filter on at 46 ms">
+</p>
+<p align="center"><sub>macOS &nbsp;·&nbsp; Windows 11</sub></p>
 
 ## The problem
 
-Mouse buttons wear out. The metal contact inside starts to bounce, so a single click arrives twice: files open when you meant to select them, links open in two tabs, and drag-and-drop lets go halfway. Replacing the switch fixes it for good; DoubleClick Fixer fixes it in software today.
+Mouse buttons wear out. The metal contact inside starts to bounce, so a single click arrives twice. If your mouse does any of these, this is the app for it:
+
+- it **double-clicks when you click once**: files open when you meant to select them, links open in two tabs;
+- **drag and drop lets go** halfway, or text selection keeps restarting;
+- a **held button seems to release on its own** while you drag a window or a file.
+
+It happens to every brand sooner or later, Logitech, Razer, SteelSeries, Microsoft and others, and it's especially common on gaming mice. Replacing the switch fixes it for good; DoubleClick Fixer fixes it in software today, on Windows 10, Windows 11 and macOS.
 
 ## How it works
 

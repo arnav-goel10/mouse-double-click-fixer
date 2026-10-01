@@ -46,6 +46,14 @@ jobs:
           DCF_E2E: "1"
       - name: Capture the real window
         run: python tools/screenshots.py screenshots --live
+      - name: Capture the README screenshot (dark mode, as on macOS)
+        shell: pwsh
+        run: |
+          $key = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+          New-Item -Path $key -Force | Out-Null
+          Set-ItemProperty -Path $key -Name AppsUseLightTheme -Value 0 -Type DWord
+          Set-ItemProperty -Path $key -Name SystemUsesLightTheme -Value 0 -Type DWord
+          python tools/screenshots.py screenshots --live --docs
       - uses: actions/upload-artifact@v7
         with:
           name: windows-screenshots

@@ -1,12 +1,16 @@
 """Render every pane in light and dark, offscreen, for review and the docs.
 
-    python tools/screenshots.py OUTPUT_DIR [--as-windows | --live]
+    python tools/screenshots.py OUTPUT_DIR [--as-windows | --live] [--docs]
 
 `--as-windows` previews the Windows layout on another platform (fonts and
 icons fall back, so use it for layout only). `--live` opens a real window and
 captures it from the screen, so native materials (Mica, vibrancy) show; CI
 uses it on the Windows runner. Settings are isolated in a temporary folder,
 so this never touches a real configuration.
+
+`--docs` captures only the Bounce Filter pane for the README, in the same state
+and at the same window size as docs/images/macos.png (filter on, 46 ms,
+calibrated, the same counts), so the two screenshots match side by side.
 """
 
 from __future__ import annotations
@@ -46,6 +50,7 @@ def main() -> None:
     out = Path(positional[0] if positional else "screenshots")
     out.mkdir(parents=True, exist_ok=True)
     as_windows = "--as-windows" in sys.argv
+    docs = "--docs" in sys.argv
 
     from app import settings
 
@@ -74,17 +79,40 @@ def main() -> None:
 
         symbols.IS_MAC, symbols.IS_WINDOWS = False, False
 
+    if docs:
+        # Shown as on, without installing a real mouse hook.
+        AppController.active = property(lambda self: True)  # type: ignore[assignment]
     controller = AppController()
-    controller.settings["filtered_total"] = 1284
-    controller.session_filtered = 37
+    if docs:
+        controller._store(threshold_ms=46, calibrated=True, fix_enabled=True)
+        controller.settings["filtered_total"] = 8324
+        controller.session_filtered = 945
+    else:
+        controller.settings["filtered_total"] = 1284
+        controller.session_filtered = 37
     main_window = window_module.MainWindow(controller)
-    main_window.resize(780, 660)
+    main_window.resize(*((1010, 680) if docs else (780, 660)))
     main_window.show()
     main_window.raise_()
     main_window.activateWindow()
     app.processEvents()
     if LIVE:
         wait(app, 1500)
+
+    if docs:
+        main_window._show_page(0)
+        main_window.refresh()
+        app.processEvents()
+        wait(app, 800 if LIVE else 50)
+        if LIVE:
+            frame = main_window.frameGeometry()
+            main_window.screen().grabWindow(0, frame.x(), frame.y(), frame.width(), frame.height()).save(
+                str(out / "docs-filter.png")
+            )
+        else:
+            main_window.grab().save(str(out / "docs-filter.png"))
+        print(f"Wrote {out / 'docs-filter.png'}")
+        return
 
     test = main_window.test_page
     for gap in [410, 520, 9, 380, 460, 12, 590, 350, 470, 7, 520, 400, 610, 380, 11, 500, 430, 560]:
