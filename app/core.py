@@ -70,10 +70,13 @@ class ClickEvent:
     #: A press that arrived after a held release had already expired: the
     #: caller must deliver that release first, then this press.
     flush_held: bool = False
+    #: Real, but held back by the hook so it reaches apps after an event the
+    #: app re-sent just before it (see GlobalClickFilter._defer).
+    deferred: bool = False
 
     @property
     def is_bounce(self) -> bool:
-        return self.pressed and not self.accepted and not self.flush_held
+        return self.pressed and not self.accepted and not self.flush_held and not self.deferred
 
 
 #: Releases are held back once the button has been down this long. Worn

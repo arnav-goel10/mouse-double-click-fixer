@@ -319,5 +319,66 @@ class ClickCountRepairTests(unittest.TestCase):
         self.assertEqual(seen, [(True, 1), (True, 2)])
 
 
+class ResendOrderTests(unittest.TestCase):
+    """A real event must never overtake one the app re-sent just before it."""
+
+    def setUp(self) -> None:
+        from unittest import mock
+
+        self.timers = FakeTimer.reset()
+        patch = mock.patch("app.platform.threading.Timer", FakeTimer)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.sent = []
+        self.filter = GlobalClickFilter(40, [Button.LEFT])
+        self.filter._use_os_time = True
+        self.filter._inject = lambda button, pressed, template: self.sent.append((pressed, template))
+
+    def comes_back(self) -> None:
+        """The hook sees the oldest re-sent event pass, as the OS delivers it."""
+        self.filter._injected_passed(Button.LEFT)
+
+    def test_press_right_as_the_window_ends_waits_for_the_resent_release(self) -> None:
+        self.filter._handle(Button.LEFT, True, 1.000, "down1")
+        self.filter._handle(Button.LEFT, False, 1.100, "up1")         # held
+        self.timers[0].fire()                                         # re-sent...
+        self.assertEqual(self.sent, [(False, "up1")])
+        # ...but the next press is already queued ahead of it in the system.
+        press = self.filter._handle(Button.LEFT, True, 1.150, "down2")
+        self.assertFalse(press.accepted, "it must not overtake the re-sent release")
+        self.assertTrue(press.deferred)
+        self.assertFalse(press.is_bounce, "a deferred press is not a bounce")
+        self.comes_back()                                             # up1 delivered
+        self.assertEqual(self.sent, [(False, "up1"), (True, "down2")])
+        self.comes_back()                                             # down2 delivered
+        self.assertTrue(self.filter._handle(Button.LEFT, False, 1.170, "up2").accepted)
+
+    def test_events_flow_normally_once_nothing_is_in_flight(self) -> None:
+        self.filter._handle(Button.LEFT, True, 1.0, "down1")
+        self.filter._handle(Button.LEFT, False, 1.1, "up1")
+        self.timers[0].fire()
+        self.comes_back()
+        self.assertTrue(self.filter._handle(Button.LEFT, True, 1.3, "down2").accepted)
+
+    def test_a_resent_event_that_never_returns_does_not_block_clicks(self) -> None:
+        from unittest import mock
+
+        self.filter._handle(Button.LEFT, True, 1.0, "down1")
+        self.filter._handle(Button.LEFT, False, 1.1, "up1")
+        self.timers[0].fire()                                         # never comes back
+        self.assertTrue(self.filter._handle(Button.LEFT, True, 1.15, "down2").deferred)
+        later = monotonic() + 1.0
+        with mock.patch("app.platform.monotonic", return_value=later):
+            self.timers[-1].fire()                                    # the give-up timer
+        self.assertEqual(self.sent[-1], (True, "down2"))
+
+    def test_a_send_that_fails_is_not_waited_for(self) -> None:
+        self.filter._inject = lambda button, pressed, template: False
+        self.filter._handle(Button.LEFT, True, 1.0, "down1")
+        self.filter._handle(Button.LEFT, False, 1.1, "up1")
+        self.timers[0].fire()
+        self.assertTrue(self.filter._handle(Button.LEFT, True, 1.3, "down2").accepted)
+
+
 if __name__ == "__main__":
     unittest.main()

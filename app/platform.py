@@ -15,6 +15,8 @@ import threading
 from time import monotonic, perf_counter
 from typing import Callable, Iterable, Optional
 
+from dataclasses import replace
+
 from .core import BounceFilter, Button, ClickEvent, clamp_threshold
 
 #: Set to 1 to let the filter act on synthetic clicks. Only used by the
@@ -24,6 +26,10 @@ FILTER_INJECTED_ENV = "DCF_FILTER_INJECTED"
 #: Marks events this app re-injects (a held release delivered late, or a
 #: press re-ordered after it), so the hook passes them straight through.
 INJECTED_MARK = 0x44434658  # "DCFX"
+
+#: A re-sent event normally passes back through the hook within a millisecond
+#: or two. If one never does (it was blocked, or lost), stop waiting for it.
+IN_FLIGHT_TIMEOUT_S = 0.5
 
 
 class HookError(RuntimeError):
@@ -70,6 +76,11 @@ class GlobalClickFilter:
         self.tap_resets = 0  # times macOS disabled the tap and it was re-armed
         self.hook_rearms = 0  # times the Windows hook was re-installed
         self._timers: list[threading.Timer] = []
+        # Per button: events re-sent but not yet seen coming back through the
+        # hook, since when, and the real events queued behind them.
+        self._in_flight: dict[Button, int] = {button: 0 for button in Button}
+        self._in_flight_since: dict[Button, float] = {}
+        self._queued: dict[Button, list[tuple[bool, object]]] = {button: [] for button in Button}
         # Set by the platform runner: re-posts an event the hook suppressed.
         self._inject: Callable[[Button, bool, object], None] = lambda _b, _p, _t: None
         self.filtered_count = 0
@@ -92,6 +103,9 @@ class GlobalClickFilter:
         self._use_os_time = None
         self._started = False
         self._held_templates.clear()
+        for button in Button:
+            self._in_flight[button] = 0
+            self._queued[button].clear()
         self._thread = threading.Thread(target=self._run, name="dcf-hook", daemon=True)
         self._thread.start()
         if not self._ready.wait(timeout=5):
@@ -110,6 +124,7 @@ class GlobalClickFilter:
         self._timers.clear()
         for button in Button:
             self._commit_held(button)
+            self._release_queue(button)
         self._stop_event.set()
         thread = self._thread
         if thread is None or thread is threading.current_thread():
@@ -164,7 +179,9 @@ class GlobalClickFilter:
         `allow_hold=False` says a release could not be re-injected later."""
         timestamp = self._normalise_time(timestamp)
         replay = []
+        overdue = []
         with self._lock:
+            overdue = self._expire_in_flight(button)
             click_filter = self._filters[button]
             click_filter.enabled = button in self._active
             event = click_filter.press(timestamp) if pressed else click_filter.release(timestamp, allow_hold)
@@ -183,7 +200,21 @@ class GlobalClickFilter:
             elif event.flush_held:
                 # The held release was real after all: deliver it, then this.
                 replay = [(False, self._held_templates.pop(button, None)), (True, template)]
-        for replay_pressed, replay_template in replay:
+                self._track(button, len(replay))
+            if event.accepted and (self._in_flight[button] or self._queued[button]):
+                # A release this app re-sent a moment ago may still be on its
+                # way. Letting this one through now could overtake it (apps
+                # would see down, down, up, up), so it goes out right after.
+                if not self._queued[button]:
+                    # Should the re-sent event never come back, don't keep
+                    # this one waiting for the next click to notice.
+                    timer = threading.Timer(IN_FLIGHT_TIMEOUT_S + 0.05, self._expire_check, (button,))
+                    timer.daemon = True
+                    self._timers = [t for t in self._timers if t.is_alive()] + [timer]
+                    timer.start()
+                self._queued[button].append((pressed, template))
+                event = replace(event, accepted=False, deferred=True)
+        for replay_pressed, replay_template in overdue + replay:
             self._safe_inject(button, replay_pressed, replay_template)
         try:
             self._on_event(event)
@@ -198,13 +229,64 @@ class GlobalClickFilter:
             if not self._filters[button].commit_held(expected):
                 return
             template = self._held_templates.pop(button, None)
+            self._track(button, 1)
         self._safe_inject(button, False, template)
+
+    # -- keeping re-sent events in order ------------------------------------
+    def _track(self, button: Button, count: int) -> None:
+        """Count events about to be re-sent. Call with the lock held."""
+        if not self._in_flight[button]:
+            self._in_flight_since[button] = monotonic()
+        self._in_flight[button] += count
+
+    def _injected_passed(self, button: Button) -> None:
+        """The hook saw one of this app's re-sent events go by. Once all of
+        them have, the events queued behind them go out, in order."""
+        with self._lock:
+            if self._in_flight[button]:
+                self._in_flight[button] -= 1
+            if self._in_flight[button]:
+                return
+            queued = self._take_queue(button)
+        for pressed, template in queued:
+            self._safe_inject(button, pressed, template)
+
+    def _expire_check(self, button: Button) -> None:
+        with self._lock:
+            overdue = self._expire_in_flight(button)
+        for pressed, template in overdue:
+            self._safe_inject(button, pressed, template)
+
+    def _expire_in_flight(self, button: Button) -> list:
+        """With the lock held: give up on re-sent events that never came back,
+        returning the queue to send now."""
+        if self._in_flight[button] and monotonic() - self._in_flight_since.get(button, 0) > IN_FLIGHT_TIMEOUT_S:
+            self._in_flight[button] = 0
+            return self._take_queue(button)
+        return []
+
+    def _take_queue(self, button: Button) -> list:
+        queued = self._queued[button][:]
+        self._queued[button].clear()
+        if queued:
+            self._track(button, len(queued))
+        return queued
+
+    def _release_queue(self, button: Button) -> None:
+        with self._lock:
+            self._in_flight[button] = 0
+            queued = self._take_queue(button)
+        for pressed, template in queued:
+            self._safe_inject(button, pressed, template)
 
     def _safe_inject(self, button: Button, pressed: bool, template: object) -> None:
         try:
-            self._inject(button, pressed, template)
+            sent = self._inject(button, pressed, template) is not False
         except Exception:  # noqa: BLE001 - never break the event stream
-            pass
+            sent = False
+        if not sent:
+            # It will never come back through the hook; don't wait for it.
+            self._injected_passed(button)
 
     def _normalise_time(self, timestamp: Optional[float]) -> float:
         """Use the operating system's event time only if it shares our clock.
@@ -310,7 +392,7 @@ class GlobalClickFilter:
             # when it was let through.
             when = int(template) & 0xFFFFFFFF if isinstance(template, int) else 0
             event = INPUT(INPUT_MOUSE, MOUSEINPUT(0, 0, 0, SEND_FLAGS[(button, pressed)], when, INJECTED_MARK))
-            user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(INPUT))
+            return user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(INPUT)) == 1
 
         self._inject = inject
 
@@ -345,7 +427,9 @@ class GlobalClickFilter:
                     info = ctypes.cast(data, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
                     injected = bool(info.flags & LLMHF_INJECTED)
                     ours = info.dwExtraInfo == INJECTED_MARK
-                    if not ours and (not injected or filter_injected):
+                    if ours:
+                        self._injected_passed(entry[0])
+                    elif not injected or filter_injected:
                         button, pressed = entry
                         # A release is only held back if it can be re-sent to
                         # the window that will receive it.
@@ -416,7 +500,7 @@ class GlobalClickFilter:
             # position, since a drag has moved on and posting it where it was
             # would jump the pointer back.
             if template is None:
-                return
+                return False
             Quartz.CGEventSetIntegerValueField(template, Quartz.kCGEventSourceUserData, INJECTED_MARK)
             if not pressed:
                 Quartz.CGEventSetLocation(template, Quartz.CGEventGetLocation(Quartz.CGEventCreate(None)))
@@ -446,6 +530,7 @@ class GlobalClickFilter:
             if entry is None:
                 return event
             if Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventSourceUserData) == INJECTED_MARK:
+                self._injected_passed(entry[0])
                 return event  # re-posted by this app; already decided
             source = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventSourceStateID)
             if source != Quartz.kCGEventSourceStateHIDSystemState and not filter_injected:
