@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.11 — 2026-10-01
+
+- A press made just as the app re-sends a held release can no longer overtake
+  it (apps saw the button go down twice, which could break a double-click).
+  Re-sent events are tracked until they pass back through the hook, and real
+  events wait behind them; a lost one is given up on after half a second.
+- Windows: --quit, used by the installer and uninstaller, now also closes a
+  copy that is still starting up, and waits until it has exited. Opening the
+  app twice in quick succession no longer runs two copies.
+
 ## 0.2.10 — 2026-10-01
 
 - macOS: the menu bar icon is drawn at the size and weight of Apple's own menu
