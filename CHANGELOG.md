@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.12 — 2026-10-01
+
+- Release pages now show what changed in each version, taken from this
+  changelog, and older ones point to the latest release.
+- Updated documentation: updates that wait for the window to close, apps
+  running as administrator on Windows, and the hook re-arming itself.
+- No change to how the app works.
+
 ## 0.2.11 — 2026-10-01
 
 - A press made just as the app re-sends a held release can no longer overtake

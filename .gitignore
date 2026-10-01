@@ -7,3 +7,5 @@ dist/
 installer/Output/
 *.spec.bak
 .DS_Store
+.venv*/
+.vscode/

@@ -23,7 +23,10 @@ python -m unittest discover -s tests
 
 UI tests run offscreen (`QT_QPA_PLATFORM=offscreen`, set by the tests). The
 Windows hook test only runs with `DCF_E2E=1`, because it injects real clicks;
-CI runs it on a Windows machine.
+CI runs it on a Windows machine, along with `tools/windows_install_e2e.ps1`,
+which installs and replaces the app for real (never run it on your own PC).
+Tests must not talk to a running copy of the app: patch `SERVER_NAME` in
+`app/main.py` when testing the single-instance channel.
 
 ## How the code is laid out
 

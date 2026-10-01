@@ -42,9 +42,10 @@ updates itself in place.
 
 The app checks for a new release shortly after launch and every six hours,
 downloads it, verifies it, installs it and reopens itself, usually within a
-few seconds. On macOS the Accessibility permission carries over. To update by
-hand instead, turn off **General › Install updates automatically** and use
-**Check Now**.
+few seconds. If its window is open, it waits and installs when you close it.
+On macOS the Accessibility permission carries over. To update by hand instead,
+turn off **General › Install updates automatically** and use **Check Now**
+(Windows: **Check now**).
 
 ## Uninstall
 

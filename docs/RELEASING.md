@@ -4,16 +4,28 @@ Installed copies of DoubleClick Fixer update themselves from GitHub Releases:
 they check the latest release a few seconds after launch and every six hours,
 download the file for their platform, verify it against the release's
 `SHA256SUMS.txt`, replace themselves and reopen. People can turn automatic
-installs off in **General › Software update** and use **Check Now** instead.
+installs off in **General › Software update** and check by hand instead.
 
 ## Cutting a release
 
-1. Update `app/__init__.py` and `CHANGELOG.md`, and commit.
+1. Update `app/__init__.py`, and add a `## <version> — <date>` entry at the
+   top of `CHANGELOG.md`. That entry becomes the release page's "What's new",
+   so write it for the people downloading the app. Commit.
 2. Tag the same version and push the tag:
 
 ```bash
-git tag -a v0.2.1 -m "DoubleClick Fixer 0.2.1"
-git push origin v0.2.1
+git tag -a v1.2.3 -m "DoubleClick Fixer 1.2.3"
+git push origin v1.2.3
+```
+
+The release page is `installer/release_notes.md` (downloads and first-launch
+help) followed by the changelog entry, assembled by `tools/release_notes.py`.
+Publishing also adds a "newer version available" note to every older release
+page. To redo one page by hand:
+
+```bash
+python3 tools/release_notes.py 1.2.3 arnav-goel10/doubleclick-fixer > notes.md
+gh release edit v1.2.3 --notes-file notes.md
 ```
 
 The release workflow checks that the tag matches `app/__init__.py`, runs the
@@ -26,6 +38,25 @@ tests on both platforms, builds and signs everything, and publishes:
 | `DoubleClickFixer-Setup.exe` | people installing on Windows, and the Windows updater |
 | `DoubleClickFixer.exe` | the portable Windows copy and its updater |
 | `SHA256SUMS.txt` | the updater's integrity check |
+
+The macOS job runs on a macOS 26 runner: only its Xcode can compile the layered
+app icon (`installer/assets/AppIcon.icon`). An older Xcode still builds the app,
+with the flat icon only.
+
+## Checks before a release
+
+CI runs on every push. Besides the unit tests on both platforms, two jobs
+exercise a real Windows machine:
+
+- **Windows hook end-to-end** sends clicks through the real low-level hook.
+- **Windows install, quit and update end-to-end** installs 0.2.6 and leaves it
+  running, installs the new build over it, opens it twice, quits it while it
+  is starting, runs a full in-app update and uninstalls
+  (`tools/windows_install_e2e.ps1`).
+
+macOS has no equivalent in CI: GitHub's Macs can't grant Accessibility, which
+the event tap needs. Before tagging, try a drag and a double-click on a Mac
+with the new build.
 
 ## macOS signing, and why it matters for updates
 

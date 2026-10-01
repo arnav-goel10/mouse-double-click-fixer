@@ -14,9 +14,9 @@ double-clicks are not at risk.
 
 ## Drags still let go
 
-Drags are protected once the button has been held for about 30 ms, a
-fraction of a click. If the switch loses contact for longer than your filter window, the
-drag still ends; raise the window a little. If drops are long and frequent,
+Drags are protected from the moment the button goes down. If the switch loses
+contact for longer than your filter window, the drag still ends; raise the
+window a little. If drops are long and frequent,
 the switch is close to failing and replacing it (or the mouse) is the real fix.
 
 ## macOS: the filter won't turn on
@@ -43,12 +43,22 @@ That was a crash in the Qt toolkit on macOS 27, fixed in DoubleClick Fixer
 
 macOS pauses event taps that stall and after waking from sleep; the app
 re-arms its tap automatically. If filtering stops anyway, the menu bar item
-switches to off; turn the filter back on.
+switches to off; turn the filter back on. If Accessibility was turned off for
+the app, the filter comes back by itself once it is allowed again.
 
-## Windows: nothing is filtered in one particular app
+## Windows: it worked, then stopped
 
-A low-level mouse hook cannot filter input for windows running as
-administrator unless DoubleClick Fixer also runs as administrator.
+Windows quietly removes a mouse hook that is slow to answer, for example while
+the PC is under heavy load. The app re-installs its hook after any slow moment
+and once a minute, so filtering resumes on its own.
+
+## Windows: apps running as administrator
+
+Windows doesn't let an ordinary app send input to a window running as
+administrator (Task Manager, an admin terminal, some installers). Over those
+windows drag protection is off, so a release goes straight through rather than
+risk the button seeming stuck. If bounce gets through there, run DoubleClick
+Fixer as administrator as well.
 
 ## Games
 
@@ -61,8 +71,16 @@ systems watch for that; turn the filter off before playing those games.
 
 Closing the window hides it; the filter keeps running. Open it from the menu
 bar icon (macOS) or the notification area icon (Windows), or open the app
-again from Launchpad, Spotlight or the Start menu. **Quit** in that menu stops
-the filter and exits.
+again from Launchpad, Spotlight or the Start menu. **Quit DoubleClick Fixer**
+(macOS) or **Exit** (Windows) in that menu stops the filter and closes the app.
+
+## Updates
+
+Updates install by themselves. If the window is open when one is ready, it
+waits and installs when you close the window; **Restart Now** in **General**
+installs it straight away. After the app reopens, **General** says whether the
+update worked. "No published releases were found" means the app couldn't read
+this repository's releases.
 
 ## Settings file
 
