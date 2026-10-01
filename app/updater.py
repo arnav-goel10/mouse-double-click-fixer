@@ -329,9 +329,10 @@ class Updater(QObject):
         reply.deleteLater()
         if reply.error() != QNetworkReply.NetworkError.NoError:
             status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
-            # 404 means no release has been published yet.
+            # 404: no release is published, or the repository can't be read
+            # (it is private). Saying "Up to date" would hide that.
             if status == 404:
-                self._set(self.CURRENT, "")
+                self._set(self.FAILED, "No published releases were found.")
             else:
                 self._set(self.FAILED, "Couldn’t check for updates.")
             return

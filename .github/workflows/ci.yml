@@ -50,3 +50,28 @@ jobs:
         with:
           name: windows-screenshots
           path: screenshots/
+
+  windows-install:
+    name: Windows install, quit and update end-to-end
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python -m pip install -r requirements.txt pyinstaller
+      - name: Build the exe and the installer
+        shell: pwsh
+        run: |
+          .\installer\build_windows.ps1
+          choco install innosetup --no-progress -y
+          $version = (python -c "import app; print(app.__version__)")
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" "installer\windows.iss"
+      - name: Download the oldest installer still in use (0.2.6, before --quit)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download v0.2.6 -p DoubleClickFixer-Setup.exe -D old
+      - name: Install over a running copy, quit, update, uninstall
+        shell: pwsh
+        run: .\tools\windows_install_e2e.ps1 -OldSetup old\DoubleClickFixer-Setup.exe -NewSetup installer\Output\DoubleClickFixer-Setup.exe
