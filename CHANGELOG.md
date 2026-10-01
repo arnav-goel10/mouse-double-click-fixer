@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.9 — 2026-10-01
+
+- When GitHub has no release the updater can read (none published yet, or the
+  repository is private), Software Update now says "No published releases were
+  found" instead of "Up to date".
+- CI now installs 0.2.6, leaves it running, upgrades over it, quits with
+  --quit, runs a full in-app update and uninstalls, on a real Windows machine.
+
 ## 0.2.8 — 2026-10-01
 
 - macOS 26 and later: a layered Liquid Glass app icon (Icon Composer), so the
