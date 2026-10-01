@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.2.8 — 2026-10-01
+
+- macOS 26 and later: a layered Liquid Glass app icon (Icon Composer), so the
+  system can draw its light, dark, tinted and clear looks.
+- Requires macOS 13 or later, which the bundled Qt has needed all along; older
+  macOS now gets a clear message instead of a crash at launch.
+- Windows: the mouse hook no longer asks a busy window to hit-test itself (that
+  could stall long enough for Windows to drop the hook), and it re-installs
+  itself after a slow moment and every minute, so filtering can't silently stop.
+- A contact that bounces as you press no longer turns the start of a drag into
+  a click.
+- Re-sent clicks keep their real time, so the Test pane no longer paints
+  double-clicks red while the filter is on, and it now shows the bounces the
+  filter blocked.
+- macOS: a triple-click with a bounce in it stays a triple-click.
+- Turning the filter on from the menu during calibration waits until
+  calibration ends; the menus say "Paused for calibration" or "Waiting for
+  Accessibility access" instead of "Off".
+- Revoking and re-granting Accessibility brings the filter back by itself, even
+  after a restart; turning it off while it waits is remembered.
+- Calibrate: no Finish button that could only fail; a run without bounce
+  explains itself; the Bounce Filter pane suggests calibrating until you have.
+- Updates: a background update waits while the window is open and installs
+  when you close it; a full disk or failed Windows install no longer leaves the
+  app stuck or closed; after an update the General pane says how it went;
+  releases still uploading are skipped.
+- Windows installer: an update no longer turns "Open at login" back on, and it
+  closes copies older than 0.2.7 too. Windows wording uses sentence case.
+- Windows: reopening the app brings its window to the front; a maximized
+  window stays maximized; the tray icon follows a taskbar-only theme change.
+- The tests no longer quit a copy of the app that is running.
+
 ## 0.2.7 — 2026-09-29
 
 - Windows: clicking in an app running as administrator (Task Manager, an
