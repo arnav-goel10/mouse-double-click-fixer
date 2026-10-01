@@ -50,10 +50,21 @@ $expected = (Get-FileHash "dist\DoubleClickFixer.exe").Hash
 if ((Get-FileHash $app).Hash -ne $expected) { Fail "the installed exe is not the new build" }
 Write-Host "upgrade replaced the running copy cleanly"
 
-Step "--quit ends a running copy, and starts nothing when none runs"
+Step "Opening the app twice in a row leaves one copy"
+Start-Process $app -ArgumentList "--minimized"
+Start-Process $app -ArgumentList "--minimized"
+Start-Sleep -Seconds 15
+# A one-file exe is two processes: the launcher and the app it unpacks.
+$copies = @(Get-Running | Where-Object { $_.ParentProcessId -notin (Get-Running).ProcessId }).Count
+if ($copies -ne 1) { Fail "expected one copy running, found $copies" }
+Start-Process $app -ArgumentList "--quit" -Wait
+Wait-For { (Get-Running).Count -eq 0 } 20 "the copy to exit"
+Write-Host "a second launch hands over to the first"
+
+Step "--quit ends a copy that is still starting, and starts nothing when none runs"
 Start-Process $app -ArgumentList "--minimized"
 Wait-For { (Get-Running).Count -gt 0 } 30 "the new copy to start"
-Start-Sleep -Seconds 5
+Start-Sleep -Seconds 1  # still unpacking: not listening yet
 Start-Process $app -ArgumentList "--quit" -Wait
 Wait-For { (Get-Running).Count -eq 0 } 20 "every DoubleClickFixer.exe to exit after --quit"
 Start-Process $app -ArgumentList "--quit" -Wait

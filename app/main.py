@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import platform
 import sys
+from time import monotonic, sleep
 from typing import Optional
 
 from PySide6.QtCore import QTimer, Qt
@@ -19,6 +21,42 @@ from .ui import tray as tray_module
 from .ui.window import MainWindow
 
 SERVER_NAME = "doubleclick-fixer-single-instance"
+#: Taken the moment a copy starts, long before its single-instance channel is
+#: listening (the Windows exe unpacks itself first, which can take seconds).
+LOCK_NAME = "doubleclick-fixer.lock"
+#: How long a second launch, or --quit, keeps trying to reach a copy that is
+#: still starting up.
+HAND_OVER_WAIT_S = 10.0
+
+
+def _instance_lock():
+    from PySide6.QtCore import QDir, QLockFile
+
+    lock = QLockFile(os.path.join(QDir.tempPath(), f"{LOCK_NAME}-{SERVER_NAME}"))
+    # A copy that crashed leaves its lock behind; Qt sees its process is gone
+    # and takes the lock over.
+    return lock
+
+
+def _quit_running_copy() -> None:
+    """Ask a running copy to exit and wait until it has. Never starts one."""
+    lock = _instance_lock()
+    deadline = monotonic() + HAND_OVER_WAIT_S
+    while monotonic() < deadline:
+        if lock.tryLock(0):
+            lock.unlock()
+            # No copy holds the lock, but one older than 0.2.11 never takes it.
+            _hand_over_to_running_instance(b"quit")
+            return
+        if _hand_over_to_running_instance(b"quit"):
+            break
+        sleep(0.2)  # a copy is starting and not listening yet
+    # Wait for it to finish quitting, so files can be replaced right after.
+    while monotonic() < deadline:
+        if lock.tryLock(0):
+            lock.unlock()
+            return
+        sleep(0.1)
 
 
 def _hand_over_to_running_instance(request: bytes = b"show") -> bool:
@@ -254,14 +292,27 @@ def main(argv: Optional[list[str]] = None) -> int:
 
     if "--quit" in arguments:
         # Never starts a copy: it only asks a running one to exit.
-        _hand_over_to_running_instance(b"quit")
+        _quit_running_copy()
         return 0
 
     if hasattr(Qt, "AA_DontShowIconsInMenus"):  # keep menus clean on macOS
         QApplication.setAttribute(Qt.ApplicationAttribute.AA_DontShowIconsInMenus, False)
 
-    if _hand_over_to_running_instance(b"quiet" if minimized else b"show"):
+    request = b"quiet" if minimized else b"show"
+    lock = _instance_lock()
+    deadline = monotonic() + HAND_OVER_WAIT_S
+    while not lock.tryLock(0):
+        # Another copy owns the lock: hand over to it, waiting if it is still
+        # starting up, rather than run a second mouse hook beside it.
+        if _hand_over_to_running_instance(request) or monotonic() > deadline:
+            return 0
+        sleep(0.2)
+
+    # A copy older than 0.2.11 runs without the lock; ask it too.
+    if _hand_over_to_running_instance(request):
+        lock.unlock()
         return 0
 
     application = Application(arguments)
+    application.instance_lock = lock  # held for as long as the app runs
     return application.start(minimized)

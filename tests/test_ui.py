@@ -336,13 +336,6 @@ class QuitCommandTests(unittest.TestCase):
             self.assertEqual(main_module.main(["DoubleClickFixer", "--quit"]), 0)
             self.assertLess(monotonic() - started, 3.0)
 
-    def test_quit_is_sent_to_a_running_copy(self) -> None:
-        from app import main as main_module
-
-        with mock.patch.object(main_module, "_hand_over_to_running_instance", return_value=True) as hand:
-            self.assertEqual(main_module.main(["DoubleClickFixer", "--quit"]), 0)
-        hand.assert_called_once_with(b"quit")
-
 
 class StateFixTests(unittest.TestCase):
     """Fixes from the 0.2.8 audit: saved choices and calibration pauses."""
@@ -385,6 +378,52 @@ class StateFixTests(unittest.TestCase):
         from app.core import DEFAULT_THRESHOLD_MS, clamp_threshold
 
         self.assertEqual(clamp_threshold(float("inf")), DEFAULT_THRESHOLD_MS)
+
+
+class InstanceLockTests(unittest.TestCase):
+    """A copy still starting up is found through its lock, not left running."""
+
+    def setUp(self) -> None:
+        from app import main as main_module
+
+        self.main = main_module
+        patch = mock.patch.object(main_module, "SERVER_NAME", f"dcf-test-lock-{os.getpid()}-{id(self)}")
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_quit_waits_for_a_starting_copy_and_for_it_to_exit(self) -> None:
+        held = self.main._instance_lock()
+        self.assertTrue(held.tryLock(0))  # a copy that has started
+        attempts = []
+
+        def hand_over(request):
+            attempts.append(request)
+            if len(attempts) < 3:
+                return False  # still starting: not listening yet
+            held.unlock()  # it answers, and exits
+            return True
+
+        with mock.patch.object(self.main, "_hand_over_to_running_instance", side_effect=hand_over), \
+                mock.patch.object(self.main, "sleep"):
+            self.main._quit_running_copy()
+        self.assertEqual(attempts, [b"quit"] * 3)
+
+    def test_quit_returns_at_once_when_nothing_runs(self) -> None:
+        with mock.patch.object(self.main, "_hand_over_to_running_instance", return_value=False) as hand:
+            self.main._quit_running_copy()
+        # One try, for a copy too old to take the lock; no waiting.
+        hand.assert_called_once_with(b"quit")
+
+    def test_second_launch_hands_over_instead_of_starting(self) -> None:
+        held = self.main._instance_lock()
+        self.assertTrue(held.tryLock(0))
+        self.addCleanup(held.unlock)
+        with mock.patch.object(self.main, "_hand_over_to_running_instance", side_effect=[False, True]) as hand, \
+                mock.patch.object(self.main, "Application") as application, \
+                mock.patch.object(self.main, "sleep"):
+            self.assertEqual(self.main.main(["DoubleClickFixer"]), 0)
+        application.assert_not_called()
+        self.assertEqual(hand.call_count, 2)
 
 
 if __name__ == "__main__":
