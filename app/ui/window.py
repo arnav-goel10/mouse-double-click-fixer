@@ -66,8 +66,18 @@ PAGES = [
 ]
 
 
+def label(text: str) -> str:
+    """Button and menu wording in the platform's own case: Title Case on
+    macOS ("Check Now"), sentence case on Windows ("Check now")."""
+    if IS_MAC:
+        return text
+    first, *rest = text.split(" ")
+    keep = {"DoubleClick", "Fixer", "Accessibility"}
+    return " ".join([first, *(word if word in keep else word.lower() for word in rest)])
+
+
 def _button(text: str, default: bool = False) -> QPushButton:
-    button = QPushButton(text)
+    button = QPushButton(label(text))
     set_primary(button, default)
     return button
 
@@ -158,6 +168,8 @@ class Page(QWidget):
 # -- panes -----------------------------------------------------------------------
 
 class FilterPage(Page):
+    calibrate_requested = Signal()
+
     def __init__(self, controller: AppController, parent: Optional[QWidget] = None) -> None:
         super().__init__("Bounce Filter", parent)
         self.controller = controller
@@ -165,7 +177,8 @@ class FilterPage(Page):
 
         self.permission = self.section()
         self.permission_button = _button("Open Settings…")
-        self.permission_button.clicked.connect(permissions.open_accessibility_settings)
+        # The same path as the switch: once access is granted, the filter starts.
+        self.permission_button.clicked.connect(lambda: self.window().request_filter(True))
         self.permission_row = self.permission.add(
             Row(
                 "Accessibility access required",
@@ -201,7 +214,9 @@ class FilterPage(Page):
         slider_layout.addWidget(self.slider)
         slider_layout.addWidget(self.value)
         window.add(Row("Ignore presses within", "", slider_box, card_icon("stopwatch")))
-        self.footnote("Most worn switches bounce within 30 ms.")
+        self.window_note = self.footnote("")
+        self.window_note.setTextFormat(Qt.TextFormat.RichText)
+        self.window_note.linkActivated.connect(lambda _link: self.calibrate_requested.emit())
 
         self.header("Buttons")
         buttons = self.section()
@@ -237,6 +252,14 @@ class FilterPage(Page):
             self.status_row.set_detail("Ignores the extra click a worn switch adds.")
         self.slider.setValue(threshold)
         self.value.setText(f"{threshold} ms")
+        if self.controller.calibrated:
+            self.window_note.setText("Most worn switches bounce within 30 ms.")
+        else:
+            accent = look().accent.name()
+            self.window_note.setText(
+                f'Not calibrated yet. <a href="calibrate" style="color:{accent}; text-decoration:none">'
+                f"{label('Calibrate')}</a> measures your mouse and sets this for you."
+            )
         for button, switch in self.button_switches.items():
             switch.setChecked(button in self.controller.buttons, animate=False)
         self.total_value.setText(f"{self.controller.filtered_total:,}")
@@ -315,10 +338,22 @@ class TestPage(Page):
         # With the filter on, bounces are removed before this pad sees them,
         # so an all-green chart would otherwise read as a healthy mouse.
         self.chart_note.setText(
-            "Bounce Filter is on, so blocked bounces don’t appear here."
+            "Bounce Filter is on: red bars are bounces it blocked."
             if self.controller.active
             else "Red bars fall within the filter window."
         )
+
+    def note_global_event(self, event: ClickEvent) -> None:
+        """A bounce the system-wide filter blocked. With the filter on, this
+        pad never receives it, so show it here: proof the filter works."""
+        if (
+            self.isVisible()
+            and event.is_bounce
+            and event.button is Button.LEFT
+            and event.gap_ms is not None
+        ):
+            self.timeline.add(event.gap_ms, True)
+            self.pad.flash(True)
 
     def reset(self) -> None:
         self.clicks = 0
@@ -473,13 +508,14 @@ class CalibratePage(Page):
         self.restart_button.setVisible(self.phase != "intro")
         self.progress_row.setVisible(self.phase in ("single", "double"))
         self.pad.setVisible(not done)
+        self.primary_button.setVisible(True)
 
         if self.phase == "intro":
             self.step_row.title.setText("Calibrate your mouse")
             self.step_row.set_detail("Click once at a time, then double-click. Filtering pauses until you finish.")
             self.count_label.setText("")
-            self.pad.set_text("Ready", "")
-            self.primary_button.setText("Begin")
+            self.pad.set_text(label("Ready"), "")
+            self.primary_button.setText(label("Begin"))
             self.primary_button.setEnabled(True)
         elif self.phase == "single":
             count = self.calibrator.single_clicks
@@ -487,8 +523,8 @@ class CalibratePage(Page):
             self.step_row.set_detail(note or "Click once, then pause.")
             self.count_label.setText(f"{count} of {REQUIRED_SINGLE_CLICKS}")
             self.progress.setValue(int(self.calibrator.single_progress * 100))
-            self.pad.set_text("Click Once", "")
-            self.primary_button.setText("Skip")
+            self.pad.set_text(label("Click Once"), "")
+            self.primary_button.setText(label("Skip"))
             self.primary_button.setEnabled(True)
         elif self.phase == "double":
             count = self.calibrator.double_clicks
@@ -496,34 +532,42 @@ class CalibratePage(Page):
             self.step_row.set_detail(note or "Double-click at your usual speed.")
             self.count_label.setText(f"{count} of {REQUIRED_DOUBLE_CLICKS}")
             self.progress.setValue(int(self.calibrator.double_progress * 100))
-            self.pad.set_text("Double-Click", "")
-            self.primary_button.setText("Finish")
-            self.primary_button.setEnabled(self.calibrator.double_clicks > 0)
+            self.pad.set_text(label("Double-Click"), "")
+            # It finishes by itself at the last double-click; a Finish button
+            # here could only lead to "not enough double-clicks".
+            self.primary_button.setVisible(False)
         else:
             suggestion = self.suggestion
             self.count_label.setText("")
             if suggestion is None:
                 self.step_row.title.setText("Not enough double-clicks")
                 self.step_row.set_detail(f"Start over and double-click at least {REQUIRED_DOUBLE_CLICKS} times.")
-                self.primary_button.setText("Apply")
+                self.primary_button.setText(label("Apply"))
                 self.primary_button.setEnabled(False)
                 return
             self.step_row.title.setText("Calibration complete")
             self.step_row.set_detail("")
             self.recommended_value.setText(f"{suggestion.threshold_ms} ms")
             self.bounce_value.setText(
-                "None" if suggestion.worst_bounce_ms is None else f"{suggestion.worst_bounce_ms:.0f} ms"
+                "None detected" if suggestion.worst_bounce_ms is None else f"{suggestion.worst_bounce_ms:.0f} ms"
             )
             self.double_value.setText(f"{suggestion.fastest_double_click_ms:.0f} ms")
-            # Only speak up when the result needs a caveat.
-            self.summary.setText(
-                ""
-                if suggestion.confident
-                else "Little margin between bounce and your double-clicks. "
-                "Raise the window if bounce still gets through."
-            )
-            self.summary.setVisible(not suggestion.confident)
-            self.primary_button.setText("Apply")
+            # Only speak up when the result needs a caveat or an explanation.
+            if not suggestion.confident:
+                note = (
+                    "Little margin between bounce and your double-clicks. "
+                    "Raise the window if bounce still gets through."
+                )
+            elif suggestion.worst_bounce_ms is None:
+                note = (
+                    "Your mouse didn’t bounce this time. Bounce comes and goes, so a light "
+                    "filter is kept on; the Test pane shows bounce when it happens."
+                )
+            else:
+                note = ""
+            self.summary.setText(note)
+            self.summary.setVisible(bool(note))
+            self.primary_button.setText(label("Apply"))
             self.primary_button.setEnabled(True)
 
 
@@ -601,22 +645,28 @@ class GeneralPage(Page):
         release = updater.release
         states = {
             updater.CHECKING: ("Checking for updates…", "Check Now", False),
-            updater.CURRENT: ("Up to date", "Check Now", True),
+            updater.CURRENT: (updater.message or "Up to date", "Check Now", True),
             updater.AVAILABLE: (f"Version {release.version} is available" if release else "", "Update Now", True),
             updater.DOWNLOADING: (f"Downloading… {int(updater.progress * 100)}%", "Update Now", False),
+            updater.READY: (
+                f"Version {release.version} is ready. It installs when you close this window."
+                if release else "",
+                "Restart Now",
+                True,
+            ),
             updater.INSTALLING: ("Installing. DoubleClick Fixer will reopen.", "Update Now", False),
             updater.FAILED: (updater.message, "Try Again", True),
         }
-        detail, label, enabled = states.get(updater.state, ("", "Check Now", True))
+        detail, text, enabled = states.get(updater.state, ("", "Check Now", True))
         self.update_row.set_detail(detail)
-        self.update_button.setText(label)
+        self.update_button.setText(globals()["label"](text))
         self.update_button.setEnabled(enabled)
-        set_primary(self.update_button, updater.state == updater.AVAILABLE)
+        set_primary(self.update_button, updater.state in (updater.AVAILABLE, updater.READY))
 
     def _on_update_button(self) -> None:
         if self.updater is None:
             return
-        if self.updater.state == self.updater.AVAILABLE:
+        if self.updater.state in (self.updater.AVAILABLE, self.updater.READY):
             self.updater.install()
         else:
             self.updater.check(user_initiated=True)
@@ -724,6 +774,8 @@ class MainWindow(QWidget):
         controller.filter_state_changed.connect(self._on_filter_state)
         controller.settings_changed.connect(self.refresh)
         controller.global_event.connect(self.filter_page.note_global_event)
+        controller.global_event.connect(self.test_page.note_global_event)
+        self.filter_page.calibrate_requested.connect(self.show_calibration)
         controller.hook_failed.connect(self._on_hook_failed)
 
         self._save_timer = QTimer(self)
@@ -842,7 +894,9 @@ class MainWindow(QWidget):
     # -- state -------------------------------------------------------------------
     def refresh(self) -> None:
         granted = self._permission_granted
-        self.filter_page.refresh(granted, self._enable_when_granted and not self.controller.active)
+        waiting = self._enable_when_granted and not self.controller.active
+        self.controller.set_waiting_for_permission(waiting)
+        self.filter_page.refresh(granted, waiting)
         self.test_page.refresh()
         self.general.refresh(granted)
 
@@ -857,8 +911,9 @@ class MainWindow(QWidget):
             self.controller.set_active(True)
         elif not granted and self.controller.active:
             # Without permission the tap cannot block anything, so an "on"
-            # switch would be lying.
-            self.controller.set_active(False)
+            # switch would be lying. The saved choice stays on, so the filter
+            # returns by itself once access is back, even after a restart.
+            self.controller.stop_for_permission()
             self._enable_when_granted = True
         self.refresh()
 
@@ -881,6 +936,12 @@ class MainWindow(QWidget):
             self.refresh()
             if prompt:
                 permissions.open_accessibility_settings()
+            return
+        if checked and self.isVisible() and PAGES[self.stack.currentIndex()][0] == "calibrate":
+            # Turned on from the menu while calibrating: the pad must keep
+            # seeing raw clicks, so filtering starts when calibration ends.
+            self.controller.enable_after_calibration()
+            self.refresh()
             return
         self.controller.set_active(checked)
         self.refresh()

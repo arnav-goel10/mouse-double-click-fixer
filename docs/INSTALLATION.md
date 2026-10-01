@@ -2,13 +2,15 @@
 
 ## macOS
 
-Requires macOS 11 or later on an Apple silicon Mac (M1 or newer).
+Requires macOS 13 Ventura or later on an Apple silicon Mac (M1 or newer).
 
 1. Download [DoubleClickFixer.dmg](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest/download/DoubleClickFixer.dmg).
 2. Open it and drag **DoubleClick Fixer** onto **Applications**.
 3. Open the app from Launchpad or Spotlight. The app is not notarized yet, so
-   the first time macOS may refuse to open it: right-click the app and choose
-   **Open**, or use **System Settings › Privacy & Security › Open Anyway**.
+   the first time macOS refuses to open it. Go to **System Settings › Privacy &
+   Security**, scroll to the message about DoubleClick Fixer and choose
+   **Open Anyway**. (On macOS 14 and earlier, right-click the app and choose
+   **Open** instead.)
 4. Turn on **Bounce Filter**. macOS asks for Accessibility access: choose
    **Open System Settings** and switch **DoubleClick Fixer** on. The app notices
    within a second and starts filtering.

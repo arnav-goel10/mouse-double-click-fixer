@@ -30,7 +30,9 @@ Name: "{autodesktop}\DoubleClick Fixer"; Filename: "{app}\DoubleClickFixer.exe";
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
-Name: "startup"; Description: "Start DoubleClick Fixer when I sign in"; Flags: unchecked
+; Offered on the first install only: afterwards "Open at login" in the app
+; owns the setting, and an update must not switch it back on.
+Name: "startup"; Description: "Start DoubleClick Fixer when I sign in"; Flags: unchecked; Check: not IsUpgrade
 
 [Run]
 Filename: "{app}\DoubleClickFixer.exe"; Description: "Open DoubleClick Fixer"; Flags: nowait postinstall skipifsilent
@@ -38,6 +40,15 @@ Filename: "{app}\DoubleClickFixer.exe"; Description: "Open DoubleClick Fixer"; F
 Filename: "{app}\DoubleClickFixer.exe"; Parameters: "--updated {code:RelaunchArguments}"; Flags: nowait runasoriginaluser; Check: RelaunchRequested
 
 [Code]
+function IsUpgrade: Boolean;
+var
+  Key: String;
+begin
+  // Inno Setup's own uninstall entry for this AppId.
+  Key := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{6B0E2F4C-3D7A-4E51-9A0B-DC1F1C5E7A21}_is1';
+  Result := RegKeyExists(HKCU, Key) or RegKeyExists(HKLM, Key);
+end;
+
 // A running copy lives in the notification area and ignores window-close
 // requests (closing only hides it), so ask it to quit through its own
 // single-instance channel before files are replaced or removed. "--quit"
@@ -51,6 +62,11 @@ begin
     Exec(Exe, '--quit', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
     Sleep(800);
   end;
+  // A copy older than 0.2.7 doesn't know "--quit" (it shows its window
+  // instead), and one that is hung can't answer: end it, so no file stays
+  // in use. Its mouse hook goes with it.
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/IM DoubleClickFixer.exe /F', '', SW_HIDE,
+    ewWaitUntilTerminated, ResultCode);
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;

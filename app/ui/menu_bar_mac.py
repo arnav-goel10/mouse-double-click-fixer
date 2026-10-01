@@ -204,11 +204,9 @@ class MacMenuBarItem:
                 if active
                 else "DoubleClick Fixer: off"
             )
-        self._status_item.setTitle_(
-            f"On · {self.controller.filtered_total:,} blocked" if active else "Off"
-        )
+        self._status_item.setTitle_(self.controller.status_text())
         self._toggle_item.setState_(NSControlStateValueOn if active else NSControlStateValueOff)
-        if self.updater is not None and self.updater.state == self.updater.AVAILABLE and self.updater.release:
+        if self.updater is not None and self.updater.state in (self.updater.AVAILABLE, self.updater.READY) and self.updater.release:
             self._update_item.setTitle_(f"Update to {self.updater.release.version}")
         else:
             self._update_item.setTitle_("Check for Updates…")
@@ -219,7 +217,7 @@ class MacMenuBarItem:
 
     # -- actions ---------------------------------------------------------------
     def _check_updates(self) -> None:
-        if self.updater is not None and self.updater.state == self.updater.AVAILABLE:
+        if self.updater is not None and self.updater.state in (self.updater.AVAILABLE, self.updater.READY):
             self.updater.install()
         elif self._on_check_updates is not None:
             self._on_check_updates()

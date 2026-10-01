@@ -250,6 +250,100 @@ class NetworkTests(unittest.TestCase):
         self.assertEqual(instance.state, instance.INSTALLING, instance.message)
         install.assert_called_once()
 
+    def matching_files(self, payload=b"pretend archive"):
+        files: dict[str, bytes] = {MAC_ASSET: payload}
+        base = self.serve(files)
+        files["latest"] = json.dumps(release_json("9.9.9", base=base)).encode()
+        path = Path(tempfile.mkdtemp()) / "p"
+        path.write_bytes(payload)
+        files[CHECKSUM_ASSET] = f"{sha256_of(path)}  {MAC_ASSET}\n".encode()
+        return base
+
+    def test_a_full_disk_fails_instead_of_hanging(self) -> None:
+        base = self.matching_files()
+        instance = self.make_updater(f"{base}/latest")
+        real_open = open
+
+        class FullDisk:
+            def __init__(self, handle):
+                self.handle = handle
+
+            def write(self, _data):
+                raise OSError(28, "No space left on device")
+
+            def close(self):
+                self.handle.close()
+
+        def opener(path, mode="r", *args, **kwargs):
+            handle = real_open(path, mode, *args, **kwargs)
+            return FullDisk(handle) if "w" in mode and str(path).endswith(MAC_ASSET) else handle
+
+        with mock.patch.dict(os.environ, {updater.URL_OVERRIDE_ENV: f"{base}/latest"}), \
+                mock.patch("builtins.open", opener):
+            instance.check(user_initiated=True)
+            self.wait_for(instance, {instance.AVAILABLE})
+            instance.install()
+            self.wait_for(instance, {instance.FAILED, instance.INSTALLING})
+        self.assertEqual(instance.state, instance.FAILED)
+        self.assertIn("free space", instance.message)
+        self.assertIsNone(instance._reply)
+
+    def test_a_background_update_waits_while_the_window_is_open(self) -> None:
+        base = self.matching_files()
+        instance = self.make_updater(f"{base}/latest")
+        instance.window_visible = lambda: True
+        with mock.patch.dict(os.environ, {updater.URL_OVERRIDE_ENV: f"{base}/latest"}), \
+                mock.patch.object(instance, "_install_mac") as install:
+            instance.check(user_initiated=True)
+            self.wait_for(instance, {instance.AVAILABLE})
+            instance.install(unattended=True)
+            self.wait_for(instance, {instance.READY, instance.FAILED})
+            install.assert_not_called()
+            instance.window_visible = lambda: False
+            instance.apply_if_ready()  # the window was closed
+            install.assert_called_once()
+        self.assertEqual(instance.state, instance.INSTALLING)
+
+
+class AssetStateTests(unittest.TestCase):
+    def test_assets_still_uploading_are_ignored(self) -> None:
+        data = release_json()
+        data["assets"][0]["state"] = "open"  # the mac zip is still uploading
+        self.assertIsNone(release_from_json(data, "mac"))
+        data["assets"][0]["state"] = "uploaded"
+        self.assertIsNotNone(release_from_json(data, "mac"))
+
+
+class WindowsInstallerScriptTests(unittest.TestCase):
+    def test_a_failed_install_reopens_the_old_copy(self) -> None:
+        script = updater.windows_installer_script(
+            Path(r"C:\Temp\dcf-update-1\DoubleClickFixer-Setup.exe"),
+            Path(r"C:\Users\a\AppData\Local\Programs\DoubleClick Fixer\DoubleClickFixer.exe"),
+            "/RELAUNCH=2",
+            ["--updated", "--minimized"],
+        )
+        self.assertIn("/VERYSILENT", script)
+        self.assertIn("/RELAUNCH=2", script)
+        failure_line = next(line for line in script.splitlines() if line.startswith("if errorlevel 1"))
+        self.assertIn('start ""', failure_line)
+        self.assertIn('DoubleClickFixer.exe" --updated --minimized', failure_line)
+        self.assertIn("--updated --minimized", script)
+
+
+class RelaunchNoticeTests(unittest.TestCase):
+    def test_result_is_reported_once(self) -> None:
+        from app.controller import AppController
+
+        with tempfile.TemporaryDirectory() as folder, \
+                mock.patch("app.settings.config_dir", return_value=Path(folder)), \
+                mock.patch("app.settings.LEGACY_PATH", Path(folder) / "legacy.json"):
+            controller = AppController()
+            controller.set_pending_update("9.9.9")
+            self.assertEqual(controller.take_update_result("9.9.9"), "updated")
+            self.assertEqual(controller.take_update_result("9.9.9"), "")
+            controller.set_pending_update("9.9.9")
+            self.assertEqual(controller.take_update_result("0.2.8"), "failed")
+
 
 if __name__ == "__main__":
     unittest.main()

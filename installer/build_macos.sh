@@ -31,6 +31,23 @@ signed="$work/DoubleClick Fixer.app"
 ditto --norsrc --noextattr "$APP" "$signed"
 xattr -cr "$signed"
 
+# macOS 26+ draws layered "Liquid Glass" icons, with dark, tinted and clear
+# variants, from an Icon Composer file compiled into Assets.car. Older macOS,
+# and builds without a new enough Xcode, use AppIcon.icns as before.
+icon_work="$work/icon"
+mkdir -p "$icon_work"
+if xcrun actool installer/assets/AppIcon.icon --compile "$icon_work" --app-icon AppIcon \
+    --platform macosx --minimum-deployment-target 13.0 \
+    --output-partial-info-plist "$icon_work/partial.plist" >/dev/null 2>&1 \
+    && [[ -f "$icon_work/Assets.car" ]]; then
+  cp "$icon_work/Assets.car" "$signed/Contents/Resources/Assets.car"
+  /usr/libexec/PlistBuddy -c "Add :CFBundleIconName string AppIcon" "$signed/Contents/Info.plist" 2>/dev/null \
+    || /usr/libexec/PlistBuddy -c "Set :CFBundleIconName AppIcon" "$signed/Contents/Info.plist"
+  printf 'Added the layered macOS 26+ icon\n'
+else
+  printf 'warning: this Xcode cannot compile AppIcon.icon; using the flat icon only\n' >&2
+fi
+
 identity="${DCF_SIGN_IDENTITY:-}"
 keychain="${DCF_SIGN_KEYCHAIN:-}"
 if [[ -z "$identity" && -f "$LOCAL_SIGNING/signing.keychain-db" ]]; then

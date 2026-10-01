@@ -60,9 +60,6 @@ class ClickEvent:
     gap_ms: Optional[float]
     #: Press-to-press interval in milliseconds; only set on a press.
     interval_ms: Optional[float]
-    #: How many presses in a row were suppressed right before this one (on a
-    #: release: before the press it belongs to).
-    suppressed_run: int = 0
     #: A release held back in case the contact is only dropping out mid-hold.
     #: The caller must suppress it and deliver it later if `commit_held`
     #: says so.
@@ -83,6 +80,10 @@ class ClickEvent:
 #: switches drop contact as early as 60 ms into a drag, which overlaps the
 #: length of an ordinary click, so only the briefest taps skip the hold.
 HOLD_AFTER_MS = 30.0
+#: A release this soon after its press is the contact bouncing as it closes
+#: (no finger lets go that fast), so it is held too: if the contact settles
+#: and presses again, the press and the hold that follows stay intact.
+IMPOSSIBLE_TAP_MS = 12.0
 
 
 class BounceFilter:
@@ -114,9 +115,9 @@ class BounceFilter:
         self._last_release_at: Optional[float] = None
         self._last_press_at: Optional[float] = None
         self._held_release_at: Optional[float] = None
+        # Numbers each held release, so a timer settles only its own one.
+        self._held_id = 0
         self._swallow_release = False
-        self._suppressed_run = 0
-        self._release_run = 0
         self.filtered_count = 0
 
     def reset(self) -> None:
@@ -124,8 +125,6 @@ class BounceFilter:
         self._last_press_at = None
         self._held_release_at = None
         self._swallow_release = False
-        self._suppressed_run = 0
-        self._release_run = 0
 
     @property
     def holding_release(self) -> bool:
@@ -143,11 +142,7 @@ class BounceFilter:
                 self._held_release_at = None
                 self._swallow_release = False
                 self.filtered_count += 1
-                # The OS still counted the swallowed press as a click, so the
-                # rest of this hold and the next click need their count repaired.
-                self._release_run += 1
-                self._suppressed_run += 1
-                return ClickEvent(self.button, True, False, held_gap, None, 0, cancels_held=True)
+                return ClickEvent(self.button, True, False, held_gap, None, cancels_held=True)
             # The held release was real; it has to be delivered before this.
             self._last_release_at = self._held_release_at
             self._held_release_at = None
@@ -158,22 +153,15 @@ class BounceFilter:
         is_bounce = gap_ms is not None and gap_ms <= self.threshold_ms
         accepted = not (self.enabled and is_bounce)
 
-        suppressed_run = self._suppressed_run
-        if accepted:
-            self._suppressed_run = 0
-            # The release of this click repairs the click count by the same run.
-            self._release_run = suppressed_run
-        else:
-            self._suppressed_run += 1
-            self._release_run = 0
+        if not accepted:
             self.filtered_count += 1
 
         self._swallow_release = not accepted
         self._last_press_at = now
         if flush and accepted:
             # Delivered by the caller, after the held release.
-            return ClickEvent(self.button, True, False, gap_ms, interval_ms, suppressed_run, flush_held=True)
-        return ClickEvent(self.button, True, accepted, gap_ms, interval_ms, suppressed_run)
+            return ClickEvent(self.button, True, False, gap_ms, interval_ms, flush_held=True)
+        return ClickEvent(self.button, True, accepted, gap_ms, interval_ms)
 
     def release(self, timestamp: Optional[float] = None, allow_hold: bool = True) -> ClickEvent:
         """`allow_hold=False` delivers the release at once, for when the caller
@@ -183,33 +171,35 @@ class BounceFilter:
         if self._swallow_release:
             self._swallow_release = False
             self._last_release_at = now
-            return ClickEvent(self.button, False, False, None, None, 0)
-        run = self._release_run
-        self._release_run = 0
-        held_ms = 0.0 if self._last_press_at is None else (now - self._last_press_at) * 1000
-        if self.enabled and self.hold_releases and allow_hold and held_ms >= HOLD_AFTER_MS:
+            return ClickEvent(self.button, False, False, None, None)
+        held_ms = None if self._last_press_at is None else (now - self._last_press_at) * 1000
+        worth_holding = held_ms is not None and (held_ms >= HOLD_AFTER_MS or held_ms < IMPOSSIBLE_TAP_MS)
+        if self.enabled and self.hold_releases and allow_hold and worth_holding:
             self._held_release_at = now
-            return ClickEvent(self.button, False, False, None, None, run, held=True)
+            self._held_id += 1
+            return ClickEvent(self.button, False, False, None, None, held=True)
         self._last_release_at = now
-        return ClickEvent(self.button, False, True, None, None, run)
+        return ClickEvent(self.button, False, True, None, None)
 
     @property
-    def held_since(self) -> Optional[float]:
-        """When the release being held back happened; identifies that release."""
-        return self._held_release_at
+    def held_id(self) -> Optional[int]:
+        """Identifies the release being held back, or None. A counter rather
+        than its timestamp: Windows stamps events in ~16 ms ticks, so two
+        releases in one burst can share a time."""
+        return self._held_id if self._held_release_at is not None else None
 
-    def commit_held(self, expected: Optional[float] = None) -> bool:
+    def commit_held(self, expected: Optional[int] = None) -> bool:
         """Settle a held release once the threshold has passed.
 
         Returns True when the release was real and must now be delivered.
-        `expected` (from `held_since`) makes a timer settle only the release it
+        `expected` (from `held_id`) makes a timer settle only the release it
         was started for: after a dropout is cancelled, a later release can be
         held while the first timer is still pending, and that one needs its
         own full window.
         """
         if self._held_release_at is None:
             return False
-        if expected is not None and self._held_release_at != expected:
+        if expected is not None and self._held_id != expected:
             return False
         self._last_release_at = self._held_release_at
         self._held_release_at = None
@@ -219,7 +209,7 @@ class BounceFilter:
 def clamp_threshold(value: float) -> int:
     try:
         number = int(round(float(value)))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):  # OverflowError: infinity
         return DEFAULT_THRESHOLD_MS
     return max(MIN_THRESHOLD_MS, min(MAX_THRESHOLD_MS, number))
 

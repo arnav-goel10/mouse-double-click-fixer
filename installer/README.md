@@ -1,31 +1,36 @@
 # Packaging
 
-Build Windows from Windows:
+Release builds come from CI when a version tag is pushed; see
+[docs/RELEASING.md](../docs/RELEASING.md). These commands are for building by hand.
 
-```powershell
-.\installer\build_windows.ps1
-```
-
-Compile `installer/windows.iss` with Inno Setup to produce the Windows installer. The installer offers an optional startup shortcut.
-
-From the project root, after installing Inno Setup:
-
-```powershell
-& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "installer\windows.iss"
-```
-
-The installer is written to the `installer\Output` folder.
-
-Build macOS from macOS:
+## macOS
 
 ```bash
 bash installer/build_macos.sh
 ```
 
-The macOS script produces a universal app bundle and DMG. macOS users must grant Accessibility permission when enabling the fix. Code signing and notarization require the publisher's Apple Developer identity and are intentionally left to release CI.
+Builds `dist/DoubleClick Fixer.app` (Apple silicon), the DMG and the zip the
+in-app updater downloads. It signs with the project's self-signed certificate
+from `~/.doubleclick-fixer-signing` when that exists, and ad-hoc otherwise. An
+ad-hoc copy is fine for trying things out but not for installing: macOS ties the
+Accessibility permission to the certificate, so updates to it would ask again.
+The same goes for the **Build macOS** Actions artifact, which is ad-hoc signed.
 
-The repository also includes a GitHub Actions macOS build. Push the repository to GitHub, open **Actions**, run **Build macOS**, then download the `DoubleClickFixer-macos` artifact.
+## Windows
 
-## Uninstall cleanup
+```powershell
+.\installer\build_windows.ps1
+$version = python -c "import app; print(app.__version__)"
+& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" "installer\windows.iss"
+```
 
-The Windows installer includes an uninstaller that removes the application, shortcut, startup registry entry, and saved settings. On macOS, run `bash installer/uninstall_macos.sh` before deleting the app; it removes the app, LaunchAgent, saved settings, and preference files.
+The first command builds the portable `dist\DoubleClickFixer.exe`; the second
+wraps it in the installer, written to `installer\Output`. Pass `/DAppVersion`,
+or the installer reports a placeholder version.
+
+## Uninstalling
+
+The Windows uninstaller closes a running copy, then removes the app, its
+shortcuts, the startup entry and saved settings. On macOS,
+`bash installer/uninstall_macos.sh` quits the app and removes it, its login
+item, settings and Accessibility permission.

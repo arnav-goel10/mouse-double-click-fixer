@@ -10,7 +10,7 @@ A small menu bar and tray app for macOS and Windows that filters the extra click
 [![Latest release](https://img.shields.io/github/v/release/arnav-goel10/doubleclick-fixer?label=release&color=3055ee)](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/arnav-goel10/doubleclick-fixer/total?color=3055ee)](https://github.com/arnav-goel10/doubleclick-fixer/releases)
 [![CI](https://github.com/arnav-goel10/doubleclick-fixer/actions/workflows/ci.yml/badge.svg)](https://github.com/arnav-goel10/doubleclick-fixer/actions/workflows/ci.yml)
-[![Platforms](https://img.shields.io/badge/platform-macOS%2011%2B%20(Apple%20silicon)%20%7C%20Windows%2010%2F11-lightgrey)](#download)
+[![Platforms](https://img.shields.io/badge/platform-macOS%2013%2B%20(Apple%20silicon)%20%7C%20Windows%2010%2F11-lightgrey)](#download)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 **[Download for Mac](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest/download/DoubleClickFixer.dmg)** &nbsp;·&nbsp;
@@ -50,12 +50,12 @@ The filter works system-wide, at the same level as the mouse driver's own events
 
 | Platform | Get it | Notes |
 | --- | --- | --- |
-| **macOS 11 or later** (Apple silicon) | [DoubleClickFixer.dmg](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest/download/DoubleClickFixer.dmg) | Open it and drag DoubleClick Fixer onto Applications. |
+| **macOS 13 or later** (Apple silicon) | [DoubleClickFixer.dmg](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest/download/DoubleClickFixer.dmg) | Open it and drag DoubleClick Fixer onto Applications. |
 | **Windows 10 or 11** | [DoubleClickFixer-Setup.exe](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest/download/DoubleClickFixer-Setup.exe) | Or the [portable exe](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest/download/DoubleClickFixer.exe), no installation needed. |
 
 The builds are not yet signed with an Apple or Microsoft developer certificate, so the first launch needs one extra step:
 
-- **macOS:** right-click the app and choose **Open**. Then allow DoubleClick Fixer under **System Settings › Privacy & Security › Accessibility** when it asks; macOS only lets trusted apps filter input.
+- **macOS:** open the app once; macOS says it can't verify it. Go to **System Settings › Privacy & Security**, scroll down to the message about DoubleClick Fixer and choose **Open Anyway**. (On macOS 14 and earlier, right-click the app and choose **Open** instead.) Then allow DoubleClick Fixer under **Privacy & Security › Accessibility** when it asks; macOS only lets trusted apps filter input.
 - **Windows:** if SmartScreen appears, choose **More info › Run anyway**.
 
 Full instructions, including uninstalling: [docs/INSTALLATION.md](docs/INSTALLATION.md).
@@ -97,7 +97,7 @@ No. The only network request is the update check to this repository's GitHub rel
 <details>
 <summary><b>Will it get me flagged in games?</b></summary>
 
-Clicks are only ever blocked, never generated. The one exception is the delayed release, which is re-sent by the app. Most games don't care, but some anti-cheat systems watch for software-sent input; turn the filter off before playing those.
+The app never invents a click, but it does re-send some: a release it held back for the filter window, and a press that arrives just as that window ends, reach apps as software input (on Windows, marked as injected). Most games don't care, but some anti-cheat systems watch for software-sent input; turn the filter off before playing those.
 </details>
 
 ## Build from source

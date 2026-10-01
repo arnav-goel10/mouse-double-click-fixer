@@ -28,6 +28,16 @@ def _hand_over_to_running_instance(request: bytes = b"show") -> bool:
     login item or an update relaunch) leaves it as it is; b"quit" asks it to
     exit, which the Windows installer uses before replacing or removing it.
     """
+    if platform.system() == "Windows" and request == b"show":
+        # Windows only lets the process the user just started bring a window
+        # forward; pass that right on, or the running copy's window opens
+        # behind and its taskbar button flashes instead.
+        try:
+            import ctypes
+
+            ctypes.windll.user32.AllowSetForegroundWindow(ctypes.c_uint32(0xFFFFFFFF).value)  # ASFW_ANY
+        except Exception:  # noqa: BLE001 - cosmetic
+            pass
     socket = QLocalSocket()
     socket.connectToServer(SERVER_NAME)
     # Generous: a copy still starting up answers late, and giving up early
@@ -77,6 +87,9 @@ class Application:
             self.tray.show()
 
         self.window.closed_to_tray.connect(self._note_hidden)
+        # A background update waits while the window is open; closing it is
+        # the moment to finish.
+        self.window.closed_to_tray.connect(self.updater.apply_if_ready)
         self._told_about_tray = False
 
         self.server = QLocalServer()
@@ -143,7 +156,12 @@ class Application:
     # -- window ------------------------------------------------------------
     def show_window(self) -> None:
         dock.set_visible(True)
-        self.window.showNormal()
+        # showNormal() would also undo a maximized window; only a minimized
+        # one needs it.
+        if self.window.isMinimized():
+            self.window.showNormal()
+        else:
+            self.window.show()
         self.window.raise_()
         self.window.activateWindow()
 
@@ -159,11 +177,12 @@ class Application:
         if self.tray is None or self._told_about_tray or platform.system() == "Darwin":
             return
         self._told_about_tray = True
-        where = "the menu bar" if platform.system() == "Darwin" else "the notification area"
         self.tray.showMessage(
             "DoubleClick Fixer is still running",
-            f"It keeps filtering from the {where.removeprefix('the ')}.",
-            icons.tray_icon(self.controller.active),
+            "It keeps filtering from the notification area."
+            if self.controller.active
+            else "Bounce Filter is off. Turn it on from the icon in the notification area.",
+            icons.app_icon(),
             4000,
         )
 
@@ -205,6 +224,7 @@ class Application:
         elif not self.controller.supported():
             QTimer.singleShot(0, self._warn_unsupported)
 
+        self.updater.note_relaunch(self.controller.take_update_result(__version__))
         self.updater.start()
         from . import install_cleanup
 

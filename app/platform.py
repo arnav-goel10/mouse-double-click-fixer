@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 import platform
 import threading
-from time import monotonic
+from time import monotonic, perf_counter
 from typing import Callable, Iterable, Optional
 
 from .core import BounceFilter, Button, ClickEvent, clamp_threshold
@@ -67,9 +67,8 @@ class GlobalClickFilter:
         self._started = False
         # Per button: the event kept for a release that is being held back.
         self._held_templates: dict = {}
-        # Repairs a kept copy's click count before it is re-sent (macOS only).
-        self._repair_template = None
         self.tap_resets = 0  # times macOS disabled the tap and it was re-armed
+        self.hook_rearms = 0  # times the Windows hook was re-installed
         self._timers: list[threading.Timer] = []
         # Set by the platform runner: re-posts an event the hook suppressed.
         self._inject: Callable[[Button, bool, object], None] = lambda _b, _p, _t: None
@@ -171,12 +170,10 @@ class GlobalClickFilter:
             event = click_filter.press(timestamp) if pressed else click_filter.release(timestamp, allow_hold)
             if event.is_bounce:
                 self.filtered_count += 1
-            if event.suppressed_run and template is not None and self._repair_template:
-                self._repair_template(template, event.suppressed_run)
             if event.held:
                 self._held_templates[button] = template
                 timer = threading.Timer(
-                    click_filter.threshold_ms / 1000.0, self._commit_held, (button, click_filter.held_since)
+                    click_filter.threshold_ms / 1000.0, self._commit_held, (button, click_filter.held_id)
                 )
                 timer.daemon = True
                 self._timers = [t for t in self._timers if t.is_alive()] + [timer]
@@ -306,10 +303,13 @@ class GlobalClickFilter:
         user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
         user32.SendInput.restype = wintypes.UINT
 
-        def inject(button: Button, pressed: bool, _template: object) -> None:
+        def inject(button: Button, pressed: bool, template: object) -> None:
             # Re-post a suppressed press or release at the current pointer
-            # position, tagged so this hook lets it through.
-            event = INPUT(INPUT_MOUSE, MOUSEINPUT(0, 0, 0, SEND_FLAGS[(button, pressed)], 0, INJECTED_MARK))
+            # position, tagged so this hook lets it through. `template` is the
+            # event's own tick time: apps then see when it really happened, not
+            # when it was let through.
+            when = int(template) & 0xFFFFFFFF if isinstance(template, int) else 0
+            event = INPUT(INPUT_MOUSE, MOUSEINPUT(0, 0, 0, SEND_FLAGS[(button, pressed)], when, INJECTED_MARK))
             user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(INPUT))
 
         self._inject = inject
@@ -319,9 +319,26 @@ class GlobalClickFilter:
         kernel32.GetTickCount.restype = wintypes.DWORD
         ticks = TickClock(kernel32.GetTickCount)
         targets = InjectableWindows(user32, kernel32)
+        # Windows silently removes a low-level hook whose callback runs past
+        # LowLevelHooksTimeout, and says nothing: the thread lives on and no
+        # click is filtered again. So a slow callback re-installs the hook,
+        # and so does a timer once a minute, in case a stall went unseen.
+        WM_REARM = 0x8000 + 0x44  # WM_APP + n
+        WM_TIMER = 0x0113
+        SLOW_CALLBACK_S = 0.2
+        REARM_INTERVAL_MS = 60_000
+        thread_id = kernel32.GetCurrentThreadId()
 
         @HOOKPROC
         def callback(code: int, message: int, data: int) -> int:
+            started = perf_counter()
+            try:
+                return decide(code, message, data)
+            finally:
+                if perf_counter() - started > SLOW_CALLBACK_S:
+                    user32.PostThreadMessageW(thread_id, WM_REARM, 0, 0)
+
+        def decide(code: int, message: int, data: int) -> int:
             if code >= 0:
                 entry = BUTTONS.get(int(message))
                 if entry is not None:
@@ -335,10 +352,16 @@ class GlobalClickFilter:
                         allow_hold = pressed or targets.accepts_injection(info.pt)
                         # `time` is the tick count, in milliseconds, recorded
                         # when the driver produced the event.
-                        event = self._handle(button, pressed, ticks.seconds(info.time), allow_hold=allow_hold)
+                        event = self._handle(
+                            button, pressed, ticks.seconds(info.time), int(info.time), allow_hold=allow_hold
+                        )
                         if not event.accepted:
                             return 1
             return user32.CallNextHookEx(None, code, message, data)
+
+        user32.SetTimer.argtypes = [wintypes.HWND, ctypes.c_size_t, wintypes.UINT, ctypes.c_void_p]
+        user32.SetTimer.restype = ctypes.c_size_t
+        user32.KillTimer.argtypes = [wintypes.HWND, ctypes.c_size_t]
 
         hook = user32.SetWindowsHookExW(WH_MOUSE_LL, callback, None, 0)
         if not hook:
@@ -347,15 +370,25 @@ class GlobalClickFilter:
             return
         self._started = True
         self._ready.set()
+        timer = user32.SetTimer(None, 0, REARM_INTERVAL_MS, None)
         message = wintypes.MSG()
         try:
             while not self._stop_event.is_set():
                 result = user32.GetMessageW(ctypes.byref(message), None, 0, 0)
                 if result in (0, -1) or message.message == WM_QUIT:
                     break
+                if message.message in (WM_REARM, WM_TIMER):
+                    fresh = user32.SetWindowsHookExW(WH_MOUSE_LL, callback, None, 0)
+                    if fresh:
+                        user32.UnhookWindowsHookEx(hook)
+                        hook = fresh
+                        self.hook_rearms += 1
+                    continue
                 user32.TranslateMessage(ctypes.byref(message))
                 user32.DispatchMessageW(ctypes.byref(message))
         finally:
+            if timer:
+                user32.KillTimer(None, timer)
             user32.UnhookWindowsHookEx(hook)
 
     # -- macOS -------------------------------------------------------------
@@ -377,19 +410,20 @@ class GlobalClickFilter:
         filter_injected = _filter_injected()
 
         def inject(_button: Button, pressed: bool, template: object) -> None:
-            # Re-post the kept copy of a suppressed event, stamped now and, for
-            # a release, at the pointer's current position (a drag has moved
-            # on since), tagged so this tap lets it through.
+            # Re-post the kept copy of a suppressed event, tagged so this tap
+            # lets it through. It keeps its own timestamp, so apps see when the
+            # click really happened; a release moves to the pointer's current
+            # position, since a drag has moved on and posting it where it was
+            # would jump the pointer back.
             if template is None:
                 return
             Quartz.CGEventSetIntegerValueField(template, Quartz.kCGEventSourceUserData, INJECTED_MARK)
-            Quartz.CGEventSetTimestamp(template, _mach_now())
             if not pressed:
                 Quartz.CGEventSetLocation(template, Quartz.CGEventGetLocation(Quartz.CGEventCreate(None)))
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, template)
 
         self._inject = inject
-        self._repair_template = lambda template, run: _rewrite_click_state(Quartz, template, run)
+        click_counts = ClickCountRepair()
 
         def callback(proxy: object, event_type: int, event: object, refcon: object) -> object:
             # An exception here would make PyObjC return nothing, which drops
@@ -423,14 +457,17 @@ class GlobalClickFilter:
                 if number != 2:
                     return event  # a side button, not the middle one
 
+            # Repair the click count first, so the copy kept for a re-send
+            # carries the corrected count too.
+            state = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGMouseEventClickState)
+            corrected = click_counts.correct(button, pressed, state)
+            if corrected != state:
+                Quartz.CGEventSetIntegerValueField(event, Quartz.kCGMouseEventClickState, corrected)
             result = self._handle(
                 button, pressed, to_seconds(Quartz.CGEventGetTimestamp(event)), Quartz.CGEventCreateCopy(event)
             )
-            if not result.accepted:
-                return None
-            if result.suppressed_run:
-                _rewrite_click_state(Quartz, event, result.suppressed_run)
-            return event
+            click_counts.record(button, result)
+            return event if result.accepted else None
 
         mask = 0
         for event_type in BUTTONS:
@@ -527,8 +564,12 @@ class InjectableWindows:
         self._user32 = user32
         self._kernel32 = kernel32
         self._advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
-        user32.WindowFromPoint.argtypes = [wintypes.POINT]
-        user32.WindowFromPoint.restype = wintypes.HWND
+        # Not WindowFromPoint: it asks the window under the pointer to hit-test
+        # itself (WM_NCHITTEST), which blocks on a window that is busy, long
+        # enough for Windows to drop the hook. This walks the window list only.
+        user32.GetDesktopWindow.restype = wintypes.HWND
+        user32.ChildWindowFromPointEx.argtypes = [wintypes.HWND, wintypes.POINT, wintypes.UINT]
+        user32.ChildWindowFromPointEx.restype = wintypes.HWND
         user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
         user32.GetAncestor.restype = wintypes.HWND
         user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
@@ -568,7 +609,12 @@ class InjectableWindows:
         if self._elevated:
             return True
         try:
-            windows = [self._user32.WindowFromPoint(point)]
+            CWP_SKIPINVISIBLE, CWP_SKIPDISABLED, CWP_SKIPTRANSPARENT = 0x1, 0x2, 0x4
+            desktop = self._user32.GetDesktopWindow()
+            under = self._user32.ChildWindowFromPointEx(
+                desktop, point, CWP_SKIPINVISIBLE | CWP_SKIPDISABLED | CWP_SKIPTRANSPARENT
+            )
+            windows = [under if under != desktop else None]
             # A drag sends its release to the window that captured the mouse,
             # wherever the pointer is.
             info = self._GUITHREADINFO()
@@ -625,29 +671,29 @@ class InjectableWindows:
             self._kernel32.CloseHandle(token)
 
 
-def _rewrite_click_state(Quartz, event: object, suppressed: int) -> None:
-    """Undo the click count macOS added for presses that were suppressed.
+class ClickCountRepair:
+    """Keep macOS's click count right when presses are suppressed.
 
-    macOS tags each press with how many clicks it counts as. A suppressed
-    bounce still bumped that counter, so without this a real double-click
-    arrives labeled as a triple-click.
+    macOS numbers each press of a chain (1 = single, 2 = double, ...) as it
+    sees it, before the filter runs, so every suppressed bounce still adds one.
+    This tracks how many presses of the current chain were suppressed and
+    takes them off every later press and release in the chain; macOS starting
+    a new chain (a press numbered 1) clears the count.
     """
-    try:
-        state = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGMouseEventClickState)
-        if state > 1:
-            Quartz.CGEventSetIntegerValueField(
-                event, Quartz.kCGMouseEventClickState, max(1, state - suppressed)
-            )
-    except Exception:  # pragma: no cover - never break the event stream
-        pass
 
+    def __init__(self) -> None:
+        self._suppressed: dict[Button, int] = {}
 
-def _mach_now() -> int:
-    import ctypes
+    def correct(self, button: Button, pressed: bool, state: int) -> int:
+        if pressed and state <= 1:
+            self._suppressed[button] = 0
+        return max(1, state - self._suppressed.get(button, 0)) if state >= 1 else state
 
-    libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
-    libc.mach_absolute_time.restype = ctypes.c_uint64
-    return int(libc.mach_absolute_time())
+    def record(self, button: Button, result: ClickEvent) -> None:
+        # A press that never reaches apps, except one only being re-ordered
+        # behind a late release (flush_held), which apps still get.
+        if result.pressed and not result.accepted and not result.flush_held:
+            self._suppressed[button] = self._suppressed.get(button, 0) + 1
 
 
 def _mach_timebase() -> Callable[[int], float]:

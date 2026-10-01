@@ -100,60 +100,103 @@ class LifecycleTests(unittest.TestCase):
         self.assertFalse(click_filter.running)
 
 
-if __name__ == "__main__":
-    unittest.main()
+class FakeTimer:
+    """Stands in for threading.Timer: records each timer instead of starting
+    it, so a test decides exactly when it fires instead of racing the clock."""
+
+    created: list = []
+    daemon = True
+
+    def __init__(self, _interval, function, args=()):
+        self.function, self.args = function, args
+        FakeTimer.created.append(self)
+
+    @classmethod
+    def reset(cls) -> list:
+        cls.created = []
+        return cls.created
+
+    def start(self):
+        pass
+
+    def is_alive(self):
+        return False
+
+    def cancel(self):
+        pass
+
+    def fire(self):
+        self.function(*self.args)
 
 
 class HeldReleaseTests(unittest.TestCase):
     """The hook re-injects what the core holds back, in the right order."""
 
     def setUp(self) -> None:
+        from unittest import mock
+
         self.injected = []
+        self.timers = FakeTimer.reset()
+        patch = mock.patch("app.platform.threading.Timer", FakeTimer)
+        patch.start()
+        self.addCleanup(patch.stop)
         self.filter = GlobalClickFilter(40, [Button.LEFT])
         self.filter._use_os_time = True
         self.filter._inject = lambda button, pressed, template: self.injected.append((pressed, template))
 
-    def test_dropout_is_swallowed_and_nothing_is_injected(self) -> None:
-        from time import sleep
+    def fire_all(self) -> None:
+        for timer in list(self.timers):
+            timer.fire()
 
+    def test_dropout_is_swallowed_and_nothing_is_injected(self) -> None:
         self.assertTrue(self.filter._handle(Button.LEFT, True, 0.0, "down").accepted)
         self.assertFalse(self.filter._handle(Button.LEFT, False, 0.5, "up").accepted)
         self.assertFalse(self.filter._handle(Button.LEFT, True, 0.51, "down2").accepted)
-        sleep(0.1)  # past the 40 ms window
+        self.fire_all()  # the window ends
         self.assertEqual(self.injected, [])
 
     def test_real_release_is_delivered_after_the_window(self) -> None:
-        from time import sleep
-
         self.filter._handle(Button.LEFT, True, 0.0, "down")
         self.filter._handle(Button.LEFT, False, 0.5, "up")
-        sleep(0.15)
+        self.assertEqual(self.injected, [], "nothing before the window ends")
+        self.fire_all()
         self.assertEqual(self.injected, [(False, "up")])
 
     def test_late_press_replays_release_then_press(self) -> None:
         self.filter._handle(Button.LEFT, True, 0.0, "down")
         self.filter._handle(Button.LEFT, False, 0.5, "up")
-        # Arrives after the window but before the timer fires.
-        self.filter._filters[Button.LEFT].threshold_ms = 40
+        # Arrives after the window, but before the timer has fired.
         event = self.filter._handle(Button.LEFT, True, 0.6, "down2")
         self.assertFalse(event.accepted)
         self.assertEqual(self.injected, [(False, "up"), (True, "down2")])
-
-    def test_held_copy_gets_its_click_count_repaired(self) -> None:
-        repaired = []
-        self.filter._repair_template = lambda template, run: repaired.append((template, run))
-        self.filter._handle(Button.LEFT, True, 0.0, "down")
-        self.filter._handle(Button.LEFT, False, 0.08, "up")
-        self.filter._handle(Button.LEFT, True, 0.087, "bounce")   # cancels the held up
-        self.filter._handle(Button.LEFT, False, 0.095, "up2")     # held again
-        self.assertEqual(repaired, [("up2", 1)])
-        self.filter.stop()
+        self.fire_all()
+        self.assertEqual(len(self.injected), 2, "the late timer must not deliver it twice")
 
     def test_stopping_delivers_a_held_release(self) -> None:
         self.filter._handle(Button.LEFT, True, 0.0, "down")
         self.filter._handle(Button.LEFT, False, 0.5, "up")
         self.filter.stop()
         self.assertEqual(self.injected, [(False, "up")], "apps must not think the button is stuck")
+
+    def test_bounce_as_the_contact_closes_keeps_the_drag(self) -> None:
+        # Press, a 3 ms flicker open, closed again: the start of a drag.
+        self.filter._handle(Button.LEFT, True, 0.000, "down")
+        self.assertTrue(self.filter._handle(Button.LEFT, False, 0.003, "flicker").held)
+        self.assertTrue(self.filter._handle(Button.LEFT, True, 0.008, "back").cancels_held)
+        lift = self.filter._handle(Button.LEFT, False, 0.500, "lift")
+        self.assertTrue(lift.held, "the real lift must not be swallowed")
+        self.fire_all()
+        self.assertEqual(self.injected, [(False, "lift")])
+
+    def test_releases_in_one_tick_keep_their_own_windows(self) -> None:
+        # Windows stamps events in ~16 ms ticks: these all share one time.
+        self.filter._handle(Button.LEFT, True, 1.0, "down")
+        self.filter._handle(Button.LEFT, False, 1.3, "up1")
+        self.filter._handle(Button.LEFT, True, 1.3, "back1")
+        self.filter._handle(Button.LEFT, False, 1.3, "up2")
+        first, _second = self.timers
+        first.fire()
+        self.assertEqual(self.injected, [], "the first timer must not settle the second release")
 
 
 class TimerTokenTests(unittest.TestCase):
@@ -163,29 +206,7 @@ class TimerTokenTests(unittest.TestCase):
         from unittest import mock
 
         injected = []
-        timers = []
-
-        class FakeTimer:
-            """Records the timer instead of starting it, so the test decides
-            exactly when each one fires."""
-
-            def __init__(self, _interval, function, args):
-                self.function, self.args = function, args
-                timers.append(self)
-
-            daemon = True
-
-            def start(self):
-                pass
-
-            def is_alive(self):
-                return False
-
-            def cancel(self):
-                pass
-
-            def fire(self):
-                self.function(*self.args)
+        timers = FakeTimer.reset()
 
         click_filter = GlobalClickFilter(40, [Button.LEFT])
         click_filter._use_os_time = True
@@ -243,3 +264,60 @@ class AllowHoldTests(unittest.TestCase):
         release = click_filter._handle(Button.LEFT, False, 0.5, "up", allow_hold=False)
         self.assertTrue(release.accepted)
         self.assertFalse(release.held)
+
+
+class ClickCountRepairTests(unittest.TestCase):
+    """macOS numbers presses before the filter runs; the repair undoes that."""
+
+    def run_chain(self, chain):
+        """chain: (pressed, os_state, accepted, flush) per event -> states apps see."""
+        from app.core import ClickEvent
+        from app.platform import ClickCountRepair
+
+        repair = ClickCountRepair()
+        seen = []
+        for pressed, state, accepted, flush in chain:
+            corrected = repair.correct(Button.LEFT, pressed, state)
+            repair.record(Button.LEFT, ClickEvent(Button.LEFT, pressed, accepted, None, None, flush_held=flush))
+            if accepted or flush:
+                seen.append((pressed, corrected))
+        return seen
+
+    def test_triple_click_with_one_bounce_stays_a_triple_click(self) -> None:
+        seen = self.run_chain([
+            (True, 1, True, False), (False, 1, True, False),
+            (True, 2, False, False), (False, 2, False, False),   # bounce, suppressed
+            (True, 3, True, False), (False, 3, True, False),
+            (True, 4, True, False), (False, 4, True, False),
+        ])
+        self.assertEqual([state for pressed, state in seen if pressed], [1, 2, 3])
+        self.assertEqual([state for pressed, state in seen if not pressed], [1, 2, 3])
+
+    def test_dropout_mid_drag_keeps_the_release_a_single_click(self) -> None:
+        seen = self.run_chain([
+            (True, 1, True, False),
+            (False, 1, False, False),   # held, then cancelled
+            (True, 2, False, False),    # the contact coming back
+            (False, 2, True, False),    # the real lift
+        ])
+        self.assertEqual(seen, [(True, 1), (False, 1)])
+
+    def test_a_new_chain_clears_the_count(self) -> None:
+        seen = self.run_chain([
+            (True, 1, True, False), (False, 1, True, False),
+            (True, 2, False, False), (False, 2, False, False),
+            (True, 1, True, False), (False, 1, True, False),     # later, a fresh click
+            (True, 2, True, False),                              # a real double-click
+        ])
+        self.assertEqual([state for pressed, state in seen if pressed], [1, 1, 2])
+
+    def test_a_reordered_press_still_counts(self) -> None:
+        seen = self.run_chain([
+            (True, 1, True, False), (False, 1, False, False),    # held release
+            (True, 2, False, True),                              # flushed: apps get it
+        ])
+        self.assertEqual(seen, [(True, 1), (True, 2)])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -57,6 +57,7 @@ users grant Accessibility one more time.
 ```bash
 bash installer/build_macos.sh       # app, DMG and updater zip in dist/
 .\installer\build_windows.ps1       # portable exe; then compile installer\windows.iss
+                                    # with ISCC "/DAppVersion=<version>" (see installer/README.md)
 ```
 
 Build outside a synced folder if you can; iCloud Drive adds file attributes

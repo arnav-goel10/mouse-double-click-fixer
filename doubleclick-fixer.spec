@@ -79,7 +79,9 @@ if sys.platform == "darwin":
             "CFBundleVersion": VERSION,
             "NSHighResolutionCapable": True,
             "NSRequiresAquaSystemAppearance": False,
-            "LSMinimumSystemVersion": "11.0",
+            # Qt 6.11 needs macOS 13; macOS then refuses to open the app on
+            # anything older with a clear message, instead of a crash.
+            "LSMinimumSystemVersion": "13.0",
             "LSApplicationCategoryType": "public.app-category.utilities",
             # A menu bar app: no Dock icon at launch. The app shows one only
             # while its window is open (app/ui/dock.py).

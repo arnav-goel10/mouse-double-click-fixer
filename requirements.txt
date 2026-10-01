@@ -1,5 +1,8 @@
+# Pinned, so every release is built from the same Qt and PyObjC; Dependabot
+# proposes upgrades. Check the macOS minimum when Qt changes: it sets
+# LSMinimumSystemVersion in doubleclick-fixer.spec (Qt 6.11 needs macOS 13).
 # Qt user interface, tray icon and native event access.
-PySide6-Essentials>=6.9
+PySide6-Essentials==6.11.2
 # macOS: the event tap (Quartz) and native window materials and symbols (AppKit).
-pyobjc-framework-Quartz>=10.0; sys_platform == "darwin"
-pyobjc-framework-Cocoa>=10.0; sys_platform == "darwin"
+pyobjc-framework-Quartz==12.2.2; sys_platform == "darwin"
+pyobjc-framework-Cocoa==12.2.2; sys_platform == "darwin"

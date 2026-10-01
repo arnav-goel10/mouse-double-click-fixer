@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Callable, Optional
 
+from PySide6.QtCore import QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon, QWidget
 
@@ -54,13 +55,14 @@ class Tray(QSystemTrayIcon):
         menu.addSeparator()
 
         open_action = QAction("Open DoubleClick Fixer", menu)
+        # Windows wording: sentence case (the macOS menu has its own module).
         open_action.triggered.connect(lambda: on_open())
         menu.addAction(open_action)
         calibrate_action = QAction("Calibrate…", menu)
         calibrate_action.triggered.connect(lambda: on_calibrate())
         menu.addAction(calibrate_action)
         self.updater = updater
-        self.update_action = QAction("Check for Updates…", menu)
+        self.update_action = QAction("Check for updates…", menu)
         self.update_action.triggered.connect(self._on_update_action)
         self._on_check_updates = on_check_updates
         if updater is not None and updater.supported:
@@ -79,6 +81,12 @@ class Tray(QSystemTrayIcon):
         controller.settings_changed.connect(self.refresh)
         controller.global_event.connect(lambda *_: self.refresh())
         self.refresh()
+        # Windows sends no theme signal Qt passes on when only the taskbar
+        # switches between light and dark, so look now and then.
+        self._theme_timer = QTimer(self)
+        self._theme_timer.setInterval(5000)
+        self._theme_timer.timeout.connect(self.refresh)
+        self._theme_timer.start()
 
     def _on_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         # macOS opens the menu on click; Windows opens the app, as tray apps do.
@@ -91,16 +99,16 @@ class Tray(QSystemTrayIcon):
             self._on_open()
 
     def _on_update_action(self) -> None:
-        if self.updater is not None and self.updater.state == self.updater.AVAILABLE:
+        if self.updater is not None and self.updater.state in (self.updater.AVAILABLE, self.updater.READY):
             self.updater.install()
         elif self._on_check_updates is not None:
             self._on_check_updates()
 
     def refresh(self) -> None:
-        if self.updater is not None and self.updater.state == self.updater.AVAILABLE and self.updater.release:
+        if self.updater is not None and self.updater.state in (self.updater.AVAILABLE, self.updater.READY) and self.updater.release:
             self.update_action.setText(f"Update to {self.updater.release.version}")
         else:
-            self.update_action.setText("Check for Updates…")
+            self.update_action.setText("Check for updates…")
         active = self.controller.active
         state = (active, icons.taskbar_is_light())
         if state != getattr(self, "_icon_state", None):
@@ -109,11 +117,9 @@ class Tray(QSystemTrayIcon):
             self._icon_state = state
             self.setIcon(icons.tray_icon(active))
         self.toggle_action.setChecked(active)
-        if active:
-            self.status_action.setText(
-                f"On · {self.controller.filtered_total:,} blocked"
-            )
-            self.setToolTip(f"DoubleClick Fixer: on, {self.controller.threshold_ms} ms")
-        else:
-            self.status_action.setText("Off")
-            self.setToolTip("DoubleClick Fixer: off")
+        status = self.controller.status_text()
+        self.status_action.setText(status)
+        self.setToolTip(
+            f"DoubleClick Fixer: on, {self.controller.threshold_ms} ms" if active
+            else f"DoubleClick Fixer: {status[0].lower()}{status[1:]}"
+        )

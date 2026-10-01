@@ -175,10 +175,15 @@ class WindowTests(unittest.TestCase):
         with mock.patch("app.permissions.needs_accessibility", return_value=True), mock.patch(
             "app.permissions.has_accessibility", return_value=False
         ), mock.patch.object(type(self.controller), "active", new_callable=mock.PropertyMock, return_value=True), \
+                mock.patch.object(self.controller, "stop_for_permission") as stop, \
                 mock.patch.object(self.controller, "set_active") as set_active:
             self.window._permission_granted = True
             self.window._check_permission()
-            set_active.assert_called_once_with(False)
+            stop.assert_called_once_with()
+            # Not set_active(False): that would save "off", and the filter would
+            # not come back by itself once access is granted again.
+            set_active.assert_not_called()
+            self.assertTrue(self.window._enable_when_granted)
 
     def test_window_reopens_at_the_size_it_was_left(self) -> None:
         from app.ui.window import MainWindow
@@ -219,10 +224,6 @@ class WindowTests(unittest.TestCase):
         self.window.show()
         self.window.closeEvent(QEvent(QEvent.Type.Close))
         self.assertTrue(self.window.isHidden())
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class MenuBarItemTests(unittest.TestCase):
@@ -328,6 +329,63 @@ class QuitCommandTests(unittest.TestCase):
 
         from app import main as main_module
 
-        started = monotonic()
-        self.assertEqual(main_module.main(["DoubleClickFixer", "--quit"]), 0)
-        self.assertLess(monotonic() - started, 3.0)
+        # A name of its own: the real one would reach (and quit) a copy of
+        # the app the developer has running.
+        with mock.patch.object(main_module, "SERVER_NAME", f"dcf-test-quit-{os.getpid()}"):
+            started = monotonic()
+            self.assertEqual(main_module.main(["DoubleClickFixer", "--quit"]), 0)
+            self.assertLess(monotonic() - started, 3.0)
+
+    def test_quit_is_sent_to_a_running_copy(self) -> None:
+        from app import main as main_module
+
+        with mock.patch.object(main_module, "_hand_over_to_running_instance", return_value=True) as hand:
+            self.assertEqual(main_module.main(["DoubleClickFixer", "--quit"]), 0)
+        hand.assert_called_once_with(b"quit")
+
+
+class StateFixTests(unittest.TestCase):
+    """Fixes from the 0.2.8 audit: saved choices and calibration pauses."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.application = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        self.folder = tempfile.TemporaryDirectory()
+        patches = [
+            mock.patch("app.settings.config_dir", return_value=Path(self.folder.name)),
+            mock.patch("app.settings.LEGACY_PATH", Path(self.folder.name) / "legacy.json"),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.addCleanup(self.folder.cleanup)
+        from app.controller import AppController
+
+        self.controller = AppController()
+
+    def test_turning_off_while_waiting_for_permission_is_saved(self) -> None:
+        self.controller._store(fix_enabled=True)
+        self.controller.set_active(False)  # never started: only waiting
+        self.assertFalse(self.controller.settings["fix_enabled"])
+
+    def test_turning_on_during_calibration_waits_for_it_to_end(self) -> None:
+        self.controller.enable_after_calibration()
+        self.assertTrue(self.controller.suspended)
+        self.assertTrue(self.controller.settings["fix_enabled"])
+        self.assertEqual(self.controller.status_text(), "Paused for calibration")
+
+    def test_a_failed_settings_write_still_takes_effect(self) -> None:
+        with mock.patch("app.settings.save", side_effect=OSError("disk full")):
+            self.controller.set_threshold(35)
+        self.assertEqual(self.controller.threshold_ms, 35)
+
+    def test_infinite_threshold_in_settings_falls_back(self) -> None:
+        from app.core import DEFAULT_THRESHOLD_MS, clamp_threshold
+
+        self.assertEqual(clamp_threshold(float("inf")), DEFAULT_THRESHOLD_MS)
+
+
+if __name__ == "__main__":
+    unittest.main()

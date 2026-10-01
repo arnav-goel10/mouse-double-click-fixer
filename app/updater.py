@@ -121,7 +121,13 @@ def release_from_json(data: dict, kind: str) -> Optional[Release]:
     if data.get("draft") or data.get("prerelease"):
         return None
     wanted = asset_for(kind)
-    assets = {asset.get("name"): asset.get("browser_download_url") for asset in data.get("assets", [])}
+    # A release is visible while its files are still uploading; skip any that
+    # aren't finished, and the next check picks the release up.
+    assets = {
+        asset.get("name"): asset.get("browser_download_url")
+        for asset in data.get("assets", [])
+        if asset.get("state", "uploaded") == "uploaded"
+    }
     if not wanted or wanted not in assets or CHECKSUM_ASSET not in assets:
         return None
     return Release(
@@ -229,6 +235,20 @@ del "%~f0"
 """
 
 
+def windows_installer_script(installer: Path, current: Path, relaunch: str, relaunch_args: list[str]) -> str:
+    """Run the installer silently; if it fails, reopen the copy that was
+    running, so a failed update never leaves the user without the app. On
+    success the installer relaunches the new copy itself."""
+    batch = lambda value: str(value).replace("%", "%%")  # noqa: E731
+    flags = f"/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS {relaunch}"
+    return f"""@echo off
+setlocal
+"{batch(installer)}" {flags}
+if errorlevel 1 start "" "{batch(current)}" {" ".join(relaunch_args)}
+del "%~f0"
+"""
+
+
 # -- the updater ------------------------------------------------------------------
 
 class Updater(QObject):
@@ -238,8 +258,8 @@ class Updater(QObject):
     #: Emitted when the app should quit so the update can be applied.
     quit_requested = Signal()
 
-    IDLE, CHECKING, CURRENT, AVAILABLE, DOWNLOADING, INSTALLING, FAILED = (
-        "idle", "checking", "current", "available", "downloading", "installing", "failed",
+    IDLE, CHECKING, CURRENT, AVAILABLE, DOWNLOADING, READY, INSTALLING, FAILED = (
+        "idle", "checking", "current", "available", "downloading", "ready", "installing", "failed",
     )
 
     def __init__(self, controller, parent: Optional[QObject] = None) -> None:
@@ -253,6 +273,9 @@ class Updater(QObject):
         self._network = QNetworkAccessManager(self)
         self._reply: Optional[QNetworkReply] = None
         self._workdir: Optional[Path] = None
+        # A verified download waiting for a good moment to restart the app.
+        self._ready_file: Optional[Path] = None
+        self._unattended = False
         self._timer = QTimer(self)
         self._timer.setInterval(CHECK_INTERVAL_MS)
         self._timer.timeout.connect(lambda: self.check(user_initiated=False))
@@ -283,10 +306,16 @@ class Updater(QObject):
         self._reply = self._network.get(request)
         self._reply.finished.connect(lambda: self._on_checked(user_initiated))
 
-    def install(self) -> None:
-        """Download the available update and apply it."""
+    def install(self, unattended: bool = False) -> None:
+        """Download the available update and apply it. `unattended` (a
+        background update) waits rather than restart the app while its window
+        is open or calibration is running."""
+        if self.state == self.READY:
+            self._apply(self._ready_file)
+            return
         if self.release is None or self.state in (self.DOWNLOADING, self.INSTALLING):
             return
+        self._unattended = unattended
         self._workdir = Path(tempfile.mkdtemp(prefix=WORKDIR_PREFIX))
         self._set(self.DOWNLOADING, "")
         self._download(self.release.checksum_url, self._workdir / CHECKSUM_ASSET, self._on_checksums)
@@ -319,8 +348,21 @@ class Updater(QObject):
             return
         self.release = release
         self._set(self.AVAILABLE, "")
-        if not user_initiated and self.controller.settings.get("auto_update", True) and not self.controller.suspended:
-            self.install()
+        if not user_initiated and self.controller.settings.get("auto_update", True):
+            self.install(unattended=True)
+
+    def note_relaunch(self, result: str) -> None:
+        """Say how the update that just restarted the app went."""
+        if result == "updated":
+            self._set(self.CURRENT, f"Updated to {__version__}")
+        elif result == "failed":
+            self._set(self.FAILED, "The update didn’t install. Try again.")
+
+    def apply_if_ready(self) -> None:
+        """A good moment to restart (the window was closed): finish a
+        background update that was waiting."""
+        if self.state == self.READY and self._unattended and not self.controller.suspended:
+            self._apply(self._ready_file)
 
     def _download(self, url: str, target: Path, done) -> None:
         request = QNetworkRequest(QUrl(url))
@@ -338,8 +380,20 @@ class Updater(QObject):
         reply = self._network.get(request)
         self._reply = reply
 
+        failed = []
+
+        def write(data: bytes) -> bool:
+            try:
+                handle.write(data)
+                return True
+            except OSError:  # disk full, or the folder went away
+                if not failed:
+                    failed.append(True)
+                    reply.abort()
+                return False
+
         def on_ready() -> None:
-            handle.write(bytes(reply.readAll()))
+            write(bytes(reply.readAll()))
 
         def on_progress(received: int, total: int) -> None:
             if total > 0 and target.name != CHECKSUM_ASSET:
@@ -347,10 +401,17 @@ class Updater(QObject):
                 self.changed.emit()
 
         def on_finished() -> None:
-            handle.write(bytes(reply.readAll()))
-            handle.close()
+            if not failed:
+                write(bytes(reply.readAll()))
+            try:
+                handle.close()
+            except OSError:
+                failed.append(True)
             reply.deleteLater()
             self._reply = None
+            if failed:
+                self._fail("Couldn’t save the update. Check that the disk has free space.")
+                return
             if reply.error() != QNetworkReply.NetworkError.NoError:
                 self._fail("The download didn’t finish.")
                 return
@@ -377,6 +438,18 @@ class Updater(QObject):
         if not expected or sha256_of(path) != expected:
             self._fail("The download didn’t match its checksum, so it wasn’t installed.")
             return
+        if self._unattended and (self.window_visible() or self.controller.suspended):
+            # Don't restart the app under someone using it; finish when the
+            # window closes, or when they press Restart Now.
+            self._ready_file = path
+            self._set(self.READY, "")
+            return
+        self._apply(path)
+
+    def _apply(self, path: Optional[Path]) -> None:
+        if path is None or self.release is None:
+            return
+        self._ready_file = None
         self._set(self.INSTALLING, "")
         try:
             if self.kind == "mac":
@@ -391,6 +464,8 @@ class Updater(QObject):
         except UpdateError as error:
             self._fail(str(error))
             return
+        # Checked after the relaunch, to say whether it worked.
+        self.controller.set_pending_update(self.release.version)
         self.quit_requested.emit()
 
     # -- platform installs ----------------------------------------------------------
@@ -437,11 +512,23 @@ class Updater(QObject):
 
     def _install_windows_installer(self, installer: Path) -> None:
         relaunch = "/RELAUNCH=1" if self.window_visible() else "/RELAUNCH=2"
-        flags = ["/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/CLOSEAPPLICATIONS", relaunch]
-        subprocess.Popen([str(installer), *flags], creationflags=_detached_flags())
+        script = installer.parent / "apply-update.cmd"
+        script.write_text(
+            windows_installer_script(installer, Path(sys.executable), relaunch, self._relaunch_args()),
+            encoding="oem" if platform.system() == "Windows" else "utf-8",
+            errors="replace",
+        )
+        subprocess.Popen(["cmd", "/c", str(script)], creationflags=_detached_flags())
 
     def _install_windows_portable(self, downloaded: Path) -> None:
         current = Path(sys.executable)
+        # Find out now, not after quitting, whether the file can be replaced.
+        probe = current.parent / f".{WORKDIR_PREFIX}probe"
+        try:
+            probe.write_bytes(b"")
+            probe.unlink()
+        except OSError as error:
+            raise UpdateError(f"No permission to replace the app in {current.parent}.") from error
         script = downloaded.parent / "apply-update.cmd"
         # cmd.exe reads batch files in the OEM code page, not the ANSI one
         # Python writes by default; non-ASCII paths would otherwise break.

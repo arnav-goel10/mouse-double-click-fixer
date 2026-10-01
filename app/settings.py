@@ -24,6 +24,8 @@ DEFAULTS: dict[str, Any] = {
     "window_geometry": "",
     "auto_update": True,
     "last_update_check": 0.0,
+    # The version an update was installing when the app quit for it.
+    "pending_update": "",
 }
 
 LEGACY_PATH = Path.home() / ".doubleclick-fixer.json"
@@ -43,7 +45,7 @@ def settings_path() -> Path:
     return config_dir() / "settings.json"
 
 
-def _coerce(values: dict[str, Any]) -> dict[str, Any]:
+def coerce(values: dict[str, Any]) -> dict[str, Any]:
     merged = {**DEFAULTS, **values}
     merged["threshold_ms"] = clamp_threshold(merged.get("threshold_ms", DEFAULT_THRESHOLD_MS))
     buttons = merged.get("buttons") or [Button.LEFT.value]
@@ -59,8 +61,9 @@ def _coerce(values: dict[str, Any]) -> dict[str, Any]:
         merged["last_update_check"] = float(merged.get("last_update_check") or 0.0)
     except (TypeError, ValueError):
         merged["last_update_check"] = 0.0
-    if not isinstance(merged.get("window_geometry"), str):
-        merged["window_geometry"] = ""
+    for text in ("window_geometry", "pending_update"):
+        if not isinstance(merged.get(text), str):
+            merged[text] = ""
     merged["version"] = SCHEMA_VERSION
     return merged
 
@@ -81,7 +84,7 @@ def load_raw() -> dict[str, Any]:
 def load() -> dict[str, Any]:
     values = load_raw()
     if values:
-        return _coerce(values)
+        return coerce(values)
 
     legacy = _read(LEGACY_PATH)
     if legacy:
@@ -94,12 +97,12 @@ def load() -> dict[str, Any]:
                 "calibrated": False,
             }
         )
-    return _coerce({})
+    return coerce({})
 
 
 def save(values: dict[str, Any]) -> dict[str, Any]:
     """Merge `values` into the stored settings and write them atomically."""
-    merged = _coerce({**load_raw(), **values})
+    merged = coerce({**load_raw(), **values})
     destination = settings_path()
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(".json.tmp")

@@ -67,14 +67,6 @@ class BounceFilterTests(unittest.TestCase):
         # A real click well after the burst is accepted again.
         self.assertTrue(click_filter.press(timestamp=1.5).accepted)
 
-    def test_suppressed_run_is_reported_for_click_state_repair(self) -> None:
-        click_filter = BounceFilter(60, hold_releases=False)
-        self.click(click_filter, 1.0, 1.05)
-        self.click(click_filter, 1.06, 1.07)  # bounce, suppressed
-        press = click_filter.press(timestamp=1.30)
-        self.assertTrue(press.accepted)
-        self.assertEqual(press.suppressed_run, 1)
-
     def test_disabled_filter_accepts_everything(self) -> None:
         click_filter = BounceFilter(60, enabled=False)
         self.click(click_filter, 1.0, 1.05)
@@ -159,10 +151,6 @@ class ButtonTests(unittest.TestCase):
         self.assertEqual([button.label for button in Button], ["Left", "Right", "Middle"])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class DragDropoutTests(unittest.TestCase):
     """A worn switch can drop contact for a few ms while the button is held."""
 
@@ -201,12 +189,9 @@ class DragDropoutTests(unittest.TestCase):
         f.press(timestamp=0.0)
         self.assertTrue(f.release(timestamp=0.080).held)
         self.assertTrue(f.press(timestamp=0.087).cancels_held)
-        final = f.release(timestamp=0.095)
-        self.assertTrue(final.held)
-        self.assertEqual(final.suppressed_run, 1, "macOS counted the bounce; the release needs repair")
+        self.assertTrue(f.release(timestamp=0.095).held)
         self.assertTrue(f.commit_held())
         self.assertFalse(f.commit_held())
-        self.assertEqual(f.press(timestamp=0.4).suppressed_run, 1)
 
     def test_release_is_delivered_when_no_press_follows(self) -> None:
         f = BounceFilter(60)
@@ -231,13 +216,6 @@ class DragDropoutTests(unittest.TestCase):
         f.press(timestamp=0.0)
         self.assertTrue(f.release(timestamp=0.5).accepted)
 
-    def test_click_count_repair_reaches_the_release_too(self) -> None:
-        f = BounceFilter(60, hold_releases=False)
-        f.press(timestamp=0.0)
-        f.release(timestamp=0.05)
-        f.press(timestamp=0.06)              # bounce
-        f.release(timestamp=0.065)
-        press = f.press(timestamp=0.25)      # real second click
-        release = f.release(timestamp=0.3)
-        self.assertEqual(press.suppressed_run, 1)
-        self.assertEqual(release.suppressed_run, 1, "mouse-up needs the same repair")
+
+if __name__ == "__main__":
+    unittest.main()

@@ -52,9 +52,10 @@ administrator unless DoubleClick Fixer also runs as administrator.
 
 ## Games
 
-Clicks are only ever blocked, never generated, except releases, which the app
-holds for the filter window and re-sends. Some anti-cheat systems watch
-for software-sent input; turn the filter off before playing those games.
+The app never invents a click, but it re-sends some: a release held back for
+the filter window, and a press that lands just as that window ends, reach
+games as software input (on Windows, marked as injected). Some anti-cheat
+systems watch for that; turn the filter off before playing those games.
 
 ## I can't find the window
 

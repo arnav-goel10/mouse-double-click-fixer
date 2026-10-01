@@ -48,6 +48,8 @@ class AppController(QObject):
                     pass
         self._filter: Optional[GlobalClickFilter] = None
         self._suspended = False
+        # Turned on, but macOS hasn't granted Accessibility yet (set by the window).
+        self.waiting_for_permission = False
         # Bounces counted on the hook thread since the last flush. Kept apart
         # from `settings`, which every settings write replaces with what is on
         # disk, so an unrelated write can never lose them.
@@ -86,6 +88,10 @@ class AppController(QObject):
         if active == self.active and (active or self._filter is None):
             # Nothing to do. A filter whose hook thread has died reads as
             # inactive but still needs releasing, so that case falls through.
+            # Turning off still records the choice: the filter may only have
+            # been waiting for permission, and must not ask again next launch.
+            if not active and self.settings["fix_enabled"]:
+                self._store(fix_enabled=False)
             return self.active
         if active:
             # Turning the filter on (from the menu bar, say) ends a pause.
@@ -127,6 +133,37 @@ class AppController(QObject):
             self._suspended = True
             self._stop_filter()
             self.filter_state_changed.emit(False, "")
+
+    def enable_after_calibration(self) -> None:
+        """Turned on while calibration has filtering paused: remember it, and
+        start once calibration ends, so the pad keeps measuring raw clicks."""
+        self._store(fix_enabled=True)
+        if self.active:
+            self._stop_filter()
+        self._suspended = True
+        self.filter_state_changed.emit(False, "")
+
+    def stop_for_permission(self) -> None:
+        """Accessibility was revoked: stop the tap, but keep the user's choice,
+        so the filter comes back by itself once access is granted again, even
+        after a restart."""
+        self._stop_filter()
+        self.filter_state_changed.emit(False, "")
+
+    def set_waiting_for_permission(self, waiting: bool) -> None:
+        if waiting != self.waiting_for_permission:
+            self.waiting_for_permission = waiting
+            self.settings_changed.emit()
+
+    def status_text(self) -> str:
+        """One line for the menu bar and tray menus."""
+        if self.active:
+            return f"On · {self.filtered_total:,} blocked"
+        if self._suspended:
+            return "Paused for calibration"
+        if self.waiting_for_permission:
+            return "Waiting for Accessibility access"
+        return "Off"
 
     def resume(self) -> None:
         if self._suspended:
@@ -187,6 +224,18 @@ class AppController(QObject):
 
         self._store(last_update_check=time.time())
 
+    def set_pending_update(self, version: str) -> None:
+        self._store(pending_update=version)
+
+    def take_update_result(self, current_version: str) -> str:
+        """After an update relaunch: "updated", "failed", or "" when no
+        update was in progress. Clears the record either way."""
+        pending = self.settings.get("pending_update", "")
+        if not pending:
+            return ""
+        self._store(pending_update="")
+        return "updated" if pending == current_version else "failed"
+
     def reset_statistics(self) -> None:
         with self._count_lock:
             self._pending_filtered = 0
@@ -195,7 +244,12 @@ class AppController(QObject):
         self.settings_changed.emit()
 
     def _store(self, **values: object) -> None:
-        self.settings = settings_store.save(values)
+        try:
+            self.settings = settings_store.save(values)
+        except OSError:
+            # The disk is full or the file is locked (a sync tool, antivirus).
+            # Keep running on the new values; the next write tries again.
+            self.settings = settings_store.coerce({**self.settings, **values})
 
     def flush_stats(self) -> None:
         """Write the running count to disk. Called from the UI thread only."""
