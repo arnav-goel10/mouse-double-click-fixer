@@ -61,20 +61,21 @@ def _handler_class():
 #: the right weight and size for the menu bar, which a shrunken bitmap cannot.
 SYMBOL_ON = "computermouse.fill"
 SYMBOL_OFF = "computermouse"
-#: Point size that renders about 17 pt tall, the height Apple's own menu bar
-#: glyphs use in a 22 pt menu bar.
-SYMBOL_POINT_SIZE = 13.0
+#: 14 pt at medium weight: about 18 pt tall with strokes as heavy as Apple's
+#: own menu bar extras (Wi-Fi, Sound). At 13 pt regular the mouse came out
+#: smaller and thinner than everything next to it.
+SYMBOL_POINT_SIZE = 14.0
 
 
 def _status_image(active: bool, size: int = 18):
     """The menu bar glyph: an SF Symbol, falling back to the drawn icon."""
-    from AppKit import NSImage, NSImageSymbolConfiguration
+    from AppKit import NSFontWeightMedium, NSImage, NSImageSymbolConfiguration
 
     name = SYMBOL_ON if active else SYMBOL_OFF
     image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, "DoubleClick Fixer")
     if image is not None:
         configured = image.imageWithSymbolConfiguration_(
-            NSImageSymbolConfiguration.configurationWithPointSize_weight_(SYMBOL_POINT_SIZE, 0)
+            NSImageSymbolConfiguration.configurationWithPointSize_weight_(SYMBOL_POINT_SIZE, NSFontWeightMedium)
         )
         image = configured or image
         image.setTemplate_(True)  # macOS tints it for light and dark menu bars

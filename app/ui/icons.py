@@ -17,23 +17,42 @@ from PySide6.QtGui import (
 )
 
 
-def _mouse_pixmap(size: int, body: QColor, outline: QColor, dot: QColor | None) -> QPixmap:
+def _mouse_pixmap(size: int, ink: QColor, filled: bool) -> QPixmap:
+    """A tray-sized mouse glyph, drawn like the system's own icons.
+
+    It fills the icon square (a notification area icon is only 16-24 px, so
+    every pixel counts), with strokes that stay crisp at 16 px. Filled, the
+    button split is cut out of the body, so it still reads as a mouse.
+    """
     pixmap = QPixmap(size, size)
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    unit = size / 16
+    stroke = max(1.5, 1.3 * unit)
+    half = stroke / 2
+    shell = QRectF(3.5 * unit + half, 1 * unit + half, 9 * unit - stroke, 14 * unit - stroke)
+    radius = shell.width() / 2
+    split_y = shell.top() + shell.height() * 0.4
+    centre_x = shell.center().x()
 
-    unit = size / 32
-    shell = QRectF(9 * unit, 4 * unit, 14 * unit, 24 * unit)
-    painter.setPen(QPen(outline, 2 * unit))
-    painter.setBrush(body)
-    painter.drawRoundedRect(shell, 7 * unit, 9 * unit)
-    painter.drawLine(shell.center().x(), shell.top() + 1.5 * unit, shell.center().x(), 13 * unit)
-
-    if dot is not None:
+    if filled:
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(dot)
-        painter.drawEllipse(QRectF(21 * unit, 2 * unit, 9 * unit, 9 * unit))
+        painter.setBrush(ink)
+        painter.drawRoundedRect(shell.adjusted(-half, -half, half, half), radius + half, radius + half)
+        cut = QPen(Qt.GlobalColor.transparent, stroke)
+        cut.setCapStyle(Qt.PenCapStyle.FlatCap)
+        painter.setCompositionMode(QPainter.CompositionMode.CompositionMode_Clear)
+        painter.setPen(cut)
+        painter.drawLine(QPointF(centre_x, shell.top() - half - 1), QPointF(centre_x, split_y))
+        painter.drawLine(QPointF(shell.left() - half - 1, split_y), QPointF(shell.right() + half + 1, split_y))
+    else:
+        pen = QPen(ink, stroke)
+        pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRoundedRect(shell, radius, radius)
+        painter.drawLine(QPointF(centre_x, shell.top()), QPointF(centre_x, split_y))
     painter.end()
     return pixmap
 
@@ -156,18 +175,16 @@ def tray_icon(active: bool) -> QIcon:
     if platform.system() == "Darwin":
         icon = QIcon()
         for size in (18, 36, 54):
-            body = QColor(0, 0, 0, 255 if active else 0)
-            icon.addPixmap(_mouse_pixmap(size, body, QColor(0, 0, 0), None))
+            icon.addPixmap(_mouse_pixmap(size, QColor(0, 0, 0), active))
         icon.setIsMask(True)
         return icon
 
     # Windows 11: a monochrome glyph like the system's own tray icons, white
     # on a dark taskbar and black on a light one; filled while filtering.
     ink = QColor("#000000") if taskbar_is_light() else QColor("#ffffff")
-    fill = ink if active else QColor(0, 0, 0, 0)
     icon = QIcon()
     for size in (16, 20, 24, 32, 48, 64):
-        icon.addPixmap(_mouse_pixmap(size, fill, ink, None))
+        icon.addPixmap(_mouse_pixmap(size, ink, active))
     return icon
 
 

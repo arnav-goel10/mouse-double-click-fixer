@@ -27,6 +27,12 @@ from run import _unhide_qt_plugins  # noqa: E402
 _unhide_qt_plugins()
 
 
+def patch_taskbar(light: bool):
+    from unittest import mock
+
+    return mock.patch("app.ui.icons.taskbar_is_light", return_value=light)
+
+
 def wait(app, milliseconds: int) -> None:
     from PySide6.QtCore import QEventLoop, QTimer
 
@@ -129,6 +135,27 @@ def main() -> None:
         main_window.screen().grabWindow(0, frame.x(), frame.y(), frame.width(), frame.height()).save(
             str(out / "filter-minimum-live.png")
         )
+    # The notification area / menu bar icon, both states, on dark and light,
+    # at the sizes the tray actually uses.
+    from PySide6.QtGui import QColor, QImage, QPainter
+
+    from app.ui import icons
+
+    sizes = (16, 20, 24, 32)
+    sheet = QImage(sum(sizes) * 2 + 16 * 9, 96, QImage.Format.Format_ARGB32)
+    sheet.fill(QColor("#1c1c1c"))
+    painter = QPainter(sheet)
+    painter.fillRect(0, 48, sheet.width(), 48, QColor("#f3f3f3"))
+    for row, light in enumerate((False, True)):
+        with patch_taskbar(light):
+            x = 16
+            for size in sizes:
+                for active in (False, True):
+                    pixmap = icons.tray_icon(active).pixmap(size, size)
+                    painter.drawPixmap(x, row * 48 + (48 - size) // 2, pixmap)
+                    x += size + 16
+    painter.end()
+    sheet.scaled(sheet.width() * 3, sheet.height() * 3).save(str(out / "tray-icons.png"))
     print(f"Wrote screenshots to {out}")
 
 

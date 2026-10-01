@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.10 — 2026-10-01
+
+- macOS: the menu bar icon is drawn at the size and weight of Apple's own menu
+  bar icons (Wi-Fi, Sound); it was smaller and thinner than its neighbours.
+- Windows: a new notification area icon that fills the tray square, keeps
+  crisp strokes at 16 px and shows the button split in both states (an outline
+  when off, solid when on); the old one was small and the "on" state was a
+  plain blob.
+
 ## 0.2.9 — 2026-10-01
 
 - When GitHub has no release the updater can read (none published yet, or the
