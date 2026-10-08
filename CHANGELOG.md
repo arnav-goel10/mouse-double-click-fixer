@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.3 — 2026-10-08
+
+- macOS: the filter now measures click timing from the driver's own
+  timestamps. It read them in the wrong unit before (as mach ticks; they are
+  nanoseconds), so it never trusted them and timed clicks by when its own
+  code ran instead, which is noisier.
+
 ## 0.5.2 — 2026-10-08
 
 - Windows: the installer and uninstaller can now close a copy of the app that

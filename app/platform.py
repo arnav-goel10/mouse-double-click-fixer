@@ -947,17 +947,11 @@ class ClickCountRepair:
 
 
 def _mach_timebase() -> Callable[[int], float]:
-    """Return a converter from mach absolute time to monotonic seconds."""
-    try:
-        import ctypes
+    """Return a converter from a CGEvent timestamp to monotonic seconds.
 
-        class MachTimebase(ctypes.Structure):
-            _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
-
-        libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
-        info = MachTimebase()
-        libc.mach_timebase_info(ctypes.byref(info))
-        scale = (info.numer / info.denom) / 1_000_000_000
-    except Exception:  # pragma: no cover - fall back to plain nanoseconds
-        scale = 1 / 1_000_000_000
-    return lambda value: float(value) * scale
+    CGEventGetTimestamp is in nanoseconds since boot (not mach ticks, which on
+    Apple silicon are 41.67 ns each): verified against mach_absolute_time on
+    macOS 27. `monotonic()` counts from boot too, so the two line up and
+    `_normalise_time` accepts the driver's own times.
+    """
+    return lambda value: float(value) / 1_000_000_000

@@ -453,5 +453,12 @@ class MotionFlushTests(unittest.TestCase):
         self.assertEqual(calls[-1], False)
 
 
+class MacTimestampTests(unittest.TestCase):
+    def test_event_timestamps_are_nanoseconds(self) -> None:
+        from app.platform import _mach_timebase
+
+        self.assertEqual(_mach_timebase()(1_500_000_000), 1.5)
+
+
 if __name__ == "__main__":
     unittest.main()
