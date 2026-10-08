@@ -27,9 +27,18 @@ FILTER_INJECTED_ENV = "DCF_FILTER_INJECTED"
 #: press re-ordered after it), so the hook passes them straight through.
 INJECTED_MARK = 0x44434658  # "DCFX"
 
+#: Marks pointer motion this app re-sends, one value per button whose queue it
+#: waited in, so the motion tap knows which button's in-flight count it settles.
+INJECTED_MOTION_MARKS = {INJECTED_MARK + 1 + index: button for index, button in enumerate(Button)}
+MOTION_MARK_FOR = {button: mark for mark, button in INJECTED_MOTION_MARKS.items()}
+
+#: A release this close to where its press landed counts as a click made in
+#: place (not the end of a drag), so the first pointer motion settles it.
+STATIONARY_PX = 4.0
+
 #: A re-sent event normally passes back through the hook within a millisecond
 #: or two. If one never does (it was blocked, or lost), stop waiting for it.
-IN_FLIGHT_TIMEOUT_S = 0.5
+IN_FLIGHT_TIMEOUT_S = 0.15
 
 
 class HookError(RuntimeError):
@@ -73,6 +82,9 @@ class GlobalClickFilter:
         self._started = False
         # Per button: the event kept for a release that is being held back.
         self._held_templates: dict = {}
+        # Per button: whether the release being held landed where its press
+        # did. Pointer motion settles such a release at once (see _motion).
+        self._held_stationary: dict[Button, bool] = {}
         self.tap_resets = 0  # times macOS disabled the tap and it was re-armed
         self.hook_rearms = 0  # times the Windows hook was re-installed
         self._timers: list[threading.Timer] = []
@@ -80,9 +92,15 @@ class GlobalClickFilter:
         # hook, since when, and the real events queued behind them.
         self._in_flight: dict[Button, int] = {button: 0 for button in Button}
         self._in_flight_since: dict[Button, float] = {}
-        self._queued: dict[Button, list[tuple[bool, object]]] = {button: [] for button in Button}
+        # A queued entry is (pressed, template); pressed is None for motion.
+        self._queued: dict[Button, list[tuple[Optional[bool], object]]] = {button: [] for button in Button}
         # Set by the platform runner: re-posts an event the hook suppressed.
-        self._inject: Callable[[Button, bool, object], None] = lambda _b, _p, _t: None
+        # `pressed` is None for pointer motion.
+        self._inject: Callable[[Button, Optional[bool], object], object] = lambda _b, _p, _t: None
+        # Set by the platform runner: turns the pointer-motion tap on or off.
+        # Motion only needs watching while a release is held or re-sent.
+        self._set_motion_tap: Callable[[bool], None] = lambda _wanted: None
+        self._motion_tap_lock = threading.Lock()
         self.filtered_count = 0
 
     # -- lifecycle ---------------------------------------------------------
@@ -103,6 +121,7 @@ class GlobalClickFilter:
         self._use_os_time = None
         self._started = False
         self._held_templates.clear()
+        self._held_stationary.clear()
         for button in Button:
             self._in_flight[button] = 0
             self._queued[button].clear()
@@ -173,10 +192,13 @@ class GlobalClickFilter:
         timestamp: Optional[float],
         template: object = None,
         allow_hold: bool = True,
+        stationary: bool = True,
     ) -> ClickEvent:
         """Decide one event. `template` is a copy of it, kept in case it has to
         be re-injected later; the caller suppresses whatever is not accepted.
-        `allow_hold=False` says a release could not be re-injected later."""
+        `allow_hold=False` says a release could not be re-injected later.
+        `stationary` says a release landed where its press did: if it is held,
+        the first pointer motion delivers it rather than the timer."""
         timestamp = self._normalise_time(timestamp)
         replay = []
         overdue = []
@@ -189,6 +211,7 @@ class GlobalClickFilter:
                 self.filtered_count += 1
             if event.held:
                 self._held_templates[button] = template
+                self._held_stationary[button] = stationary
                 timer = threading.Timer(
                     click_filter.threshold_ms / 1000.0, self._commit_held, (button, click_filter.held_id)
                 )
@@ -197,40 +220,104 @@ class GlobalClickFilter:
                 timer.start()
             elif event.cancels_held:
                 self._held_templates.pop(button, None)
+                self._held_stationary.pop(button, None)
             elif event.flush_held:
                 # The held release was real after all: deliver it, then this.
                 replay = [(False, self._held_templates.pop(button, None)), (True, template)]
+                self._held_stationary.pop(button, None)
                 self._track(button, len(replay))
             if event.accepted and (self._in_flight[button] or self._queued[button]):
                 # A release this app re-sent a moment ago may still be on its
                 # way. Letting this one through now could overtake it (apps
                 # would see down, down, up, up), so it goes out right after.
-                if not self._queued[button]:
-                    # Should the re-sent event never come back, don't keep
-                    # this one waiting for the next click to notice.
-                    timer = threading.Timer(IN_FLIGHT_TIMEOUT_S + 0.05, self._expire_check, (button,))
-                    timer.daemon = True
-                    self._timers = [t for t in self._timers if t.is_alive()] + [timer]
-                    timer.start()
-                self._queued[button].append((pressed, template))
+                self._enqueue(button, pressed, template)
                 event = replace(event, accepted=False, deferred=True)
         for replay_pressed, replay_template in overdue + replay:
             self._safe_inject(button, replay_pressed, replay_template)
+        self._update_motion_tap()
         try:
             self._on_event(event)
         except Exception:  # a UI callback must never break the hook
             pass
         return event
 
+    def _enqueue(self, button: Button, pressed: Optional[bool], template: object) -> None:
+        """With the lock held: queue an event behind the re-sent ones."""
+        if not self._queued[button]:
+            # Should the re-sent event never come back, don't keep this one
+            # waiting for the next event to notice.
+            timer = threading.Timer(IN_FLIGHT_TIMEOUT_S + 0.05, self._expire_check, (button,))
+            timer.daemon = True
+            self._timers = [t for t in self._timers if t.is_alive()] + [timer]
+            timer.start()
+        self._queued[button].append((pressed, template))
+
     def _commit_held(self, button: Button, expected: Optional[float] = None) -> None:
         """The threshold passed with no press: the held release was real.
         A timer passes the release it was started for; stop() passes none."""
         with self._lock:
-            if not self._filters[button].commit_held(expected):
-                return
-            template = self._held_templates.pop(button, None)
-            self._track(button, 1)
-        self._safe_inject(button, False, template)
+            committed = self._filters[button].commit_held(expected)
+            if committed:
+                template = self._held_templates.pop(button, None)
+                self._held_stationary.pop(button, None)
+                self._track(button, 1)
+        if committed:
+            self._safe_inject(button, False, template)
+        self._update_motion_tap()
+
+    def _motion(self, template: object) -> bool:
+        """The pointer moved (`template` is a copy of the motion event).
+
+        A release held where its press landed is settled now: a click made
+        in place ends when the pointer moves off, and apps must see its
+        release where it happened, before the motion. Motion arriving while
+        re-sent events are still on their way waits behind them, so apps
+        never see the pointer leave before the click is over.
+
+        Returns True to let the event through unchanged, False when the
+        platform must drop it because it was queued to be re-sent.
+        """
+        flushed = []
+        overdue = []
+        passes = True
+        with self._lock:
+            for button in Button:
+                overdue += [(button, entry) for entry in self._expire_in_flight(button)]
+                click_filter = self._filters[button]
+                if click_filter.held_id is None or not self._held_stationary.get(button):
+                    continue
+                if click_filter.commit_held():
+                    flushed.append((button, self._held_templates.pop(button, None)))
+                    self._track(button, 1)
+                self._held_stationary.pop(button, None)
+            for button in Button:
+                if self._in_flight[button] or self._queued[button]:
+                    self._enqueue(button, None, template)
+                    passes = False
+                    break
+        for button, (pressed, queued_template) in overdue:
+            self._safe_inject(button, pressed, queued_template)
+        for button, held_template in flushed:
+            self._safe_inject(button, False, held_template)
+        self._update_motion_tap()
+        return passes
+
+    def _update_motion_tap(self) -> None:
+        """Watch pointer motion only while it matters: a release held in place
+        (motion settles it) or re-sent events still on their way (motion
+        must wait behind them). Call without the lock held."""
+        with self._motion_tap_lock:
+            with self._lock:
+                wanted = any(
+                    (self._filters[button].held_id is not None and self._held_stationary.get(button, False))
+                    or self._in_flight[button] > 0
+                    or bool(self._queued[button])
+                    for button in Button
+                )
+            try:
+                self._set_motion_tap(wanted)
+            except Exception:  # noqa: BLE001 - never break the event stream
+                pass
 
     # -- keeping re-sent events in order ------------------------------------
     def _track(self, button: Button, count: int) -> None:
@@ -245,17 +332,17 @@ class GlobalClickFilter:
         with self._lock:
             if self._in_flight[button]:
                 self._in_flight[button] -= 1
-            if self._in_flight[button]:
-                return
-            queued = self._take_queue(button)
+            queued = [] if self._in_flight[button] else self._take_queue(button)
         for pressed, template in queued:
             self._safe_inject(button, pressed, template)
+        self._update_motion_tap()
 
     def _expire_check(self, button: Button) -> None:
         with self._lock:
             overdue = self._expire_in_flight(button)
         for pressed, template in overdue:
             self._safe_inject(button, pressed, template)
+        self._update_motion_tap()
 
     def _expire_in_flight(self, button: Button) -> list:
         """With the lock held: give up on re-sent events that never came back,
@@ -278,8 +365,9 @@ class GlobalClickFilter:
             queued = self._take_queue(button)
         for pressed, template in queued:
             self._safe_inject(button, pressed, template)
+        self._update_motion_tap()
 
-    def _safe_inject(self, button: Button, pressed: bool, template: object) -> None:
+    def _safe_inject(self, button: Button, pressed: Optional[bool], template: object) -> None:
         try:
             sent = self._inject(button, pressed, template) is not False
         except Exception:  # noqa: BLE001 - never break the event stream
@@ -385,7 +473,9 @@ class GlobalClickFilter:
         user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
         user32.SendInput.restype = wintypes.UINT
 
-        def inject(button: Button, pressed: bool, template: object) -> None:
+        def inject(button: Button, pressed: Optional[bool], template: object) -> bool:
+            if pressed is None:
+                return False  # re-sending pointer motion is not supported here
             # Re-post a suppressed press or release at the current pointer
             # position, tagged so this hook lets it through. `template` is the
             # event's own tick time: apps then see when it really happened, not
@@ -493,21 +583,32 @@ class GlobalClickFilter:
         to_seconds = _mach_timebase()
         filter_injected = _filter_injected()
 
-        def inject(_button: Button, pressed: bool, template: object) -> None:
-            # Re-post the kept copy of a suppressed event, tagged so this tap
-            # lets it through. It keeps its own timestamp, so apps see when the
-            # click really happened; a release moves to the pointer's current
-            # position, since a drag has moved on and posting it where it was
-            # would jump the pointer back.
+        DRAGGED = (
+            Quartz.kCGEventLeftMouseDragged,
+            Quartz.kCGEventRightMouseDragged,
+            Quartz.kCGEventOtherMouseDragged,
+        )
+
+        def inject(button: Button, pressed: Optional[bool], template: object) -> bool:
+            # Re-post the kept copy of a suppressed event, tagged so this app's
+            # taps let it through. It keeps its own timestamp and its own
+            # location, so apps see the click when and where it happened: a
+            # release that moved would land off the button that was clicked.
             if template is None:
                 return False
-            Quartz.CGEventSetIntegerValueField(template, Quartz.kCGEventSourceUserData, INJECTED_MARK)
-            if not pressed:
-                Quartz.CGEventSetLocation(template, Quartz.CGEventGetLocation(Quartz.CGEventCreate(None)))
+            mark = INJECTED_MARK if pressed is not None else MOTION_MARK_FOR[button]
+            Quartz.CGEventSetIntegerValueField(template, Quartz.kCGEventSourceUserData, mark)
+            if Quartz.CGEventGetType(template) in DRAGGED:
+                # By the time queued motion goes out, the button is up.
+                Quartz.CGEventSetType(template, Quartz.kCGEventMouseMoved)
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, template)
+            return True
 
         self._inject = inject
         click_counts = ClickCountRepair()
+        # Per button: where its last press landed, to tell a click made in
+        # place from the end of a drag.
+        press_points: dict = {}
 
         def callback(proxy: object, event_type: int, event: object, refcon: object) -> object:
             # An exception here would make PyObjC return nothing, which drops
@@ -548,8 +649,19 @@ class GlobalClickFilter:
             corrected = click_counts.correct(button, pressed, state)
             if corrected != state:
                 Quartz.CGEventSetIntegerValueField(event, Quartz.kCGMouseEventClickState, corrected)
+            location = Quartz.CGEventGetLocation(event)
+            stationary = True
+            if pressed:
+                press_points[button] = (location.x, location.y)
+            elif button in press_points:
+                px, py = press_points[button]
+                stationary = ((location.x - px) ** 2 + (location.y - py) ** 2) ** 0.5 < STATIONARY_PX
             result = self._handle(
-                button, pressed, to_seconds(Quartz.CGEventGetTimestamp(event)), Quartz.CGEventCreateCopy(event)
+                button,
+                pressed,
+                to_seconds(Quartz.CGEventGetTimestamp(event)),
+                Quartz.CGEventCreateCopy(event),
+                stationary=stationary,
             )
             click_counts.record(button, result)
             return event if result.accepted else None
@@ -574,10 +686,58 @@ class GlobalClickFilter:
             self._ready.set()
             return
 
+        # A second tap sees pointer motion. It is only switched on while a
+        # release is held in place or re-sent events are on their way (see
+        # _update_motion_tap), so ordinary motion costs nothing.
+        motion_state = {"tap": None, "enabled": False}
+
+        def motion_callback(proxy: object, event_type: int, event: object, refcon: object) -> object:
+            try:
+                return motion_decide(event_type, event)
+            except Exception:  # noqa: BLE001 - never drop motion on a bug
+                return event
+
+        def motion_decide(event_type: int, event: object) -> object:
+            if event_type in (Quartz.kCGEventTapDisabledByTimeout, Quartz.kCGEventTapDisabledByUserInput):
+                if motion_state["tap"] is not None and motion_state["enabled"]:
+                    Quartz.CGEventTapEnable(motion_state["tap"], True)
+                return event
+            mark = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventSourceUserData)
+            if mark in INJECTED_MOTION_MARKS:
+                self._injected_passed(INJECTED_MOTION_MARKS[mark])
+                return event  # re-sent by this app; already decided
+            return event if self._motion(Quartz.CGEventCreateCopy(event)) else None
+
+        motion_mask = 0
+        for event_type in (Quartz.kCGEventMouseMoved, *DRAGGED):
+            motion_mask |= Quartz.CGEventMaskBit(event_type)
+        motion_tap = Quartz.CGEventTapCreate(
+            Quartz.kCGHIDEventTap,
+            Quartz.kCGHeadInsertEventTap,
+            Quartz.kCGEventTapOptionDefault,
+            motion_mask,
+            motion_callback,
+            None,
+        )
+        motion_source = None
+        if motion_tap is not None:
+            Quartz.CGEventTapEnable(motion_tap, False)
+            motion_state["tap"] = motion_tap
+
+            def set_motion_tap(wanted: bool) -> None:
+                if wanted != motion_state["enabled"]:
+                    motion_state["enabled"] = wanted
+                    Quartz.CGEventTapEnable(motion_tap, wanted)
+
+            self._set_motion_tap = set_motion_tap
+
         self._tap = tap
         source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
         self._run_loop = Quartz.CFRunLoopGetCurrent()
         Quartz.CFRunLoopAddSource(self._run_loop, source, Quartz.kCFRunLoopCommonModes)
+        if motion_tap is not None:
+            motion_source = Quartz.CFMachPortCreateRunLoopSource(None, motion_tap, 0)
+            Quartz.CFRunLoopAddSource(self._run_loop, motion_source, Quartz.kCFRunLoopCommonModes)
         Quartz.CGEventTapEnable(tap, True)
         self._started = True
         self._ready.set()
@@ -587,6 +747,10 @@ class GlobalClickFilter:
                 # run loop is woken for reasons of its own.
                 Quartz.CFRunLoopRunInMode(Quartz.kCFRunLoopDefaultMode, 0.25, False)
         finally:
+            self._set_motion_tap = lambda _wanted: None
+            if motion_tap is not None:
+                Quartz.CGEventTapEnable(motion_tap, False)
+                Quartz.CFRunLoopRemoveSource(self._run_loop, motion_source, Quartz.kCFRunLoopCommonModes)
             Quartz.CGEventTapEnable(tap, False)
             Quartz.CFRunLoopRemoveSource(self._run_loop, source, Quartz.kCFRunLoopCommonModes)
             self._tap = None
@@ -775,9 +939,10 @@ class ClickCountRepair:
         return max(1, state - self._suppressed.get(button, 0)) if state >= 1 else state
 
     def record(self, button: Button, result: ClickEvent) -> None:
-        # A press that never reaches apps, except one only being re-ordered
-        # behind a late release (flush_held), which apps still get.
-        if result.pressed and not result.accepted and not result.flush_held:
+        # A press that never reaches apps. Not one only being re-ordered
+        # (flush_held, behind a late release) or held back behind a re-sent
+        # event (deferred): apps still get those.
+        if result.is_bounce:
             self._suppressed[button] = self._suppressed.get(button, 0) + 1
 
 

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.1 — 2026-10-08
+
+- **Fixed: clicks lost when you moved the mouse right after clicking.** The
+  filter holds every release for the filter window (to tell a contact dropout
+  from a real release), and it then re-sent the release at wherever the pointer
+  was by then. A click followed by a quick move landed off the button or link,
+  so it never registered. Re-sent releases now keep the place you actually let
+  go, and for a click made in place the first pointer movement delivers the
+  release at once, before the movement reaches apps. Drags keep their
+  dropout protection.
+- Fixed: a press re-ordered behind a late release was counted against the
+  double-click count, so the next press could be read as a single click.
+- Re-sent events that never come back are given up on after 150 ms, not 500.
+- Windows: this release keeps the previous behaviour for the mouse-move case;
+  a Windows fix follows.
+
 ## 0.5.0 — 2026-10-01
 
 One version for both platforms, and the release that rolls up everything since

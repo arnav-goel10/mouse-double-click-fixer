@@ -311,6 +311,16 @@ class ClickCountRepairTests(unittest.TestCase):
         ])
         self.assertEqual([state for pressed, state in seen if pressed], [1, 1, 2])
 
+    def test_a_deferred_press_is_not_counted_as_suppressed(self) -> None:
+        from app.core import ClickEvent
+        from app.platform import ClickCountRepair
+
+        repair = ClickCountRepair()
+        repair.correct(Button.LEFT, True, 1)
+        # Held back behind a re-sent release, then delivered: apps get it.
+        repair.record(Button.LEFT, ClickEvent(Button.LEFT, True, False, None, None, deferred=True))
+        self.assertEqual(repair.correct(Button.LEFT, True, 2), 2)
+
     def test_a_reordered_press_still_counts(self) -> None:
         seen = self.run_chain([
             (True, 1, True, False), (False, 1, False, False),    # held release
@@ -378,6 +388,69 @@ class ResendOrderTests(unittest.TestCase):
         self.filter._handle(Button.LEFT, False, 1.1, "up1")
         self.timers[0].fire()
         self.assertTrue(self.filter._handle(Button.LEFT, True, 1.3, "down2").accepted)
+
+
+class MotionFlushTests(unittest.TestCase):
+    """A click made in place ends when the pointer moves off it."""
+
+    def setUp(self) -> None:
+        from unittest import mock
+
+        self.timers = FakeTimer.reset()
+        patch = mock.patch("app.platform.threading.Timer", FakeTimer)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.injected = []
+        self.filter = GlobalClickFilter(40, [Button.LEFT])
+        self.filter._use_os_time = True
+        self.filter._inject = lambda button, pressed, template: self.injected.append((pressed, template))
+
+    def test_motion_delivers_a_stationary_release_before_itself(self) -> None:
+        self.filter._handle(Button.LEFT, True, 0.0, "down")
+        self.assertTrue(self.filter._handle(Button.LEFT, False, 0.08, "up", stationary=True).held)
+        self.assertFalse(self.filter._motion("m1"), "the motion waits behind the release")
+        self.assertEqual(self.injected, [(False, "up")])
+        self.filter._injected_passed(Button.LEFT)                     # the up comes back
+        self.assertEqual(self.injected, [(False, "up"), (None, "m1")])
+        self.filter._injected_passed(Button.LEFT)                     # the motion comes back
+        self.assertTrue(self.filter._motion("m2"), "nothing left in flight")
+        for timer in list(self.timers):
+            timer.fire()
+        self.assertEqual(self.injected, [(False, "up"), (None, "m1")], "the timer must not resend the up")
+
+    def test_motion_during_a_moving_hold_passes_and_keeps_the_drag(self) -> None:
+        self.filter._handle(Button.LEFT, True, 0.0, "down")
+        self.assertTrue(self.filter._handle(Button.LEFT, False, 0.08, "up", stationary=False).held)
+        self.assertTrue(self.filter._motion("m"))
+        self.assertEqual(self.injected, [])
+        self.assertTrue(self.filter._handle(Button.LEFT, True, 0.09, "back").cancels_held)
+
+    def test_a_cancelled_stationary_dropout_lets_motion_through(self) -> None:
+        self.filter._handle(Button.LEFT, True, 0.0, "down")
+        self.filter._handle(Button.LEFT, False, 0.06, "up", stationary=True)
+        self.assertTrue(self.filter._handle(Button.LEFT, True, 0.075, "back").cancels_held)
+        self.assertTrue(self.filter._motion("m"))
+        self.assertEqual(self.injected, [])
+
+    def test_motion_tap_is_wanted_only_while_it_matters(self) -> None:
+        calls = []
+        self.filter._set_motion_tap = calls.append
+        self.filter._handle(Button.LEFT, True, 0.0, "down")
+        self.assertEqual(calls[-1], False)
+        self.filter._handle(Button.LEFT, False, 0.08, "up", stationary=True)
+        self.assertEqual(calls[-1], True, "a release is held in place")
+        self.filter._motion("m1")
+        self.assertEqual(calls[-1], True, "the up and the motion are still on their way")
+        self.filter._injected_passed(Button.LEFT)
+        self.filter._injected_passed(Button.LEFT)
+        self.assertEqual(calls[-1], False)
+
+    def test_moving_hold_does_not_want_the_motion_tap(self) -> None:
+        calls = []
+        self.filter._set_motion_tap = calls.append
+        self.filter._handle(Button.LEFT, True, 0.0, "down")
+        self.filter._handle(Button.LEFT, False, 0.08, "up", stationary=False)
+        self.assertEqual(calls[-1], False)
 
 
 if __name__ == "__main__":
