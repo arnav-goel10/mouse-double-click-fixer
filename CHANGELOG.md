@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.2 — 2026-10-08
+
+- Windows: the installer and uninstaller can now close a copy of the app that
+  is still starting up. The exe unpacks itself for a few seconds before it
+  listens, and a quit request in that moment used to be missed, leaving the
+  old copy running with files in use.
+
 ## 0.5.1 — 2026-10-08
 
 - **Fixed: clicks lost when you moved the mouse right after clicking.** The
