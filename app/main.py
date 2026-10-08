@@ -38,24 +38,78 @@ def _instance_lock():
     return lock
 
 
+def _other_copies_running() -> bool:
+    """Whether another process of this executable exists: one still unpacking
+    itself (the Windows exe does that for a few seconds before any of this
+    code runs, so it holds no lock yet), or an older copy that takes none."""
+    if not getattr(sys, "frozen", False):
+        return False
+    mine = {os.getpid(), os.getppid()}  # a one-file exe is a launcher plus the app
+    name = os.path.basename(sys.executable).lower()
+    try:
+        if platform.system() == "Windows":
+            import ctypes
+            from ctypes import wintypes
+
+            class ProcessEntry(ctypes.Structure):
+                _fields_ = [
+                    ("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+                    ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260),
+                ]
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            snapshot = kernel32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+            if snapshot == ctypes.c_void_p(-1).value:
+                return False
+            try:
+                entry = ProcessEntry()
+                entry.dwSize = ctypes.sizeof(entry)
+                more = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+                while more:
+                    if entry.szExeFile.lower() == name and entry.th32ProcessID not in mine:
+                        return True
+                    more = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+            finally:
+                kernel32.CloseHandle(snapshot)
+            return False
+        import subprocess
+
+        found = subprocess.run(["pgrep", "-x", os.path.basename(sys.executable)], capture_output=True, text=True)
+        return any(int(pid) not in mine for pid in found.stdout.split())
+    except Exception:  # noqa: BLE001 - unsure: behave as before
+        return False
+
+
 def _quit_running_copy() -> None:
     """Ask a running copy to exit and wait until it has. Never starts one."""
     lock = _instance_lock()
     deadline = monotonic() + HAND_OVER_WAIT_S
+    asked = False
     while monotonic() < deadline:
         if lock.tryLock(0):
             lock.unlock()
-            # No copy holds the lock, but one older than 0.2.11 never takes it.
-            _hand_over_to_running_instance(b"quit")
-            return
-        if _hand_over_to_running_instance(b"quit"):
-            break
-        sleep(0.2)  # a copy is starting and not listening yet
-    # Wait for it to finish quitting, so files can be replaced right after.
-    while monotonic() < deadline:
+            if _other_copies_running():
+                # A copy is still starting (no lock yet), or is too old to
+                # take one: keep asking until it listens or goes away.
+                asked = _hand_over_to_running_instance(b"quit") or asked
+                if not asked:
+                    sleep(0.2)
+                    continue
+            elif not asked:
+                _hand_over_to_running_instance(b"quit")  # a copy older than 0.2.11
+                return
+        elif not _hand_over_to_running_instance(b"quit"):
+            sleep(0.2)  # a copy is starting and not listening yet
+            continue
+        # Asked. Wait for it to finish quitting, so files can be replaced.
+        asked = True
         if lock.tryLock(0):
             lock.unlock()
-            return
+            if not _other_copies_running():
+                return
         sleep(0.1)
 
 

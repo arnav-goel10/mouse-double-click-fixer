@@ -408,6 +408,19 @@ class InstanceLockTests(unittest.TestCase):
             self.main._quit_running_copy()
         self.assertEqual(attempts, [b"quit"] * 3)
 
+    def test_quit_keeps_asking_a_copy_that_is_still_unpacking(self) -> None:
+        # The Windows exe unpacks itself for seconds before taking the lock or
+        # listening; --quit must wait for it rather than decide nothing runs.
+        others = [True, True, True, False]  # exits after the ask lands
+        answers = [False, False, True]       # starts listening on the third try
+
+        with mock.patch.object(self.main, "_other_copies_running", side_effect=lambda: others.pop(0) if others else False), \
+                mock.patch.object(self.main, "_hand_over_to_running_instance", side_effect=lambda r: answers.pop(0) if answers else False) as hand, \
+                mock.patch.object(self.main, "sleep"):
+            self.main._quit_running_copy()
+        self.assertEqual(hand.call_count, 3)
+        self.assertEqual(others, [])
+
     def test_quit_returns_at_once_when_nothing_runs(self) -> None:
         with mock.patch.object(self.main, "_hand_over_to_running_instance", return_value=False) as hand:
             self.main._quit_running_copy()
