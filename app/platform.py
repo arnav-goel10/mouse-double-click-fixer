@@ -64,6 +64,11 @@ CLOCK_TOLERANCE_S = 2.0
 #: so it is read live, but at most this often: the tap callback must stay cheap.
 CLICK_INTERVAL_CACHE_S = 2.0
 
+#: Where macOS keeps that setting (System Settings > Mouse > Double-click
+#: speed), in seconds, and what it is when the user never changed it.
+DOUBLE_CLICK_KEY = "com.apple.mouse.doubleClickThreshold"
+DEFAULT_DOUBLE_CLICK_S = 0.5
+
 
 class HookError(RuntimeError):
     """The global hook could not be installed, or stopped unexpectedly."""
@@ -780,8 +785,9 @@ class GlobalClickFilter:
 
         self._inject = inject
         click_counts = ClickCountRepair()
-        # The first read of the double-click interval loads AppKit; do it now,
-        # not inside the tap callback, where a slow call gets the tap disabled.
+        # The first read of the double-click interval is the slowest (it asks
+        # the preferences daemon); do it now, not inside the tap callback,
+        # where a slow call gets the tap disabled.
         click_counts.interval()
         # Set when macOS keeps disabling the taps: the run loop then ends.
         given_up: list[bool] = []
@@ -1135,7 +1141,7 @@ class ClickCountRepair:
     def __init__(self, interval: Optional[Callable[[], float]] = None) -> None:
         # Reads the user's double-click interval, in seconds.
         self._read_interval = interval or _double_click_interval
-        self._interval = 0.5  # Apple's default, until a read succeeds
+        self._interval = DEFAULT_DOUBLE_CLICK_S  # until a read succeeds
         self._interval_read_at: Optional[float] = None
         # Per button: (time, count) of the last press apps received, and of
         # the press being decided now.
@@ -1178,10 +1184,19 @@ class ClickCountRepair:
 
 
 def _double_click_interval() -> float:
-    """The user's double-click speed (System Settings > Mouse), in seconds."""
-    from AppKit import NSEvent
+    """The user's double-click speed (System Settings > Mouse), in seconds.
 
-    return float(NSEvent.doubleClickInterval())
+    Read from the preference itself, as NSEvent.doubleClickInterval does,
+    rather than through AppKit: this runs on the hook thread, and AppKit is
+    the main thread's. An unset preference means macOS's default.
+    """
+    from CoreFoundation import CFPreferencesCopyAppValue, kCFPreferencesAnyApplication
+
+    value = CFPreferencesCopyAppValue(DOUBLE_CLICK_KEY, kCFPreferencesAnyApplication)
+    if value is None:
+        return DEFAULT_DOUBLE_CLICK_S
+    seconds = float(value)
+    return seconds if math.isfinite(seconds) and seconds > 0 else DEFAULT_DOUBLE_CLICK_S
 
 
 def _near(point: Optional[tuple[float, float]], location: Optional[tuple[float, float]]) -> bool:

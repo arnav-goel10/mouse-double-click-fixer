@@ -10,6 +10,8 @@ from unittest import mock
 
 from app.core import Button, ClickEvent
 from app.platform import (
+    DEFAULT_DOUBLE_CLICK_S,
+    DOUBLE_CLICK_KEY,
     INJECTED_MARK,
     MOTION_MARK_FOR,
     RESTORE_MARK,
@@ -17,6 +19,7 @@ from app.platform import (
     ClickCountRepair,
     GlobalClickFilter,
     HookError,
+    _double_click_interval,
     is_supported,
 )
 
@@ -410,6 +413,45 @@ class ClickCountRepairTests(unittest.TestCase):
 
         with fresh_error_log(), self.assertLogs("app.platform", "WARNING"):
             self.assertEqual(ClickCountRepair(interval=broken).interval(), 0.5)
+
+
+class DoubleClickIntervalTests(unittest.TestCase):
+    """The interval is read from the preference macOS keeps it in, never
+    through AppKit: it is read on the hook thread, and AppKit belongs to the
+    main thread."""
+
+    def read(self, stored):
+        asked = []
+
+        def copy_app_value(key, application):
+            asked.append((key, application))
+            return stored
+
+        core_foundation = SimpleNamespace(
+            CFPreferencesCopyAppValue=copy_app_value, kCFPreferencesAnyApplication="any application"
+        )
+        # None in sys.modules makes any import of AppKit fail.
+        with mock.patch.dict(sys.modules, {"CoreFoundation": core_foundation, "AppKit": None}):
+            return _double_click_interval(), asked
+
+    def test_the_users_setting_is_read_from_the_global_preferences(self) -> None:
+        seconds, asked = self.read(5.0)
+        self.assertEqual(seconds, 5.0)
+        self.assertEqual(asked, [("com.apple.mouse.doubleClickThreshold", "any application")])
+        self.assertEqual(DOUBLE_CLICK_KEY, "com.apple.mouse.doubleClickThreshold")
+
+    def test_an_unset_or_unusable_setting_means_the_default(self) -> None:
+        for stored in (None, 0, -1.0, float("nan")):
+            with self.subTest(stored=stored):
+                self.assertEqual(self.read(stored)[0], DEFAULT_DOUBLE_CLICK_S)
+
+    @unittest.skipUnless(platform.system() == "Darwin", "macOS preferences")
+    def test_it_agrees_with_appkit(self) -> None:
+        try:
+            from AppKit import NSEvent
+        except ImportError:
+            self.skipTest("AppKit is not installed")
+        self.assertAlmostEqual(_double_click_interval(), float(NSEvent.doubleClickInterval()), places=6)
 
 
 class ResendOrderTests(unittest.TestCase):
