@@ -651,7 +651,6 @@ class GeneralPage(Page):
         super().__init__("General", parent)
         self.controller = controller
         self.updater = updater
-        self._loading = False
 
         startup_section = self.section()
         self.login_switch = Switch(accessible_name="Open at login")
@@ -684,9 +683,12 @@ class GeneralPage(Page):
 
         self.update_header = self.header("Software update")
         self.update_section = self.section()
-        self.auto_update_switch = Switch(accessible_name="Install updates automatically")
-        self.auto_update_switch.clicked.connect(self._on_auto_update)
-        self.update_section.add(Row("Install updates automatically", "", self.auto_update_switch, card_icon("sync")))
+        self.auto_check_switch = Switch(accessible_name="Check for updates automatically")
+        self.auto_check_switch.clicked.connect(self._on_auto_check)
+        self.update_section.add(Row("Check for updates automatically", "", self.auto_check_switch, card_icon("sync")))
+        self.auto_install_switch = Switch(accessible_name="Install updates automatically")
+        self.auto_install_switch.clicked.connect(self._on_auto_install)
+        self.update_section.add(Row("Install updates automatically", "", self.auto_install_switch, card_icon("sync")))
         self.update_button = _button("Check Now")
         self.update_button.clicked.connect(self._on_update_button)
         self.update_row = self.update_section.add(
@@ -738,15 +740,16 @@ class GeneralPage(Page):
             self.permission_row.set_detail("Allowed" if granted else "Not allowed")
         total = self.controller.filtered_total
         self.stats_row.set_detail(f"{total:,} total")
-        self._loading = True
-        self.auto_update_switch.setChecked(bool(self.controller.settings.get("auto_update", True)), animate=False)
-        self._loading = False
         self.refresh_update()
 
     def refresh_update(self) -> None:
         updater = self.updater
         if updater is None or not updater.supported:
             return
+        self.auto_check_switch.setChecked(updater.auto_check, animate=False)
+        self.auto_install_switch.setChecked(updater.auto_install, animate=False)
+        # Only a background check installs anything by itself.
+        self.auto_install_switch.setEnabled(updater.auto_check)
         release = updater.release
         states = {
             updater.CHECKING: ("Checking for updates…", "Check Now", False),
@@ -776,9 +779,15 @@ class GeneralPage(Page):
         else:
             self.updater.check(user_initiated=True)
 
-    def _on_auto_update(self, checked: bool) -> None:
-        if not self._loading:
-            self.controller.set_auto_update(checked)
+    def _on_auto_check(self, checked: bool) -> None:
+        if self.updater is not None:
+            self.updater.set_auto_check(checked)
+
+    def _on_auto_install(self, checked: bool) -> None:
+        # Through the updater, which also drops a download waiting to
+        # install when this is turned off.
+        if self.updater is not None:
+            self.updater.set_auto_install(checked)
 
     def refresh_login(self) -> None:
         self.login_switch.setChecked(bool(self.controller.settings["start_at_login"]), animate=False)
@@ -787,8 +796,6 @@ class GeneralPage(Page):
         self.login_items_button.setVisible(IS_MAC and state == startup.BLOCKED)
 
     def _on_login(self, checked: bool) -> None:
-        if self._loading:
-            return
         error = self.controller.set_start_at_login(checked)
         if error:
             self.login_switch.setChecked(not checked)

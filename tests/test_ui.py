@@ -744,12 +744,14 @@ class AccessibilityTests(LiveWindowTests):
         from PySide6.QtCore import Qt
         from PySide6.QtTest import QTest
 
-        switch = self.window.general.auto_update_switch
+        from app.core import Button
+
+        switch = self.window.filter_page.button_switches[Button.RIGHT]
         self.window.show()
         before = switch.isChecked()
         QTest.keyClick(switch, Qt.Key.Key_Space)
         self.assertNotEqual(switch.isChecked(), before)
-        self.assertEqual(self.controller.settings["auto_update"], switch.isChecked())
+        self.assertEqual(Button.RIGHT in self.controller.buttons, switch.isChecked())
 
     def test_sidebar_is_a_list_of_its_panes(self) -> None:
         from PySide6.QtGui import QAccessible
@@ -843,6 +845,67 @@ class AccessibilityTests(LiveWindowTests):
             self.window.apply_look()
             self.assertFalse(self.window.sidebar.grab().isNull())
             self.assertFalse(self.window.filter_page.switch.grab().isNull())
+
+
+class UpdateSettingsTests(LiveWindowTests):
+    """General's update switches, through the real updater (no network:
+    nothing here checks or downloads)."""
+
+    def general(self):
+        from app.ui.window import GeneralPage
+        from app.updater import Updater
+
+        updater = Updater(self.controller)
+        updater.kind = "mac"  # an installed copy, so the section shows
+        page = GeneralPage(self.controller, updater)
+        self.addCleanup(page.deleteLater)
+        page.refresh(True)
+        return page, updater
+
+    def test_checking_and_installing_are_separate_switches(self) -> None:
+        from app import settings
+
+        page, updater = self.general()
+        self.assertTrue(page.auto_check_switch.isChecked())
+        self.assertTrue(page.auto_install_switch.isChecked())
+        self.assertTrue(page.auto_install_switch.isEnabled())
+        page.auto_check_switch.click()
+        self.assertFalse(updater.auto_check)
+        self.assertFalse(settings.load()["auto_check"], "saved")
+        self.assertTrue(self.controller.settings["auto_update"], "installing is its own choice")
+        self.assertFalse(page.auto_install_switch.isEnabled(), "nothing installs without a check")
+        page.auto_check_switch.click()
+        self.assertTrue(page.auto_install_switch.isEnabled())
+        page.auto_install_switch.click()
+        self.assertFalse(updater.auto_install)
+        self.assertFalse(settings.load()["auto_update"])
+        self.assertTrue(updater.auto_check)
+
+    def test_turning_installs_off_goes_through_the_updater(self) -> None:
+        page, updater = self.general()
+        with mock.patch.object(updater, "set_auto_install", wraps=updater.set_auto_install) as set_install:
+            page.auto_install_switch.click()
+        set_install.assert_called_once_with(False)
+
+    def test_the_switches_follow_the_updater(self) -> None:
+        page, updater = self.general()
+        updater.set_auto_check(False)  # from anywhere but this pane
+        self.assertFalse(page.auto_check_switch.isChecked())
+        self.assertFalse(page.auto_install_switch.isEnabled())
+
+    def test_an_old_opt_out_shows_both_off(self) -> None:
+        import json
+
+        from app import settings
+
+        settings.config_dir().mkdir(parents=True, exist_ok=True)
+        settings.settings_path().write_text(json.dumps({"auto_update": False}))
+        from app.controller import AppController
+
+        self.controller = AppController()
+        page, _updater = self.general()
+        self.assertFalse(page.auto_check_switch.isChecked(), "no background checks either")
+        self.assertFalse(page.auto_install_switch.isChecked())
 
 
 class CalibrationFlowTests(LiveWindowTests):
