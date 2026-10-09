@@ -131,7 +131,7 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertIn("line 249", text)
         self.assertNotIn("line 48\n", text, "only the last lines")
         self.assertNotIn(str(Path.home()), text, "the home folder shows as ~")
-        self.assertIn("~/Library", text)
+        self.assertIn(str(Path("~") / "Library"), text)
 
     def test_report_reaches_into_the_previous_file_after_a_rotation(self) -> None:
         self.flush()

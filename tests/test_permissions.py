@@ -11,7 +11,7 @@ class PaneNameTests(unittest.TestCase):
         uname = mock.Mock(release=darwin)
         with mock.patch.object(permissions.platform, "system", return_value="Darwin"), \
                 mock.patch.object(permissions.platform, "mac_ver", return_value=(product, ("", "", ""), "arm64")), \
-                mock.patch.object(permissions.os, "uname", return_value=uname):
+                mock.patch.object(permissions.os, "uname", return_value=uname, create=True):
             return permissions.pane_name()
 
     def test_macos_27_calls_it_device_control_and_data_access(self) -> None:
