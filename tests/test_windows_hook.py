@@ -399,6 +399,19 @@ class WindowsHookLogicTests(unittest.TestCase):
         self.assertEqual(self.win.buttons()[1][:3], ("up", Button.LEFT, (250, 200)))
         self.assertEqual([entry[0] for entry in self.win.seen], ["down", "move", "up"])
 
+    def test_a_hidden_pointer_never_holds_motion_back_past_the_window(self) -> None:
+        # A re-sent move is absolute: in a game's mouse-look it would jump
+        # the view. So motion past the window passes, and the timer delivers.
+        self.win.hidden = True
+        self.click()
+        self.win.wait(100)
+        self.win.move(50, 0)
+        self.win.run()
+        self.assertEqual([entry[0] for entry in self.win.seen], ["down", "move"])
+        self.assertEqual([entry[2] for entry in self.win.seen if entry[0] == "move"], [0], "the hand's own move")
+        self.fire_timers()
+        self.assertEqual([entry[0] for entry in self.win.seen], ["down", "move", "up"])
+
     def test_pen_and_touch_keep_timer_delivery(self) -> None:
         self.win.press(extra=PEN)
         self.win.wait(80)

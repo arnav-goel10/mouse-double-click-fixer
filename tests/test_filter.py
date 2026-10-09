@@ -408,11 +408,11 @@ class EventTimeTests(unittest.TestCase):
         self.assertEqual(self.sent, [])
 
     def test_releases_due_together_go_out_oldest_first(self) -> None:
-        self.handle(Button.LEFT, True, 100.000, "ldown")
-        self.handle(Button.RIGHT, True, 100.010, "rdown")
-        self.handle(Button.RIGHT, False, 100.100, "rup")
-        self.handle(Button.LEFT, False, 100.110, "lup")
-        self.assertFalse(self.move(100.200, "m", (0, 0)))
+        self.handle(Button.LEFT, True, 100.000, "ldown", at=(0, 0))
+        self.handle(Button.RIGHT, True, 100.010, "rdown", at=(0, 0))
+        self.handle(Button.RIGHT, False, 100.100, "rup", at=(0, 0))
+        self.handle(Button.LEFT, False, 100.110, "lup", at=(0, 0))
+        self.assertFalse(self.move(100.200, "m", (1, 0)))
         self.assertEqual(self.sent, [(Button.RIGHT, False, "rup"), (Button.LEFT, False, "lup")])
 
     def test_a_settled_release_waiting_in_its_queue_keeps_the_event_behind_it(self) -> None:
@@ -496,8 +496,8 @@ class EventTimeTests(unittest.TestCase):
     def test_a_real_race_between_the_timer_and_an_event_delivers_once(self) -> None:
         for _round in range(300):
             click_filter, sent = self.make_filter()
-            click_filter._handle(Button.LEFT, True, 100.000, "down")
-            click_filter._handle(Button.LEFT, False, 100.100, "up")
+            click_filter._handle(Button.LEFT, True, 100.000, "down", location=(0, 0))
+            click_filter._handle(Button.LEFT, False, 100.100, "up", location=(30, 0))
             held_id = click_filter._filters[Button.LEFT].held_id
             start = threading.Barrier(2)
 
@@ -508,9 +508,10 @@ class EventTimeTests(unittest.TestCase):
             thread = threading.Thread(target=timer_thread)
             thread.start()
             start.wait()
-            click_filter._motion("m", (50, 0), 100.200)
+            passes = click_filter._motion("m", (50, 0), 100.200)
             thread.join()
             self.assertEqual([entry for entry in sent if entry[1] is False], [(Button.LEFT, False, "up")])
+            self.assertFalse(passes, "either way the motion waits behind the release")
 
 
 def quantized_tick(ms: float) -> int:
@@ -1065,13 +1066,24 @@ class MotionFlushTests(unittest.TestCase):
 
     def test_a_release_with_no_known_location_is_left_to_the_timer(self) -> None:
         # Windows passes none where the pointer's place means nothing (a
-        # hidden pointer, pen and touch, a remote session).
+        # hidden pointer, pen and touch, a remote session). Motion is never
+        # held back there, not even motion stamped past the window.
+        calls = self.watched()
         self.filter._handle(Button.LEFT, True, 0.0, "down")
         self.filter._handle(Button.LEFT, False, 0.08, "up")
+        self.assertEqual(calls[-1], False, "motion is not judged for it")
         self.assertTrue(self.filter._motion("m", (50, 0)))
+        self.assertTrue(self.filter._motion("m2", (60, 0), 0.5))
         self.assertEqual(self.injected, [])
         self.fire_all()
         self.assertEqual(self.injected, [(False, "up")])
+
+    def test_a_press_still_settles_a_release_with_no_known_location(self) -> None:
+        self.filter.update(buttons=[Button.LEFT, Button.RIGHT])
+        self.filter._handle(Button.LEFT, True, 0.0, "down")
+        self.filter._handle(Button.LEFT, False, 0.08, "up")
+        self.assertTrue(self.filter._handle(Button.RIGHT, True, 0.2, "rdown").deferred)
+        self.assertEqual(self.injected, [(False, "up"), (True, "rdown")])
 
 
 class QueuedReleaseTests(unittest.TestCase):

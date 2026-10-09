@@ -373,9 +373,10 @@ class GlobalClickFilter:
                 self._held_stationary[button] = event.hold_reason == "lift" and self._is_near(
                     self._press_points.get(button), location
                 )
-                # Motion is judged while any release is held: motion stamped
-                # past the window settles it (see _motion).
-                self._motion_wanted = True
+                # Motion is judged while a release is held at a known place:
+                # motion stamped past the window settles it (see _motion).
+                if location is not None:
+                    self._motion_wanted = True
                 timer = threading.Timer(
                     self._fallback_delay(click_filter.threshold_ms, timestamp, arrived),
                     self._commit_held,
@@ -428,16 +429,21 @@ class GlobalClickFilter:
             _log_ignored("the click event callback")
         return event
 
-    def _settle_due(self, timestamp: float, skip: Optional[Button] = None) -> tuple[list, Optional[Button]]:
+    def _settle_due(
+        self, timestamp: float, skip: Optional[Button] = None, located_only: bool = False
+    ) -> tuple[list, Optional[Button]]:
         """With the lock held: settle every held release that an event stamped
         `timestamp` shows was real (see BounceFilter.due), the oldest first,
-        except `skip`'s. Returns the releases to re-send now, as (button,
-        False, template), and the last button whose release had to join real
-        events already queued behind a re-sent one instead, or None."""
+        except `skip`'s, and with `located_only` except those whose place
+        is unknown. Returns the releases to re-send now, as (button, False,
+        template), and the last button whose release had to join real events
+        already queued behind a re-sent one instead, or None."""
         due = sorted(
             (click_filter.held_at, button)
             for button, click_filter in self._filters.items()
-            if button is not skip and click_filter.due(timestamp)
+            if button is not skip
+            and click_filter.due(timestamp)
+            and not (located_only and self._held_points.get(button) is None)
         )
         send: list = []
         waiting_on = None
@@ -534,7 +540,12 @@ class GlobalClickFilter:
         happened, if known).
 
         Motion stamped past a held release's window settles that release
-        first (see _settle_due), as any event does. A release held where its
+        first (see _settle_due), as any event does, unless the release has no
+        known place (Windows: a hidden pointer, pen and touch, a remote
+        session). Motion then waits behind it, and there motion is never held
+        back: a re-sent move is absolute, and in a game's mouse-look it would
+        jump the view. Those are left to the timer and to button events. A
+        release held where its
         press landed is settled sooner, once the pointer leaves the spot
         where the button came up: a click made in place ends when the
         pointer moves off, and apps must see its release where it happened,
@@ -555,7 +566,7 @@ class GlobalClickFilter:
             for button in Button:
                 resend += self._expire_in_flight(button)
             if timestamp is not None:
-                settled, _waiting_on = self._settle_due(timestamp)
+                settled, _waiting_on = self._settle_due(timestamp, located_only=True)
                 resend += settled
             for button in Button:
                 click_filter = self._filters[button]
@@ -579,17 +590,18 @@ class GlobalClickFilter:
         return passes
 
     def _update_motion_tap(self) -> None:
-        """Judge pointer motion only while it matters: a release is held
-        (motion stamped past its window settles it, and motion leaving a
-        click made in place settles that sooner) or re-sent events are still
-        on their way (motion must wait behind them). Otherwise the hook lets
-        every move straight through after one look at _motion_wanted. The
-        flag is raised as soon as something becomes pending (with the lock
-        held); this lowers it once nothing is. Call without the lock held."""
+        """Judge pointer motion only while it matters: a release is held at a
+        known place (motion stamped past its window settles it, and motion
+        leaving a click made in place settles that sooner) or re-sent events
+        are still on their way (motion must wait behind them). Otherwise the
+        hook lets every move straight through after one look at
+        _motion_wanted. The flag is raised as soon as something becomes
+        pending (with the lock held); this lowers it once nothing is. Call
+        without the lock held."""
         with self._motion_tap_lock:
             with self._lock:
                 wanted = any(
-                    self._filters[button].held_id is not None
+                    (self._filters[button].held_id is not None and self._held_points.get(button) is not None)
                     or self._in_flight[button] > 0
                     or bool(self._queued[button])
                     for button in Button
