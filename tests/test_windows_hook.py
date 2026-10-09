@@ -213,7 +213,7 @@ class FakeWindows:
             button, pressed, self.cursor[0], self.cursor[1], flags, tick, extra, self.now_ms / 1000, int(self.now_ms)
         )
         if not dropped:
-            self.seen.append(("down" if pressed else "up", button, self.cursor, tick))
+            self.seen.append(("down" if pressed else "up", button, self.cursor, tick, extra))
 
     # -- what apps saw -----------------------------------------------------
     def buttons(self) -> list:
@@ -396,6 +396,7 @@ class WindowsHookLogicTests(unittest.TestCase):
         self.click()
         self.fire_timers()
         self.assertEqual([entry[:2] for entry in self.win.buttons()], [("down", Button.RIGHT), ("up", Button.RIGHT)])
+        self.assertEqual(self.win.buttons()[1][4], INJECTED_MARK, "the up was held and re-sent")
 
     def test_a_hidden_pointer_keeps_timer_delivery(self) -> None:
         # A game's mouse-look: no motion is held back, and the release goes
@@ -465,7 +466,6 @@ class WindowsHookLogicTests(unittest.TestCase):
         self.fire_timers()
         self.assertEqual(self.win.buttons()[1][:3], ("up", Button.LEFT, (200, 200)))
         self.assertEqual(self.win.cursor, (250, 200))
-
 
 
 class InputSenderTests(unittest.TestCase):
@@ -893,24 +893,13 @@ class WindowsMotionTests(RealWindows):
         self.move_by(40, 0)                                           # motion re-sends the up
         time.sleep(0.3)
         messages = [entry[0] for entry in self.observed_buttons()]
-        self.report(f"[swapped] {[hex(message) for message in messages]}")
+        marks = [entry[2] for entry in self.observed_buttons()]
+        self.report(f"[swapped] {[hex(message) for message in messages]} marks {[hex(mark) for mark in marks]}")
         self.assertEqual(len(messages), 4, messages)
         self.assertEqual(messages[0::2], [messages[0]] * 2)
         self.assertEqual(messages[1::2], [messages[0] + 1] * 2, "each re-sent release matches its press")
-
-    def test_another_programs_move_doesnt_turn_a_click_into_a_drag(self) -> None:
-        # Pen-signed motion stands for another program's (this test's own
-        # input counts as the hand's): the pointer goes where it was put, and
-        # the held up still lands on the click.
-        self.start_filter()
-        self.click_at_200()
-        time.sleep(0.005)
-        with self.api.physical_pixels():
-            self.send(self.api.move_input(600, 400, PEN))
-        time.sleep(0.3)
-        up = self.first(WM_LBUTTONUP)
-        self.assertEqual(self.observed[up][1], (200, 200), f"the click ended off its spot: {self.observed}")
-        self.assertEqual(self.cursor(), (600, 400))
+        # The releases apps saw are the ones this app re-sent: both were held.
+        self.assertEqual(marks[1::2], [INJECTED_MARK] * 2, "a release went through without being held")
 
     def test_a_small_move_after_a_click_releases_in_place(self) -> None:
         # Inside the drag rectangle it is still the same spot: a plain up
@@ -925,6 +914,20 @@ class WindowsMotionTests(RealWindows):
         self.assertEqual(self.observed[up][2], INJECTED_MARK, "the up was held and re-sent")
         self.assertNotIn(TELEPORT_MARK, [entry[2] for entry in self.observed if entry[0] == WM_MOUSEMOVE])
         self.assertEqual(self.cursor(), (202, 200))
+
+    def test_another_programs_move_doesnt_turn_a_click_into_a_drag(self) -> None:
+        # Pen-signed motion stands for another program's (this test's own
+        # input counts as the hand's): the pointer goes where it was put, and
+        # the held up still lands on the click.
+        self.start_filter()
+        self.click_at_200()
+        time.sleep(0.005)
+        with self.api.physical_pixels():
+            self.send(self.api.move_input(600, 400, PEN))
+        time.sleep(0.3)
+        up = self.first(WM_LBUTTONUP)
+        self.assertEqual(self.observed[up][1], (200, 200), f"the click ended off its spot: {self.observed}")
+        self.assertEqual(self.cursor(), (600, 400))
 
     def test_the_hook_stays_cheap(self) -> None:
         # (g) Every move reaches this Python callback; while nothing is held
