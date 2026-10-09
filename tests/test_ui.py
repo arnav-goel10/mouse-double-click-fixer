@@ -1029,6 +1029,36 @@ class CalibrationFlowTests(LiveWindowTests):
         self.assertEqual(self.window.test_page.clicks, 4)
         self.assertTrue(self.window.test_page.last_value.text().endswith("(right)"))
 
+    def pad_gap(self, windows: bool, arrivals: list) -> float:
+        """A press, release and press with tick-quantized event stamps
+        (1000, 1016, 1016 ms) arriving at `arrivals` on the precise clock."""
+        from PySide6.QtCore import Qt
+
+        from app.ui import widgets
+
+        pad = widgets.ClickPad()
+        self.addCleanup(pad.deleteLater)
+        gaps = []
+        pad.pressed_with_gap.connect(lambda gap, _interval, _button: gaps.append(gap))
+
+        def event(stamp):
+            return mock.Mock(button=mock.Mock(return_value=Qt.MouseButton.LeftButton),
+                             timestamp=mock.Mock(return_value=stamp))
+
+        with mock.patch.object(widgets, "IS_WINDOWS", windows), \
+                mock.patch.object(widgets, "perf_counter", side_effect=arrivals):
+            pad.mousePressEvent(event(1000))
+            pad.mouseReleaseEvent(event(1016))
+            pad.mousePressEvent(event(1016))
+        return gaps[-1]
+
+    def test_the_pad_times_windows_clicks_on_the_precise_clock(self) -> None:
+        # Windows stamps both from the same 15.6 ms tick: a 9 ms bounce reads 0.
+        self.assertAlmostEqual(self.pad_gap(True, [10.000, 10.050, 10.059]), 9.0, places=3)
+
+    def test_the_pad_keeps_the_events_own_stamps_elsewhere(self) -> None:
+        self.assertEqual(self.pad_gap(False, []), 0.0, "macOS stamps are precise; these say 0")
+
     def test_test_pane_shows_bounces_on_every_button(self) -> None:
         from app.core import Button, ClickEvent
 

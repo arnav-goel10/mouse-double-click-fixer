@@ -6,7 +6,7 @@ macOS, settings cards and the ToggleSwitch on Windows 11.
 
 from __future__ import annotations
 
-from time import monotonic
+from time import monotonic, perf_counter
 from typing import Optional
 
 from PySide6.QtCore import (
@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
 
 from ..core import Button
 from . import symbols
-from .theme import IS_MAC, Look, current_look, font, with_alpha
+from .theme import IS_MAC, IS_WINDOWS, Look, current_look, font, with_alpha
 
 # The active look, shared by every painted widget and swapped when the system
 # switches between light and dark.
@@ -627,8 +627,13 @@ class ClickPad(QWidget):
 
     @staticmethod
     def _event_time(event) -> float:
-        """When the click happened, from the event itself: a busy moment
-        before it is processed must not stretch the gap being measured."""
+        """When the click happened. On macOS that is the event's own stamp:
+        a busy moment before it is processed must not stretch the gap being
+        measured. Windows stamps events from its 15.6 ms tick, so every gap
+        would read 0, 15, 16 or 31 ms, and a bounce couldn't be told from a
+        quick click; there the precise clock is read as the event arrives."""
+        if IS_WINDOWS:
+            return perf_counter()
         stamp = event.timestamp()
         return stamp / 1000.0 if stamp else monotonic()
 
