@@ -529,6 +529,9 @@ class SignPathWorkflowTests(unittest.TestCase):
     def test_the_files_sent_for_signing_never_become_release_files(self) -> None:
         names = re.findall(r"name: (unsigned-[\w-]+)\n", self.windows)
         self.assertEqual(names, ["unsigned-windows-executables", "unsigned-windows-installer"])
+        # SignPath fetches them while the job waits; nothing needs them after.
+        for upload in ("Hand the executables to SignPath", "Hand the installer to SignPath"):
+            self.assertIn("          retention-days: 1\n", step(self.windows, upload))
         download = step(job(self.release, "publish"), "uses: actions/download-artifact")
         self.assertIn("pattern: DoubleClickFixer-*", download)
         for name in names:

@@ -152,6 +152,8 @@ jobs:
           name: unsigned-windows-executables
           path: signing/unsigned/
           if-no-files-found: error
+          # Only SignPath reads it, while the job waits.
+          retention-days: 1
       - name: Sign the executables (SignPath artifact configuration windows-executables)
         if: steps.signpath.outputs.sign == 'true'
         uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
@@ -188,6 +190,8 @@ jobs:
           name: unsigned-windows-installer
           path: installer/Output/DoubleClickFixer-Setup.exe
           if-no-files-found: error
+          # Only SignPath reads it, while the job waits.
+          retention-days: 1
       - name: Sign the installer (SignPath artifact configuration windows-installer)
         if: steps.signpath.outputs.sign == 'true'
         uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
