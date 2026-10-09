@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import platform
 import time
 from typing import Optional
@@ -242,7 +243,8 @@ class AppsPage(Page):
 
     def choose_file(self) -> None:
         if platform.system() == "Windows":
-            start, kinds = "C:\\Program Files", "Programs (*.exe)"
+            # Where this Windows keeps programs, which needn't be drive C.
+            start, kinds = os.environ.get("ProgramFiles") or "C:\\Program Files", "Programs (*.exe)"
         else:
             start, kinds = "/Applications", "Applications (*.app)"
         path, _filter = QFileDialog.getOpenFileName(self, _choose_title().rstrip("…"), start, kinds)

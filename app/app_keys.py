@@ -78,6 +78,22 @@ def _text(value: object) -> str:
 
 # -- running apps ------------------------------------------------------------------
 
+#: Windows programs whose windows are the shell's, not an app's: explorer.exe
+#: is the desktop, the taskbar and File Explorer, and every Store (UWP) app's
+#: window belongs to ApplicationFrameHost.exe, so excluding either would
+#: exclude far more than the one app someone picked.
+WINDOWS_SHELL_PROGRAMS = frozenset({"explorer.exe", "applicationframehost.exe"})
+
+
+def running_windows_choice(executable: str) -> Optional[AppChoice]:
+    """The choice the running list offers for a program with a window, or
+    None for the shell's own (WINDOWS_SHELL_PROGRAMS)."""
+    choice = from_exe(executable)
+    if choice is None or choice.key in WINDOWS_SHELL_PROGRAMS:
+        return None
+    return choice
+
+
 def running_apps() -> list[AppChoice]:
     """The apps open now, by name, without this one. Empty when the system
     won't say."""
@@ -176,8 +192,8 @@ def _running_windows() -> list[AppChoice]:
         more = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
         while more:
             if entry.th32ProcessID in pids and entry.th32ProcessID != own:
-                choice = from_exe(entry.szExeFile)
-                if choice is not None and choice.key != "explorer.exe":
+                choice = running_windows_choice(entry.szExeFile)
+                if choice is not None:
                     apps.append(choice)
             more = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
     finally:

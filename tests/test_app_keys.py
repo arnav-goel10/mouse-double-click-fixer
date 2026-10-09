@@ -7,6 +7,8 @@ except ImportError:  # run as tests.<module> from the repository root
 
 import platform
 import plistlib
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -65,18 +67,65 @@ class AppKeyTests(unittest.TestCase):
                 self.assertLogs("app.app_keys", "WARNING"):
             self.assertEqual(app_keys.running_apps(), [])
 
+    def test_the_shells_own_windows_are_not_offered(self) -> None:
+        # Every Store app's window is ApplicationFrameHost.exe's, and
+        # explorer.exe is the desktop: excluding either would exclude far
+        # more than one app.
+        self.assertIsNone(app_keys.running_windows_choice("ApplicationFrameHost.exe"))
+        self.assertIsNone(app_keys.running_windows_choice("explorer.exe"))
+        self.assertIsNone(app_keys.running_windows_choice(""))
+        self.assertEqual(app_keys.running_windows_choice("cs2.exe"), AppChoice("cs2.exe", "cs2"))
+
     @unittest.skipUnless(platform.system() == "Darwin", "macOS")
     def test_the_running_apps_on_this_mac(self) -> None:
-        # Reads NSWorkspace's list; opens nothing.
+        # Reads NSWorkspace's list; opens nothing. Finder runs in every
+        # login session with a desktop, so the list can't be empty there.
+        if subprocess.run(["pgrep", "-x", "Finder"], capture_output=True).returncode != 0:
+            self.skipTest("Finder isn't running: no desktop session")
         apps = app_keys._running_mac()
         self.assertTrue(all(isinstance(app, AppChoice) and app.key and app.name for app in apps))
+        self.assertIn("com.apple.finder", {app.key for app in apps})
 
     @unittest.skipUnless(platform.system() == "Windows", "Windows")
     def test_the_running_programs_on_this_pc(self) -> None:
-        # EnumWindows and a toolhelp snapshot; opens nothing.
+        # EnumWindows and a toolhelp snapshot, with a window of the test's
+        # own (in a child process: the list leaves out the app's own) so the
+        # list can't pass by being empty.
+        probe = subprocess.Popen(
+            [sys.executable, "-I", "-c", WINDOW_PROBE], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+        )
+        self.addCleanup(probe.stderr.close)
+        self.addCleanup(probe.stdout.close)
+        self.addCleanup(probe.wait, 10)
+        self.addCleanup(probe.kill)
+        self.assertEqual(probe.stdout.readline().strip(), "ready", probe.stderr.read() if probe.poll() is not None else "")
         apps = app_keys._running_windows()
+        keys = {app.key for app in apps}
+        self.assertIn(app_keys.windows_key(sys.executable), keys, "the probe's window is listed")
         self.assertTrue(all(app.key.endswith(".exe") and app.key == app.key.lower() for app in apps))
-        self.assertNotIn("explorer.exe", {app.key for app in apps})
+        self.assertFalse(keys & app_keys.WINDOWS_SHELL_PROGRAMS)
+
+
+#: A visible, titled top-level window, kept up until the test kills it.
+WINDOW_PROBE = """
+import ctypes, sys
+from ctypes import wintypes
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+user32.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.HWND, wintypes.HMENU,
+    wintypes.HINSTANCE, wintypes.LPVOID]
+user32.CreateWindowExW.restype = wintypes.HWND
+WS_OVERLAPPEDWINDOW, WS_VISIBLE = 0x00CF0000, 0x10000000
+window = user32.CreateWindowExW(0, "STATIC", "Mouse Double-Click Fixer test window",
+    WS_OVERLAPPEDWINDOW | WS_VISIBLE, 0, 0, 240, 120, None, None, None, None)
+if not window:
+    sys.exit(f"CreateWindowExW failed: {ctypes.get_last_error()}")
+print("ready", flush=True)
+message = wintypes.MSG()
+while user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
+    user32.TranslateMessage(ctypes.byref(message))
+    user32.DispatchMessageW(ctypes.byref(message))
+"""
 
 
 if __name__ == "__main__":

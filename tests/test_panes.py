@@ -482,6 +482,15 @@ class AppsPaneTests(PaneTestCase):
         self.assertEqual(len(self.controller.excluded_apps), 1)
 
 
+    def test_the_program_dialog_starts_where_this_windows_keeps_programs(self) -> None:
+        with mock.patch("app.ui.panes.platform.system", return_value="Windows"), \
+                mock.patch.dict(os.environ, {"ProgramFiles": "D:\\Programs"}), \
+                mock.patch("app.ui.panes.QFileDialog.getOpenFileName", return_value=("", "")) as dialog:
+            self.window.apps.choose_file()
+        self.assertEqual(dialog.call_args.args[2], "D:\\Programs")
+        self.assertIn("*.exe", dialog.call_args.args[3])
+
+
 class DevicesPaneTests(PaneTestCase):
     def device(self, key, name, kind="mouse"):
         from app.contracts import DeviceInfo
