@@ -107,6 +107,35 @@ begin
     Result := Parts[2] >= Patch;
 end;
 
+const
+  // How long the installed copy gets to ask a running one to quit.
+  QuitWaitSeconds = 20;
+
+// The installed exe, when it can be run to ask a running copy to quit, or ''
+// when it can't (the log says why). It knows how to reach a running copy of
+// its own version; the new exe can't run on its own from {tmp}, as it needs
+// its folder.
+function InstalledQuitter: String;
+var
+  Version: String;
+begin
+  Result := '';
+  Version := InstalledVersion;
+  if not VersionAtLeast(Version, 0, 2, 7) then
+    // Before 0.2.7 "--quit" is unknown: run with it, such a copy may start a
+    // second one that never exits.
+    Log('Quit: taskkill only: no installed copy, or one before 0.2.7 (' + Version + ')')
+  else if VersionAtLeast(Version, 1, 0, 0) and not DirExists(ExpandConstant('{app}\_internal')) then
+    // From 1.0 the installed app is a folder build, and its exe can't start
+    // without _internal: a failed update may have removed it
+    // ([InstallDelete] runs first, and rollback doesn't restore it). Run, it
+    // would show "Failed to load Python DLL" and wait for a click. Before
+    // 1.0 it was one self-contained file.
+    Log('Quit: taskkill only: the installed ' + Version + ' has no _internal folder, so it can''t start')
+  else
+    Result := ExpandConstant('{app}\DoubleClickFixer.exe');
+end;
+
 // A running copy lives in the notification area and ignores window-close
 // requests (closing only hides it), so ask it to quit through its own
 // single-instance channel before files are replaced or removed. "--quit"
@@ -114,36 +143,50 @@ end;
 procedure AskRunningCopyToQuit(const Exe: String);
 var
   ResultCode: Integer;
+  Script: String;
 begin
-  if FileExists(Exe) then
+  if (Exe <> '') and FileExists(Exe) then
   begin
-    Exec(Exe, '--quit', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    // Through PowerShell, for a time limit: Exec waits for ever or not at
+    // all, and a copy that can't start or hangs would hold this installer
+    // (a silent update, with the app already closed) for ever. The exe is
+    // found from the folder PowerShell starts in, so no path is ever
+    // quoted into the command.
+    Script := '$ErrorActionPreference = ''Stop''; ' +
+      'try { $p = Start-Process -FilePath (Join-Path -Path (Get-Location).ProviderPath -ChildPath ''' +
+      ExtractFileName(Exe) + ''') -ArgumentList ''--quit'' -WindowStyle Hidden -PassThru } catch { exit 4 }; ' +
+      'if ($p.WaitForExit(' + IntToStr(QuitWaitSeconds * 1000) + ')) { exit 0 }; ' +
+      'Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; exit 3';
+    Log('Quit: asking the installed copy: ' + Exe + ' --quit');
+    if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+      '-NoProfile -NonInteractive -Command "' + Script + '"', ExtractFileDir(Exe), SW_HIDE,
+      ewWaitUntilTerminated, ResultCode) then
+      Log('Quit: couldn''t start PowerShell: ' + SysErrorMessage(ResultCode))
+    else if ResultCode = 0 then
+      Log('Quit: --quit finished')
+    else if ResultCode = 3 then
+      Log(Format('Quit: --quit did not finish within %d s; stopped it', [QuitWaitSeconds]))
+    else
+      Log(Format('Quit: --quit couldn''t be run (PowerShell exit code %d)', [ResultCode]));
     Sleep(800);
   end;
   // A copy older than 0.2.7 doesn't know "--quit" (it shows its window
   // instead), and one that is hung can't answer: end it, so no file stays
   // in use. Its mouse hook goes with it.
-  Exec(ExpandConstant('{sys}\taskkill.exe'), '/IM DoubleClickFixer.exe /F', '', SW_HIDE,
-    ewWaitUntilTerminated, ResultCode);
+  if Exec(ExpandConstant('{sys}\taskkill.exe'), '/IM DoubleClickFixer.exe /F', '', SW_HIDE,
+    ewWaitUntilTerminated, ResultCode) then
+    Log(Format('Quit: taskkill exit code %d (0 ended a copy, 128 found none running)', [ResultCode]));
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
-  // The installed copy knows how to reach a running one of its own version.
-  // (The new exe can't run on its own from {tmp}: it needs its folder.) A
-  // copy before 0.2.7 doesn't know "--quit": run with it, it may start a
-  // second copy that never exits, and this installer would wait on it for
-  // ever. So that one, like a copy installed elsewhere, is left to taskkill.
-  if VersionAtLeast(InstalledVersion, 0, 2, 7) then
-    AskRunningCopyToQuit(ExpandConstant('{app}\DoubleClickFixer.exe'))
-  else
-    AskRunningCopyToQuit('');
+  AskRunningCopyToQuit(InstalledQuitter);
   Result := '';
 end;
 
 function InitializeUninstall(): Boolean;
 begin
-  AskRunningCopyToQuit(ExpandConstant('{app}\DoubleClickFixer.exe'));
+  AskRunningCopyToQuit(InstalledQuitter);
   Result := True;
 end;
 
