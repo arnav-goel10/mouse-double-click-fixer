@@ -1,6 +1,7 @@
 import http.server
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -314,22 +315,48 @@ class AssetStateTests(unittest.TestCase):
         self.assertIsNotNone(release_from_json(data, "mac"))
 
 
-class WindowsInstallerScriptTests(unittest.TestCase):
+class WindowsScriptTests(unittest.TestCase):
     def test_a_failed_install_reopens_the_old_copy(self) -> None:
-        script = updater.windows_installer_script(
-            Path(r"C:\Temp\dcf-update-1\DoubleClickFixer-Setup.exe"),
-            Path(r"C:\Users\a\AppData\Local\Programs\DoubleClick Fixer\DoubleClickFixer.exe"),
-            "/RELAUNCH=2",
-            ["--updated", "--minimized"],
-        )
+        script = updater.windows_installer_script("/RELAUNCH=2", ["--updated", "--minimized"])
         self.assertIn("/VERYSILENT", script)
         self.assertIn("/RELAUNCH=2", script)
+        self.assertIn('"%DCF_SRC%" /VERYSILENT', script)
         failure_line = next(line for line in script.splitlines() if line.startswith("if errorlevel 1"))
         self.assertIn('start ""', failure_line)
-        self.assertIn('DoubleClickFixer.exe" --updated --minimized', failure_line)
-        self.assertIn("--updated --minimized", script)
+        self.assertIn('"%DCF_APP%" --updated --minimized', failure_line)
+
+    def test_scripts_hold_no_paths_and_are_plain_ascii(self) -> None:
+        for script in (
+            updater.windows_installer_script("/RELAUNCH=1", ["--updated"]),
+            updater.windows_portable_script(1234, ["--updated", "--minimized"]),
+        ):
+            script.encode("ascii")
+            self.assertNotIn(":\\", script)
+            self.assertIn("%DCF_APP%", script)
+            self.assertIn("%DCF_SRC%", script)
+        portable = updater.windows_portable_script(1234, ["--updated"])
+        self.assertIn('move /Y "%DCF_SRC%" "%DCF_APP%"', portable)
+        self.assertIn('start "" "%DCF_APP%" --updated', portable)
+
+    def test_paths_go_through_the_environment(self) -> None:
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, folder, True)
+        app = Path(r"C:\Users\Łukasz 张伟\AppData\Local\Programs\DoubleClick Fixer\DoubleClickFixer.exe")
+        setup = Path(r"C:\Users\Łukasz 张伟\AppData\Local\Temp\dcf-update-1\DoubleClickFixer-Setup.exe")
+        script = folder / "apply-update.cmd"
+        with mock.patch.object(updater.subprocess, "Popen") as popen:
+            updater.start_windows_script(script, updater.windows_installer_script("/RELAUNCH=2", []), app, setup)
+        self.assertEqual(popen.call_args.args[0], ["cmd", "/c", str(script)])
+        environment = popen.call_args.kwargs["env"]
+        self.assertEqual((environment["DCF_APP"], environment["DCF_SRC"]), (str(app), str(setup)))
+        script.read_bytes().decode("ascii")
+
+        with mock.patch.object(updater.subprocess, "Popen") as popen, self.assertRaises(updater.UpdateError):
+            updater.start_windows_script(script, "echo Łukasz", app, setup)
+        popen.assert_not_called()
 
 
+@unittest.skipUnless(sys.platform == "win32", "runs cmd.exe")
 class RelaunchNoticeTests(unittest.TestCase):
     def test_result_is_reported_once(self) -> None:
         from app.controller import AppController

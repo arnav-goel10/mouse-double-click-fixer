@@ -45,6 +45,12 @@ WINDOWS_INSTALLER_ASSET = "DoubleClickFixer-Setup.exe"
 WINDOWS_PORTABLE_ASSET = "DoubleClickFixer.exe"
 CHECKSUM_ASSET = "SHA256SUMS.txt"
 
+#: The Windows update scripts find the running app and the download through
+#: these. cmd reads a batch file in the OEM code page, which can't spell every
+#: path, but expands variables from its Unicode environment intact.
+APP_ENV = "DCF_APP"
+SOURCE_ENV = "DCF_SRC"
+
 CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000
 FIRST_CHECK_DELAY_MS = 20 * 1000
 #: A request that transfers nothing for this long is abandoned, so a stalled
@@ -208,15 +214,15 @@ xattr -dr com.apple.quarantine {quoted(current)} 2>/dev/null
 """
 
 
-def windows_portable_script(pid: int, current: Path, downloaded: Path, relaunch_args: list[str]) -> str:
-    """Swap the portable executable once the app has quit, then reopen it.
+def windows_portable_script(pid: int, relaunch_args: list[str]) -> str:
+    """Swap the portable executable (%DCF_APP%) for the download (%DCF_SRC%)
+    once the app has quit, then reopen it.
 
     The move is retried: in a one-file build the launcher process holds the
     executable for a moment after the app itself has exited. `ping` is the
     delay because `timeout` refuses to run without a console. After 30 failed
     tries the old copy is reopened rather than leaving the user with nothing.
     """
-    batch = lambda value: str(value).replace("%", "%%")  # noqa: E731
     args = " ".join(relaunch_args)
     return f"""@echo off
 setlocal
@@ -224,27 +230,26 @@ set tries=0
 :wait
 tasklist /FI "PID eq {pid}" 2>nul | find "{pid}" >nul && (ping -n 2 127.0.0.1 >nul & goto wait)
 :move
-move /Y "{batch(downloaded)}" "{batch(current)}" >nul 2>&1 && goto done
+move /Y "%{SOURCE_ENV}%" "%{APP_ENV}%" >nul 2>&1 && goto done
 set /a tries+=1
 if %tries% GEQ 30 goto done
 ping -n 2 127.0.0.1 >nul
 goto move
 :done
-start "" "{batch(current)}" {args}
+start "" "%{APP_ENV}%" {args}
 del "%~f0"
 """
 
 
-def windows_installer_script(installer: Path, current: Path, relaunch: str, relaunch_args: list[str]) -> str:
-    """Run the installer silently; if it fails, reopen the copy that was
-    running, so a failed update never leaves the user without the app. On
-    success the installer relaunches the new copy itself."""
-    batch = lambda value: str(value).replace("%", "%%")  # noqa: E731
+def windows_installer_script(relaunch: str, relaunch_args: list[str]) -> str:
+    """Run the installer (%DCF_SRC%) silently; if it fails, reopen the copy
+    that was running (%DCF_APP%), so a failed update never leaves the user
+    without the app. On success the installer relaunches the new copy itself."""
     flags = f"/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS {relaunch}"
     return f"""@echo off
 setlocal
-"{batch(installer)}" {flags}
-if errorlevel 1 start "" "{batch(current)}" {" ".join(relaunch_args)}
+"%{SOURCE_ENV}%" {flags}
+if errorlevel 1 start "" "%{APP_ENV}%" {" ".join(relaunch_args)}
 del "%~f0"
 """
 
@@ -513,13 +518,12 @@ class Updater(QObject):
 
     def _install_windows_installer(self, installer: Path) -> None:
         relaunch = "/RELAUNCH=1" if self.window_visible() else "/RELAUNCH=2"
-        script = installer.parent / "apply-update.cmd"
-        script.write_text(
-            windows_installer_script(installer, Path(sys.executable), relaunch, self._relaunch_args()),
-            encoding="oem" if platform.system() == "Windows" else "utf-8",
-            errors="replace",
+        start_windows_script(
+            installer.parent / "apply-update.cmd",
+            windows_installer_script(relaunch, self._relaunch_args()),
+            app=Path(sys.executable),
+            source=installer,
         )
-        subprocess.Popen(["cmd", "/c", str(script)], creationflags=_detached_flags())
 
     def _install_windows_portable(self, downloaded: Path) -> None:
         current = Path(sys.executable)
@@ -530,16 +534,12 @@ class Updater(QObject):
             probe.unlink()
         except OSError as error:
             raise UpdateError(f"No permission to replace the app in {current.parent}.") from error
-        script = downloaded.parent / "apply-update.cmd"
-        # cmd.exe reads batch files in the OEM code page, not the ANSI one
-        # Python writes by default; non-ASCII paths would otherwise break.
-        encoding = "oem" if platform.system() == "Windows" else "utf-8"
-        script.write_text(
-            windows_portable_script(os.getpid(), current, downloaded, self._relaunch_args()),
-            encoding=encoding,
-            errors="replace",
+        start_windows_script(
+            downloaded.parent / "apply-update.cmd",
+            windows_portable_script(os.getpid(), self._relaunch_args()),
+            app=current,
+            source=downloaded,
         )
-        subprocess.Popen(["cmd", "/c", str(script)], creationflags=_detached_flags())
 
     # -- state ------------------------------------------------------------------------
     def _fail(self, message: str) -> None:
@@ -558,6 +558,17 @@ class Updater(QObject):
 
 class UpdateError(RuntimeError):
     pass
+
+
+def start_windows_script(script: Path, text: str, app: Path, source: Path) -> None:
+    """Write an update script as plain ASCII and run it detached, handing it
+    the paths through its environment (see APP_ENV)."""
+    try:
+        script.write_text(text, encoding="ascii")
+    except (OSError, UnicodeError) as error:
+        raise UpdateError("Couldn’t prepare the update.") from error
+    environment = {**os.environ, APP_ENV: str(app), SOURCE_ENV: str(source)}
+    subprocess.Popen(["cmd", "/c", str(script)], env=environment, creationflags=_detached_flags())
 
 
 def _detached_flags() -> int:
