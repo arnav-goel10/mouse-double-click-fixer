@@ -37,6 +37,10 @@ Type: filesandordirs; Name: "{app}\_internal"
 ; A folder, not the portable one-file exe: launching it (and every sign-in)
 ; unpacks nothing.
 Source: "..\dist\onedir\DoubleClickFixer\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; The licences of what the app bundles (Qt's LGPL among them), where anyone
+; looking in the install folder finds them. The PyInstaller spec writes the
+; file for the exact versions it bundled, and the app has its own copy.
+Source: "..\build\notices\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\DoubleClick Fixer"; Filename: "{app}\DoubleClickFixer.exe"
