@@ -174,6 +174,7 @@ class Application:
                 on_toggle=self.window.request_filter,
                 updater=self.updater,
                 on_check_updates=self.check_for_updates,
+                on_install_update=self.install_update,
                 parent=self.window,
             )
             self.tray.show()
@@ -182,7 +183,6 @@ class Application:
         # A background update waits while the window is open; closing it is
         # the moment to finish.
         self.window.closed_to_tray.connect(self.updater.apply_if_ready)
-        self._told_about_tray = False
 
         self.server = QLocalServer()
         QLocalServer.removeServer(SERVER_NAME)
@@ -231,12 +231,26 @@ class Application:
         quit_action.setMenuRole(QAction.MenuRole.QuitRole)
         quit_action.triggered.connect(self.quit)
         menu.addActions([about, updates, settings, quit_action])
+        # The standard Window menu: Minimize (⌘M) and Zoom, as in every Mac app.
         window_menu = bar.addMenu("Window")
+        minimize = QAction("Minimize", window_menu)
+        minimize.setShortcut(QKeySequence("Ctrl+M"))  # Qt's Ctrl is ⌘ on macOS
+        minimize.triggered.connect(self.window.showMinimized)
+        zoom = QAction("Zoom", window_menu)
+        zoom.triggered.connect(self._zoom)
         close = QAction("Close", window_menu)
         close.setShortcut(QKeySequence.StandardKey.Close)
         close.triggered.connect(self.window.close)
+        window_menu.addActions([minimize, zoom])
+        window_menu.addSeparator()
         window_menu.addAction(close)
         return bar
+
+    def _zoom(self) -> None:
+        if self.window.isMaximized():
+            self.window.showNormal()
+        else:
+            self.window.showMaximized()
 
     def _on_theme_changed(self) -> None:
         self.window.apply_look()
@@ -247,6 +261,13 @@ class Application:
         self.show_window()
         self.window.show_page("general")
         self.updater.check(user_initiated=True)
+
+    def install_update(self) -> None:
+        """The menu's "Update to X": install with General on screen, where
+        the progress, and any failure, shows."""
+        self.show_window()
+        self.window.show_page("general")
+        self.updater.install()
 
     def _about(self) -> None:
         QMessageBox.about(
@@ -274,11 +295,12 @@ class Application:
     def _note_hidden(self) -> None:
         # The window is closed; the app carries on from the menu bar alone.
         dock.set_visible(False)
-        # A one-time hint on Windows, where tray icons hide in the overflow.
-        # macOS apps don't announce this; the menu bar icon speaks for itself.
-        if self.tray is None or self._told_about_tray or platform.system() == "Darwin":
+        # A one-time hint on Windows, where tray icons hide in the overflow:
+        # once ever, not once per sign-in. macOS apps don't announce this;
+        # the menu bar icon speaks for itself.
+        if self.tray is None or self.controller.tray_hint_shown or platform.system() == "Darwin":
             return
-        self._told_about_tray = True
+        self.controller.note_tray_hint_shown()
         self.tray.showMessage(
             "DoubleClick Fixer is still running",
             "It keeps filtering from the notification area."
@@ -347,7 +369,10 @@ class Application:
         if self.window.isVisible():
             self.window.save_geometry()
         self.controller.shutdown()
-        if self.tray is not None:
+        if self.tray is not None and platform.system() != "Darwin":
+            # Windows leaves a dead icon in the notification area otherwise.
+            # macOS removes the item with the app, and hiding it first would
+            # be remembered under its autosave name.
             self.tray.hide()
         self.qt.quit()
 

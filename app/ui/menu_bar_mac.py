@@ -56,6 +56,9 @@ def _handler_class():
     return _HANDLER_CLASS
 
 
+#: The status item's position is saved under this name.
+AUTOSAVE_NAME = "com.doubleclickfixer.app.status-item"
+
 #: SF Symbols for the menu bar: filled while filtering, outline when off.
 #: Apple's own menu extras are drawn this way, and the system renders them at
 #: the right weight and size for the menu bar, which a shrunken bitmap cannot.
@@ -111,6 +114,7 @@ class MacMenuBarItem:
         on_toggle: Optional[Callable[[bool], None]] = None,
         updater=None,
         on_check_updates: Optional[Callable[[], None]] = None,
+        on_install_update: Optional[Callable[[], None]] = None,
         parent=None,
     ) -> None:
         from AppKit import NSMenu, NSMenuItem, NSStatusBar, NSVariableStatusItemLength
@@ -119,6 +123,7 @@ class MacMenuBarItem:
         self.updater = updater
         self._on_toggle = on_toggle or controller.set_active
         self._on_check_updates = on_check_updates
+        self._on_install_update = on_install_update
 
         self._target = _handler_class().alloc().initWithActions_(
             {
@@ -133,6 +138,8 @@ class MacMenuBarItem:
         )
 
         self._item = NSStatusBar.systemStatusBar().statusItemWithLength_(NSVariableStatusItemLength)
+        # macOS remembers where the user ⌘-dragged the item to, by this name.
+        self._item.setAutosaveName_(AUTOSAVE_NAME)
         menu = NSMenu.alloc().init()
         menu.setAutoenablesItems_(False)
 
@@ -218,6 +225,7 @@ class MacMenuBarItem:
     # -- actions ---------------------------------------------------------------
     def _check_updates(self) -> None:
         if self.updater is not None and self.updater.state in (self.updater.AVAILABLE, self.updater.READY):
-            self.updater.install()
+            # Opens General first, so the install shows its progress.
+            (self._on_install_update or self.updater.install)()
         elif self._on_check_updates is not None:
             self._on_check_updates()

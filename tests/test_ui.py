@@ -921,6 +921,14 @@ class MenuToggleTests(unittest.TestCase):
         )
         return item, appkit
 
+    def test_mac_status_item_is_saved_by_name_and_shown(self) -> None:
+        from app.ui import menu_bar_mac
+
+        item, _appkit = self.mac_item(self.controller(), mock.Mock())
+        item._item.setAutosaveName_.assert_called_once_with(menu_bar_mac.AUTOSAVE_NAME)
+        item.show()
+        item._item.setVisible_.assert_called_with(True)
+
     def test_mac_menu_toggle_follows_the_users_choice(self) -> None:
         controller = self.controller(active=False, wanted=True)
         toggle = mock.Mock()
@@ -1038,6 +1046,133 @@ class WindowFixTests(WindowTests):
             self.window.request_filter(True, prompt=False)
             ask.assert_not_called()
             self.assertTrue(self.window._enable_when_granted, "still starts once allowed")
+
+
+class SmallFixTests(LiveWindowTests):
+    """Window menu, the tray hint, first-launch size and the status item."""
+
+    def application_stand_in(self, system: str = "Darwin"):
+        """Enough of main.Application to call its methods unbound."""
+        stand_in = mock.Mock()
+        stand_in.window = mock.Mock()
+        stand_in.controller = self.controller
+        stand_in.tray = mock.Mock()
+        stand_in.updater.supported = True
+        # Only main's view of the platform; the rest of the app stays real.
+        patch = mock.patch("app.main.platform", mock.Mock(system=mock.Mock(return_value=system)))
+        patch.start()
+        self.addCleanup(patch.stop)
+        return stand_in
+
+    def test_window_menu_has_minimize_and_zoom(self) -> None:
+        from PySide6.QtGui import QKeySequence
+        from PySide6.QtWidgets import QMenu
+
+        from app.main import Application
+
+        stand_in = self.application_stand_in()
+        bar = Application._build_menu_bar(stand_in)
+        self.addCleanup(bar.deleteLater)
+        window_menu = [menu for menu in bar.findChildren(QMenu) if menu.title() == "Window"][0]
+        actions = {action.text(): action for action in window_menu.actions() if action.text()}
+        self.assertEqual(list(actions), ["Minimize", "Zoom", "Close"])
+        self.assertEqual(actions["Minimize"].shortcut(), QKeySequence("Ctrl+M"))
+        actions["Minimize"].trigger()
+        stand_in.window.showMinimized.assert_called_once()
+        actions["Zoom"].trigger()
+        stand_in._zoom.assert_called_once()
+
+    def test_zoom_toggles_between_maximized_and_normal(self) -> None:
+        from app.main import Application
+
+        stand_in = self.application_stand_in()
+        stand_in.window.isMaximized.return_value = False
+        Application._zoom(stand_in)
+        stand_in.window.showMaximized.assert_called_once()
+        stand_in.window.isMaximized.return_value = True
+        Application._zoom(stand_in)
+        stand_in.window.showNormal.assert_called_once()
+
+    def test_the_tray_hint_shows_once_ever(self) -> None:
+        from app.controller import AppController
+        from app.main import Application
+
+        stand_in = self.application_stand_in("Windows")
+        Application._note_hidden(stand_in)
+        Application._note_hidden(stand_in)
+        self.assertEqual(stand_in.tray.showMessage.call_count, 1)
+        stand_in.controller = AppController()  # the next sign-in reads the saved flag
+        Application._note_hidden(stand_in)
+        self.assertEqual(stand_in.tray.showMessage.call_count, 1)
+
+    def test_quitting_leaves_the_menu_bar_item_alone_on_macos(self) -> None:
+        from app.main import Application
+
+        stand_in = self.application_stand_in("Darwin")
+        stand_in.window.isVisible.return_value = False
+        Application.quit(stand_in)
+        stand_in.tray.hide.assert_not_called()
+
+    def test_quitting_removes_the_tray_icon_on_windows(self) -> None:
+        from app.main import Application
+
+        stand_in = self.application_stand_in("Windows")
+        stand_in.window.isVisible.return_value = False
+        Application.quit(stand_in)
+        stand_in.tray.hide.assert_called_once()
+
+    def test_first_launch_fits_the_screen(self) -> None:
+        from app.ui.window import FRAME_ALLOWANCE, MainWindow
+
+        window = MainWindow(self.controller)
+        self.addCleanup(window.deleteLater)
+        self.addCleanup(self.stop_timers, window)
+        available = window.screen().availableGeometry()
+        self.assertLessEqual(window.width(), available.width() - FRAME_ALLOWANCE[0])
+        self.assertLessEqual(window.height(), available.height() - FRAME_ALLOWANCE[1])
+        self.assertLessEqual(window.minimumHeight(), window.height())
+
+    def test_a_small_screen_lowers_the_minimum_too(self) -> None:
+        from PySide6.QtCore import QRect
+
+        from app.ui.window import MainWindow
+
+        screen = mock.Mock()
+        screen.availableGeometry.return_value = QRect(0, 0, 960, 492)  # Windows at 200%
+        with mock.patch.object(MainWindow, "screen", return_value=screen):
+            window = MainWindow(self.controller)
+        self.addCleanup(window.deleteLater)
+        self.addCleanup(self.stop_timers, window)
+        self.assertLessEqual(window.height(), 492 - 48)
+        self.assertLessEqual(window.minimumHeight(), window.height(), "the user can still fit it")
+
+    def test_install_from_the_menu_opens_general_first(self) -> None:
+        from app.main import Application
+
+        stand_in = self.application_stand_in()
+        order = []
+        stand_in.show_window.side_effect = lambda: order.append("show")
+        stand_in.window.show_page.side_effect = lambda page: order.append(page)
+        stand_in.updater.install.side_effect = lambda: order.append("install")
+        Application.install_update(stand_in)
+        self.assertEqual(order, ["show", "general", "install"])
+
+    def test_tray_update_item_installs_through_the_app(self) -> None:
+        from app.ui.tray import Tray
+
+        updater = mock.Mock(supported=True, AVAILABLE="available", READY="ready", state="available")
+        updater.release.version = "1.0.0"
+        install = mock.Mock()
+        controller = mock.Mock(active=False, wanted=False, threshold_ms=60)
+        controller.status_text.return_value = "Off"
+        controller.tooltip_text.return_value = "DoubleClick Fixer: off"
+        tray = Tray(controller, on_open=mock.Mock(), on_calibrate=mock.Mock(), on_quit=mock.Mock(),
+                    updater=updater, on_check_updates=mock.Mock(), on_install_update=install)
+        self.addCleanup(tray.deleteLater)
+        self.assertEqual(tray.update_action.text(), "Update to 1.0.0")
+        tray.update_action.trigger()
+        install.assert_called_once_with()
+        updater.install.assert_not_called()
 
 
 class QuitCommandTests(unittest.TestCase):

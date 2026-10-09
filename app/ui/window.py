@@ -70,6 +70,8 @@ HEALTH_CHECK_MS = 5000
 COLUMN_MAX = 640 if IS_MAC else 1000
 #: The narrowest the content column may get before the window stops shrinking.
 COLUMN_MIN = 440
+#: Room left around a first-launch window for its frame and title bar.
+FRAME_ALLOWANCE = (16, 48)
 
 DIAGNOSTICS_DETAIL = "Version, settings and the recent log, for a bug report. Never your clicks."
 
@@ -838,7 +840,9 @@ class MainWindow(QWidget):
         self._material = False
         side = look().sidebar_width
         page_margins = 40 if IS_MAC else 72
-        self.setMinimumSize(side + page_margins + COLUMN_MIN + 16, 480 if IS_MAC else 540)
+        # Every pane scrolls, so the minimum height only has to fit the
+        # sidebar; Windows at 200% scaling leaves about 490 px.
+        self.setMinimumSize(side + page_margins + COLUMN_MIN + 16, 480)
         self.resize(side + page_margins + COLUMN_MAX // (1 if IS_MAC else 2) + 60, 640 if IS_MAC else 700)
 
         root = QHBoxLayout(self)
@@ -943,14 +947,32 @@ class MainWindow(QWidget):
         self._session_active = True
 
         self._show_page(0)
-        self._restore_geometry()
+        if not self._restore_geometry():
+            self._fit_to_screen()
 
     # -- size and position -------------------------------------------------------
-    def _restore_geometry(self) -> None:
-        """Reopen where the window was left, as Mac and Windows apps do."""
+    def _restore_geometry(self) -> bool:
+        """Reopen where the window was left, as Mac and Windows apps do.
+        Qt keeps a restored window on a screen that is still there."""
         saved = self.controller.settings.get("window_geometry") or ""
         if saved:
-            self.restoreGeometry(QByteArray.fromBase64(saved.encode("ascii")))
+            return bool(self.restoreGeometry(QByteArray.fromBase64(saved.encode("ascii"))))
+        return False
+
+    def _fit_to_screen(self) -> None:
+        """First launch: the default size, but never more than the screen's
+        work area. A 1080p laptop at 150% has about 670 px above the
+        taskbar, less than the default, and Qt only centres a window that
+        fits; one that doesn't hides its bottom edge under the taskbar."""
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        # The size set here leaves out the title bar and frame.
+        width = min(self.width(), available.width() - FRAME_ALLOWANCE[0])
+        height = min(self.height(), available.height() - FRAME_ALLOWANCE[1])
+        self.setMinimumSize(min(self.minimumWidth(), width), min(self.minimumHeight(), height))
+        self.resize(width, height)
 
     def save_geometry(self) -> None:
         encoded = bytes(self.saveGeometry().toBase64()).decode("ascii")

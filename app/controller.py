@@ -336,6 +336,13 @@ class AppController(QObject):
         if encoded != self.settings.get("window_geometry"):
             self._store(window_geometry=encoded)
 
+    @property
+    def tray_hint_shown(self) -> bool:
+        return bool(self.settings.get("tray_hint_shown"))
+
+    def note_tray_hint_shown(self) -> None:
+        self._store(tray_hint_shown=True)
+
     def set_auto_update(self, enabled: bool) -> None:
         self._store(auto_update=bool(enabled))
 

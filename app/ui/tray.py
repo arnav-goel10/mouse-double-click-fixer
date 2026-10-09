@@ -36,6 +36,7 @@ class Tray(QSystemTrayIcon):
         on_toggle: Optional[Callable[[bool], None]] = None,
         updater=None,
         on_check_updates: Optional[Callable[[], None]] = None,
+        on_install_update: Optional[Callable[[], None]] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -67,6 +68,7 @@ class Tray(QSystemTrayIcon):
         self.update_action = QAction("Check for updates…", menu)
         self.update_action.triggered.connect(self._on_update_action)
         self._on_check_updates = on_check_updates
+        self._on_install_update = on_install_update
         if updater is not None and updater.supported:
             menu.addAction(self.update_action)
             updater.changed.connect(self.refresh)
@@ -102,7 +104,8 @@ class Tray(QSystemTrayIcon):
 
     def _on_update_action(self) -> None:
         if self.updater is not None and self.updater.state in (self.updater.AVAILABLE, self.updater.READY):
-            self.updater.install()
+            # Opens General first, so the install shows its progress.
+            (self._on_install_update or self.updater.install)()
         elif self._on_check_updates is not None:
             self._on_check_updates()
 
