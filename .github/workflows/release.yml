@@ -4,8 +4,11 @@ name: Release
 # a draft release. Nothing reaches users from here: the owner checks, signs
 # and publishes the draft on the Mac that holds the update keys, with
 #   python3 tools/sign_release.py publish v1.0.1
-# A tag with a suffix (v1.1.0-rc.1) makes a pre-release. A manual run only
-# builds and tests, as a packaging check; it never puts anything up.
+# `python3 tools/sign_release.py --help` lists every step of a release, from
+# merging to main to publishing. A tag with a suffix (v1.1.0-rc.1) makes a
+# pre-release. A manual run (workflow_dispatch), on a branch or on a tag, only
+# builds and tests, as a packaging check: it never loads the signing
+# certificate and never puts anything up.
 on:
   workflow_dispatch:
   push:
@@ -15,7 +18,10 @@ on:
 permissions:
   contents: read
 
-# One release at a time; a second tag waits for the first.
+# One release run at a time. GitHub keeps at most one more run of the group
+# waiting: while one runs, a newer run cancels the one already waiting and
+# takes its place. Push one release tag at a time, and re-run a cancelled one
+# from the Actions tab.
 concurrency:
   group: release
   cancel-in-progress: false
@@ -52,8 +58,9 @@ jobs:
         run: |
           python -m pip install --require-hashes --only-binary :all: -r requirements-build.txt
       - name: Refuse CI's throwaway update key
-        # CI's end-to-end build trusts a key made for that run; a release must
-        # trust the release keys only (see tools/ci_update_key.py).
+        # With this set, the spec would freeze in a start-up hook that trusts
+        # a key made for one CI run (tools/ci_update_key.py). A release must
+        # trust the release keys only.
         shell: pwsh
         run: |
           if ($env:DCF_CI_UPDATE_KEY) { throw "DCF_CI_UPDATE_KEY is set: a release must never trust CI's update key" }
@@ -69,7 +76,7 @@ jobs:
       - name: Build the portable executable and the installed folder
         shell: pwsh
         run: .\installer\build_windows.ps1
-      - name: Confirm no build carries CI's update key
+      - name: Confirm no build carries CI's update key or its start-up hook
         shell: pwsh
         run: python tools/ci_update_key.py check dist\DoubleClickFixer.exe dist\onedir
       - name: Build the Windows installer
@@ -83,6 +90,9 @@ jobs:
         run: |
           New-Item -ItemType Directory release | Out-Null
           Copy-Item dist\DoubleClickFixer.exe, installer\Output\DoubleClickFixer-Setup.exe release\
+          # The notices the installer puts beside the app (windows.iss's {app}
+          # entry); build_windows.ps1 checked the portable exe ships the same.
+          Copy-Item build\notices\THIRD_PARTY_NOTICES.md release\THIRD_PARTY_NOTICES-windows.md
           Get-FileHash release\* -Algorithm SHA256 | Format-Table Hash, Path -AutoSize | Out-String -Width 200 | Write-Host
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -137,8 +147,9 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 40
     # The signing certificate is kept in the "release" environment, which
-    # only tags may use. A manual run builds without it, ad-hoc signed.
-    environment: ${{ startsWith(github.ref, 'refs/tags/') && 'release' || '' }}
+    # only tags may use, and only the push of a tag loads it. A manual run,
+    # even on a tag, builds without it, ad-hoc signed.
+    environment: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && 'release' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -151,15 +162,13 @@ jobs:
         # macOS keeps the Accessibility permission only while updates are
         # signed with the same certificate, so a release must never go out
         # without it.
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         env:
           P12: ${{ secrets.MACOS_SIGNING_P12 }}
           P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
         run: |
           if [ -z "$P12" ]; then
-            if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-              echo "::error::MACOS_SIGNING_P12 is not set; refusing to build an unsigned release"; exit 1
-            fi
-            echo "No signing certificate; this packaging check will be ad-hoc signed."; exit 0
+            echo "::error::MACOS_SIGNING_P12 is not set; refusing to build an unsigned release"; exit 1
           fi
           keychain="$RUNNER_TEMP/signing.keychain-db"
           password="$(openssl rand -hex 16)"
@@ -176,8 +185,10 @@ jobs:
           echo "DCF_SIGN_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
           echo "DCF_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
       - name: Show whether this Mac enforces code signatures
-        # The build's injection check needs it: with System Integrity
-        # Protection off, dyld loads DYLD_INSERT_LIBRARIES into any app.
+        # With System Integrity Protection off, as on GitHub's Macs, dyld loads
+        # DYLD_INSERT_LIBRARIES into any app, so the build's injection check
+        # skips that one leg here; tools/sign_release.py runs it in full, with
+        # SIP on, before a release is published.
         run: csrutil status || true
       - name: Build macOS app, DMG and update archive
         run: bash installer/build_macos.sh
@@ -189,24 +200,17 @@ jobs:
       - name: Confirm the app keeps the designated requirement installed copies have
         # The requirement is what macOS keys the Accessibility permission on;
         # tools/sign_release.py checks it again before publishing.
-        if: startsWith(github.ref, 'refs/tags/') || env.DCF_SIGN_IDENTITY != ''
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         run: |
           expected='identifier "com.doubleclickfixer.app" and certificate root = H"81a512665a945aebb386f04541f5c41f341a6c31"'
           found="$(codesign -d -r- "dist/DoubleClick Fixer.app" 2>&1 | sed -n 's/^designated => //p')"
           echo "designated => $found"
           [ "$found" = "$expected" ] || { echo "::error::the app's designated requirement changed"; exit 1; }
-      - name: Check the app loads no code named in its environment
-        run: |
-          if grep -q macos_injection_check installer/build_macos.sh; then
-            echo "installer/build_macos.sh already ran tools/macos_injection_check.sh"
-          else
-            bash tools/macos_injection_check.sh "dist/DoubleClick Fixer.app"
-          fi
       - name: Collect the release files
         run: |
           mkdir release
           cp dist/DoubleClickFixer.dmg dist/DoubleClickFixer-macos.zip release/
-          cp "dist/DoubleClick Fixer.app/Contents/Resources/THIRD_PARTY_NOTICES.md" release/
+          cp "dist/DoubleClick Fixer.app/Contents/Resources/THIRD_PARTY_NOTICES.md" release/THIRD_PARTY_NOTICES-macos.md
           shasum -a 256 release/*
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -220,7 +224,8 @@ jobs:
   publish:
     name: Put the release up as a draft
     needs: [checks, windows, macos, windows-e2e]
-    if: startsWith(github.ref, 'refs/tags/')
+    # Only the push of a tag: a manual run never puts up a draft.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -237,7 +242,7 @@ jobs:
         # only once the owner has signed the list.
         run: |
           cd release
-          expected="DoubleClickFixer-Setup.exe DoubleClickFixer-macos.zip DoubleClickFixer.dmg DoubleClickFixer.exe THIRD_PARTY_NOTICES.md"
+          expected="DoubleClickFixer-Setup.exe DoubleClickFixer-macos.zip DoubleClickFixer.dmg DoubleClickFixer.exe THIRD_PARTY_NOTICES-macos.md THIRD_PARTY_NOTICES-windows.md"
           found="$(LC_ALL=C ls | tr '\n' ' ' | sed 's/ $//')"
           [ "$found" = "$expected" ] || { echo "::error::expected $expected, found $found"; exit 1; }
           sha256sum * > SHA256SUMS.txt
@@ -263,9 +268,12 @@ jobs:
             --notes-file release-notes.md release/*
           {
             echo "### Draft ready"
-            echo "Check, sign and publish it on the Mac that holds the update keys:"
+            echo "Check, sign and publish it on the Mac that holds the update keys (System Integrity"
+            echo "Protection on, Xcode's command line tools installed), in a checkout of main at $GITHUB_REF_NAME:"
             echo '```'
             echo "python3 tools/sign_release.py publish $GITHUB_REF_NAME --dry-run"
             echo "python3 tools/sign_release.py publish $GITHUB_REF_NAME"
             echo '```'
+            echo "Both run every check, including the injection check on the draft's own macOS app;"
+            echo "only the second signs, uploads SHA256SUMS.txt.minisig and publishes."
           } >> "$GITHUB_STEP_SUMMARY"

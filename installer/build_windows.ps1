@@ -11,6 +11,10 @@ if ($LASTEXITCODE -ne 0) { throw "pip could not install requirements-build.txt" 
 Remove-Item Env:\DCF_ONEDIR -ErrorAction SilentlyContinue
 python -m PyInstaller --clean --noconfirm doubleclick-fixer.spec
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed to build the portable exe" }
+# Each build writes build\notices\THIRD_PARTY_NOTICES.md for what it bundles.
+$notices = "build\notices\THIRD_PARTY_NOTICES.md"
+$portableNotices = "build\notices\THIRD_PARTY_NOTICES-portable.md"
+Copy-Item $notices $portableNotices -Force
 
 $env:DCF_ONEDIR = "1"
 try {
@@ -18,5 +22,10 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed to build the installed folder" }
 } finally {
     Remove-Item Env:\DCF_ONEDIR -ErrorAction SilentlyContinue
+}
+# A release lists one notices file for both Windows downloads (the one the
+# installer puts beside the app), so the two must bundle the same software.
+if ((Get-FileHash $portableNotices).Hash -ne (Get-FileHash $notices).Hash) {
+    throw "the portable exe and the installed folder ship different third-party notices"
 }
 Write-Host "Built dist\DoubleClickFixer.exe and dist\onedir\DoubleClickFixer\."

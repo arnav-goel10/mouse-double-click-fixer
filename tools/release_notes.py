@@ -10,8 +10,9 @@ older release says that a newer one exists. A pre-release (1.1.0-rc.1) shows
 its own section if the changelog has one, else its version's, else the
 "Unreleased" one, under a line saying installed copies won't update to it.
 
---point-older rewrites every published release page other than the latest
-release's, so each says a newer version exists. Without --apply it only
+--point-older rewrites every published release page older than the latest
+release, so each says a newer version exists; a page for a later version (a
+pre-release of the next one, say) is left alone. Without --apply it only
 prints what it would write. The Release pages workflow runs it when a release
 is published; it needs `gh`, signed in with permission to edit releases.
 """
@@ -28,8 +29,12 @@ from typing import Callable, Optional
 
 ROOT = Path(__file__).resolve().parents[1]
 UNRELEASED = "Unreleased"
-#: The first version whose release carries THIRD_PARTY_NOTICES.md.
+#: The first version whose release carries the notices files.
 NOTICES_SINCE = (1, 0, 0)
+#: The third-party notices a release carries, one per platform's downloads,
+#: with the label its page gives each (tools/sign_release.py's MAC_NOTICES
+#: and WINDOWS_NOTICES).
+NOTICES = (("macOS", "THIRD_PARTY_NOTICES-macos.md"), ("Windows", "THIRD_PARTY_NOTICES-windows.md"))
 
 
 def changelog_section(version: str, changelog: str) -> str:
@@ -111,10 +116,12 @@ def notes(version: str, repo: str, latest: Optional[str] = None) -> str:
     parts.append(template.replace("__VERSION__", version).replace("__REPO__", repo).strip())
     parts.append(f"## What's new\n\n{unwrap(section)}")
     if version_tuple(version) >= NOTICES_SINCE:
+        links = " and ".join(
+            f"[{name}](https://github.com/{repo}/releases/download/v{version}/{name}) ({label})" for label, name in NOTICES
+        )
         parts.append(
-            "**Third-party software:** "
-            f"[THIRD_PARTY_NOTICES.md](https://github.com/{repo}/releases/download/v{version}/THIRD_PARTY_NOTICES.md) "
-            "lists the open-source software in DoubleClick Fixer, its licences and where to get its source."
+            f"**Third-party software:** {links} list the open-source software in each download, "
+            "its licences and where to get its source."
         )
     previous = previous_version(version, changelog)
     if previous:
@@ -131,14 +138,24 @@ def _gh(*arguments: str) -> str:
     return result.stdout
 
 
+def is_older(version: str, latest: str) -> bool:
+    """Whether `version` came before `latest`. A pre-release comes before its
+    own version's release (1.0.0-rc.1 before 1.0.0)."""
+    return version_tuple(version) < version_tuple(latest) or (
+        version_tuple(version) == version_tuple(latest) and "-" in version and "-" not in latest
+    )
+
+
 def point_older(
     repo: str,
     apply: bool = False,
     gh: Callable[..., str] = _gh,
     say: Callable[[str], None] = print,
 ) -> list[str]:
-    """Rewrite every published release page but the latest one so that it
-    points at the latest. Returns the tags rewritten (or that would be)."""
+    """Rewrite every published release page older than the latest release so
+    that it points at the latest. A page for a later version (a pre-release
+    of the next one) is left alone. Returns the tags rewritten (or that
+    would be)."""
     latest_tag = gh("api", f"repos/{repo}/releases/latest", "--jq", ".tag_name").strip()
     if not re.fullmatch(r"v\d+(?:\.\d+)+", latest_tag):
         raise SystemExit(f"The latest release's tag isn't a version: {latest_tag!r}")
@@ -151,6 +168,9 @@ def point_older(
             continue
         if not re.fullmatch(r"v\d+(?:\.\d+)+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?", tag):
             say(f"{tag}: left alone (not a version tag)")
+            continue
+        if not is_older(tag[1:], latest):
+            say(f"{tag}: left alone (later than the latest release, {latest})")
             continue
         try:
             body = notes(tag[1:], repo, latest)

@@ -6,9 +6,28 @@ built into the app: RELEASE_KEYS in app/updater.py, which this tool reads too
 (tools/keys/ has copies for the minisign tool). The secret keys never go to
 GitHub or CI; they stay on the owner's Mac, and releases are signed there.
 
-Pushing a tag makes release.yml build, test and put up a draft release. Then,
-on the Mac that holds the keys:
+Pushing a tag makes release.yml build, test and put up a draft release.
+Every step of a release, in order (`python3 tools/sign_release.py --help`
+prints them too):
 
+    # 1. Merge what is being released into main:
+    git switch main && git pull --ff-only
+    git merge --no-ff BRANCH
+    # 2. Set the version in app/__init__.py (__version__ = "1.0.1"), turn the
+    #    top of CHANGELOG.md into "## 1.0.1 — YYYY-MM-DD" (today's date), and
+    #    check both as release.yml will, then commit and push:
+    GITHUB_REF=refs/tags/v1.0.1 python3 -m unittest tests.test_release
+    git commit -am "DoubleClick Fixer 1.0.1"
+    git push origin main
+    # 3. Tag that commit and push the tag; release.yml builds it:
+    git tag -a v1.0.1 -m "DoubleClick Fixer 1.0.1"
+    git push origin v1.0.1
+    # 4. Wait until the tag's run exists (it can take a few seconds to
+    #    appear), then until it finishes; it puts up the draft:
+    until run="$(gh run list --workflow release.yml --branch v1.0.1 --event push --limit 1 --json databaseId --jq '.[].databaseId')" && [ -n "$run" ]; do sleep 5; done
+    gh run watch "$run" --exit-status
+    # 5. Check the draft, then sign and publish it, on this Mac (the one with
+    #    the update keys, System Integrity Protection on), still at the tag:
     python3 tools/sign_release.py publish v1.0.1 --dry-run
     python3 tools/sign_release.py publish v1.0.1
 
@@ -22,7 +41,13 @@ and refuses unless:
   exactly one app, of the tag's version;
 - that app's signature is valid and its designated requirement is the one
   installed copies have (APP_REQUIREMENT), so macOS keeps their Accessibility
-  permission.
+  permission;
+- its THIRD_PARTY_NOTICES.md is the draft's THIRD_PARTY_NOTICES-macos.md;
+- tools/macos_injection_check.sh passes on that app with all its legs, which
+  needs System Integrity Protection on (it is off on GitHub's Macs, so the
+  build there skips the leg that needs it): no library or program named in
+  the app's environment loads into it or runs as it. This needs clang, from
+  Xcode's command line tools.
 
 It then signs SHA256SUMS.txt with the trusted comment "dcf 1.0.1", checks the
 signature against RELEASE_KEYS, uploads SHA256SUMS.txt.minisig, checks that
@@ -43,9 +68,12 @@ look at the latest full release anyway, can never install it.
                         comment then names it, and installed copies accept it.
     --repo OWNER/NAME   another repository (default: the one copies update from)
 
-The steps `publish` takes, by hand:
+The steps `publish` takes, by hand (after comparing the files with the run's
+artifacts):
 
     gh release download v1.0.1 --dir ~/dcf-release-1.0.1
+    ditto -x -k ~/dcf-release-1.0.1/DoubleClickFixer-macos.zip ~/dcf-app-1.0.1
+    bash tools/macos_injection_check.sh ~/dcf-app-1.0.1/"DoubleClick Fixer.app" --require-sip
     python3 tools/sign_release.py sign 1.0.1 ~/dcf-release-1.0.1
     gh release upload v1.0.1 ~/dcf-release-1.0.1/SHA256SUMS.txt.minisig
     gh release edit v1.0.1 --draft=false --latest
@@ -439,11 +467,16 @@ def keygen(name: str, key_dir: Path = KEY_DIR, public_dir: Path = PUBLIC_KEY_DIR
 #: The workflow that builds a tag and puts its draft release up.
 RELEASE_WORKFLOW = "release.yml"
 RELEASE_WORKFLOW_NAME = "Release"
+#: The third-party notices each platform's downloads ship: the macOS app's
+#: Contents/Resources/THIRD_PARTY_NOTICES.md, and the one the Windows
+#: installer puts beside the app.
+MAC_NOTICES = "THIRD_PARTY_NOTICES-macos.md"
+WINDOWS_NOTICES = "THIRD_PARTY_NOTICES-windows.md"
 #: Every file a release carries besides SHA256SUMS.txt, by the workflow
 #: artifact it was built into.
 ARTIFACTS = {
-    "DoubleClickFixer-windows": ("DoubleClickFixer.exe", "DoubleClickFixer-Setup.exe"),
-    "DoubleClickFixer-macos": ("DoubleClickFixer.dmg", MAC_ZIP, "THIRD_PARTY_NOTICES.md"),
+    "DoubleClickFixer-windows": ("DoubleClickFixer.exe", "DoubleClickFixer-Setup.exe", WINDOWS_NOTICES),
+    "DoubleClickFixer-macos": ("DoubleClickFixer.dmg", MAC_ZIP, MAC_NOTICES),
 }
 RELEASE_FILES = tuple(sorted(name for names in ARTIFACTS.values() for name in names)) + (CHECKSUMS,)
 #: The macOS app's designated requirement. macOS keeps the Accessibility
@@ -451,6 +484,9 @@ RELEASE_FILES = tuple(sorted(name for names in ARTIFACTS.values() for name in na
 APP_REQUIREMENT = (
     'identifier "com.doubleclickfixer.app" and certificate root = H"81a512665a945aebb386f04541f5c41f341a6c31"'
 )
+#: Checks that nothing named in the app's environment loads into it or runs as
+#: it. --require-sip makes it run every leg, and fail where it can't.
+INJECTION_CHECK = ROOT / "tools" / "macos_injection_check.sh"
 TAG_PATTERN = re.compile(r"v(?P<version>\d+\.\d+\.\d+)(?P<suffix>-[0-9A-Za-z][0-9A-Za-z.-]*)?")
 
 
@@ -614,17 +650,21 @@ class Publisher:
         if problems:
             raise ReleaseError("\n".join(problems))
 
-    def check_mac_app(self, folder: Path) -> str:
-        """The designated requirement of the app in the macOS zip, once it is
-        the one installed copies expect (or the --requirement being moved to)."""
+    def unpack_mac_app(self, folder: Path) -> Path:
+        """The app in the draft's macOS zip, unpacked."""
         unpacked = self.workdir / "unpacked"
         # ditto keeps the symlinks and extended attributes a signature needs.
         self.commands.run("ditto", "-x", "-k", str(folder / MAC_ZIP), str(unpacked))
         apps = sorted(path for path in unpacked.iterdir() if path.suffix == ".app")
         if len(apps) != 1:
             raise ReleaseError(f"{MAC_ZIP} unpacks to {len(apps)} apps, not one.")
-        self.commands.run("codesign", "--verify", "--deep", "--strict", str(apps[0]))
-        output = self.commands.run("codesign", "-d", "-r-", str(apps[0]), both=True)
+        return apps[0]
+
+    def check_mac_app(self, app: Path) -> str:
+        """The designated requirement of the app, once it is the one installed
+        copies expect (or the --requirement being moved to)."""
+        self.commands.run("codesign", "--verify", "--deep", "--strict", str(app))
+        output = self.commands.run("codesign", "-d", "-r-", str(app), both=True)
         found = [line.split("=>", 1)[1].strip() for line in output.splitlines() if line.startswith("designated =>")]
         expected = self.requirement or APP_REQUIREMENT
         if found != [expected]:
@@ -637,6 +677,22 @@ class Publisher:
                 f"updated.{hint}"
             )
         return found[0]
+
+    def check_mac_notices(self, app: Path, folder: Path) -> None:
+        """The draft's macOS notices are the ones inside the app."""
+        bundled = app / "Contents" / "Resources" / "THIRD_PARTY_NOTICES.md"
+        if not bundled.is_file() or bundled.read_bytes() != (folder / MAC_NOTICES).read_bytes():
+            raise ReleaseError(f"{MAC_NOTICES} on the draft isn't the THIRD_PARTY_NOTICES.md inside the app in {MAC_ZIP}.")
+
+    def check_injection(self, app: Path) -> None:
+        """tools/macos_injection_check.sh, every leg, on the release's own app."""
+        try:
+            self.commands.run("bash", str(INJECTION_CHECK), str(app), "--require-sip")
+        except ReleaseError as error:
+            raise ReleaseError(
+                f"The app in {MAC_ZIP} failed tools/macos_injection_check.sh, which needs System Integrity "
+                f"Protection on and clang (Xcode's command line tools):\n{error}"
+            ) from error
 
     # -- the whole flow --------------------------------------------------------------
     def publish(self) -> None:
@@ -655,8 +711,14 @@ class Publisher:
         say("Every file on the draft is the one the run built.")
         check_release_folder(folder, self.version)
         say(f"{CHECKSUMS} lists every file, each hash matches, and the macOS app is version {self.version}.")
-        requirement = self.check_mac_app(folder)
+        app = self.unpack_mac_app(folder)
+        requirement = self.check_mac_app(app)
         say(f"The macOS app is signed with: {requirement}")
+        self.check_mac_notices(app, folder)
+        say(f"{MAC_NOTICES} is the notices file inside the macOS app.")
+        say("Running tools/macos_injection_check.sh on the macOS app (every leg, SIP on)...")
+        self.check_injection(app)
+        say("No library or program named in the app's environment loads into it or runs as it.")
 
         signed = SIGNATURE in assets
         if self.prerelease:
@@ -731,12 +793,23 @@ def publish_release(
 
 # -- command line -----------------------------------------------------------------
 
+def release_steps() -> str:
+    """Every step of a release, as the module docstring lists them (nothing
+    when Python was asked to drop docstrings)."""
+    doc = __doc__ or ""
+    start, end = doc.find("    # 1."), doc.find("\n\n`publish` downloads")
+    return "every step of a release:\n\n" + doc[start:end] if 0 <= start < end else ""
+
+
 def _ask_password() -> str:
     return getpass.getpass("Password for the secret key: ")
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Sign DoubleClick Fixer releases.")
+    parser = argparse.ArgumentParser(
+        description="Sign DoubleClick Fixer releases.", epilog=release_steps(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     sign = commands.add_parser("sign", help="sign a downloaded release folder")
     sign.add_argument("version")
@@ -748,7 +821,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     check.add_argument("folder", type=Path)
     make = commands.add_parser("keygen", help="make a new key pair")
     make.add_argument("name")
-    release = commands.add_parser("publish", help="check, sign and publish a draft release")
+    release = commands.add_parser(
+        "publish", help="check, sign and publish a draft release", epilog=release_steps(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     release.add_argument("tag")
     release.add_argument("--dry-run", action="store_true", help="check everything; sign, upload and publish nothing")
     release.add_argument("--run", type=int, help="the release.yml run that built the tag, if more than one did")

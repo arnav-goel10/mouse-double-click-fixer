@@ -20,6 +20,8 @@ import os
 import plistlib
 import re
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 import zipfile
@@ -29,14 +31,17 @@ from unittest import mock
 
 import app
 from app.update_signature import parse_claim, parse_public_key, verify
-from tools import release_notes, sign_release
+from tools import ci_update_key, release_notes, sign_release
 from tools.sign_release import (
     APP_REQUIREMENT,
     ARTIFACTS,
     CHECKSUMS,
+    INJECTION_CHECK,
+    MAC_NOTICES,
     MAC_ZIP,
     RELEASE_FILES,
     SIGNATURE,
+    WINDOWS_NOTICES,
     ReleaseError,
     keygen,
     parse_tag,
@@ -115,7 +120,11 @@ class ReleaseNotesTests(unittest.TestCase):
         self.assertIn("releases/download/v1.0.0/DoubleClickFixer.dmg", page)
         self.assertIn("- **One point oh.** It wraps.", page)
         self.assertIn("compare/v0.5.3...v1.0.0", page)
-        self.assertIn("releases/download/v1.0.0/THIRD_PARTY_NOTICES.md", page)
+        self.assertIn("[THIRD_PARTY_NOTICES-macos.md](https://github.com/owner/doubleclick-fixer/releases/download/v1.0.0/THIRD_PARTY_NOTICES-macos.md) (macOS)", page)
+        self.assertIn("[THIRD_PARTY_NOTICES-windows.md](https://github.com/owner/doubleclick-fixer/releases/download/v1.0.0/THIRD_PARTY_NOTICES-windows.md) (Windows)", page)
+        self.assertEqual(
+            {name for _label, name in release_notes.NOTICES}, {MAC_NOTICES, WINDOWS_NOTICES}, "the files a release carries"
+        )
         self.assertNotIn("pre-release", page)
         self.assertNotIn("newer version", page)
 
@@ -157,6 +166,7 @@ class ReleaseNotesTests(unittest.TestCase):
 
     def test_older_pages_are_pointed_at_the_latest(self) -> None:
         releases = [
+            {"tagName": "v1.1.0-beta.2", "isDraft": False},  # newer than the latest: left alone
             {"tagName": "v1.0.0", "isDraft": False},
             {"tagName": "v1.1.0", "isDraft": True},
             {"tagName": "v1.0.0-rc.1", "isDraft": False},
@@ -173,6 +183,19 @@ class ReleaseNotesTests(unittest.TestCase):
         edited = [call[2] for call in calls if call[:2] == ("release", "edit")]
         self.assertEqual(edited, ["v1.0.0-rc.1", "v0.5.3"])
         self.assertTrue(any("v0.1.9: left alone" in line for line in said))
+        self.assertTrue(any(line.startswith("v1.1.0-beta.2: left alone") for line in said))
+
+    def test_a_pre_release_of_the_next_version_is_never_told_an_older_one_is_newer(self) -> None:
+        for tag, latest, pointed in (
+            ("v1.1.0-rc.1", "v1.0.0", False),
+            ("v1.0.1-rc.1", "v1.0.0", False),
+            ("v1.0.0-rc.1", "v1.0.0", True),  # 1.0.0 came after its own release candidate
+            ("v0.5.3", "v1.0.0", True),
+        ):
+            with self.subTest(tag=tag, latest=latest):
+                gh, _calls = self.gh([{"tagName": tag, "isDraft": False}], latest=latest)
+                changed = release_notes.point_older(REPOSITORY, gh=gh, say=lambda _line: None)
+                self.assertEqual(changed, [tag] if pointed else [])
 
     def test_a_latest_release_without_a_version_tag_changes_nothing(self) -> None:
         gh, calls = self.gh([{"tagName": "v0.5.3", "isDraft": False}], latest="nightly")
@@ -274,9 +297,52 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("--draft", release)
         self.assertIn("--latest=false", release)
         self.assertNotIn("make_latest: true", release)
-        self.assertIn("environment: ${{ startsWith(github.ref, 'refs/tags/') && 'release' || '' }}", release)
         self.assertEqual(release.count("secrets."), 2, "the signing secrets belong to the macOS job alone")
         self.assertIn(f"expected='{APP_REQUIREMENT}'", release)
+
+    def test_a_manual_run_never_loads_the_certificate_or_puts_up_a_draft(self) -> None:
+        # workflow_dispatch can run on a tag too: only the push of one counts.
+        pushed_tag = "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')"
+        macos, publish = job(self.workflow("release.yml"), "macos"), job(self.workflow("release.yml"), "publish")
+        self.assertIn(f"environment: ${{{{ {pushed_tag} && 'release' || '' }}}}", macos)
+        load = step(macos, "Load the signing certificate")
+        self.assertIn(f"if: {pushed_tag}\n", load)
+        self.assertIn("secrets.MACOS_SIGNING_P12", load)
+        self.assertIn(f"if: {pushed_tag}\n", step(macos, "Confirm the app keeps the designated requirement"))
+        self.assertIn(f"\n    if: {pushed_tag}\n", publish)
+
+    def test_the_concurrency_comment_says_what_github_does(self) -> None:
+        release = self.workflow("release.yml")
+        comment = release[: release.index("\nconcurrency:")].rsplit("\n\n", 1)[1]
+        self.assertIn("cancel-in-progress: false", release)
+        self.assertIn("a newer run cancels the one already waiting", comment)
+        self.assertNotIn("waits for the first", comment)
+
+    def test_the_macos_build_runs_the_injection_check_itself(self) -> None:
+        build = (ROOT / "installer" / "build_macos.sh").read_text(encoding="utf-8")
+        self.assertIn('\nbash tools/macos_injection_check.sh "$signed"\n', build)
+        self.assertNotIn("macos_injection_check", self.workflow("release.yml"))
+
+    def test_release_files_carry_each_platforms_notices(self) -> None:
+        release = self.workflow("release.yml")
+        self.assertIn(
+            "Copy-Item build\\notices\\THIRD_PARTY_NOTICES.md release\\THIRD_PARTY_NOTICES-windows.md",
+            step(job(release, "windows"), "Collect the release files"),
+        )
+        self.assertIn('Source: "..\\build\\notices\\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"',
+                      (ROOT / "installer" / "windows.iss").read_text(encoding="utf-8"))
+        self.assertIn(
+            'cp "dist/DoubleClick Fixer.app/Contents/Resources/THIRD_PARTY_NOTICES.md" release/THIRD_PARTY_NOTICES-macos.md',
+            step(job(release, "macos"), "Collect the release files"),
+        )
+        self.assertEqual(ARTIFACTS["DoubleClickFixer-windows"][-1], WINDOWS_NOTICES)
+        self.assertEqual(ARTIFACTS["DoubleClickFixer-macos"][-1], MAC_NOTICES)
+
+    def test_dependabot_leaves_the_hash_locked_pins_alone(self) -> None:
+        # It can't regenerate requirements-build.txt (uv pip compile, with
+        # hashes; see requirements-build.in), so it isn't asked to.
+        config = (ROOT / ".github" / "dependabot.yml").read_text(encoding="utf-8")
+        self.assertEqual(re.findall(r"package-ecosystem: (\S+)", config), ["github-actions"])
 
     def test_ci_and_releases_use_the_same_inno_setup(self) -> None:
         versions = {re.search(r'INNO_SETUP_VERSION: "([\d.]+)"', self.workflow(name)).group(1) for name in ("ci.yml", "release.yml")}
@@ -285,15 +351,195 @@ class WorkflowTests(unittest.TestCase):
     def test_the_release_files_are_the_ones_publish_expects(self) -> None:
         expected = " ".join(sorted(set(RELEASE_FILES) - {CHECKSUMS}, key=lambda name: name.encode()))
         self.assertIn(f'expected="{expected}"', self.workflow("release.yml"))
+        self.assertIn(MAC_NOTICES, expected)
+        self.assertIn(WINDOWS_NOTICES, expected)
+
+    def test_the_draft_summary_gives_the_commands_that_publish_it(self) -> None:
+        put_up = step(job(self.workflow("release.yml"), "publish"), "Put up the draft")
+        self.assertIn('echo "python3 tools/sign_release.py publish $GITHUB_REF_NAME --dry-run"', put_up)
+        self.assertIn('echo "python3 tools/sign_release.py publish $GITHUB_REF_NAME"', put_up)
+        self.assertIn('>> "$GITHUB_STEP_SUMMARY"', put_up)
+
+
+def job(workflow: str, name: str) -> str:
+    """One job of a workflow, as text."""
+    match = re.search(rf"^  {re.escape(name)}:\n(.*?)(?=^  [\w-]+:\n|\Z)", workflow, re.MULTILINE | re.DOTALL)
+    assert match, f"no job {name}"
+    return match.group(0)
+
+
+def step(job_text: str, name: str) -> str:
+    """The step of a job whose name starts with `name`, as text."""
+    match = re.search(rf"^      - (?:name: )?{re.escape(name)}.*?(?=^      - |\Z)", job_text, re.MULTILINE | re.DOTALL)
+    assert match, f"no step {name}"
+    return match.group(0)
+
+
+class CiUpdateKeyGuardTests(unittest.TestCase):
+    """doubleclick-fixer.spec's guard for CI's update key, run as each Windows
+    job runs it for a tag. On a tag, release.yml calls ci.yml, so CI's
+    windows-install job builds with GITHUB_REF=refs/tags/v1.0.1 too."""
+
+    TAG = {"GITHUB_REF": "refs/tags/v1.0.1", "GITHUB_REF_NAME": "v1.0.1", "GITHUB_REF_TYPE": "tag", "GITHUB_ACTIONS": "true"}
+
+    def setUp(self) -> None:
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.public = ci_update_key.make(self.root / "dcf-ci-key")
+        self.hooks = self.root / "build" / "ci-update-key"
+
+    def workflow(self, name: str) -> str:
+        return (ROOT / ".github" / "workflows" / name).read_text(encoding="utf-8")
+
+    def guard(self, environ: dict, platform: str = "win32") -> list[str]:
+        with redirect_stdout(io.StringIO()):
+            return ci_update_key.spec_runtime_hooks(environ, platform, self.hooks)
+
+    def test_the_spec_runs_this_guard_and_never_looks_at_the_ref(self) -> None:
+        spec = (ROOT / "doubleclick-fixer.spec").read_text(encoding="utf-8")
+        self.assertIn('ci_update_key.spec_runtime_hooks(os.environ, sys.platform, Path("build", "ci-update-key"))', spec)
+        self.assertIn("runtime_hooks=RUNTIME_HOOKS", spec)
+        self.assertNotIn("GITHUB_REF", spec)
+        self.assertNotIn("DCF_CI_UPDATE_KEY", spec.replace("# CI's end-to-end Windows build alone: with DCF_CI_UPDATE_KEY", ""))
+
+    def test_ci_install_job_on_a_tag_builds_the_key_in(self) -> None:
+        build = step(job(self.workflow("ci.yml"), "windows-install"), "Build the exe and the installer")
+        self.assertIn('$env:DCF_CI_UPDATE_KEY = "$env:RUNNER_TEMP\\dcf-ci-key\\dcf-ci-update-key.pub"', build)
+        hooks = self.guard({**self.TAG, ci_update_key.ENV: str(self.public)})
+        self.assertEqual(hooks, [str((self.hooks / ci_update_key.HOOK_FILE).resolve())])
+        key_line = self.public.read_text(encoding="ascii").splitlines()[-1]
+        self.assertIn(f"app.build_flags.CI_UPDATE_KEY = {key_line!r}", Path(hooks[0]).read_text(encoding="ascii"))
+        # Its builds must then carry the hook where the release check looks.
+        guard = step(job(self.workflow("ci.yml"), "windows-install"), "The release guard finds CI's key in each build")
+        self.assertIn('foreach ($build in "dist\\DoubleClickFixer.exe", "dist\\onedir")', guard)
+        self.assertIn("if ($LASTEXITCODE -ne 1)", guard)
+
+    def test_the_release_windows_job_on_a_tag_never_does(self) -> None:
+        windows = job(self.workflow("release.yml"), "windows")
+        refuse = step(windows, "Refuse CI's throwaway update key")
+        self.assertIn('if ($env:DCF_CI_UPDATE_KEY) { throw', refuse)
+        self.assertEqual(self.workflow("release.yml").count("DCF_CI_UPDATE_KEY"), 2, "only the refusal names it")
+        check = step(windows, "Confirm no build carries CI's update key")
+        self.assertIn("python tools/ci_update_key.py check dist\\DoubleClickFixer.exe dist\\onedir", check)
+        order = [windows.index(text) for text in (refuse, "installer\\build_windows.ps1", check, "Collect the release files")]
+        self.assertEqual(order, sorted(order))
+        (self.hooks).mkdir(parents=True)
+        (self.hooks / ci_update_key.HOOK_FILE).write_text("left over", encoding="ascii")
+        self.assertEqual(self.guard(dict(self.TAG)), [])
+        self.assertFalse((self.hooks / ci_update_key.HOOK_FILE).exists())
+
+    def test_a_macos_build_ignores_the_variable(self) -> None:
+        for environ in ({**self.TAG, ci_update_key.ENV: str(self.public)}, {ci_update_key.ENV: "not even a file"}):
+            with self.subTest(environ=environ):
+                self.assertEqual(self.guard(environ, platform="darwin"), [])
+                self.assertFalse(self.hooks.exists() and any(self.hooks.iterdir()))
+
+
+@unittest.skipIf(sys.platform == "win32" or shutil.which("bash") is None, "a bash script")
+class InjectionCheckScriptTests(unittest.TestCase):
+    """tools/macos_injection_check.sh with csrutil, clang, codesign and the
+    app's self-test faked: which legs run with System Integrity Protection on
+    and off, and what fails."""
+
+    #: Stands in for the app's --self-test. FAKE_LOADS names the canaries that
+    #: get in: dyld only does when SIP is off (or the app isn't hardened).
+    #: macOS drops DYLD_* variables when it starts /bin/sh, which SIP protects
+    #: (and a real loader would load the fake canary), so the dyld leg is told
+    #: apart as the one that sets neither of the other legs' variables.
+    APP = """#!/bin/sh -p
+leg=dyld
+[ -n "$OPENSSL_CONF" ] && leg=openssl
+[ -n "$BASH_ENV" ] && leg=path
+case " $FAKE_LOADS " in
+  *" $leg "*) echo loaded > "$DCF_CANARY_DIR/dcf-canary-$leg" ;;
+esac
+exit 0
+"""
+
+    def setUp(self) -> None:
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.fakes = self.root / "fakes"
+        self.fakes.mkdir()
+        programs = {
+            "csrutil": 'echo "System Integrity Protection status: $FAKE_SIP."',
+            "clang": 'while [ $# -gt 0 ]; do [ "$1" = -o ] && : > "$2"; shift; done',
+            "codesign": "exit 0",
+        }
+        for name, body in programs.items():
+            (self.fakes / name).write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
+            (self.fakes / name).chmod(0o755)
+        self.app = self.root / "DoubleClick Fixer.app"
+        binary = self.app / "Contents" / "MacOS" / "DoubleClickFixer"
+        binary.parent.mkdir(parents=True)
+        binary.write_text(self.APP, encoding="utf-8")
+        binary.chmod(0o755)
+        (self.root / "marks").mkdir()
+        (self.root / "tmp").mkdir()
+
+    def check(self, sip: str, loads: str = "", *options: str) -> subprocess.CompletedProcess:
+        environment = {
+            "PATH": f"{self.fakes}:/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(self.root), "TMPDIR": str(self.root / "tmp"),
+            "FAKE_SIP": sip, "FAKE_LOADS": loads, "DCF_CANARY_DIR": str(self.root / "marks"),
+        }
+        for mark in (self.root / "marks").iterdir():
+            mark.unlink()
+        return subprocess.run(
+            ["bash", str(INJECTION_CHECK), str(self.app), *options],
+            env=environment, capture_output=True, text=True, timeout=60, check=False,
+        )
+
+    def test_with_sip_on_every_leg_runs(self) -> None:
+        result = self.check("enabled")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("== dyld: DYLD_INSERT_LIBRARIES=", result.stdout)
+        self.assertIn("== openssl: OPENSSL_CONF=", result.stdout)
+        self.assertIn("== path: PATH=", result.stdout)
+        self.assertIn("with System Integrity Protection enabled", result.stdout)
+        result = self.check("enabled", "dyld", "--require-sip")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("canary dyld FIRED", result.stdout)
+        self.assertIn("FAILED (dyld)", result.stderr)
+
+    def test_with_sip_off_only_the_dyld_leg_is_skipped_and_loudly(self) -> None:
+        result = self.check("disabled", "dyld")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("== dyld: SKIPPED (System Integrity Protection is disabled)", result.stdout)
+        self.assertNotIn("DYLD_INSERT_LIBRARIES=", result.stdout)
+        self.assertIn("WARNING: System Integrity Protection is disabled", result.stderr)
+        self.assertIn("OK, WITHOUT THE DYLD LEG", result.stdout)
+        # The other legs still run, and still fail the check.
+        result = self.check("disabled", "openssl")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("FAILED (openssl)", result.stderr)
+
+    def test_require_sip_refuses_a_mac_without_it(self) -> None:
+        for sip in ("disabled", "unknown (Custom Configuration)"):
+            with self.subTest(sip=sip):
+                result = self.check(sip, "", "--require-sip")
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("System Integrity Protection isn't reported enabled", result.stderr)
+                self.assertNotIn("== openssl", result.stdout)
+        result = self.check("enabled", "", "--require-sip")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_an_unknown_sip_status_still_runs_the_dyld_leg(self) -> None:
+        result = self.check("unknown (Custom Configuration)", "dyld")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("FAILED (dyld)", result.stderr)
 
 
 # -- tools/sign_release.py publish ------------------------------------------------------
 
-def app_zip(version: str) -> bytes:
+MAC_NOTICES_TEXT = b"# Notices for the Mac app\n"
+
+
+def app_zip(version: str, notices: bytes = MAC_NOTICES_TEXT) -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
         archive.writestr("DoubleClick Fixer.app/Contents/Info.plist", plistlib.dumps({"CFBundleShortVersionString": version}))
         archive.writestr("DoubleClick Fixer.app/Contents/MacOS/DoubleClickFixer", b"binary " + version.encode())
+        archive.writestr("DoubleClick Fixer.app/Contents/Resources/THIRD_PARTY_NOTICES.md", notices)
     return buffer.getvalue()
 
 
@@ -302,7 +548,8 @@ def sha256(data: bytes) -> str:
 
 
 class FakeGitHub:
-    """GitHub (through gh), ditto and codesign, as `publish` uses them."""
+    """GitHub (through gh), ditto, codesign and the injection check, as
+    `publish` uses them."""
 
     def __init__(self, tag: str = "v1.0.1") -> None:
         self.tag = tag
@@ -312,6 +559,7 @@ class FakeGitHub:
         self.prerelease = "-" in tag
         self.requirement = APP_REQUIREMENT
         self.codesign_ok = True
+        self.injection_ok = True
         self.calls: list[tuple] = []
         self.serial = 0
         self.assets: dict = {}
@@ -323,13 +571,24 @@ class FakeGitHub:
             "DoubleClickFixer-Setup.exe": b"installer",
             "DoubleClickFixer.dmg": b"disk image",
             MAC_ZIP: app_zip(self.version),
-            "THIRD_PARTY_NOTICES.md": b"# Notices\n",
+            MAC_NOTICES: MAC_NOTICES_TEXT,
+            WINDOWS_NOTICES: b"# Notices for Windows\n",
         }
         self.artifacts = {name: {file: built[file] for file in files} for name, files in ARTIFACTS.items()}
         for name, data in built.items():
             self.put(name, data)
         self.put(CHECKSUMS, "".join(f"{sha256(data)}  {name}\n" for name, data in sorted(built.items())).encode())
         self.runs = [self.run_record(4242)]
+
+    def rebuild(self, name: str, data: bytes) -> None:
+        """As if the run had built `data` as `name`: the draft, the artifact and
+        SHA256SUMS.txt all agree on it."""
+        self.put(name, data)
+        for files in self.artifacts.values():
+            if name in files:
+                files[name] = data
+        built = {other: self.assets[other][1] for other in RELEASE_FILES if other != CHECKSUMS}
+        self.put(CHECKSUMS, "".join(f"{sha256(content)}  {other}\n" for other, content in sorted(built.items())).encode())
 
     def run_record(self, number: int, **changes) -> dict:
         record = dict(databaseId=number, headBranch=self.tag, headSha=self.commit, event="push",
@@ -352,6 +611,13 @@ class FakeGitHub:
             with zipfile.ZipFile(arguments[2]) as archive:
                 archive.extractall(arguments[3])
             return ""
+        if program == "bash":
+            assert arguments[0] == str(INJECTION_CHECK) and arguments[2:] == ["--require-sip"], command
+            assert (Path(arguments[1]) / "Contents" / "MacOS" / "DoubleClickFixer").is_file(), command
+            if not self.injection_ok:
+                raise ReleaseError("`bash tools/macos_injection_check.sh` failed (exit 1): FAILED (dyld): the app loaded "
+                                   "or ran code named in its environment, or its self-test failed")
+            return "OK: no canary fired and the self-test passed, with System Integrity Protection enabled\n"
         if program == "codesign":
             if arguments[0] == "--verify":
                 if not self.codesign_ok:
@@ -453,6 +719,11 @@ class PublishTests(unittest.TestCase):
         self.assertTrue(all(call[3] == "4242" for call in self.github.calls_of("gh", "run", "download")))
         self.assertTrue(self.github.calls_of("codesign", "--verify", "--deep", "--strict"))
         self.assertEqual(len(self.github.calls_of("gh", "release", "view")), 2, "the draft wasn't re-read before publishing")
+        # The injection check ran, every leg, on the draft's own app, before anything was signed.
+        (check,) = self.github.calls_of("bash")
+        self.assertEqual(check[1:], (str(INJECTION_CHECK), str(self.root / "work1" / "unpacked" / "DoubleClick Fixer.app"), "--require-sip"))
+        self.assertLess(calls.index(check), upload)
+        self.assertGreater(calls.index(check), calls.index(self.github.calls_of("codesign", "-d", "-r-")[0]))
 
     def test_a_dry_run_checks_everything_and_changes_nothing(self) -> None:
         self.publish(dry_run=True)
@@ -473,8 +744,8 @@ class PublishTests(unittest.TestCase):
         self.refused(r"DoubleClickFixer.exe on the draft isn't the file the run built")
 
     def test_a_draft_with_files_missing_or_extra_is_refused(self) -> None:
-        del self.github.assets["THIRD_PARTY_NOTICES.md"]
-        self.refused("The draft has no THIRD_PARTY_NOTICES.md")
+        del self.github.assets[MAC_NOTICES]
+        self.refused("The draft has no THIRD_PARTY_NOTICES-macos.md")
         self.github = FakeGitHub()
         self.github.put("extra.zip", b"?")
         self.refused("a file no release carries: extra.zip")
@@ -500,6 +771,23 @@ class PublishTests(unittest.TestCase):
         lines = [line for line in self.github.assets[CHECKSUMS][1].decode().splitlines() if not line.endswith(MAC_ZIP)]
         self.github.put(CHECKSUMS, ("\n".join(lines + [f"{sha256(data)}  {MAC_ZIP}"]) + "\n").encode())
         self.refused("is version 1.0.0, not 1.0.1")
+
+    def test_the_injection_check_must_pass_before_anything_is_signed(self) -> None:
+        self.github.injection_ok = False
+        for dry_run in (False, True):
+            with self.subTest(dry_run=dry_run):
+                with mock.patch.object(sign_release, "read_secret_key", side_effect=AssertionError("read the key")):
+                    self.refused(r"failed tools/macos_injection_check\.sh(.|\n)*FAILED \(dyld\)", dry_run=dry_run)
+                self.assertNotIn(SIGNATURE, self.github.assets)
+        self.assertTrue(INJECTION_CHECK.is_file())
+        self.assertIn("--require-sip)", INJECTION_CHECK.read_text(encoding="utf-8"))
+
+    def test_the_mac_notices_must_be_the_ones_inside_the_app(self) -> None:
+        self.github.rebuild(MAC_NOTICES, b"# Some other notices\n")
+        self.refused("THIRD_PARTY_NOTICES-macos.md on the draft isn't the THIRD_PARTY_NOTICES.md inside the app")
+        self.github = FakeGitHub()
+        self.github.rebuild(MAC_ZIP, app_zip("1.0.1", notices=b"# Notices from another build\n"))
+        self.refused("isn't the THIRD_PARTY_NOTICES.md inside the app")
 
     def test_only_a_draft_is_published(self) -> None:
         self.github.draft = False
@@ -626,6 +914,31 @@ class PublishTests(unittest.TestCase):
         self.assertIn(f"What was checked is in {work}", output.getvalue())
         self.assertIn("already published", errors.getvalue())
         self.assertTrue(self.github.calls_of("gh", "release", "view"))
+
+    def test_help_lists_every_step_of_a_release(self) -> None:
+        for arguments in (["--help"], ["publish", "--help"]):
+            output = io.StringIO()
+            with redirect_stdout(output), self.assertRaises(SystemExit):
+                sign_release.main(arguments)
+            text = output.getvalue()
+            steps = [
+                "git switch main && git pull --ff-only",
+                "git merge --no-ff BRANCH",
+                '__version__ = "1.0.1"',
+                '"## 1.0.1 — YYYY-MM-DD"',
+                "GITHUB_REF=refs/tags/v1.0.1 python3 -m unittest tests.test_release",
+                "git push origin main",
+                'git tag -a v1.0.1 -m "DoubleClick Fixer 1.0.1"',
+                "git push origin v1.0.1",
+                "until run=\"$(gh run list --workflow release.yml --branch v1.0.1 --event push --limit 1 "
+                "--json databaseId --jq '.[].databaseId')\" && [ -n \"$run\" ]; do sleep 5; done",
+                'gh run watch "$run" --exit-status',
+                "python3 tools/sign_release.py publish v1.0.1 --dry-run",
+                "python3 tools/sign_release.py publish v1.0.1",
+            ]
+            positions = [text.find(step) for step in steps]
+            self.assertNotIn(-1, positions, f"{arguments}: {[step for step in steps if step not in text]}")
+            self.assertEqual(positions, sorted(positions), "the steps are out of order")
 
 
 if __name__ == "__main__":
