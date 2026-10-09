@@ -26,6 +26,8 @@ class FakeFilter:
     """Stands in for GlobalClickFilter: no hook, just the lifecycle."""
 
     fail_with = None
+    #: Set: stop() gives up with the hook thread still alive.
+    stuck = False
     instances = []
 
     def __init__(self, threshold_ms, buttons, on_event=None, on_error=None,
@@ -49,7 +51,7 @@ class FakeFilter:
         self.started = True
 
     def stop(self) -> None:
-        self.stopped = True
+        self.stopped = not FakeFilter.stuck
 
     def update(self, **_changes) -> None:
         pass
@@ -69,6 +71,7 @@ class ControllerStateTests(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
         FakeFilter.fail_with = None
+        FakeFilter.stuck = False
         FakeFilter.instances = []
         patcher = mock.patch("app.controller.GlobalClickFilter", FakeFilter)
         patcher.start()
@@ -196,6 +199,22 @@ class ControllerStateTests(unittest.TestCase):
         with mock.patch.object(permissions, "needs_accessibility", return_value=False):
             self.controller.set_active(True)
         self.assertIsNone(self.controller._filter.permission_ok, "nothing to check without a permission")
+
+    def test_a_hook_that_wont_stop_is_kept_and_nothing_starts_beside_it(self) -> None:
+        self.controller.set_active(True)
+        stuck = FakeFilter.instances[0]
+        FakeFilter.stuck = True
+        self.controller.stop_keeping_choice()  # a rebuild, say
+        self.assertTrue(stuck.running, "its thread is still alive")
+        self.assertFalse(self.controller.set_active(True))
+        self.assertEqual(len(FakeFilter.instances), 1, "no second hook on top of a live one")
+        self.assertIn("still stopping", self.controller.failure_detail)
+        self.assertEqual(self.controller.diagnostic_state()["old hook still stopping"], True)
+        FakeFilter.stuck = False  # it lets go on the next try
+        self.assertTrue(self.controller.set_active(True))
+        self.assertTrue(stuck.stopped)
+        self.assertEqual(len(FakeFilter.instances), 2)
+        self.assertEqual(self.controller.failure, "")
 
     def test_tap_check_defaults_to_alive(self) -> None:
         self.assertTrue(self.controller.tap_alive(), "no filter: nothing to check")

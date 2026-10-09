@@ -54,6 +54,10 @@ class AppController(QObject):
                 except (OSError, RuntimeError):
                     pass
         self._filter: Optional[GlobalClickFilter] = None
+        # A filter whose stop() gave up with its hook thread still alive.
+        # Never dropped: no second hook may start beside it, and the next
+        # stop tries it again.
+        self._unstopped: Optional[GlobalClickFilter] = None
         self._suspended = False
         # Set at quit. Nothing may start a hook after that: the window still
         # hears hide events, and AppKit notifications, as the app goes down.
@@ -132,6 +136,12 @@ class AppController(QObject):
         # Turning the filter on (from the menu bar, say) ends a pause.
         self._suspended = False
         self._stop_filter()  # release a filter whose hook thread died
+        if self._unstopped is not None:
+            message = "The filter from before is still stopping. Try again in a moment."
+            log.warning("The filter can't start: %s", message)
+            self.failure, self.failure_detail = "Couldn’t start the filter", message
+            self.filter_state_changed.emit(False, message)
+            return False
         try:
             self._filter = GlobalClickFilter(
                 self.threshold_ms,
@@ -172,15 +182,25 @@ class AppController(QObject):
             self.filter_state_changed.emit(False, "")
 
     def _stop_filter(self) -> None:
-        if self._filter is not None:
-            current, self._filter = self._filter, None
-            current.stop()
-            # Counted on the hook thread, so only read here, never logged there.
-            log.info(
-                "Filter stopped (tap resets %s, hook re-arms %s)",
-                getattr(current, "tap_resets", 0),
-                getattr(current, "hook_rearms", 0),
-            )
+        current, self._filter = self._filter, None
+        if current is None:
+            # One that didn't stop last time gets another try.
+            current, self._unstopped = self._unstopped, None
+        if current is None:
+            return
+        current.stop()
+        if current.running:
+            # Its hook thread didn't end in time. Dropping the handle to a
+            # live hook would let a second one start on top of it.
+            log.error("The filter's hook thread didn't stop; no new filter starts until it does")
+            self._unstopped = current
+            return
+        # Counted on the hook thread, so only read here, never logged there.
+        log.info(
+            "Filter stopped (tap resets %s, hook re-arms %s)",
+            getattr(current, "tap_resets", 0),
+            getattr(current, "hook_rearms", 0),
+        )
 
     def suspend(self) -> None:
         """Pause filtering so the click pad measures the raw mouse.
@@ -303,6 +323,7 @@ class AppController(QObject):
         current = self._filter
         return {
             "filter running": self.active,
+            "old hook still stopping": self._unstopped is not None,
             "user has it on": self.wanted,
             "saved choice": "on" if self.settings["fix_enabled"] else "off",
             "paused for calibration": self._suspended,
