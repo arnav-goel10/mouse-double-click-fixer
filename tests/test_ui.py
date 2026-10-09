@@ -577,6 +577,17 @@ class KeepFilterAliveTests(LiveWindowTests):
         self.window.request_filter(False)
         self.assertFalse(self.window._retry_timer.isActive())
 
+    def test_a_saved_on_that_keeps_failing_can_be_switched_off(self) -> None:
+        self.controller._store(fix_enabled=True)
+        FakeFilter.fail_with = "busy"
+        self.window.restore_filter(background=True)
+        self.assertTrue(self.window.filter_page.switch.isChecked(), "shows the user's on")
+        self.window.filter_page.switch.click()
+        self.assertFalse(self.controller.settings["fix_enabled"])
+        self.assertFalse(self.window._retry_timer.isActive())
+        self.assertFalse(self.window.filter_page.switch.isChecked())
+        self.assertEqual(self.controller.status_text(), "Off")
+
     def test_an_opened_window_does_not_retry_by_itself(self) -> None:
         self.controller._store(fix_enabled=True)
         FakeFilter.fail_with = "busy"

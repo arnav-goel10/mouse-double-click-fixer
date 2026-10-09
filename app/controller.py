@@ -108,13 +108,14 @@ class AppController(QObject):
     @property
     def wanted(self) -> bool:
         """Whether the user has the filter on: running, waiting for
-        permission, or paused while calibration measures. The menus show and
-        toggle this, so choosing the item while waiting or paused turns the
-        filter off instead of asking again."""
+        permission, paused while calibration measures, or saved as on but
+        failing to start. The menus show and toggle this, so choosing the
+        item in any of those states turns the filter off instead of asking
+        for on again."""
         return (
             self.active
             or self.waiting_for_permission
-            or (self._suspended and bool(self.settings["fix_enabled"]))
+            or (bool(self.settings["fix_enabled"]) and (self._suspended or bool(self.failure)))
         )
 
     def set_active(self, active: bool) -> bool:

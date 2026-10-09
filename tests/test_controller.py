@@ -96,6 +96,7 @@ class ControllerStateTests(unittest.TestCase):
         FakeFilter.fail_with = "busy"
         self.controller.set_active(True)
         self.assertFalse(self.controller.settings["fix_enabled"], "never got as far as on")
+        self.assertFalse(self.controller.wanted, "so choosing the item again tries again")
         self.assertEqual(self.controller.status_text(), "Couldn't start the filter")
         self.controller.set_active(False)
         self.assertEqual(self.controller.status_text(), "Off")
@@ -199,6 +200,17 @@ class ControllerStateTests(unittest.TestCase):
         with mock.patch.object(permissions, "needs_accessibility", return_value=False):
             self.controller.set_active(True)
         self.assertIsNone(self.controller._filter.permission_ok, "nothing to check without a permission")
+
+    def test_a_saved_on_that_keeps_failing_can_be_turned_off(self) -> None:
+        self.controller._store(fix_enabled=True)  # on at the last login
+        FakeFilter.fail_with = "busy"
+        self.controller.set_active(True)
+        self.assertTrue(self.controller.wanted, "the menus show the user's on")
+        self.controller.set_active(not self.controller.wanted)  # what the menus do
+        self.assertFalse(self.controller.settings["fix_enabled"])
+        self.assertEqual(self.controller.failure, "")
+        self.assertFalse(self.controller.wanted)
+        self.assertEqual(self.controller.status_text(), "Off")
 
     def test_a_hook_that_wont_stop_is_kept_and_nothing_starts_beside_it(self) -> None:
         self.controller.set_active(True)
