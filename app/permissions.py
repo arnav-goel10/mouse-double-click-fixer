@@ -172,4 +172,4 @@ def open_accessibility_settings() -> None:
         return
     if not has_accessibility():
         request_accessibility()
-    subprocess.Popen(["open", ACCESSIBILITY_PANE])
+    subprocess.Popen(["/usr/bin/open", ACCESSIBILITY_PANE])

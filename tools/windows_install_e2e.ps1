@@ -82,10 +82,23 @@ function Assert-NewBuild($Log) {
     if ($fileVersion -ne $version) { Fail "the exe says version '$fileVersion', expected $version" }
     if ($listed -ne $version) { Fail "Installed apps lists version '$listed', expected $version" }
 }
-function Uninstall-App {
+# Runs the uninstaller silently. Bounded like Install: it waits for the
+# uninstaller and for the copy of itself the uninstaller runs from the temp
+# folder (its child, which outlives it), and fails the run if either is
+# still going after $Seconds.
+function Uninstall-App([int] $Seconds = 120) {
     $app = App-Path
     $uninstaller = (Get-ItemProperty $UninstallKey).UninstallString.Trim('"')
-    Start-Process $uninstaller -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -Wait
+    $process = Start-Process $uninstaller -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -PassThru
+    $null = $process.Handle  # no other process can take its ID while this holds it
+    $deadline = (Get-Date).AddSeconds($Seconds)
+    while (-not $process.HasExited -or @(Get-CimInstance Win32_Process -Filter "ParentProcessId=$($process.Id)").Count) {
+        if ((Get-Date) -gt $deadline) {
+            Get-CimInstance Win32_Process | Format-Table ProcessId, ParentProcessId, Name, CommandLine -AutoSize | Out-String -Width 300 | Write-Host
+            Fail "the uninstaller was still running after $Seconds s"
+        }
+        Start-Sleep -Milliseconds 500
+    }
     Wait-For { (Get-Running).Count -eq 0 } 30 "the app to be closed by the uninstaller"
     Wait-For { -not (Test-Path $app) } 30 "the exe to be removed"
     Wait-For { -not (Test-Path $UninstallKey) } 30 "the app to leave Installed apps"
@@ -131,11 +144,11 @@ Step "A folder install that lost its runtime is closed with taskkill, not run"
 # A failed update can leave the exe without _internal: [InstallDelete] runs
 # first, and rollback doesn't put it back. Such an exe can't start; run with
 # --quit, it would show "Failed to load Python DLL" and wait for a click. The
-# installer runs the installed copy only when it is a one-file build (before
-# 1.0) or still has _internal. Until the release bump this build says 0.x, so
-# it is listed as 1.0.0 here, as a released folder install is.
+# installer runs the installed copy only when it is a one-file build (0.5.3
+# and earlier) or still has _internal. Listed as 0.5.4, the first folder
+# release, it is a folder build without its runtime.
 Remove-Item -Recurse -Force (Join-Path $folder "_internal")
-Set-ItemProperty $UninstallKey -Name DisplayVersion -Value "1.0.0"
+Set-ItemProperty $UninstallKey -Name DisplayVersion -Value "0.5.4"
 $log = "$env:TEMP\dcf-no-runtime.log"
 $started = Get-Date
 Install $NewSetup $log 120
@@ -148,13 +161,12 @@ Assert-NewBuild $log
 Write-Host ("setup took {0:N1} s and put the runtime back" -f $seconds)
 
 Step "An installed copy that hangs on --quit holds the installer up for 20 s at most"
-# Its runtime is there but broken: without the Python DLL the copy setup runs
-# to ask for a quit shows "Failed to load Python DLL" and waits for a click
-# that never comes (its window is hidden, too).
-$dll = Get-ChildItem (Join-Path $folder "_internal") -Filter "python3*.dll" |
-    Where-Object { $_.Name -match '^python3\d+\.dll$' } | Select-Object -First 1
-if (-not $dll) { Fail "the folder build has no python3NN.dll in _internal" }
-Remove-Item $dll.FullName -Force
+# Listed as 0.5.3, the last one-file release, the installed copy is run to ask
+# for a quit whatever its folder holds: a one-file build has no _internal.
+# This one is a folder build without it, so it shows "Failed to load Python
+# DLL" and waits for a click that never comes (its window is hidden, too).
+Remove-Item -Recurse -Force (Join-Path $folder "_internal")
+Set-ItemProperty $UninstallKey -Name DisplayVersion -Value "0.5.3"
 $log = "$env:TEMP\dcf-hangs.log"
 $started = Get-Date
 Install $NewSetup $log 180
@@ -164,7 +176,6 @@ $quit | Write-Host
 Expect-Quit $quit @("asking the installed copy", "did not finish within 20 s; stopped it")
 if ($seconds -lt 20) { Fail ("setup took {0:N1} s: the hung copy wasn't what held it" -f $seconds) }
 if ((Get-Running).Count) { Fail "the hung copy was left running" }
-if (-not (Test-Path $dll.FullName)) { Fail "the Python DLL wasn't put back" }
 Assert-NewBuild $log
 Write-Host ("setup stopped the hung copy and finished in {0:N1} s" -f $seconds)
 

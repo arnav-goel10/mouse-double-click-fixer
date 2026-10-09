@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import ntpath
 import os
 import platform
 import plistlib
@@ -83,6 +84,8 @@ CI_KEY_FILE = "dcf-ci-update-key.pub"
 #: path, but expands variables from its Unicode environment intact.
 APP_ENV = "DCF_APP"
 SOURCE_ENV = "DCF_SRC"
+#: Windows' System32 folder, for the programs the scripts run (see system_program).
+SYSTEM_ENV = "DCF_SYSTEM"
 
 CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000
 FIRST_CHECK_DELAY_MS = 20 * 1000
@@ -194,9 +197,9 @@ def release_from_json(data: dict, kind: str) -> Optional[Release]:
 
 
 def _ci_key() -> Optional[PublicKey]:
-    """CI's throwaway key, in a packaged app built by CI's end-to-end job."""
+    """CI's throwaway key, in a packaged Windows app built by CI's end-to-end job."""
     bundled = getattr(sys, "_MEIPASS", None)
-    if not getattr(sys, "frozen", False) or not bundled:
+    if sys.platform != "win32" or not getattr(sys, "frozen", False) or not bundled:
         return None
     path = Path(bundled) / CI_KEY_FILE
     if not path.is_file():
@@ -302,7 +305,7 @@ def bundle_version(app: Path) -> str:
 def designated_requirement(app: Path) -> str:
     """The signature requirement macOS stores with privacy grants."""
     result = subprocess.run(
-        ["codesign", "-d", "-r-", str(app)], capture_output=True, text=True, check=False
+        ["/usr/bin/codesign", "-d", "-r-", str(app)], capture_output=True, text=True, check=False
     )
     for line in (result.stdout + result.stderr).splitlines():
         if line.startswith("designated =>"):
@@ -312,7 +315,7 @@ def designated_requirement(app: Path) -> str:
 
 def signature_is_valid(app: Path) -> bool:
     result = subprocess.run(
-        ["codesign", "--verify", "--deep", "--strict", str(app)], capture_output=True, check=False
+        ["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)], capture_output=True, check=False
     )
     return result.returncode == 0
 
@@ -342,7 +345,7 @@ def mac_swap_script(
     current: Path,
     staged: Path,
     relaunch_args: list[str],
-    opener: str = "open",
+    opener: str = "/usr/bin/open",
     workdir: Optional[Path] = None,
 ) -> str:
     """Wait for the app to exit, move the new bundle into place, reopen it.
@@ -356,18 +359,18 @@ def mac_swap_script(
     # Only ever delete the updater's own download folder, never whatever
     # folder the script happens to sit in.
     if workdir is not None and workdir.name.startswith(WORKDIR_PREFIX):
-        cleanup = f"rm -rf {quoted(workdir)}"
+        cleanup = f"/bin/rm -rf {quoted(workdir)}"
     else:
-        cleanup = 'rm -f "$0"'
+        cleanup = '/bin/rm -f "$0"'
     return f"""#!/bin/bash
-for _ in $(seq 1 150); do kill -0 {pid} 2>/dev/null || break; sleep 0.2; done
-rm -rf {quoted(backup)}
-if mv {quoted(current)} {quoted(backup)} && mv {quoted(staged)} {quoted(current)}; then
-  rm -rf {quoted(backup)}
+for _ in $(/usr/bin/seq 1 150); do kill -0 {pid} 2>/dev/null || break; /bin/sleep 0.2; done
+/bin/rm -rf {quoted(backup)}
+if /bin/mv {quoted(current)} {quoted(backup)} && /bin/mv {quoted(staged)} {quoted(current)}; then
+  /bin/rm -rf {quoted(backup)}
 else
-  [ -d {quoted(current)} ] || mv {quoted(backup)} {quoted(current)}
+  [ -d {quoted(current)} ] || /bin/mv {quoted(backup)} {quoted(current)}
 fi
-xattr -dr com.apple.quarantine {quoted(current)} 2>/dev/null
+/usr/bin/xattr -dr com.apple.quarantine {quoted(current)} 2>/dev/null
 {opener} {quoted(current)} --args {args}
 {cleanup}
 """
@@ -383,16 +386,17 @@ def windows_portable_script(pid: int, relaunch_args: list[str]) -> str:
     tries the old copy is reopened rather than leaving the user with nothing.
     """
     args = " ".join(relaunch_args)
+    system = f"%{SYSTEM_ENV}%"
     return f"""@echo off
 setlocal
 set tries=0
 :wait
-tasklist /FI "PID eq {pid}" 2>nul | find "{pid}" >nul && (ping -n 2 127.0.0.1 >nul & goto wait)
+"{system}\\tasklist.exe" /FI "PID eq {pid}" 2>nul | "{system}\\find.exe" "{pid}" >nul && ("{system}\\ping.exe" -n 2 127.0.0.1 >nul & goto wait)
 :move
 move /Y "%{SOURCE_ENV}%" "%{APP_ENV}%" >nul 2>&1 && goto done
 set /a tries+=1
 if %tries% GEQ 30 goto done
-ping -n 2 127.0.0.1 >nul
+"{system}\\ping.exe" -n 2 127.0.0.1 >nul
 goto move
 :done
 start "" "%{APP_ENV}%" {args}
@@ -769,7 +773,7 @@ class Updater(QObject):
         if current is None:
             raise UpdateError("Couldn’t find the installed app.")
         unpacked = archive.parent / "unpacked"
-        result = subprocess.run(["ditto", "-x", "-k", str(archive), str(unpacked)], capture_output=True)
+        result = subprocess.run(["/usr/bin/ditto", "-x", "-k", str(archive), str(unpacked)], capture_output=True)
         if result.returncode != 0:
             raise UpdateError("Couldn’t unpack the update.")
         candidates = list(unpacked.glob("*.app"))
@@ -790,7 +794,7 @@ class Updater(QObject):
         # same volume and can't be left half done.
         staged = current.with_name("." + current.stem + " update.app")
         shutil.rmtree(staged, ignore_errors=True)
-        copied = subprocess.run(["ditto", str(new_app), str(staged)], capture_output=True)
+        copied = subprocess.run(["/usr/bin/ditto", str(new_app), str(staged)], capture_output=True)
         if copied.returncode != 0:
             shutil.rmtree(staged, ignore_errors=True)
             raise UpdateError(f"No permission to replace the app in {current.parent}.")
@@ -798,7 +802,7 @@ class Updater(QObject):
         script.write_text(
             mac_swap_script(os.getpid(), current, staged, self._relaunch_args(), workdir=self._workdir)
         )
-        subprocess.Popen(["/bin/bash", str(script)], start_new_session=True,
+        subprocess.Popen(["/bin/bash", "-p", str(script)], start_new_session=True,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def _install_windows_installer(self, installer: Path) -> None:
@@ -874,6 +878,20 @@ class UpdateError(RuntimeError):
     pass
 
 
+def system_program(name: str) -> str:
+    """The full path of one of Windows' own programs, in System32.
+
+    Never start one by name alone: Windows looks for it first in the folder
+    of the program starting it, then in the current folder, and cmd.exe in
+    the current folder. The portable exe may sit in Downloads, and the
+    installed app's folder is one the user can write to, so a cmd.exe or
+    tasklist.bat put there would run instead."""
+    root = os.environ.get("SystemRoot", "")
+    if not ntpath.isabs(root) or not ntpath.splitdrive(root)[0]:
+        root = "C:\\Windows"
+    return ntpath.join(root, "System32", name)
+
+
 def start_windows_script(script: Path, text: str, app: Path, source: Path) -> None:
     """Write an update script as plain ASCII and run it detached, handing it
     the paths through its environment (see APP_ENV)."""
@@ -881,8 +899,9 @@ def start_windows_script(script: Path, text: str, app: Path, source: Path) -> No
         script.write_text(text, encoding="ascii")
     except (OSError, UnicodeError) as error:
         raise UpdateError("Couldn’t prepare the update.") from error
-    environment = {**os.environ, APP_ENV: str(app), SOURCE_ENV: str(source)}
-    subprocess.Popen(["cmd", "/c", str(script)], env=environment, creationflags=_detached_flags())
+    system = ntpath.dirname(system_program("cmd.exe"))
+    environment = {**os.environ, APP_ENV: str(app), SOURCE_ENV: str(source), SYSTEM_ENV: system}
+    subprocess.Popen([system_program("cmd.exe"), "/c", str(script)], env=environment, creationflags=_detached_flags())
 
 
 def _detached_flags() -> int:

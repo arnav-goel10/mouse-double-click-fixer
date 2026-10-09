@@ -30,7 +30,9 @@ RUN_LOOP_MODE = "com.doubleclickfixer.selftest"
 #: The PyObjC timer check gives up after this long.
 TIMER_WAIT_S = 0.5
 
-#: The modules the app needs at launch, beyond what the checks import.
+#: Modules every build must have; the check imports these and every other
+#: module of the app it finds (a module imported only later, when a menu or
+#: an update needs it, fails here rather than in front of the user).
 APP_MODULES = ("app.main", "app.platform", "app.updater", "app.ui.window")
 
 #: CS_RUNTIME in the code-signing flags of a running process (cs_blobs.h).
@@ -39,9 +41,13 @@ CS_RUNTIME = 0x10000
 #: Variables installer/runtime_hooks/scrub_env.py removes from a built macOS
 #: app, and the ones that may be set again afterwards (by the self-test
 #: itself, or by PyInstaller's own Qt hook, which points Qt at the bundle).
-SCRUBBED_PREFIXES = ("OPENSSL_", "SSL_CERT_", "QT_", "QML", "PYTHON", "DYLD_")
+SCRUBBED_PREFIXES = ("OPENSSL_", "SSL_CERT_", "QT_", "QML", "PYTHON", "DYLD_", "BASH_FUNC_", "__BASH_FUNC")
+SCRUBBED_NAMES = ("BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS")
 SET_BY_SELF_TEST = ("QT_QPA_PLATFORM",)
 BUNDLE_PATHS = ("QT_PLUGIN_PATH", "QML2_IMPORT_PATH")
+#: The hook pins PATH to the system's own folders, so whatever the app starts
+#: by name comes from there.
+SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 
 
 class Skipped(Exception):
@@ -52,7 +58,8 @@ class Skipped(Exception):
 
 def check_environment() -> str:
     """The runtime hook ran: nothing is left that would make OpenSSL, Qt or
-    dyld load code from outside the app."""
+    dyld load code from outside the app, or make a program the app starts
+    run something else."""
     if sys.platform != "darwin":
         raise Skipped("macOS only")
     if not getattr(sys, "frozen", False):
@@ -60,7 +67,8 @@ def check_environment() -> str:
     bundle = os.path.dirname(os.path.realpath(getattr(sys, "_MEIPASS", sys.executable)))  # Contents
     left = []
     for name, value in os.environ.items():
-        if not name.startswith(SCRUBBED_PREFIXES) or name in SET_BY_SELF_TEST or name == "OPENSSL_CONF":
+        scrubbed = name.startswith(SCRUBBED_PREFIXES) or name in SCRUBBED_NAMES
+        if not scrubbed or name in SET_BY_SELF_TEST or name == "OPENSSL_CONF":
             continue
         if name in BUNDLE_PATHS and all(
             os.path.realpath(path).startswith(bundle + os.sep) for path in value.split(os.pathsep) if path
@@ -69,9 +77,43 @@ def check_environment() -> str:
         left.append(name)
     if os.environ.get("OPENSSL_CONF") != os.devnull:
         left.append("OPENSSL_CONF (not pinned to an empty file)")
+    if os.environ.get("PATH") != SYSTEM_PATH:
+        left.append(f"PATH (not pinned to {SYSTEM_PATH})")
     if left:
         raise RuntimeError("still set: " + ", ".join(sorted(left)))
-    return f"clean, OPENSSL_CONF={os.devnull}"
+    return f"clean, OPENSSL_CONF={os.devnull}, PATH={SYSTEM_PATH}"
+
+
+def check_child_processes() -> str:
+    """The programs the app starts run from the system, whatever the app was
+    started with: pgrep, as --quit and every launch run it, and bash -p, as
+    the update swap runs it, finding sleep by name. A program placed earlier
+    on PATH, a BASH_ENV file or an exported function would run as the app."""
+    if sys.platform != "darwin":
+        raise Skipped("macOS only")
+    if not getattr(sys, "frozen", False):
+        raise Skipped("not a built app")
+    import subprocess
+
+    from . import main
+
+    # The app's own call treats any failure as "no other copy", so run the
+    # same command here, where a failure shows: pgrep exits 0 when it found
+    # a process and 1 when it found none, and anything else when it couldn't
+    # look.
+    pgrep = subprocess.run(main._pgrep_command(), capture_output=True, text=True, timeout=10, check=False)
+    if pgrep.returncode not in (0, 1):
+        raise RuntimeError(f"pgrep exited {pgrep.returncode}: {pgrep.stderr.strip()}")
+    mine = {os.getpid(), os.getppid()}
+    others = [pid for pid in pgrep.stdout.split() if int(pid) not in mine]
+    shell = subprocess.run(
+        ["/bin/bash", "-p", "-c", "command -v sleep && sleep 0"],
+        capture_output=True, text=True, timeout=10, check=False,
+    )
+    found = shell.stdout.strip()
+    if shell.returncode != 0 or found != "/bin/sleep":
+        raise RuntimeError(f"bash -p found sleep at {found or 'nothing'!r}: {shell.stderr.strip()}")
+    return f"pgrep ran ({'another copy is running' if others else 'no other copy'}), bash -p runs {found}"
 
 
 def check_code_signature() -> str:
@@ -215,6 +257,53 @@ def check_qt_platform() -> str:
     return f"{name} plugin loaded and unloaded, Qt {qVersion()}"
 
 
+def check_app_icons() -> str:
+    """The app's icons draw with the Qt that shipped: the application icon,
+    the menu bar (tray) icon in both states, and the PNG round trip that the
+    checkbox tick and the SF Symbol glyphs go through. PNG is built into Qt
+    GUI, so none of this needs the image-format plugins the build leaves out."""
+    from PySide6.QtCore import QBuffer, QCoreApplication, QIODevice
+    from PySide6.QtGui import QGuiApplication, QImage, QImageReader
+
+    running = QCoreApplication.instance()
+    if running is not None and not isinstance(running, QGuiApplication):
+        raise Skipped("a non-GUI Qt application is running")
+    application = QGuiApplication(["DoubleClickFixer"]) if running is None else None
+    try:
+        from .ui import icons
+
+        drawn = []
+        for name, icon, size in (
+            ("app", icons.app_icon(), 64),
+            ("tray", icons.tray_icon(False), 18),
+            ("tray active", icons.tray_icon(True), 18),
+        ):
+            image = icon.pixmap(size, size).toImage()
+            painted = _painted_pixels(image)
+            if not painted:
+                raise RuntimeError(f"the {name} icon drew nothing")
+            drawn.append(f"{name} {image.width()}px ({painted} px painted)")
+        png = QBuffer()
+        png.open(QIODevice.OpenModeFlag.WriteOnly)
+        if not image.save(png, "PNG"):
+            raise RuntimeError("couldn't write a PNG")
+        again = QImage()
+        if not again.loadFromData(png.data(), "PNG") or again.size() != image.size():
+            raise RuntimeError("couldn't read back the PNG it wrote")
+        formats = sorted(bytes(name).decode() for name in QImageReader.supportedImageFormats())
+    finally:
+        if application is not None:
+            application.shutdown()
+            del application
+    return f"{', '.join(drawn)}; PNG round trip; image formats: {' '.join(formats)}"
+
+
+def _painted_pixels(image) -> int:
+    return sum(
+        1 for y in range(image.height()) for x in range(image.width()) if image.pixelColor(x, y).alpha()
+    )
+
+
 def _platform_plugin(name: str):
     from PySide6.QtCore import QCoreApplication
 
@@ -238,11 +327,23 @@ def check_notices() -> str:
 
 
 def check_app_modules() -> str:
+    """Every module of the app imports: walked from the package itself, so a
+    module imported only later (by a menu, or an update) is checked too."""
     import importlib
+    import pkgutil
 
-    for name in APP_MODULES:
+    import app
+
+    def unreadable(name: str) -> None:
+        raise RuntimeError(f"couldn't look inside {name}")
+
+    found = [info.name for info in pkgutil.walk_packages(app.__path__, "app.", onerror=unreadable)]
+    missing = sorted(set(APP_MODULES) - set(found))
+    if missing:
+        raise RuntimeError("not found in the app package: " + ", ".join(missing))
+    for name in found:
         importlib.import_module(name)
-    return ", ".join(APP_MODULES)
+    return f"{len(found)} modules imported"
 
 
 #: Name and check, in the order they run. The environment goes first, before
@@ -255,7 +356,9 @@ CHECKS: List[Tuple[str, Callable[[], str]]] = [
     ("PyObjC callback", check_pyobjc_callback),
     ("event tap", check_event_tap),
     ("Qt platform plugin", check_qt_platform),
+    ("app icons", check_app_icons),
     ("app modules", check_app_modules),
+    ("child processes", check_child_processes),
     ("third-party notices", check_notices),
 ]
 

@@ -169,10 +169,16 @@ def _other_copies_running() -> bool:
             return False
         import subprocess
 
-        found = subprocess.run(["pgrep", "-x", os.path.basename(sys.executable)], capture_output=True, text=True)
+        found = subprocess.run(_pgrep_command(), capture_output=True, text=True)
         return any(int(pid) not in mine for pid in found.stdout.split())
     except Exception:  # noqa: BLE001 - unsure: behave as before
         return False
+
+
+def _pgrep_command() -> list:
+    """How _other_copies_running lists this executable's processes on macOS
+    (the self-test runs the same command)."""
+    return ["/usr/bin/pgrep", "-x", os.path.basename(sys.executable)]
 
 
 def _quit_running_copy() -> None:
