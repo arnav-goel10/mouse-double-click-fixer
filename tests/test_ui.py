@@ -1118,14 +1118,15 @@ class CalibrationFlowTests(LiveWindowTests):
         self.assertEqual(self.pad_gap(False, []), 0.0, "macOS stamps are precise; these say 0")
 
     def test_test_pane_shows_bounces_on_every_button(self) -> None:
-        from app.core import Button, ClickEvent
+        from app.contracts import Button
+        from app.core import ClickEvent
 
         page = self.window.test_page
         self.window.show()
         self.window._show_page(self.page_index("test"))
         for button in Button:
             page.note_global_event(ClickEvent(button, True, False, 9.0, None))  # blocked
-        self.assertEqual(len(page.timeline._gaps), 3)
+        self.assertEqual(len(page.timeline._gaps), len(Button), "side buttons too")
 
 
 class AppKitCallbackTests(unittest.TestCase):
