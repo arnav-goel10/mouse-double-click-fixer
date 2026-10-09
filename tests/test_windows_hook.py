@@ -32,6 +32,8 @@ from app.platform import (
     GlobalClickFilter,
     InputSender,
     WindowsHook,
+    mark_kind,
+    mark_seq,
     normalized_absolute,
     send_batch,
 )
@@ -157,8 +159,8 @@ class FakeWindows:
     def button_flags(self, button: Button, pressed: bool):
         return (self._swap(button), pressed)  # the physical button
 
-    def button_input(self, flags, when):
-        return ("button", flags, when, INJECTED_MARK)
+    def button_input(self, flags, when, mark):
+        return ("button", flags, when, mark)
 
     def move_input(self, x, y, mark):
         return ("move", normalized_absolute(x, y, *self.screen), mark)
@@ -327,7 +329,7 @@ class WindowsHookLogicTests(unittest.TestCase):
         self.fire_timers()
         self.assertEqual(self.win.buttons()[1][:3], ("up", Button.LEFT, (300, 200)))
         self.assertEqual(self.win.cursor, (500, 200), "the pointer comes back")
-        marks = [entry[2] for entry in self.win.seen if entry[0] == "move"][-2:]
+        marks = [mark_kind(entry[2]) for entry in self.win.seen if entry[0] == "move"][-2:]
         self.assertEqual(marks, [TELEPORT_MARK, MOTION_MARK_FOR[Button.LEFT]])
         self.assertFalse(self.win.hook.watch[0])
 
@@ -346,11 +348,36 @@ class WindowsHookLogicTests(unittest.TestCase):
         self.win.run()
         self.assertEqual(self.win.buttons()[1][:3], ("up", Button.LEFT, (300, 200)))
         self.assertEqual(self.win.cursor, (320, 200))
-        marks = [entry[2] for entry in self.win.seen if entry[0] == "move"][-3:]
+        marks = [mark_kind(entry[2]) for entry in self.win.seen if entry[0] == "move"][-3:]
         self.assertEqual(marks, [TELEPORT_MARK, MOTION_MARK_FOR[Button.LEFT], MOTION_MARK_FOR[Button.LEFT]])
         self.assertFalse(self.win.hook.watch[0])
         self.fire_timers()
         self.assertEqual(len(self.win.buttons()), 2, "the timer must not send the up again")
+
+    def test_a_release_sent_with_its_way_back_is_waited_for_until_that_is_back(self) -> None:
+        self.drag_and_let_go_while_moving()
+        for timer in list(FakeTimer.created):
+            timer.fire()
+        ((number, _sent),) = self.filter._in_flight[Button.LEFT]
+        there, release, back = self.win.queue
+        self.assertEqual((mark_kind(there[2]), mark_seq(there[2])), (TELEPORT_MARK, 0))
+        self.assertEqual((mark_kind(release[3]), mark_seq(release[3])), (INJECTED_MARK, 0), "it numbers nothing")
+        self.assertEqual((mark_kind(back[2]), mark_seq(back[2])), (MOTION_MARK_FOR[Button.LEFT], number))
+        self.win._process(self.win.queue.pop(0))
+        self.win._process(self.win.queue.pop(0))
+        self.assertEqual(self.win.buttons()[1][:3], ("up", Button.LEFT, (300, 200)))
+        self.assertEqual(len(self.filter._in_flight[Button.LEFT]), 1, "the way back is still to come")
+        self.win.run()
+        self.assertEqual(len(self.filter._in_flight[Button.LEFT]), 0)
+        self.assertFalse(self.win.hook.watch[0])
+
+    def test_a_batch_that_does_not_go_in_is_not_waited_for(self) -> None:
+        self.click()
+        self.win.send = lambda inputs: 0                              # blocked: an elevated window
+        self.win.move(50, 0)
+        self.win.run()
+        self.assertEqual(len(self.filter._in_flight[Button.LEFT]), 0)
+        self.assertFalse(self.win.hook.watch[0])
 
     def test_a_move_inside_the_teleport_is_kept(self) -> None:
         for position in (1, 2):  # after the move there, after the release
@@ -476,32 +503,33 @@ class InputSenderTests(unittest.TestCase):
 
     def test_batches_go_out_in_order_on_the_senders_thread(self) -> None:
         api = self.Api()
-        sender = InputSender(api, lost=lambda _button: None)
+        sender = InputSender(api, lost=lambda _button, _seq: None)
         for index in range(50):
-            sender.submit([(index, Button.LEFT)])
+            sender.submit([(index, Button.LEFT, index + 1)])
         sender.close()
         self.assertEqual(api.sent, list(range(50)))
         self.assertEqual(set(api.threads), {"dcf-send"})
 
     def test_inputs_that_dont_go_in_are_settled_not_waited_for(self) -> None:
         lost = []
-        sent = send_batch(self.Api(accept=1), [("there", None), ("up", Button.LEFT), ("back", Button.LEFT)], lost.append)
+        batch = [("there", None, 0), ("up", Button.LEFT, 7), ("back", Button.RIGHT, 9)]
+        sent = send_batch(self.Api(accept=1), batch, lambda button, seq: lost.append((button, seq)))
         self.assertEqual(sent, 1)
-        self.assertEqual(lost, [Button.LEFT, Button.LEFT])
+        self.assertEqual(lost, [(Button.LEFT, 7), (Button.RIGHT, 9)])
 
     def test_a_failing_send_settles_the_whole_batch(self) -> None:
         api = self.Api()
         api.send = mock.Mock(side_effect=OSError("blocked"))
         lost = []
         with mock.patch("app.platform._logged_sites", set()), self.assertLogs("app.platform", "WARNING"):
-            self.assertEqual(send_batch(api, [("up", Button.RIGHT)], lost.append), 0)
-        self.assertEqual(lost, [Button.RIGHT])
+            self.assertEqual(send_batch(api, [("up", Button.RIGHT, 3)], lambda *settled: lost.append(settled)), 0)
+        self.assertEqual(lost, [(Button.RIGHT, 3)])
 
     def test_after_closing_batches_are_sent_directly(self) -> None:
         api = self.Api()
-        sender = InputSender(api, lost=lambda _button: None)
+        sender = InputSender(api, lost=lambda _button, _seq: None)
         sender.close()
-        sender.submit([("late", Button.LEFT)])
+        sender.submit([("late", Button.LEFT, 1)])
         self.assertEqual(api.sent, ["late"])
         self.assertEqual(api.threads, [threading.current_thread().name])
 
@@ -860,7 +888,7 @@ class WindowsMotionTests(RealWindows):
         up = self.first(WM_LBUTTONUP)
         self.assertEqual(self.observed[up][1], (300, 200), f"the drop landed off its spot: {self.observed}")
         self.assertEqual(self.cursor(), (500, 200))
-        self.assertIn(TELEPORT_MARK, [entry[2] for entry in self.observed if entry[0] == WM_MOUSEMOVE])
+        self.assertIn(TELEPORT_MARK, [mark_kind(entry[2]) for entry in self.observed if entry[0] == WM_MOUSEMOVE])
 
     def test_swapped_buttons_come_back_in_pairs(self) -> None:
         # (f) A left-handed setup: SendInput names the physical button, and a

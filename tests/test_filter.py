@@ -19,9 +19,13 @@ from app.core import Button, ClickEvent
 from app.platform import (
     DEFAULT_DOUBLE_CLICK_S,
     DOUBLE_CLICK_KEY,
+    IN_FLIGHT_CHECK_SLACK_S,
+    IN_FLIGHT_TIMEOUT_S,
     INJECTED_MARK,
+    MARK_SEQ_SPAN,
     MOTION_MARK_FOR,
     RESTORE_MARK,
+    TELEPORT_MARK,
     TAP_DISABLE_LIMIT,
     TAP_DISABLED_MESSAGE,
     ClickCountRepair,
@@ -29,6 +33,9 @@ from app.platform import (
     HookError,
     _double_click_interval,
     is_supported,
+    make_mark,
+    mark_kind,
+    mark_seq,
     windows_event_time,
 )
 
@@ -37,6 +44,13 @@ def fresh_error_log():
     """Each place that ignores an error logs only its first one per run of
     the app; start a test with none of them logged yet."""
     return mock.patch("app.platform._logged_sites", set())
+
+
+def come_back(click_filter: GlobalClickFilter, button: Button) -> None:
+    """The oldest of `button`'s re-sent events still in flight passes back
+    through the hook, carrying its number as its mark does."""
+    number = click_filter._in_flight[button][0][0]
+    click_filter._injected_passed(button, mark_seq(make_mark(INJECTED_MARK, number)))
 
 
 class HandlerTests(unittest.TestCase):
@@ -208,7 +222,7 @@ class HeldReleaseTests(unittest.TestCase):
         self.addCleanup(patch.stop)
         self.filter = GlobalClickFilter(40, [Button.LEFT])
         self.filter._use_os_time = True
-        self.filter._inject = lambda button, pressed, template: self.injected.append((pressed, template))
+        self.filter._inject = lambda button, pressed, template, _seq: self.injected.append((pressed, template))
 
     def fire_all(self) -> None:
         for timer in list(self.timers):
@@ -276,7 +290,7 @@ class TimerTokenTests(unittest.TestCase):
 
         click_filter = GlobalClickFilter(40, [Button.LEFT])
         click_filter._use_os_time = True
-        click_filter._inject = lambda button, pressed, template: injected.append((pressed, template))
+        click_filter._inject = lambda button, pressed, template, _seq: injected.append((pressed, template))
         with mock.patch("app.platform.threading.Timer", FakeTimer):
             click_filter._handle(Button.LEFT, True, 1.000, "down")
             click_filter._handle(Button.LEFT, False, 1.300, "up1")    # dropout one: timer A
@@ -318,7 +332,7 @@ class EventTimeTests(unittest.TestCase):
         sent = []
         click_filter = GlobalClickFilter(40, [Button.LEFT, Button.RIGHT])
         click_filter._use_os_time = True
-        click_filter._inject = lambda button, pressed, template: sent.append((button, pressed, template))
+        click_filter._inject = lambda button, pressed, template, _seq: sent.append((button, pressed, template))
         return click_filter, sent
 
     def handle(self, button, pressed, stamp, name, late_ms=1.0, at=None, allow_hold=True):
@@ -369,9 +383,9 @@ class EventTimeTests(unittest.TestCase):
         self.assertEqual(self.sent, [])
         self.assertFalse(self.move(100.541, "m2", (70, 0)), "past it: it waits behind the release")
         self.assertEqual(self.sent, [(Button.LEFT, False, "up")])
-        self.filter._injected_passed(Button.LEFT)                     # the up comes back
+        come_back(self.filter, Button.LEFT)                           # the up comes back
         self.assertEqual(self.sent[-1], (Button.LEFT, None, "m2"))
-        self.filter._injected_passed(Button.LEFT)                     # and the motion
+        come_back(self.filter, Button.LEFT)                           # and the motion
         self.assertTrue(self.move(100.550, "m3", (80, 0)), "nothing left in flight")
         for timer in list(self.timers):
             timer.fire()
@@ -392,9 +406,9 @@ class EventTimeTests(unittest.TestCase):
         self.assertTrue(right.deferred)
         self.assertFalse(right.is_bounce)
         self.assertEqual(self.sent, [(Button.LEFT, False, "up"), (Button.RIGHT, True, "rdown")])
-        self.assertEqual((self.filter._in_flight[Button.LEFT], self.filter._in_flight[Button.RIGHT]), (1, 1))
-        self.filter._injected_passed(Button.LEFT)
-        self.filter._injected_passed(Button.RIGHT)
+        self.assertEqual((len(self.filter._in_flight[Button.LEFT]), len(self.filter._in_flight[Button.RIGHT])), (1, 1))
+        come_back(self.filter, Button.LEFT)
+        come_back(self.filter, Button.RIGHT)
         self.assertTrue(self.handle(Button.RIGHT, False, 100.300, "rup").held)
         for timer in list(self.timers):
             timer.fire()
@@ -443,7 +457,7 @@ class EventTimeTests(unittest.TestCase):
         # down2, and rup, then the press, follow it there.
         self.assertTrue(self.handle(Button.RIGHT, True, 100.300, "rdown2").deferred)
         self.assertEqual(self.sent, [(Button.LEFT, False, "up1")])
-        self.filter._injected_passed(Button.LEFT)                     # up1 delivered
+        come_back(self.filter, Button.LEFT)                           # up1 delivered
         self.assertEqual(self.sent, [
             (Button.LEFT, False, "up1"),
             (Button.LEFT, True, "down2"),
@@ -466,7 +480,7 @@ class EventTimeTests(unittest.TestCase):
         self.filter.update(buttons=[Button.RIGHT])
         self.assertTrue(self.handle(Button.LEFT, True, 100.360, "ldown2").flush_held)
         self.assertEqual(self.sent, [(Button.RIGHT, False, "rup1")])
-        self.filter._injected_passed(Button.RIGHT)                    # rup1 delivered
+        come_back(self.filter, Button.RIGHT)                          # rup1 delivered
         self.assertEqual(self.sent, [
             (Button.RIGHT, False, "rup1"),
             (Button.RIGHT, True, "rdown2"),
@@ -487,14 +501,14 @@ class EventTimeTests(unittest.TestCase):
         right = self.handle(Button.RIGHT, True, 100.250, "rdown")
         self.assertTrue(right.deferred)
         self.assertEqual(self.sent, [(Button.LEFT, False, "up1")])
-        self.filter._injected_passed(Button.LEFT)                     # up1 delivered
+        come_back(self.filter, Button.LEFT)                           # up1 delivered
         self.assertEqual(self.sent, [
             (Button.LEFT, False, "up1"),
             (Button.LEFT, True, "down2"),
             (Button.LEFT, False, "up2"),
             (Button.RIGHT, True, "rdown"),
         ])
-        self.assertEqual((self.filter._in_flight[Button.LEFT], self.filter._in_flight[Button.RIGHT]), (2, 1))
+        self.assertEqual((len(self.filter._in_flight[Button.LEFT]), len(self.filter._in_flight[Button.RIGHT])), (2, 1))
 
     def test_a_buttons_later_events_follow_one_parked_in_another_queue(self) -> None:
         # rdown settles up2, which waits behind down2 in the left queue, so
@@ -517,7 +531,7 @@ class EventTimeTests(unittest.TestCase):
                 else:
                     self.assertTrue(rup.deferred)
                 self.assertEqual(self.sent, [(Button.LEFT, False, "up1")])
-                self.filter._injected_passed(Button.LEFT)             # up1 delivered
+                come_back(self.filter, Button.LEFT)                   # up1 delivered
                 self.assertEqual(self.sent, [
                     (Button.LEFT, False, "up1"),
                     (Button.LEFT, True, "down2"),
@@ -539,9 +553,9 @@ class EventTimeTests(unittest.TestCase):
         self.assertTrue(self.handle(Button.RIGHT, False, 100.200, "rup2", at=(0, 0)).held)
 
     def assert_motion_follows_the_right_queue(self) -> None:
-        self.filter._injected_passed(Button.LEFT)                     # lup delivered
+        come_back(self.filter, Button.LEFT)                           # lup delivered
         self.assertEqual(self.sent, [(Button.LEFT, False, "lup"), (Button.RIGHT, False, "rup1")])
-        self.filter._injected_passed(Button.RIGHT)                    # rup1 delivered
+        come_back(self.filter, Button.RIGHT)                          # rup1 delivered
         self.assertEqual(self.sent[2:], [
             (Button.RIGHT, True, "rdown2"),
             (Button.RIGHT, False, "rup2"),
@@ -621,7 +635,7 @@ class EventTimeTests(unittest.TestCase):
         self.timers[0].fire()
         self.assertFalse(self.move(100.150, "m", (40, 0)), "waits behind the release on its way")
         self.assertTrue(self.handle(Button.LEFT, True, 100.400, "down2").deferred)
-        self.filter._injected_passed(Button.LEFT)
+        come_back(self.filter, Button.LEFT)
         self.assertEqual(
             self.sent, [(Button.LEFT, False, "up"), (Button.LEFT, None, "m"), (Button.LEFT, True, "down2")]
         )
@@ -634,17 +648,22 @@ class EventTimeTests(unittest.TestCase):
         self.timers[-1].fire()
         self.assertTrue(self.handle(Button.LEFT, True, 100.210, "down2", late_ms=0).deferred)
 
+    def check_due(self) -> float:
+        """When the latest timer started fires: here, the in-flight check."""
+        return self.clock[0] + self.timers[-1].interval
+
     def test_events_behind_a_lost_resend_wait_twice_the_worst_lateness(self) -> None:
-        # Within 150-500 ms. Motion is how the wait is seen ending: it gives
-        # up on whatever is overdue, then waits behind what is left.
+        # Within 150-500 ms of the re-send. Motion is how the wait is seen
+        # ending: it gives up on whatever is overdue, then waits behind what
+        # is left.
         for late_ms, bound_ms in ((0.2, 150), (60, 150), (100, 200), (180, 360), (400, 500), (1500, 500)):
             with self.subTest(late_ms=late_ms):
                 self.timers.clear()
                 self.filter, self.sent = self.make_filter()
                 self.busy(late_ms=late_ms)
                 self.resend_that_never_returns()
-                self.assertAlmostEqual(self.timers[-1].interval, bound_ms / 1000 + 0.05, places=9)
                 bound = bound_ms / 1000
+                self.assertAlmostEqual(self.check_due(), 100.200 + bound + IN_FLIGHT_CHECK_SLACK_S, places=9)
                 self.assertFalse(self.move(100.199 + bound, "m1", (0, 0), late_ms=0))
                 self.assertEqual(self.sent, [(Button.LEFT, False, "up1")], "still waiting for up1")
                 self.assertFalse(self.move(100.201 + bound, "m2", (0, 0), late_ms=0))
@@ -655,15 +674,16 @@ class EventTimeTests(unittest.TestCase):
     def test_a_late_event_while_waiting_lengthens_the_wait(self) -> None:
         self.resend_that_never_returns()                              # a prompt machine: 150 ms
         check = self.timers[-1]
-        self.assertAlmostEqual(check.interval, 0.200, places=9)
+        self.assertAlmostEqual(self.check_due(), 100.200 + 0.150 + IN_FLIGHT_CHECK_SLACK_S, places=9)
         # A click reaches the hook 180 ms late: up1 may be that late too.
-        self.handle(Button.RIGHT, True, 100.215, "rdown", late_ms=180)
+        self.assertTrue(self.handle(Button.RIGHT, True, 100.215, "rdown", late_ms=180).accepted)
         self.clock[0] = 100.410
         check.fire()
         self.assertEqual(self.sent, [(Button.LEFT, False, "up1")], "not overdue any more")
         recheck = self.timers[-1]
-        self.assertAlmostEqual(recheck.interval, 100.200 + 0.360 - 100.410 + 0.05, places=6)
-        self.clock[0] = 100.610
+        self.assertIsNot(recheck, check)
+        self.assertAlmostEqual(self.check_due(), 100.200 + 0.360 + IN_FLIGHT_CHECK_SLACK_S, places=9)
+        self.clock[0] = 100.566
         recheck.fire()
         self.assertEqual(self.sent, [(Button.LEFT, False, "up1"), (Button.LEFT, True, "down2")])
 
@@ -686,6 +706,310 @@ class EventTimeTests(unittest.TestCase):
             thread.join()
             self.assertEqual([entry for entry in sent if entry[1] is False], [(Button.LEFT, False, "up")])
             self.assertFalse(passes, "either way the motion waits behind the release")
+
+
+class Pipeline:
+    """A filter driven on a fake clock, its re-sent events coming back
+    through the hook after `round_trip` seconds (None: never), and timers
+    that fire when due. Timers and returning events run in time order."""
+
+    def __init__(self, test: unittest.TestCase, buttons=(Button.LEFT,), threshold: int = 40) -> None:
+        self.clock = [90.0]
+        self.timers: list = []
+        self.round_trip: Optional[float] = 0.002
+        clock, timers = self.clock, self.timers
+
+        class Timer:
+            daemon = True
+
+            def __init__(self, interval, function, args=()):
+                self.interval, self.function, self.args = interval, function, args
+                self.due, self.alive = clock[0] + interval, False
+                timers.append(self)
+
+            def start(self):
+                self.alive = True
+
+            def cancel(self):
+                self.alive = False
+
+            def is_alive(self):
+                return self.alive
+
+        for patch in (
+            mock.patch("app.platform.threading.Timer", Timer),
+            mock.patch("app.platform.monotonic", lambda: self.clock[0]),
+        ):
+            patch.start()
+            test.addCleanup(patch.stop)
+        self.filter = GlobalClickFilter(threshold, list(buttons))
+        self.filter._use_os_time = True
+        self.sent: list = []  # (button, pressed, template), as re-sent
+        self.pipe: list = []  # (when it comes back, button, its number)
+
+        def inject(button, pressed, template, seq):
+            self.sent.append((button, pressed, template))
+            if self.round_trip is not None:
+                self.pipe.append((self.clock[0] + self.round_trip, button, seq))
+
+        self.filter._inject = inject
+
+    def checks(self, alive: bool = True) -> list:
+        return [timer for timer in self.timers if timer.function.__name__ == "_expire_check" and (timer.alive or not alive)]
+
+    def run_until(self, moment: float) -> None:
+        while True:
+            due = [(entry[0], 0, entry) for entry in self.pipe if entry[0] <= moment]
+            due += [(timer.due, 1, timer) for timer in self.timers if timer.alive and timer.due <= moment]
+            if not due:
+                break
+            when, kind, item = min(due, key=lambda each: (each[0], each[1]))
+            self.clock[0] = max(self.clock[0], when)
+            if kind == 0:
+                self.pipe.remove(item)
+                self.filter._injected_passed(item[1], mark_seq(make_mark(INJECTED_MARK, item[2])))
+            else:
+                item.alive = False
+                item.function(*item.args)
+        self.clock[0] = max(self.clock[0], moment)
+
+    def handle(self, button, pressed, stamp, name, late_ms=1.0, at=(0, 0)):
+        self.run_until(stamp + late_ms / 1000)
+        return self.filter._handle(button, pressed, stamp, name, location=at)
+
+    def move(self, stamp, name, at, late_ms=1.0) -> bool:
+        self.run_until(stamp + late_ms / 1000)
+        return self.filter._motion(name, at, stamp)
+
+
+class InFlightCheckTests(unittest.TestCase):
+    """Should a re-sent event never come back, one check per button gives up
+    on it, set for when the oldest re-send in flight is due."""
+
+    def test_one_check_per_button_however_long_the_hand_moves(self) -> None:
+        # Re-sent events take 5 ms to come back and a 1 kHz mouse keeps
+        # moving after a click: every move waits behind re-sent motion, and
+        # the queue empties and fills again every round trip.
+        rig = Pipeline(self)
+        rig.round_trip = 0.005
+        rig.handle(Button.LEFT, True, 100.000, "down")
+        rig.handle(Button.LEFT, False, 100.080, "up")
+        most = 0
+        for step in range(3000):
+            stamp = 100.081 + step / 1000
+            if rig.filter._motion_wanted:
+                rig.move(stamp, ("m", step), (step + 10, 0), late_ms=0.5)
+            most = max(most, len(rig.checks()))
+        rig.run_until(104.0)
+        self.assertEqual(most, 1)
+        self.assertLess(len(rig.checks(alive=False)), 30, "one per wait, not one per move (3000)")
+        self.assertEqual(rig.checks(), [])
+        self.assertEqual([entry[2] for entry in rig.sent if entry[1] is None], [("m", step) for step in range(3000)])
+
+    def test_the_check_counts_from_the_resend_not_from_what_waits(self) -> None:
+        rig = Pipeline(self)
+        rig.round_trip = None                                         # it never comes back
+        rig.handle(Button.LEFT, True, 100.000, "down1")
+        rig.handle(Button.LEFT, False, 100.100, "up1")
+        rig.run_until(100.150)
+        self.assertEqual(rig.sent, [(Button.LEFT, False, "up1")])
+        sent_at = rig.filter._in_flight[Button.LEFT][0][1]
+        self.assertTrue(rig.handle(Button.LEFT, True, 100.250, "down2").deferred)
+        (check,) = rig.checks()
+        self.assertAlmostEqual(check.due, sent_at + IN_FLIGHT_TIMEOUT_S + IN_FLIGHT_CHECK_SLACK_S, places=9)
+        rig.run_until(check.due - 0.001)
+        self.assertEqual(len(rig.sent), 1)
+        rig.run_until(check.due)
+        self.assertEqual(rig.sent[1:], [(Button.LEFT, True, "down2")])
+
+    def test_the_check_moves_on_to_the_next_resend_once_the_first_came_back(self) -> None:
+        rig = Pipeline(self)
+        rig.round_trip = None
+        rig.handle(Button.LEFT, True, 100.000, "down1")
+        rig.handle(Button.LEFT, False, 100.100, "up1")
+        rig.run_until(100.150)                                        # up1 re-sent
+        self.assertTrue(rig.handle(Button.LEFT, True, 100.160, "down2").deferred)
+        (check,) = rig.checks()
+        rig.clock[0] = 100.200
+        come_back(rig.filter, Button.LEFT)                            # up1 back: down2 re-sent
+        self.assertEqual(rig.sent[-1], (Button.LEFT, True, "down2"))
+        self.assertFalse(rig.move(100.205, "m", (50, 0), late_ms=0), "waits behind down2")
+        self.assertEqual(rig.checks(), [check], "no second check")
+        rig.run_until(check.due)
+        (recheck,) = rig.checks()
+        self.assertAlmostEqual(recheck.due, 100.200 + IN_FLIGHT_TIMEOUT_S + IN_FLIGHT_CHECK_SLACK_S, places=9)
+        self.assertEqual(rig.sent[-1], (Button.LEFT, True, "down2"), "down2 is not overdue yet")
+        rig.run_until(recheck.due)
+        self.assertEqual(rig.sent[-1], (Button.LEFT, None, "m"))
+        self.assertEqual(rig.checks(), [])
+
+    def test_a_check_left_from_before_stop_does_nothing(self) -> None:
+        rig = Pipeline(self)
+        rig.round_trip = None
+        rig.handle(Button.LEFT, True, 100.000, "down1")
+        rig.handle(Button.LEFT, False, 100.100, "up1")
+        rig.run_until(100.150)
+        rig.handle(Button.LEFT, True, 100.160, "down2")
+        (old,) = rig.checks()
+        rig.filter.stop()
+        self.assertFalse(old.alive)
+        self.assertEqual(rig.filter._checks, {})
+        self.assertEqual(rig.sent[-1], (Button.LEFT, True, "down2"), "stop() let it go")
+        # A new wait, then the old check runs late, as one already under way
+        # while stop() cancelled it would.
+        rig.handle(Button.LEFT, False, 101.000, "up2")
+        rig.run_until(101.050)
+        rig.handle(Button.LEFT, True, 101.060, "down3")
+        (new,) = rig.checks()
+        rig.clock[0] = 101.200
+        old.function(*old.args)
+        self.assertEqual(rig.checks(), [new])
+        self.assertEqual(rig.sent[-1], (Button.LEFT, False, "up2"), "down3 still waits for up2")
+
+
+class ResendNumberTests(unittest.TestCase):
+    """Every re-sent event carries its number in its button's sequence; the
+    hook settles exactly what came back, and everything sent before it."""
+
+    def test_marks_keep_their_kind_below_the_number(self) -> None:
+        for kind in (INJECTED_MARK, *MOTION_MARK_FOR.values()):
+            for seq in (1, 2, 1000, MARK_SEQ_SPAN, MARK_SEQ_SPAN + 1, 5 * MARK_SEQ_SPAN + 7):
+                mark = make_mark(kind, seq)
+                self.assertEqual(mark_kind(mark), kind)
+                self.assertEqual(mark & 0xFFFFFFFF, kind, "the low 32 bits are the kind")
+                self.assertEqual(mark_seq(mark), (seq - 1) % MARK_SEQ_SPAN + 1)
+                self.assertTrue(0 < mark < 2**63, "a positive 64-bit value")
+                self.assertNotEqual(mark & 0xFFFFFF00, 0xFF515700, "never pen or touch")
+        for kind in (INJECTED_MARK, RESTORE_MARK, TELEPORT_MARK):
+            self.assertEqual(make_mark(kind), kind, "numbering none, a mark is its kind")
+            self.assertEqual(mark_seq(kind), 0)
+
+    def test_an_event_back_settles_every_resend_before_it(self) -> None:
+        # down2 settles up1, and both are re-sent. up1 is swallowed by
+        # another app's tap; down2 comes back: up1 is not waited for.
+        rig = Pipeline(self)
+        rig.round_trip = None
+        rig.handle(Button.LEFT, True, 100.000, "down1")
+        rig.handle(Button.LEFT, False, 100.100, "up1")
+        self.assertTrue(rig.handle(Button.LEFT, True, 100.141, "down2").deferred)
+        self.assertEqual(rig.sent, [(Button.LEFT, False, "up1"), (Button.LEFT, True, "down2")])
+        self.assertFalse(rig.move(100.143, "m", (50, 0)))
+        rig.filter._injected_passed(Button.LEFT, rig.filter._in_flight[Button.LEFT][1][0])  # down2 back
+        self.assertEqual(rig.sent[-1], (Button.LEFT, None, "m"), "no time-out")
+        self.assertEqual([seq for seq, _sent in rig.filter._in_flight[Button.LEFT]], [3])
+
+    def test_an_event_back_after_a_give_up_settles_nothing_sent_since(self) -> None:
+        rig = Pipeline(self)
+        rig.round_trip = None
+        rig.handle(Button.LEFT, True, 100.000, "down1")
+        rig.handle(Button.LEFT, False, 100.100, "up1")
+        rig.run_until(100.150)                                        # up1 re-sent, number 1
+        rig.handle(Button.LEFT, True, 100.160, "down2")
+        rig.run_until(100.400)                                        # given up: down2 re-sent, number 2
+        self.assertEqual(rig.sent[-1], (Button.LEFT, True, "down2"))
+        rig.filter._injected_passed(Button.LEFT, 1)                   # up1 turns up after all
+        self.assertFalse(rig.move(100.401, "m", (50, 0), late_ms=0), "still behind down2")
+        rig.filter._injected_passed(Button.LEFT, 2)
+        self.assertEqual(rig.sent[-1], (Button.LEFT, None, "m"))
+
+    def test_the_wait_counts_from_the_oldest_resend_still_in_flight(self) -> None:
+        # down2 re-sent at 100.215; up2, settled by motion, re-sent at 100.300
+        # while down2 was still on its way. Once down2 is back, up2 is timed
+        # from its own send, not from down2's.
+        rig = Pipeline(self)
+        rig.round_trip = None
+        rig.handle(Button.LEFT, True, 100.000, "down1")
+        rig.handle(Button.LEFT, False, 100.100, "up1")
+        rig.run_until(100.200)                                        # up1 re-sent at 100.145
+        rig.handle(Button.LEFT, True, 100.210, "down2")
+        rig.clock[0] = 100.215
+        come_back(rig.filter, Button.LEFT)                            # up1 back: down2 re-sent
+        self.assertTrue(rig.handle(Button.LEFT, False, 100.250, "up2").held)
+        self.assertFalse(rig.move(100.291, "m1", (60, 0)))            # settles up2, waits behind it
+        self.assertEqual(rig.sent[-1], (Button.LEFT, False, "up2"))
+        rig.clock[0] = 100.310
+        come_back(rig.filter, Button.LEFT)                            # down2 back
+        self.assertFalse(rig.move(100.420, "m2", (70, 0)), "up2 has been on its way 120 ms")
+        self.assertEqual(rig.sent[-1], (Button.LEFT, False, "up2"))
+
+    def test_a_send_that_fails_settles_only_itself(self) -> None:
+        rig = Pipeline(self, buttons=(Button.LEFT, Button.RIGHT))
+        rig.round_trip = None
+        inject = rig.filter._inject
+        rig.filter._inject = lambda button, pressed, template, seq: False if template == "down2" else inject(
+            button, pressed, template, seq
+        )
+        rig.handle(Button.LEFT, True, 100.000, "down1")
+        rig.handle(Button.LEFT, False, 100.100, "up1")
+        rig.handle(Button.LEFT, True, 100.141, "down2")               # up1 re-sent; down2 could not be
+        self.assertEqual([seq for seq, _sent in rig.filter._in_flight[Button.LEFT]], [1])
+        self.assertFalse(rig.move(100.143, "m", (50, 0)), "up1 is still on its way")
+
+    def test_numbers_start_again_after_the_last_a_mark_holds(self) -> None:
+        rig = Pipeline(self)
+        rig.round_trip = None
+        rig.filter._last_seq[Button.LEFT] = MARK_SEQ_SPAN - 1
+        rig.handle(Button.LEFT, True, 100.000, "down1")
+        rig.handle(Button.LEFT, False, 100.100, "up1")
+        rig.handle(Button.LEFT, True, 100.141, "down2")               # numbers MARK_SEQ_SPAN and one more
+        self.assertFalse(rig.move(100.143, "m", (50, 0)))
+        rig.filter._injected_passed(Button.LEFT, mark_seq(make_mark(INJECTED_MARK, MARK_SEQ_SPAN + 1)))
+        self.assertEqual(rig.sent[-1], (Button.LEFT, None, "m"))
+
+    def test_an_event_from_before_a_resend_never_gives_it_up(self) -> None:
+        # The pipeline stalls for 600 ms just after up1 is re-sent. Motion
+        # and the second press of a double-click, both made before that, come
+        # out of the stall first: up1 is right behind them.
+        rig = Pipeline(self)
+        rig.round_trip = None
+        rig.handle(Button.LEFT, True, 100.000, "down1", at=None)
+        rig.handle(Button.LEFT, False, 100.080, "up1", at=None)
+        rig.run_until(100.125)
+        self.assertEqual(rig.sent, [(Button.LEFT, False, "up1")])
+        self.assertFalse(rig.move(100.110, "m", (0, 0), late_ms=600))
+        self.assertTrue(rig.handle(Button.LEFT, True, 100.121, "down2", late_ms=590).deferred)
+        self.assertEqual(rig.sent, [(Button.LEFT, False, "up1")], "up1 is not given up")
+        come_back(rig.filter, Button.LEFT)
+        self.assertEqual(rig.sent[1:], [(Button.LEFT, None, "m"), (Button.LEFT, True, "down2")])
+
+
+class SendOrderTests(unittest.TestCase):
+    """Re-sent events go out in the order they were decided, whichever
+    thread decided them."""
+
+    def test_a_press_decided_while_a_timer_sends_goes_out_after_it(self) -> None:
+        # The left timer delivers lup1. While it is sending, the hook sees a
+        # left press that settles the right release: both are re-sent, and
+        # lup1 must still go out first. The hook must not wait for the
+        # timer's send.
+        sent, sending, go = [], threading.Event(), threading.Event()
+        click_filter = GlobalClickFilter(40, [Button.LEFT, Button.RIGHT])
+        click_filter._use_os_time = True
+
+        def inject(button, pressed, template, _seq):
+            if template == "lup1":
+                sending.set()
+                go.wait(5)
+            sent.append(template)
+
+        click_filter._inject = inject
+        timers = FakeTimer.reset()
+        with mock.patch("app.platform.threading.Timer", FakeTimer):
+            click_filter._handle(Button.LEFT, True, 100.000, "ldown1")
+            click_filter._handle(Button.RIGHT, True, 100.010, "rdown")
+            click_filter._handle(Button.LEFT, False, 100.090, "lup1")
+            click_filter._handle(Button.RIGHT, False, 100.100, "rup")
+            left_timer = timers[0]
+            timer = threading.Thread(target=left_timer.fire)
+            timer.start()
+            self.assertTrue(sending.wait(5))
+            hook = threading.Thread(target=click_filter._handle, args=(Button.LEFT, True, 100.141, "ldown2"))
+            hook.start()
+            hook.join(5)
+            self.assertFalse(hook.is_alive(), "the hook waited for the timer's send")
+            go.set()
+            timer.join(5)
+        self.assertEqual(sent, ["lup1", "rup", "ldown2"])
 
 
 def quantized_tick(ms: float) -> int:
@@ -724,7 +1048,7 @@ class WindowsEventTimeTests(unittest.TestCase):
         # from one event to the next, so the next click is simply late.
         click_filter = GlobalClickFilter(60, [Button.LEFT])
         click_filter._use_os_time = True
-        click_filter._inject = lambda _button, _pressed, _template: False  # not waited for
+        click_filter._inject = lambda _button, _pressed, _template, _seq: False  # not waited for
         days = 30 * 24 * 3600
         tick = (days * 1000) & 0xFFFFFFFF
         with mock.patch("app.platform.threading.Timer", FakeTimer):
@@ -752,7 +1076,7 @@ class WindowsClickTimingTests(unittest.TestCase):
     def make_filter(self, threshold: int) -> GlobalClickFilter:
         click_filter = GlobalClickFilter(threshold, [Button.LEFT])
         click_filter._use_os_time = True
-        click_filter._inject = lambda button, pressed, template: self.injected.append((pressed, template))
+        click_filter._inject = lambda button, pressed, template, _seq: self.injected.append((pressed, template))
         return click_filter
 
     def stamp(self, happened_ms: float, seen_ms: Optional[float] = None) -> float:
@@ -989,11 +1313,11 @@ class ResendOrderTests(unittest.TestCase):
         self.sent = []
         self.filter = GlobalClickFilter(40, [Button.LEFT])
         self.filter._use_os_time = True
-        self.filter._inject = lambda button, pressed, template: self.sent.append((pressed, template))
+        self.filter._inject = lambda button, pressed, template, _seq: self.sent.append((pressed, template))
 
     def comes_back(self) -> None:
         """The hook sees the oldest re-sent event pass, as the OS delivers it."""
-        self.filter._injected_passed(Button.LEFT)
+        come_back(self.filter, Button.LEFT)
 
     def test_press_right_as_the_window_ends_waits_for_the_resent_release(self) -> None:
         self.filter._handle(Button.LEFT, True, 1.000, "down1")
@@ -1032,7 +1356,7 @@ class ResendOrderTests(unittest.TestCase):
         self.assertEqual(self.sent[-1], (True, "down2"))
 
     def test_a_send_that_fails_is_not_waited_for(self) -> None:
-        self.filter._inject = lambda button, pressed, template: False
+        self.filter._inject = lambda button, pressed, template, _seq: False
         self.filter._handle(Button.LEFT, True, 1.0, "down1")
         self.filter._handle(Button.LEFT, False, 1.1, "up1")
         self.timers[0].fire()
@@ -1050,7 +1374,7 @@ class MotionFlushTests(unittest.TestCase):
         self.injected = []
         self.filter = GlobalClickFilter(40, [Button.LEFT])
         self.filter._use_os_time = True
-        self.filter._inject = lambda button, pressed, template: self.injected.append((pressed, template))
+        self.filter._inject = lambda button, pressed, template, _seq: self.injected.append((pressed, template))
 
     def handle(self, pressed, moment, name, at):
         return self.filter._handle(Button.LEFT, pressed, moment, name, location=at)
@@ -1064,9 +1388,9 @@ class MotionFlushTests(unittest.TestCase):
         self.assertTrue(self.handle(False, 0.08, "up", (101, 100)).held)
         self.assertFalse(self.filter._motion("m1", (106, 100)), "the motion waits behind the release")
         self.assertEqual(self.injected, [(False, "up")])
-        self.filter._injected_passed(Button.LEFT)                     # the up comes back
+        come_back(self.filter, Button.LEFT)                           # the up comes back
         self.assertEqual(self.injected, [(False, "up"), (None, "m1")])
-        self.filter._injected_passed(Button.LEFT)                     # the motion comes back
+        come_back(self.filter, Button.LEFT)                           # the motion comes back
         self.assertTrue(self.filter._motion("m2", (110, 100)), "nothing left in flight")
         self.fire_all()
         self.assertEqual(self.injected, [(False, "up"), (None, "m1")], "the timer must not resend the up")
@@ -1175,7 +1499,7 @@ class MotionFlushTests(unittest.TestCase):
         self.handle(True, 0.000, "down", (0, 0))
         self.handle(False, 0.100, "up", (0, 0))
         self.fire_all()                                               # the click is over
-        self.filter._injected_passed(Button.LEFT)
+        come_back(self.filter, Button.LEFT)
         self.assertTrue(self.handle(True, 0.110, "bounce", (40, 0)).is_bounce)
         self.handle(False, 0.112, "bounce-up", (40, 0))
         self.handle(True, 0.500, "down2", (80, 0))
@@ -1203,8 +1527,8 @@ class MotionFlushTests(unittest.TestCase):
         self.assertEqual(calls[-1], True, "a release is held in place")
         self.filter._motion("m1", (9, 0))
         self.assertEqual(calls[-1], True, "the up and the motion are still on their way")
-        self.filter._injected_passed(Button.LEFT)
-        self.filter._injected_passed(Button.LEFT)
+        come_back(self.filter, Button.LEFT)
+        come_back(self.filter, Button.LEFT)
         self.assertEqual(calls[-1], False)
 
     def test_motion_in_a_moving_holds_window_is_judged_and_passes(self) -> None:
@@ -1234,7 +1558,7 @@ class MotionFlushTests(unittest.TestCase):
         self.handle(True, 0.0, "down", (0, 0))
         self.handle(False, 0.08, "up", (30, 0))
         judged_as_sent = []
-        self.filter._inject = lambda button, pressed, template: judged_as_sent.append(self.filter._motion_wanted)
+        self.filter._inject = lambda button, pressed, template, _seq: judged_as_sent.append(self.filter._motion_wanted)
         self.fire_all()
         self.assertEqual(judged_as_sent, [True])
         self.assertFalse(self.filter._motion("m", (40, 0)), "it waits behind the release")
@@ -1273,7 +1597,7 @@ class QueuedReleaseTests(unittest.TestCase):
         self.sent = []
         self.filter = GlobalClickFilter(40, [Button.LEFT])
         self.filter._use_os_time = True
-        self.filter._inject = lambda button, pressed, template: self.sent.append((pressed, template))
+        self.filter._inject = lambda button, pressed, template, _seq: self.sent.append((pressed, template))
 
     def queue_a_press(self) -> None:
         self.filter._handle(Button.LEFT, True, 1.000, "down1", location=(0, 0))
@@ -1291,14 +1615,14 @@ class QueuedReleaseTests(unittest.TestCase):
         self.queue_a_press()
         self.timers[-1].fire()                                        # up2's window ends
         self.assertEqual(self.sent, [(False, "up1")])
-        self.filter._injected_passed(Button.LEFT)                     # up1 delivered
+        come_back(self.filter, Button.LEFT)                           # up1 delivered
         self.assertEqual(self.sent, [(False, "up1"), (True, "down2"), (False, "up2")])
 
     def test_motion_queues_the_release_behind_the_press(self) -> None:
         self.queue_a_press()
         self.assertFalse(self.filter._motion("m", (10, 0)))
         self.assertEqual(self.sent, [(False, "up1")])
-        self.filter._injected_passed(Button.LEFT)
+        come_back(self.filter, Button.LEFT)
         self.assertEqual(self.sent, [(False, "up1"), (True, "down2"), (False, "up2"), (None, "m")])
 
     def test_a_late_press_queues_behind_the_press_already_waiting(self) -> None:
@@ -1307,7 +1631,7 @@ class QueuedReleaseTests(unittest.TestCase):
         event = self.filter._handle(Button.LEFT, True, 1.300, "down3", location=(0, 0))
         self.assertTrue(event.deferred)
         self.assertEqual(self.sent, [(False, "up1")])
-        self.filter._injected_passed(Button.LEFT)
+        come_back(self.filter, Button.LEFT)
         self.assertEqual(self.sent, [(False, "up1"), (True, "down2"), (False, "up2"), (True, "down3")])
 
 
@@ -1601,7 +1925,8 @@ class MacTapTests(unittest.TestCase):
         return seen
 
     def mark(self, event):
-        return event.fields.get(self.Q.kCGEventSourceUserData)
+        """Which of this app's marks an event carries (see make_mark)."""
+        return mark_kind(event.fields.get(self.Q.kCGEventSourceUserData, 0))
 
     def test_one_tap_sees_clicks_and_motion(self) -> None:
         self.assertEqual(len(self.quartz.taps), 1)
@@ -1641,7 +1966,7 @@ class MacTapTests(unittest.TestCase):
         self.button(self.Q.kCGEventLeftMouseUp, (100, 100), 0.1)
         self.quartz.pointer = (100.0, 100.0)
         self.stream(self.move((106, 100)))                            # the up, then the motion
-        self.assertEqual(self.filter._in_flight[Button.LEFT], 0)
+        self.assertEqual(len(self.filter._in_flight[Button.LEFT]), 0)
         self.assert_motion_goes_straight_through()
 
     def test_motion_during_a_hold_in_place_is_judged_and_queued(self) -> None:
@@ -1654,7 +1979,7 @@ class MacTapTests(unittest.TestCase):
         judged.assert_called_once()
         self.assertEqual(judged.call_args.args[1], (106.0, 100.0))
         self.assertEqual([self.mark(event) for event in self.quartz.posted], [INJECTED_MARK])
-        self.assertEqual([entry[0] for entry in self.filter._queued[Button.LEFT]], [None])
+        self.assertEqual([entry[1] for entry in self.filter._queued[Button.LEFT]], [None])  # motion
 
     def test_a_held_release_reaches_apps_before_the_motion_after_it(self) -> None:
         # The first moves after a click made in place: the one that leaves
@@ -1676,7 +2001,12 @@ class MacTapTests(unittest.TestCase):
         self.assertEqual(
             seen, [(self.Q.kCGEventLeftMouseDown, 100), (up, 100), (moved, 106), (moved, 112), (moved, 118)]
         )
-        self.assertEqual(self.filter._in_flight[Button.LEFT], 0, "everything re-sent came back")
+        self.assertEqual(
+            [mark_seq(event.fields[self.Q.kCGEventSourceUserData]) for event in self.quartz.posted],
+            [1, 2, 3, 4],
+            "each re-send numbered in turn",
+        )
+        self.assertEqual(len(self.filter._in_flight[Button.LEFT]), 0, "everything re-sent came back")
         self.assertFalse(self.filter._motion_wanted)
         for timer in list(self.timers):
             timer.fire()
@@ -1725,7 +2055,7 @@ class MacTapTests(unittest.TestCase):
         self.assertEqual((restore.kind, restore.location.x, self.mark(restore)), (self.Q.kCGEventMouseMoved, 90, RESTORE_MARK))
         self.assertIs(self.pass_back(release), release)
         self.assertIs(self.pass_back(restore), restore, "the restore passes untouched")
-        self.assertEqual(self.filter._in_flight[Button.LEFT], 0, "the restore is not waited for")
+        self.assertEqual(len(self.filter._in_flight[Button.LEFT]), 0, "the restore is not waited for")
 
     def test_a_release_made_in_place_posts_no_restore(self) -> None:
         self.button(self.Q.kCGEventLeftMouseDown, (10, 10), 0.0)
