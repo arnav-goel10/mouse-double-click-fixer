@@ -8,6 +8,7 @@ from typing import Optional
 
 from PySide6.QtCore import QObject, Signal
 
+from . import permissions
 from . import settings as settings_store
 from . import startup
 from .core import Button, ClickEvent, clamp_threshold
@@ -162,7 +163,7 @@ class AppController(QObject):
         if self._suspended:
             return "Paused for calibration"
         if self.waiting_for_permission:
-            return "Waiting for Accessibility access"
+            return f"Waiting for {permissions.pane_name()} permission"
         return "Off"
 
     def resume(self) -> None:

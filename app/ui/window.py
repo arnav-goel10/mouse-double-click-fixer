@@ -181,8 +181,8 @@ class FilterPage(Page):
         self.permission_button.clicked.connect(lambda: self.window().request_filter(True))
         self.permission_row = self.permission.add(
             Row(
-                "Accessibility access required",
-                "Allow DoubleClick Fixer in Privacy & Security.",
+                "Permission required",
+                f"Allow DoubleClick Fixer in Privacy & Security › {permissions.pane_name()}.",
                 self.permission_button,
                 SymbolView("warning", 22, "symbol"),
             )
@@ -247,7 +247,7 @@ class FilterPage(Page):
         if self.controller.suspended:
             self.status_row.set_detail("Paused during calibration.")
         elif waiting_for_permission:
-            self.status_row.set_detail("Waiting for Accessibility access.")
+            self.status_row.set_detail(f"Waiting for {permissions.pane_name()} permission.")
         else:
             self.status_row.set_detail("Ignores the extra click a worn switch adds.")
         self.slider.setValue(threshold)
@@ -593,7 +593,8 @@ class GeneralPage(Page):
             self.permission_icon = SymbolView("ok", 20, "symbol")
             button = _button("Open Settings…")
             button.clicked.connect(permissions.open_accessibility_settings)
-            self.permission_row = section.add(Row("Accessibility", "", button, self.permission_icon))
+            # The name System Settings itself uses, which macOS 27 changed.
+            self.permission_row = section.add(Row(permissions.pane_name(), "", button, self.permission_icon))
 
         self.update_header = self.header("Software update")
         self.update_section = self.section()
