@@ -12,6 +12,12 @@ touchpad reports its touches before Windows turns a tap into a click.
 Raw Input made by software (SendInput, and the mouse input Windows makes from
 a touchpad's gestures) names no device (handle 0), and changes nothing.
 
+A touch surface reports for as long as a finger is on it, so a click from it
+always follows a report by moments. A touch device that has been quiet for
+longer than TOUCH_QUIET_S is no longer taken for the one clicking: a mouse
+clicked without being moved first may not have reported yet when its click
+reaches the hook, and must not pass as a touch.
+
 A device's kind: Raw Input of type HID is a digitizer (a touchpad, a
 touchscreen or a pen, by its usage); of type mouse with absolute positions,
 a touchscreen; otherwise a mouse. Its key (see device_key) comes from its
@@ -29,7 +35,10 @@ import queue
 import re
 import threading
 from dataclasses import dataclass
+from time import monotonic
 from typing import Callable, NamedTuple, Optional
+
+from .core import TOUCH_KINDS
 
 log = logging.getLogger(__name__)
 
@@ -43,6 +52,9 @@ MOUSE_MOVE_ABSOLUTE = 0x0001
 USAGES = ((0x01, 0x02), (0x0D, 0x05), (0x0D, 0x04))
 #: Digitizer usages (page 0x0D) and the kind of device they are.
 DIGITIZER_KINDS = {0x05: "trackpad", 0x04: "touchscreen", 0x02: "pen", 0x01: "pen"}
+#: How long after its last report a touch device still counts as the one
+#: clicking (see the module notes).
+TOUCH_QUIET_S = 1.0
 #: Bluetooth's HID service class IDs, as they appear in a device path.
 BLUETOOTH_SERVICES = ("{00001124-0000-1000-8000-00805F9B34FB}", "{00001812-0000-1000-8000-00805F9B34FB}")
 
@@ -300,6 +312,8 @@ class RawInputDevices:
         self._paths: dict[int, PathInfo] = {}
         self._current: Optional[HandleInfo] = None
         self._current_handle = 0
+        # When the current device last reported (monotonic()).
+        self._current_at = 0.0
         self._results: "queue.SimpleQueue" = queue.SimpleQueue()
         self._jobs: "queue.SimpleQueue" = queue.SimpleQueue()
         self._worker: Optional[threading.Thread] = None
@@ -322,14 +336,23 @@ class RawInputDevices:
         if self._worker is not None:
             self._jobs.put(None)
 
-    def current(self) -> Optional[HandleInfo]:
-        return self._current
+    def current(self, now: Optional[float] = None) -> Optional[HandleInfo]:
+        """The device that reported last, or None: none has, or it is a
+        touch device that has been quiet too long to be the one clicking."""
+        info = self._current
+        if info is not None and info.kind in TOUCH_KINDS:
+            if (monotonic() if now is None else now) - self._current_at > TOUCH_QUIET_S:
+                return None
+        return info
 
     def on_input(self, lparam) -> None:
         if self._api is None:
             return
         handle, raw_type = self._api.handle_of(lparam)
-        if not handle or handle == self._current_handle:
+        if not handle:
+            return
+        self._current_at = monotonic()
+        if handle == self._current_handle:
             return
         info = self._handles.get(handle)
         path = None

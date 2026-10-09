@@ -436,6 +436,7 @@ class MacTapEndToEndTests(unittest.TestCase):
     def test_the_wheel_fix_drops_a_stray_reversing_notch(self) -> None:
         self.configure(wheel_fix=True, wheel_window_ms=50)
         self.wheel_in_tap(True)
+        dropped = self.filter.wheel_dropped
         seen = self.play([
             Step(0, "scroll", P, delta=-1), Step(20, "scroll", P, delta=-1),
             Step(30, "scroll", P, delta=1),                                  # the stray notch
@@ -446,7 +447,7 @@ class MacTapEndToEndTests(unittest.TestCase):
         with self.explained():
             scrolls = [(item.delta, item.continuous) for item in seen if item.kind == "scroll"]
             self.assertEqual(scrolls, [(-1, 0), (-1, 0), (-1, 0), (3, 1), (1, 0)])
-            self.assertEqual(self.filter.wheel_dropped, 1)
+            self.assertEqual(self.filter.wheel_dropped - dropped, 1)
 
     def test_with_the_wheel_fix_off_the_wheel_is_not_in_the_tap(self) -> None:
         self.configure(wheel_fix=True)

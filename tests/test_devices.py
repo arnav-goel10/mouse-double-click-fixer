@@ -118,6 +118,16 @@ class RawInputDevicesTests(unittest.TestCase):
         self.devices.on_input(0x10)
         self.assertEqual(self.devices.current().kind, "mouse")
 
+    def test_a_quiet_touch_device_no_longer_counts(self) -> None:
+        from time import monotonic
+
+        self.devices.on_input(0x20)
+        self.assertEqual(self.devices.current().kind, "trackpad")
+        later = monotonic() + devices_win.TOUCH_QUIET_S + 0.1
+        self.assertIsNone(self.devices.current(now=later), "a mouse clicked without moving may not have reported")
+        self.devices.on_input(0x10)
+        self.assertEqual(self.devices.current(now=later).kind, "mouse", "a mouse counts however long it rests")
+
     def test_each_device_is_classified_and_named_once(self) -> None:
         for handle in (0x10, 0x10, 0x20, 0x10, 0x20):
             self.devices.on_input(handle)
