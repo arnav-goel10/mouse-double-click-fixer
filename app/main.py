@@ -482,9 +482,18 @@ class Application:
         self.qt.quit()
 
 
+#: How long Python lets one thread run before another waiting thread gets a
+#: turn. The mouse hook runs Python for every click and pointer move while
+#: the window may be busy in Python too; at the 5 ms default, each event could
+#: wait that long, felt as pointer lag (and on Windows, a slow hook gets
+#: removed). 1 ms keeps the wait short at a negligible cost.
+INTERPRETER_SWITCH_INTERVAL_S = 0.001
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     arguments = list(sys.argv if argv is None else argv)
     minimized = "--minimized" in arguments
+    sys.setswitchinterval(INTERPRETER_SWITCH_INTERVAL_S)
 
     if "--quit" in arguments:
         # Never starts a copy: it only asks a running one to exit.

@@ -81,5 +81,19 @@ class WindowsSessionTests(unittest.TestCase):
         client.disconnectFromServer()
 
 
+class InterpreterSwitchTests(unittest.TestCase):
+    def test_the_app_shortens_the_interpreter_switch_interval(self) -> None:
+        import sys
+        from unittest import mock
+
+        from app import main as main_module
+
+        before = sys.getswitchinterval()
+        self.addCleanup(sys.setswitchinterval, before)
+        with mock.patch.object(main_module, "_quit_running_copy"):
+            main_module.main(["DoubleClickFixer", "--quit"])
+        self.assertEqual(sys.getswitchinterval(), main_module.INTERPRETER_SWITCH_INTERVAL_S)
+
+
 if __name__ == "__main__":
     unittest.main()
