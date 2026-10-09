@@ -73,19 +73,20 @@ class ClickEvent:
     #: Real, but held back by the hook so it reaches apps after an event the
     #: app re-sent just before it (see GlobalClickFilter._defer).
     deferred: bool = False
+    #: Why a release was held: "closing" when it came too soon after the
+    #: contact closed to be a finger letting go (the contact is still
+    #: settling), "lift" otherwise. None for anything not held.
+    hold_reason: Optional[str] = None
 
     @property
     def is_bounce(self) -> bool:
         return self.pressed and not self.accepted and not self.flush_held and not self.deferred
 
 
-#: Releases are held back once the button has been down this long. Worn
-#: switches drop contact as early as 60 ms into a drag, which overlaps the
-#: length of an ordinary click, so only the briefest taps skip the hold.
-HOLD_AFTER_MS = 30.0
-#: A release this soon after its press is the contact bouncing as it closes
-#: (no finger lets go that fast), so it is held too: if the contact settles
-#: and presses again, the press and the hold that follows stay intact.
+#: A release this soon after the contact last closed is the contact bouncing
+#: as it closes: no finger lets go that fast. It is held like every release,
+#: so the press and the hold that follows stay intact, but it is never a click
+#: ending, so pointer motion must not settle it (see ClickEvent.hold_reason).
 IMPOSSIBLE_TAP_MS = 12.0
 
 
@@ -98,10 +99,12 @@ class BounceFilter:
       bounce and is suppressed, together with its matching release, so no
       application ever sees half a click.
     * While the button is held (a drag), the contact can drop out for a few
-      milliseconds, which looks like a release followed by a press. Such a
+      milliseconds, which looks like a release followed by a press. So every
       release is held back for the threshold: if a press follows in time, both
       are dropped and the drag carries on; otherwise the release is delivered
-      late by the caller (see `commit_held`).
+      late by the caller (see `commit_held`). Worn switches drop contact as
+      early as 60 ms into a drag, and bounce as they close, so no length of
+      press is safe to skip.
     """
 
     def __init__(
@@ -117,6 +120,9 @@ class BounceFilter:
         self.hold_releases = hold_releases
         self._last_release_at: Optional[float] = None
         self._last_press_at: Optional[float] = None
+        # Every time the contact closed, including a press that only cancelled
+        # a held release, which apps never see and `_last_press_at` skips.
+        self._last_close_at: Optional[float] = None
         self._held_release_at: Optional[float] = None
         # Numbers each held release, so a timer settles only its own one.
         self._held_id = 0
@@ -126,6 +132,7 @@ class BounceFilter:
     def reset(self) -> None:
         self._last_release_at = None
         self._last_press_at = None
+        self._last_close_at = None
         self._held_release_at = None
         self._swallow_release = False
 
@@ -135,6 +142,7 @@ class BounceFilter:
 
     def press(self, timestamp: Optional[float] = None) -> ClickEvent:
         now = monotonic() if timestamp is None else float(timestamp)
+        self._last_close_at = now
         flush = False
         if self._held_release_at is not None:
             held_gap = max(0.0, (now - self._held_release_at) * 1000)
@@ -175,12 +183,15 @@ class BounceFilter:
             self._swallow_release = False
             self._last_release_at = now
             return ClickEvent(self.button, False, False, None, None)
-        held_ms = None if self._last_press_at is None else (now - self._last_press_at) * 1000
-        worth_holding = held_ms is not None and (held_ms >= HOLD_AFTER_MS or held_ms < IMPOSSIBLE_TAP_MS)
+        # A release with no press seen since the filter started has nothing
+        # to protect: the button went down before the filter was watching.
+        worth_holding = self._last_press_at is not None
         if self.enabled and self.hold_releases and allow_hold and worth_holding:
             self._held_release_at = now
             self._held_id += 1
-            return ClickEvent(self.button, False, False, None, None, held=True)
+            closing = self._last_close_at is not None and (now - self._last_close_at) * 1000 < IMPOSSIBLE_TAP_MS
+            reason = "closing" if closing else "lift"
+            return ClickEvent(self.button, False, False, None, None, held=True, hold_reason=reason)
         self._last_release_at = now
         return ClickEvent(self.button, False, True, None, None)
 

@@ -168,12 +168,52 @@ class DragDropoutTests(unittest.TestCase):
         self.assertTrue(final.held)
         self.assertTrue(f.commit_held(), "the real lift is delivered after the window")
 
-    def test_brief_taps_gain_no_delay(self) -> None:
+    def test_brief_taps_are_held_too(self) -> None:
+        # No length of press is safe to skip: a release this soon can be the
+        # contact bouncing as it closes, the start of a drag.
         f = BounceFilter(60)
         f.press(timestamp=0.0)
         release = f.release(timestamp=0.02)  # a 20 ms tap
-        self.assertTrue(release.accepted)
-        self.assertFalse(release.held)
+        self.assertTrue(release.held)
+        self.assertEqual(release.hold_reason, "lift")
+        self.assertTrue(f.commit_held(), "it is delivered once the window passes")
+
+    def test_a_release_as_the_contact_closes_is_held_as_closing(self) -> None:
+        f = BounceFilter(60)
+        f.press(timestamp=0.0)
+        release = f.release(timestamp=0.004)
+        self.assertTrue(release.held)
+        self.assertEqual(release.hold_reason, "closing")
+
+    def test_closing_is_measured_from_the_contact_coming_back(self) -> None:
+        # The comeback press never reaches apps, but the contact did close.
+        f = BounceFilter(60)
+        f.press(timestamp=0.0)
+        self.assertEqual(f.release(timestamp=0.5).hold_reason, "lift")
+        self.assertTrue(f.press(timestamp=0.508).cancels_held)
+        self.assertEqual(f.release(timestamp=0.512).hold_reason, "closing")
+
+    def test_only_held_releases_carry_a_reason(self) -> None:
+        f = BounceFilter(60, hold_releases=False)
+        self.assertIsNone(f.press(timestamp=0.0).hold_reason)
+        self.assertIsNone(f.release(timestamp=0.1).hold_reason)
+
+    def test_two_bounces_as_the_contact_closes_keep_the_drag(self) -> None:
+        # D, U 4.7 ms, D 7.8 ms, then a second bounce opening at 12.7 ms (past
+        # the impossible-tap time from the first press) or at 20 ms.
+        for second_bounce in (0.0127, 0.020):
+            with self.subTest(second_bounce=second_bounce):
+                f = BounceFilter(60)
+                self.assertTrue(f.press(timestamp=0.0).accepted)
+                self.assertTrue(f.release(timestamp=0.0047).held)
+                self.assertTrue(f.press(timestamp=0.0078).cancels_held)
+                release = f.release(timestamp=second_bounce)
+                self.assertTrue(release.held, "a release delivered here would turn the drag into a click")
+                self.assertTrue(f.press(timestamp=second_bounce + 0.0008).cancels_held)
+                lift = f.release(timestamp=1.365)
+                self.assertTrue(lift.held)
+                self.assertEqual(lift.hold_reason, "lift")
+                self.assertTrue(f.commit_held(), "the real lift is delivered")
 
     def test_early_dropout_keeps_the_drag(self) -> None:
         # Captured on a real worn switch: contact lost 60 ms into a drag.

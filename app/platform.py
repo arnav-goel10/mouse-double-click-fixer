@@ -9,6 +9,7 @@ bounce through.
 
 from __future__ import annotations
 
+import math
 import os
 import platform
 import threading
@@ -32,13 +33,33 @@ INJECTED_MARK = 0x44434658  # "DCFX"
 INJECTED_MOTION_MARKS = {INJECTED_MARK + 1 + index: button for index, button in enumerate(Button)}
 MOTION_MARK_FOR = {button: mark for mark, button in INJECTED_MOTION_MARKS.items()}
 
-#: A release this close to where its press landed counts as a click made in
-#: place (not the end of a drag), so the first pointer motion settles it.
+#: Marks the pointer motion this app posts to put the pointer back after a
+#: re-sent release pulled it to where the button came up (see _run_macos).
+RESTORE_MARK = max(INJECTED_MOTION_MARKS) + 1
+
+#: A release this close to where apps saw its press counts as a click made in
+#: place (not the end of a drag). Motion that takes the pointer this far from
+#: where the button came up settles it; less is a hand resting on the mouse.
 STATIONARY_PX = 4.0
 
 #: A re-sent event normally passes back through the hook within a millisecond
 #: or two. If one never does (it was blocked, or lost), stop waiting for it.
 IN_FLIGHT_TIMEOUT_S = 0.15
+
+#: macOS disables an event tap that it judges too slow. If it does so this
+#: many times within this many seconds, re-arming the tap would only fight
+#: the system, so the filter stops and every click goes through untouched.
+TAP_DISABLE_LIMIT = 3
+TAP_DISABLE_WINDOW_S = 30.0
+TAP_DISABLED_MESSAGE = "macOS keeps disabling the filter. Turn it on again from the menu."
+
+#: How far an event's own timestamp may sit from `monotonic()` and still be
+#: believed. A tap sees an event within milliseconds of the driver making it.
+CLOCK_TOLERANCE_S = 2.0
+
+#: The double-click interval is a user setting that can change at any time,
+#: so it is read live, but at most this often: the tap callback must stay cheap.
+CLICK_INTERVAL_CACHE_S = 2.0
 
 
 class HookError(RuntimeError):
@@ -82,9 +103,15 @@ class GlobalClickFilter:
         self._started = False
         # Per button: the event kept for a release that is being held back.
         self._held_templates: dict = {}
-        # Per button: whether the release being held landed where its press
-        # did. Pointer motion settles such a release at once (see _motion).
+        # Per button: whether the release being held landed where apps saw its
+        # press, and where it landed. Pointer motion that leaves that spot
+        # settles such a release at once (see _motion).
         self._held_stationary: dict[Button, bool] = {}
+        self._held_points: dict[Button, Optional[tuple[float, float]]] = {}
+        # Per button: where the last press that reached apps landed.
+        self._press_points: dict[Button, Optional[tuple[float, float]]] = {}
+        # When macOS disabled a tap lately (see _tap_disabled).
+        self._tap_disables: list[float] = []
         self.tap_resets = 0  # times macOS disabled the tap and it was re-armed
         self.hook_rearms = 0  # times the Windows hook was re-installed
         self._timers: list[threading.Timer] = []
@@ -122,6 +149,9 @@ class GlobalClickFilter:
         self._started = False
         self._held_templates.clear()
         self._held_stationary.clear()
+        self._held_points.clear()
+        self._press_points.clear()
+        self._tap_disables.clear()
         for button in Button:
             self._in_flight[button] = 0
             self._queued[button].clear()
@@ -164,6 +194,24 @@ class GlobalClickFilter:
         self._thread_id = None
         self._run_loop = None
 
+    def tap_alive(self) -> bool:
+        """Whether the filter is still in the event stream. On macOS that is
+        whether the main tap is enabled: the system can disable it, or drop
+        it with the Accessibility grant, while the hook thread lives on."""
+        if not self.running:
+            return False
+        if platform.system() != "Darwin":
+            return True
+        tap = self._tap
+        if tap is None:
+            return False
+        try:
+            import Quartz
+
+            return bool(Quartz.CGEventTapIsEnabled(tap))
+        except Exception:  # noqa: BLE001 - unsure: don't make a health check churn the filter
+            return True
+
     def _request_thread_stop(self) -> None:
         if platform.system() == "Windows" and self._thread_id is not None:
             import ctypes
@@ -192,13 +240,14 @@ class GlobalClickFilter:
         timestamp: Optional[float],
         template: object = None,
         allow_hold: bool = True,
-        stationary: bool = True,
+        location: Optional[tuple[float, float]] = None,
     ) -> ClickEvent:
         """Decide one event. `template` is a copy of it, kept in case it has to
         be re-injected later; the caller suppresses whatever is not accepted.
         `allow_hold=False` says a release could not be re-injected later.
-        `stationary` says a release landed where its press did: if it is held,
-        the first pointer motion delivers it rather than the timer."""
+        `location` is where the pointer was, as (x, y), if the platform knows:
+        a release held where apps saw its press is a click made in place, and
+        pointer motion leaving that spot delivers it rather than the timer."""
         timestamp = self._normalise_time(timestamp)
         replay = []
         overdue = []
@@ -211,7 +260,13 @@ class GlobalClickFilter:
                 self.filtered_count += 1
             if event.held:
                 self._held_templates[button] = template
-                self._held_stationary[button] = stationary
+                self._held_points[button] = location
+                # A release that came while the contact was still closing is
+                # never a click ending, however still the pointer: it waits for
+                # its press to come back, and motion must not settle it.
+                self._held_stationary[button] = event.hold_reason == "lift" and _near(
+                    self._press_points.get(button), location
+                )
                 timer = threading.Timer(
                     click_filter.threshold_ms / 1000.0, self._commit_held, (button, click_filter.held_id)
                 )
@@ -220,18 +275,30 @@ class GlobalClickFilter:
                 timer.start()
             elif event.cancels_held:
                 self._held_templates.pop(button, None)
-                self._held_stationary.pop(button, None)
+                self._forget_held(button)
             elif event.flush_held:
                 # The held release was real after all: deliver it, then this.
                 replay = [(False, self._held_templates.pop(button, None)), (True, template)]
-                self._held_stationary.pop(button, None)
-                self._track(button, len(replay))
+                self._forget_held(button)
+                if self._queued[button]:
+                    # Real events already wait behind a re-sent one, and these
+                    # came after them.
+                    for entry in replay:
+                        self._enqueue(button, *entry)
+                    replay = []
+                else:
+                    self._track(button, len(replay))
             if event.accepted and (self._in_flight[button] or self._queued[button]):
                 # A release this app re-sent a moment ago may still be on its
                 # way. Letting this one through now could overtake it (apps
                 # would see down, down, up, up), so it goes out right after.
                 self._enqueue(button, pressed, template)
                 event = replace(event, accepted=False, deferred=True)
+            if pressed and not event.is_bounce:
+                # Where apps saw the button go down. A press they never see (a
+                # bounce, or the contact coming back mid-drag) must not move
+                # it, or a drag would look like a click made in place.
+                self._press_points[button] = location
         for replay_pressed, replay_template in overdue + replay:
             self._safe_inject(button, replay_pressed, replay_template)
         self._update_motion_tap()
@@ -255,24 +322,55 @@ class GlobalClickFilter:
     def _commit_held(self, button: Button, expected: Optional[float] = None) -> None:
         """The threshold passed with no press: the held release was real.
         A timer passes the release it was started for; stop() passes none."""
+        send = False
         with self._lock:
             committed = self._filters[button].commit_held(expected)
             if committed:
                 template = self._held_templates.pop(button, None)
-                self._held_stationary.pop(button, None)
-                self._track(button, 1)
-        if committed:
+                self._forget_held(button)
+                send = self._send_or_queue(button, template)
+        if send:
             self._safe_inject(button, False, template)
         self._update_motion_tap()
 
-    def _motion(self, template: object) -> bool:
-        """The pointer moved (`template` is a copy of the motion event).
+    def _send_or_queue(self, button: Button, template: object) -> bool:
+        """With the lock held: a held release is now to be delivered. Returns
+        True when the caller re-sends it now; otherwise it joins the real
+        events already queued behind a re-sent one, since it came after them
+        (sent first, apps could see this release before its own press)."""
+        if self._queued[button]:
+            self._enqueue(button, False, template)
+            return False
+        self._track(button, 1)
+        return True
 
-        A release held where its press landed is settled now: a click made
-        in place ends when the pointer moves off, and apps must see its
-        release where it happened, before the motion. Motion arriving while
-        re-sent events are still on their way waits behind them, so apps
-        never see the pointer leave before the click is over.
+    def _forget_held(self, button: Button) -> None:
+        """With the lock held: the held release is settled one way or another."""
+        self._held_stationary.pop(button, None)
+        self._held_points.pop(button, None)
+
+    def _tap_disabled(self, now: Optional[float] = None) -> bool:
+        """macOS disabled one of the taps. Returns True when that has now
+        happened TAP_DISABLE_LIMIT times within TAP_DISABLE_WINDOW_S, and the
+        filter should stop rather than re-arm it again."""
+        now = monotonic() if now is None else now
+        with self._lock:
+            recent = [moment for moment in self._tap_disables if now - moment < TAP_DISABLE_WINDOW_S]
+            self._tap_disables = recent + [now]
+            return len(self._tap_disables) >= TAP_DISABLE_LIMIT
+
+    def _motion(self, template: object, location: Optional[tuple[float, float]] = None) -> bool:
+        """The pointer moved (`template` is a copy of the motion event, and
+        `location` where it took the pointer, if known).
+
+        A release held where its press landed is settled once the pointer
+        leaves the spot where the button came up: a click made in place ends
+        when the pointer moves off, and apps must see its release where it
+        happened, before the motion. Smaller motion goes through and the hold
+        stays: it is a hand resting on the mouse, or a drag only starting,
+        and the contact may yet come back. Motion arriving while re-sent
+        events are still on their way waits behind them, so apps never see
+        the pointer leave before the click is over.
 
         Returns True to let the event through unchanged, False when the
         platform must drop it because it was queued to be re-sent.
@@ -286,10 +384,13 @@ class GlobalClickFilter:
                 click_filter = self._filters[button]
                 if click_filter.held_id is None or not self._held_stationary.get(button):
                     continue
+                if location is not None and _near(self._held_points.get(button), location):
+                    continue
                 if click_filter.commit_held():
-                    flushed.append((button, self._held_templates.pop(button, None)))
-                    self._track(button, 1)
-                self._held_stationary.pop(button, None)
+                    held_template = self._held_templates.pop(button, None)
+                    if self._send_or_queue(button, held_template):
+                        flushed.append((button, held_template))
+                self._forget_held(button)
             for button in Button:
                 if self._in_flight[button] or self._queued[button]:
                     self._enqueue(button, None, template)
@@ -382,8 +483,10 @@ class GlobalClickFilter:
         Event records are stamped when the driver produced the event, which is
         what a gap should be measured from. Both platforms happen to count from
         boot like `monotonic()` does, but synthetic events can carry a zero or
-        otherwise unusable stamp, so the first event decides once whether these
-        numbers are trustworthy. Mixing two clocks would corrupt every gap.
+        otherwise unusable stamp, so on Windows the first event decides once
+        whether these numbers are trustworthy. Mixing two clocks would corrupt
+        every gap. macOS checks each stamp on its own instead (see
+        _mach_timebase) and settles this check up front.
         """
         now = monotonic()
         if timestamp is None:
@@ -581,6 +684,9 @@ class GlobalClickFilter:
             Quartz.kCGEventOtherMouseUp: (Button.MIDDLE, False),
         }
         to_seconds = _mach_timebase()
+        # Every stamp is checked on its own as it arrives (see _mach_timebase),
+        # so the once-per-run check in _normalise_time must not second-guess it.
+        self._use_os_time = True
         filter_injected = _filter_injected()
 
         DRAGGED = (
@@ -588,6 +694,7 @@ class GlobalClickFilter:
             Quartz.kCGEventRightMouseDragged,
             Quartz.kCGEventOtherMouseDragged,
         )
+        DISABLED = (Quartz.kCGEventTapDisabledByTimeout, Quartz.kCGEventTapDisabledByUserInput)
 
         def inject(button: Button, pressed: Optional[bool], template: object) -> bool:
             # Re-post the kept copy of a suppressed event, tagged so this app's
@@ -601,14 +708,54 @@ class GlobalClickFilter:
             if Quartz.CGEventGetType(template) in DRAGGED:
                 # By the time queued motion goes out, the button is up.
                 Quartz.CGEventSetType(template, Quartz.kCGEventMouseMoved)
+            positions = pointer_and_release(template) if pressed is False else None
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, template)
+            if positions is not None:
+                restore_pointer(*positions)
             return True
+
+        def pointer_and_release(template: object) -> Optional[tuple]:
+            # Where the hand has the pointer now, read before the release goes
+            # out, and where the button came up.
+            try:
+                return Quartz.CGEventGetLocation(Quartz.CGEventCreate(None)), Quartz.CGEventGetLocation(template)
+            except Exception:  # noqa: BLE001 - the release must go out regardless
+                return None
+
+        def restore_pointer(pointer: object, released_at: object) -> None:
+            # A release posted where the button came up takes the pointer
+            # there. After a drag let go while moving, the hand has carried
+            # the pointer on since, so put it back. The move is not tracked:
+            # the motion tap is usually off then and would never see it come
+            # back, which would hold the next click for IN_FLIGHT_TIMEOUT_S.
+            try:
+                if math.hypot(pointer.x - released_at.x, pointer.y - released_at.y) < STATIONARY_PX:
+                    return
+                move = Quartz.CGEventCreateMouseEvent(
+                    None, Quartz.kCGEventMouseMoved, pointer, Quartz.kCGMouseButtonLeft
+                )
+                Quartz.CGEventSetIntegerValueField(move, Quartz.kCGEventSourceUserData, RESTORE_MARK)
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, move)
+            except Exception:  # noqa: BLE001 - the release itself already went out
+                pass
 
         self._inject = inject
         click_counts = ClickCountRepair()
-        # Per button: where its last press landed, to tell a click made in
-        # place from the end of a drag.
-        press_points: dict = {}
+        # The first read of the double-click interval loads AppKit; do it now,
+        # not inside the tap callback, where a slow call gets the tap disabled.
+        click_counts.interval()
+        # Set when macOS keeps disabling the taps: the run loop then ends.
+        given_up: list[bool] = []
+
+        def rearm(disabled_tap: object) -> None:
+            # macOS disables a tap that takes too long, or on some user input.
+            # Re-arm it instead of dying silently, unless it keeps happening.
+            if self._tap_disabled():
+                given_up.append(True)
+                Quartz.CFRunLoopStop(self._run_loop)
+                return
+            self.tap_resets += 1
+            Quartz.CGEventTapEnable(disabled_tap, True)
 
         def callback(proxy: object, event_type: int, event: object, refcon: object) -> object:
             # An exception here would make PyObjC return nothing, which drops
@@ -619,12 +766,9 @@ class GlobalClickFilter:
                 return event
 
         def decide(event_type: int, event: object) -> object:
-            # macOS disables a tap that takes too long, or when the user
-            # revokes permission. Re-arm it instead of dying silently.
-            if event_type in (Quartz.kCGEventTapDisabledByTimeout, Quartz.kCGEventTapDisabledByUserInput):
-                self.tap_resets += 1
+            if event_type in DISABLED:
                 if self._tap is not None:
-                    Quartz.CGEventTapEnable(self._tap, True)
+                    rearm(self._tap)
                 return event
 
             entry = BUTTONS.get(event_type)
@@ -643,25 +787,20 @@ class GlobalClickFilter:
                 if number != 2:
                     return event  # a side button, not the middle one
 
+            timestamp = to_seconds(Quartz.CGEventGetTimestamp(event))
             # Repair the click count first, so the copy kept for a re-send
             # carries the corrected count too.
             state = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGMouseEventClickState)
-            corrected = click_counts.correct(button, pressed, state)
+            corrected = click_counts.correct(button, pressed, state, timestamp)
             if corrected != state:
                 Quartz.CGEventSetIntegerValueField(event, Quartz.kCGMouseEventClickState, corrected)
             location = Quartz.CGEventGetLocation(event)
-            stationary = True
-            if pressed:
-                press_points[button] = (location.x, location.y)
-            elif button in press_points:
-                px, py = press_points[button]
-                stationary = ((location.x - px) ** 2 + (location.y - py) ** 2) ** 0.5 < STATIONARY_PX
             result = self._handle(
                 button,
                 pressed,
-                to_seconds(Quartz.CGEventGetTimestamp(event)),
+                timestamp,
                 Quartz.CGEventCreateCopy(event),
-                stationary=stationary,
+                location=(location.x, location.y),
             )
             click_counts.record(button, result)
             return event if result.accepted else None
@@ -698,15 +837,18 @@ class GlobalClickFilter:
                 return event
 
         def motion_decide(event_type: int, event: object) -> object:
-            if event_type in (Quartz.kCGEventTapDisabledByTimeout, Quartz.kCGEventTapDisabledByUserInput):
+            if event_type in DISABLED:
                 if motion_state["tap"] is not None and motion_state["enabled"]:
-                    Quartz.CGEventTapEnable(motion_state["tap"], True)
+                    rearm(motion_state["tap"])
                 return event
             mark = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventSourceUserData)
+            if mark == RESTORE_MARK:
+                return event  # puts the pointer back after a re-sent release
             if mark in INJECTED_MOTION_MARKS:
                 self._injected_passed(INJECTED_MOTION_MARKS[mark])
                 return event  # re-sent by this app; already decided
-            return event if self._motion(Quartz.CGEventCreateCopy(event)) else None
+            location = Quartz.CGEventGetLocation(event)
+            return event if self._motion(Quartz.CGEventCreateCopy(event), (location.x, location.y)) else None
 
         motion_mask = 0
         for event_type in (Quartz.kCGEventMouseMoved, *DRAGGED):
@@ -742,17 +884,31 @@ class GlobalClickFilter:
         self._started = True
         self._ready.set()
         try:
-            while not self._stop_event.is_set():
+            while not self._stop_event.is_set() and not given_up:
                 # A bounded run keeps the stop flag responsive even when the
                 # run loop is woken for reasons of its own.
                 Quartz.CFRunLoopRunInMode(Quartz.kCFRunLoopDefaultMode, 0.25, False)
+            if given_up and not self._stop_event.is_set():
+                # Fail open: what is held back goes out now, every later click
+                # passes untouched, and the app is told the filter stopped.
+                for button in Button:
+                    self._commit_held(button)
+                    self._release_queue(button)
+                raise HookError(TAP_DISABLED_MESSAGE)
         finally:
-            self._set_motion_tap = lambda _wanted: None
+            with self._motion_tap_lock:
+                self._set_motion_tap = lambda _wanted: None
+            # Disabling a tap is not enough: macOS keeps it registered, for
+            # the life of the process, until its port is invalidated.
             if motion_tap is not None:
                 Quartz.CGEventTapEnable(motion_tap, False)
                 Quartz.CFRunLoopRemoveSource(self._run_loop, motion_source, Quartz.kCFRunLoopCommonModes)
+                Quartz.CFMachPortInvalidate(motion_tap)
+                motion_state["tap"] = None
+                motion_state["enabled"] = False
             Quartz.CGEventTapEnable(tap, False)
             Quartz.CFRunLoopRemoveSource(self._run_loop, source, Quartz.kCFRunLoopCommonModes)
+            Quartz.CFMachPortInvalidate(tap)
             self._tap = None
 
 
@@ -923,35 +1079,116 @@ class InjectableWindows:
 class ClickCountRepair:
     """Keep macOS's click count right when presses are suppressed.
 
-    macOS numbers each press of a chain (1 = single, 2 = double, ...) as it
-    sees it, before the filter runs, so every suppressed bounce still adds one.
-    This tracks how many presses of the current chain were suppressed and
-    takes them off every later press and release in the chain; macOS starting
-    a new chain (a press numbered 1) clears the count.
+    macOS numbers each press of a chain (1 = single, 2 = double, ...) before
+    the filter runs. A press continues the chain when it comes within the
+    double-click interval of the press before it, and that includes a press
+    the filter then suppresses: a bounce adds one to the count and restarts
+    the interval, so a click the user made well apart from the last one can
+    reach apps as a double-click. So the count is worked out again by Apple's
+    own rule, over the presses apps actually receive: a new chain (1) when
+    macOS starts one (it does when the pointer moves away, too) or when the
+    interval has passed since the last press apps got; otherwise one more
+    than that press. A release carries its press's count.
     """
 
-    def __init__(self) -> None:
-        self._suppressed: dict[Button, int] = {}
+    def __init__(self, interval: Optional[Callable[[], float]] = None) -> None:
+        # Reads the user's double-click interval, in seconds.
+        self._read_interval = interval or _double_click_interval
+        self._interval = 0.5  # Apple's default, until a read succeeds
+        self._interval_read_at: Optional[float] = None
+        # Per button: (time, count) of the last press apps received, and of
+        # the press being decided now.
+        self._delivered: dict[Button, tuple[float, int]] = {}
+        self._pending: dict[Button, tuple[float, int]] = {}
 
-    def correct(self, button: Button, pressed: bool, state: int) -> int:
-        if pressed and state <= 1:
-            self._suppressed[button] = 0
-        return max(1, state - self._suppressed.get(button, 0)) if state >= 1 else state
+    def interval(self) -> float:
+        now = monotonic()
+        if self._interval_read_at is None or now - self._interval_read_at >= CLICK_INTERVAL_CACHE_S:
+            self._interval_read_at = now
+            try:
+                self._interval = float(self._read_interval())
+            except Exception:  # noqa: BLE001 - keep the last good value
+                pass
+        return self._interval
+
+    def correct(self, button: Button, pressed: bool, state: int, timestamp: float) -> int:
+        """The count apps should see for this event, given macOS's `state`
+        and the event's time in seconds."""
+        last = self._delivered.get(button)
+        if pressed:
+            # Strictly less, as macOS compares.
+            chained = state > 1 and last is not None and timestamp - last[0] < self.interval()
+            # Never more than macOS itself counted.
+            count = min(last[1] + 1, state) if chained else 1
+            self._pending[button] = (timestamp, count)
+            return count if state >= 1 else state  # synthetic events carry none
+        if state < 1 or last is None:
+            return state
+        return min(state, last[1])
 
     def record(self, button: Button, result: ClickEvent) -> None:
-        # A press that never reaches apps. Not one only being re-ordered
-        # (flush_held, behind a late release) or held back behind a re-sent
-        # event (deferred): apps still get those.
-        if result.is_bounce:
-            self._suppressed[button] = self._suppressed.get(button, 0) + 1
+        # Only a press that reaches apps moves the chain on: one let through,
+        # or only re-ordered (flush_held, behind a late release) or held back
+        # behind a re-sent event (deferred). Not a suppressed bounce, nor the
+        # contact coming back mid-drag.
+        pending = self._pending.pop(button, None)
+        if result.pressed and not result.is_bounce and pending is not None:
+            self._delivered[button] = pending
 
 
-def _mach_timebase() -> Callable[[int], float]:
-    """Return a converter from a CGEvent timestamp to monotonic seconds.
+def _double_click_interval() -> float:
+    """The user's double-click speed (System Settings > Mouse), in seconds."""
+    from AppKit import NSEvent
 
-    CGEventGetTimestamp is in nanoseconds since boot (not mach ticks, which on
-    Apple silicon are 41.67 ns each): verified against mach_absolute_time on
-    macOS 27. `monotonic()` counts from boot too, so the two line up and
-    `_normalise_time` accepts the driver's own times.
+    return float(NSEvent.doubleClickInterval())
+
+
+def _near(point: Optional[tuple[float, float]], location: Optional[tuple[float, float]]) -> bool:
+    """Whether two pointer positions are within STATIONARY_PX of each other."""
+    if point is None or location is None:
+        return False
+    return math.hypot(location[0] - point[0], location[1] - point[1]) < STATIONARY_PX
+
+
+def _mach_timebase() -> Callable[..., float]:
+    """Return a converter from a CGEvent timestamp to `monotonic()` seconds.
+
+    CGEventGetTimestamp comes in two units. Events from real hardware, as a
+    kCGHIDEventTap sees them, carry mach ticks (41.67 ns each on Apple
+    silicon, 1 ns on Intel); events another program posted carry
+    nanoseconds. Both count from boot, leaving out sleep, as `monotonic()`
+    does. So each event is read both ways and whichever reading lands near
+    the current time is used; if neither does, the event is timed as it
+    arrives. Deciding once per run instead would let a single posted click
+    put every later real click on the wrong scale, 41.67 times too close.
     """
-    return lambda value: float(value) / 1_000_000_000
+    numer, denom = _timebase_ratio()
+    tick_seconds = numer / denom / 1_000_000_000
+
+    def to_seconds(value: int, now: Optional[float] = None) -> float:
+        now = monotonic() if now is None else now
+        best, best_error = now, CLOCK_TOLERANCE_S
+        for seconds in (float(value) * tick_seconds, float(value) / 1_000_000_000):
+            error = abs(seconds - now)
+            if error < best_error:
+                best, best_error = seconds, error
+        return best
+
+    return to_seconds
+
+
+def _timebase_ratio() -> tuple[int, int]:
+    """mach_timebase_info: one mach tick is numer/denom nanoseconds."""
+    import ctypes
+
+    class TimebaseInfo(ctypes.Structure):
+        _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
+
+    info = TimebaseInfo()
+    try:
+        status = ctypes.CDLL("/usr/lib/libSystem.B.dylib").mach_timebase_info(ctypes.byref(info))
+    except (OSError, AttributeError):
+        status = -1
+    if status != 0 or not info.numer or not info.denom:
+        return 1, 1  # ticks read as nanoseconds; posted events still time right
+    return info.numer, info.denom
