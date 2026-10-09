@@ -1,5 +1,10 @@
 """One copy of the app per signed-in user and session (app/main.py)."""
 
+try:
+    import _isolation  # noqa: F401  (first: keeps tests off the real machine)
+except ImportError:  # run as tests.<module> from the repository root
+    from tests import _isolation  # noqa: F401
+
 import os
 import platform
 import unittest

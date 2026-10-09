@@ -21,7 +21,9 @@ from .ui import dock, icons
 from .ui import tray as tray_module
 from .ui.window import MainWindow
 
-SERVER_NAME = "doubleclick-fixer-single-instance"
+# A suffix only the test suite sets (tests/_isolation.py), so tests can never
+# reach, or quit, a copy of the app that is running for real.
+SERVER_NAME = "doubleclick-fixer-single-instance" + os.environ.get("DCF_INSTANCE_SUFFIX", "")
 #: Taken the moment a copy starts, long before its single-instance channel is
 #: listening (the portable Windows exe unpacks itself first, which can take
 #: seconds).

@@ -1,6 +1,11 @@
 """The --self-test a release runs on the built app, and the macOS runtime hook
 that cleans its environment."""
 
+try:
+    import _isolation  # noqa: F401  (first: keeps tests off the real machine)
+except ImportError:  # run as tests.<module> from the repository root
+    from tests import _isolation  # noqa: F401
+
 import contextlib
 import io
 import os
