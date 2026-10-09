@@ -1254,7 +1254,16 @@ class WindowsHook:
         if (flags & self.LLMHF_INJECTED and not self._filter_injected) or (
             extra & PEN_SIGNATURE_MASK
         ) == PEN_SIGNATURE:
-            return False  # another program's motion, or pen and touch: left alone
+            # Another program's motion, or pen and touch: left alone. It puts
+            # the pointer somewhere new, so the hand's next step is taken from
+            # there; and with none of the hand's moves held back, that is
+            # where the pointer stays, so a release still held goes back to
+            # where it happened rather than landing here.
+            if not self.known or self.virtual == self.basis:
+                self.virtual = (x, y)
+            self.basis = (x, y)
+            self.known = True
+            return False
         if not self.known:
             self.basis = self.virtual = (x, y)
             self.known = True

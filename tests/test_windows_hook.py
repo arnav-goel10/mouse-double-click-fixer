@@ -401,6 +401,33 @@ class WindowsHookLogicTests(unittest.TestCase):
         self.win.run()
         self.assertEqual(self.win.cursor, (600, 600))
         self.assertEqual(len(self.win.buttons()), 1, "still held: the move wasn't the hand's")
+        # The click still ends where it was made, not where the other
+        # program put the pointer (that would be a drag), and the pointer
+        # stays where it was put.
+        self.fire_timers()
+        self.assertEqual(self.win.buttons()[1][:3], ("up", Button.LEFT, (200, 200)))
+        self.assertEqual(self.win.cursor, (600, 600))
+
+    def test_the_hand_moves_on_from_where_another_program_put_the_pointer(self) -> None:
+        self.click()
+        self.win.queue.append(("move", normalized_absolute(600, 600, *self.win.screen), 0))
+        self.win.move(2, 0)                                           # small: the hold stays
+        self.win.move(30, 0)                                          # leaves the spot: the up goes out
+        self.win.run()
+        self.fire_timers()
+        self.assertEqual(self.win.buttons()[1][:3], ("up", Button.LEFT, (200, 200)))
+        self.assertEqual(self.win.cursor, (632, 600))
+
+    def test_pen_motion_rebases_like_another_programs(self) -> None:
+        self.click()                                                  # the mouse's click
+        self.win.move(50, 0, extra=PEN)
+        self.win.run()
+        self.assertEqual(self.win.cursor, (250, 200))
+        self.assertEqual(len(self.win.buttons()), 1, "pen motion doesn't settle the mouse's release")
+        self.fire_timers()
+        self.assertEqual(self.win.buttons()[1][:3], ("up", Button.LEFT, (200, 200)))
+        self.assertEqual(self.win.cursor, (250, 200))
+
 
 
 class InputSenderTests(unittest.TestCase):
@@ -832,6 +859,20 @@ class WindowsMotionTests(RealWindows):
         self.assertEqual(len(messages), 4, messages)
         self.assertEqual(messages[0::2], [messages[0]] * 2)
         self.assertEqual(messages[1::2], [messages[0] + 1] * 2, "each re-sent release matches its press")
+
+    def test_another_programs_move_doesnt_turn_a_click_into_a_drag(self) -> None:
+        # Pen-signed motion stands for another program's (this test's own
+        # input counts as the hand's): the pointer goes where it was put, and
+        # the held up still lands on the click.
+        self.start_filter()
+        self.click_at_200()
+        time.sleep(0.005)
+        with self.api.physical_pixels():
+            self.send(self.api.move_input(600, 400, PEN))
+        time.sleep(0.3)
+        up = self.first(WM_LBUTTONUP)
+        self.assertEqual(self.observed[up][1], (200, 200), f"the click ended off its spot: {self.observed}")
+        self.assertEqual(self.cursor(), (600, 400))
 
     def test_the_hook_stays_cheap(self) -> None:
         # (g) Every move reaches this Python callback; while nothing is held
