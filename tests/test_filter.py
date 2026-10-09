@@ -5,8 +5,8 @@ import unittest
 from time import monotonic
 from unittest import mock
 
-from app.core import Button
-from app.platform import GlobalClickFilter, HookError, is_supported
+from app.core import Button, ClickEvent
+from app.platform import ClickCountRepair, GlobalClickFilter, HookError, is_supported
 
 
 class HandlerTests(unittest.TestCase):
@@ -274,66 +274,119 @@ class AllowHoldTests(unittest.TestCase):
 
 
 class ClickCountRepairTests(unittest.TestCase):
-    """macOS numbers presses before the filter runs; the repair undoes that."""
+    """macOS numbers presses before the filter runs, and a suppressed press
+    both adds one and restarts the double-click interval. The repair counts
+    over the presses apps receive instead, by Apple's rule."""
 
-    def run_chain(self, chain):
-        """chain: (pressed, os_state, accepted, flush) per event -> states apps see."""
-        from app.core import ClickEvent
-        from app.platform import ClickCountRepair
+    INTERVAL = 0.5
 
-        repair = ClickCountRepair()
+    def run_chain(self, chain, interval=None):
+        """chain: (time, pressed, os_state, kind) per event, kind one of
+        "ok" (let through), "bounce", "held", "flush" or "deferred"
+        -> (pressed, state) for each event apps receive."""
+        repair = ClickCountRepair(interval=lambda: interval or self.INTERVAL)
         seen = []
-        for pressed, state, accepted, flush in chain:
-            corrected = repair.correct(Button.LEFT, pressed, state)
-            repair.record(Button.LEFT, ClickEvent(Button.LEFT, pressed, accepted, None, None, flush_held=flush))
-            if accepted or flush:
+        for moment, pressed, state, kind in chain:
+            corrected = repair.correct(Button.LEFT, pressed, state, moment)
+            result = ClickEvent(
+                Button.LEFT, pressed, kind == "ok", None, None,
+                held=kind == "held", flush_held=kind == "flush", deferred=kind == "deferred",
+            )
+            repair.record(Button.LEFT, result)
+            if kind != "bounce":
                 seen.append((pressed, corrected))
         return seen
 
-    def test_triple_click_with_one_bounce_stays_a_triple_click(self) -> None:
+    def presses(self, seen):
+        return [state for pressed, state in seen if pressed]
+
+    def test_release_chatter_does_not_chain_a_click_made_after_the_interval(self) -> None:
+        # The bounce press at 0.105 s keeps macOS's chain going, so the click
+        # at interval + 60 ms after the real one arrives numbered 3.
         seen = self.run_chain([
-            (True, 1, True, False), (False, 1, True, False),
-            (True, 2, False, False), (False, 2, False, False),   # bounce, suppressed
-            (True, 3, True, False), (False, 3, True, False),
-            (True, 4, True, False), (False, 4, True, False),
+            (0.000, True, 1, "ok"), (0.080, False, 1, "held"),
+            (0.105, True, 2, "bounce"), (0.108, False, 2, "bounce"),
+            (0.560, True, 3, "ok"), (0.640, False, 3, "held"),
         ])
-        self.assertEqual([state for pressed, state in seen if pressed], [1, 2, 3])
+        self.assertEqual(seen, [(True, 1), (False, 1), (True, 1), (False, 1)])
+
+    def test_a_dropout_in_a_hold_does_not_chain_the_next_click(self) -> None:
+        seen = self.run_chain([
+            (0.000, True, 1, "ok"),
+            (0.400, False, 1, "held"),        # contact drops out...
+            (0.405, True, 2, "bounce"),       # ...and comes back: cancels_held
+            (0.450, False, 2, "held"),        # the real lift
+            (0.800, True, 3, "ok"),           # inside macOS's window from 0.405 only
+        ])
+        self.assertEqual(self.presses(seen), [1, 1])
+        self.assertEqual(seen[1], (False, 1), "the lift carries its press's count")
+
+    def test_double_click_with_a_bounce_stays_a_double_click(self) -> None:
+        seen = self.run_chain([
+            (0.000, True, 1, "ok"), (0.080, False, 1, "held"),
+            (0.085, True, 2, "bounce"), (0.088, False, 2, "bounce"),
+            (0.200, True, 3, "ok"), (0.280, False, 3, "held"),
+        ])
+        self.assertEqual(seen, [(True, 1), (False, 1), (True, 2), (False, 2)])
+
+    def test_triple_click_with_a_bounce_stays_a_triple_click(self) -> None:
+        seen = self.run_chain([
+            (0.000, True, 1, "ok"), (0.080, False, 1, "held"),
+            (0.085, True, 2, "bounce"), (0.088, False, 2, "bounce"),
+            (0.200, True, 3, "ok"), (0.280, False, 3, "held"),
+            (0.400, True, 4, "ok"), (0.480, False, 4, "held"),
+        ])
+        self.assertEqual(self.presses(seen), [1, 2, 3])
         self.assertEqual([state for pressed, state in seen if not pressed], [1, 2, 3])
 
-    def test_dropout_mid_drag_keeps_the_release_a_single_click(self) -> None:
+    def test_macos_starting_a_chain_starts_one(self) -> None:
+        # Within the interval, but macOS saw the pointer move away: state 1.
+        seen = self.run_chain([(0.0, True, 1, "ok"), (0.1, False, 1, "held"), (0.2, True, 1, "ok")])
+        self.assertEqual(self.presses(seen), [1, 1])
+
+    def test_never_more_than_macos_counted(self) -> None:
+        seen = self.run_chain([(0.0, True, 1, "ok"), (0.1, False, 1, "held"),
+                               (0.2, True, 2, "ok"), (0.3, False, 2, "held"),
+                               (0.4, True, 2, "ok")])
+        self.assertEqual(self.presses(seen), [1, 2, 2])
+
+    def test_deferred_and_reordered_presses_count(self) -> None:
+        # Held back behind a re-sent release, or re-ordered after a late
+        # one: apps still get them, so the chain moves on.
         seen = self.run_chain([
-            (True, 1, True, False),
-            (False, 1, False, False),   # held, then cancelled
-            (True, 2, False, False),    # the contact coming back
-            (False, 2, True, False),    # the real lift
+            (0.0, True, 1, "ok"), (0.1, False, 1, "held"),
+            (0.2, True, 2, "flush"), (0.3, False, 2, "held"),
+            (0.4, True, 3, "deferred"),
         ])
-        self.assertEqual(seen, [(True, 1), (False, 1)])
+        self.assertEqual(self.presses(seen), [1, 2, 3])
 
-    def test_a_new_chain_clears_the_count(self) -> None:
-        seen = self.run_chain([
-            (True, 1, True, False), (False, 1, True, False),
-            (True, 2, False, False), (False, 2, False, False),
-            (True, 1, True, False), (False, 1, True, False),     # later, a fresh click
-            (True, 2, True, False),                              # a real double-click
-        ])
-        self.assertEqual([state for pressed, state in seen if pressed], [1, 1, 2])
+    def test_the_interval_is_the_users_setting(self) -> None:
+        chain = [(0.0, True, 1, "ok"), (0.1, False, 1, "held"), (0.9, True, 2, "ok")]
+        self.assertEqual(self.presses(self.run_chain(chain, interval=0.5)), [1, 1])
+        self.assertEqual(self.presses(self.run_chain(chain, interval=5.0)), [1, 2])
 
-    def test_a_deferred_press_is_not_counted_as_suppressed(self) -> None:
-        from app.core import ClickEvent
-        from app.platform import ClickCountRepair
+    def test_the_interval_is_read_live_but_not_on_every_press(self) -> None:
+        reads = []
+        setting = [0.5]
 
-        repair = ClickCountRepair()
-        repair.correct(Button.LEFT, True, 1)
-        # Held back behind a re-sent release, then delivered: apps get it.
-        repair.record(Button.LEFT, ClickEvent(Button.LEFT, True, False, None, None, deferred=True))
-        self.assertEqual(repair.correct(Button.LEFT, True, 2), 2)
+        def read():
+            reads.append(setting[0])
+            return setting[0]
 
-    def test_a_reordered_press_still_counts(self) -> None:
-        seen = self.run_chain([
-            (True, 1, True, False), (False, 1, False, False),    # held release
-            (True, 2, False, True),                              # flushed: apps get it
-        ])
-        self.assertEqual(seen, [(True, 1), (True, 2)])
+        repair = ClickCountRepair(interval=read)
+        with mock.patch("app.platform.monotonic", return_value=100.0):
+            self.assertEqual(repair.interval(), 0.5)
+            setting[0] = 0.8
+            self.assertEqual(repair.interval(), 0.5, "cached")
+        with mock.patch("app.platform.monotonic", return_value=103.0):
+            self.assertEqual(repair.interval(), 0.8, "a changed setting is picked up")
+        self.assertEqual(reads, [0.5, 0.8])
+
+    def test_an_unreadable_setting_keeps_the_last_value(self) -> None:
+        def broken():
+            raise RuntimeError("no AppKit")
+
+        self.assertEqual(ClickCountRepair(interval=broken).interval(), 0.5)
 
 
 class ResendOrderTests(unittest.TestCase):

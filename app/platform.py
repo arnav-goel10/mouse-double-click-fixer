@@ -46,6 +46,10 @@ IN_FLIGHT_TIMEOUT_S = 0.15
 #: believed. A tap sees an event within milliseconds of the driver making it.
 CLOCK_TOLERANCE_S = 2.0
 
+#: The double-click interval is a user setting that can change at any time,
+#: so it is read live, but at most this often: the tap callback must stay cheap.
+CLICK_INTERVAL_CACHE_S = 2.0
+
 
 class HookError(RuntimeError):
     """The global hook could not be installed, or stopped unexpectedly."""
@@ -703,7 +707,7 @@ class GlobalClickFilter:
             # Repair the click count first, so the copy kept for a re-send
             # carries the corrected count too.
             state = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGMouseEventClickState)
-            corrected = click_counts.correct(button, pressed, state)
+            corrected = click_counts.correct(button, pressed, state, timestamp)
             if corrected != state:
                 Quartz.CGEventSetIntegerValueField(event, Quartz.kCGMouseEventClickState, corrected)
             location = Quartz.CGEventGetLocation(event)
@@ -975,27 +979,68 @@ class InjectableWindows:
 class ClickCountRepair:
     """Keep macOS's click count right when presses are suppressed.
 
-    macOS numbers each press of a chain (1 = single, 2 = double, ...) as it
-    sees it, before the filter runs, so every suppressed bounce still adds one.
-    This tracks how many presses of the current chain were suppressed and
-    takes them off every later press and release in the chain; macOS starting
-    a new chain (a press numbered 1) clears the count.
+    macOS numbers each press of a chain (1 = single, 2 = double, ...) before
+    the filter runs. A press continues the chain when it comes within the
+    double-click interval of the press before it, and that includes a press
+    the filter then suppresses: a bounce adds one to the count and restarts
+    the interval, so a click the user made well apart from the last one can
+    reach apps as a double-click. So the count is worked out again by Apple's
+    own rule, over the presses apps actually receive: a new chain (1) when
+    macOS starts one (it does when the pointer moves away, too) or when the
+    interval has passed since the last press apps got; otherwise one more
+    than that press. A release carries its press's count.
     """
 
-    def __init__(self) -> None:
-        self._suppressed: dict[Button, int] = {}
+    def __init__(self, interval: Optional[Callable[[], float]] = None) -> None:
+        # Reads the user's double-click interval, in seconds.
+        self._read_interval = interval or _double_click_interval
+        self._interval = 0.5  # Apple's default, until a read succeeds
+        self._interval_read_at: Optional[float] = None
+        # Per button: (time, count) of the last press apps received, and of
+        # the press being decided now.
+        self._delivered: dict[Button, tuple[float, int]] = {}
+        self._pending: dict[Button, tuple[float, int]] = {}
 
-    def correct(self, button: Button, pressed: bool, state: int) -> int:
-        if pressed and state <= 1:
-            self._suppressed[button] = 0
-        return max(1, state - self._suppressed.get(button, 0)) if state >= 1 else state
+    def interval(self) -> float:
+        now = monotonic()
+        if self._interval_read_at is None or now - self._interval_read_at >= CLICK_INTERVAL_CACHE_S:
+            self._interval_read_at = now
+            try:
+                self._interval = float(self._read_interval())
+            except Exception:  # noqa: BLE001 - keep the last good value
+                pass
+        return self._interval
+
+    def correct(self, button: Button, pressed: bool, state: int, timestamp: float) -> int:
+        """The count apps should see for this event, given macOS's `state`
+        and the event's time in seconds."""
+        last = self._delivered.get(button)
+        if pressed:
+            # Strictly less, as macOS compares.
+            chained = state > 1 and last is not None and timestamp - last[0] < self.interval()
+            # Never more than macOS itself counted.
+            count = min(last[1] + 1, state) if chained else 1
+            self._pending[button] = (timestamp, count)
+            return count if state >= 1 else state  # synthetic events carry none
+        if state < 1 or last is None:
+            return state
+        return min(state, last[1])
 
     def record(self, button: Button, result: ClickEvent) -> None:
-        # A press that never reaches apps. Not one only being re-ordered
-        # (flush_held, behind a late release) or held back behind a re-sent
-        # event (deferred): apps still get those.
-        if result.is_bounce:
-            self._suppressed[button] = self._suppressed.get(button, 0) + 1
+        # Only a press that reaches apps moves the chain on: one let through,
+        # or only re-ordered (flush_held, behind a late release) or held back
+        # behind a re-sent event (deferred). Not a suppressed bounce, nor the
+        # contact coming back mid-drag.
+        pending = self._pending.pop(button, None)
+        if result.pressed and not result.is_bounce and pending is not None:
+            self._delivered[button] = pending
+
+
+def _double_click_interval() -> float:
+    """The user's double-click speed (System Settings > Mouse), in seconds."""
+    from AppKit import NSEvent
+
+    return float(NSEvent.doubleClickInterval())
 
 
 def _near(point: Optional[tuple[float, float]], location: Optional[tuple[float, float]]) -> bool:
