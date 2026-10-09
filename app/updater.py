@@ -26,6 +26,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import ntpath
 import os
 import platform
 import plistlib
@@ -83,6 +84,8 @@ CI_KEY_FILE = "dcf-ci-update-key.pub"
 #: path, but expands variables from its Unicode environment intact.
 APP_ENV = "DCF_APP"
 SOURCE_ENV = "DCF_SRC"
+#: Windows' System32 folder, for the programs the scripts run (see system_program).
+SYSTEM_ENV = "DCF_SYSTEM"
 
 CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000
 FIRST_CHECK_DELAY_MS = 20 * 1000
@@ -383,16 +386,17 @@ def windows_portable_script(pid: int, relaunch_args: list[str]) -> str:
     tries the old copy is reopened rather than leaving the user with nothing.
     """
     args = " ".join(relaunch_args)
+    system = f"%{SYSTEM_ENV}%"
     return f"""@echo off
 setlocal
 set tries=0
 :wait
-tasklist /FI "PID eq {pid}" 2>nul | find "{pid}" >nul && (ping -n 2 127.0.0.1 >nul & goto wait)
+"{system}\\tasklist.exe" /FI "PID eq {pid}" 2>nul | "{system}\\find.exe" "{pid}" >nul && ("{system}\\ping.exe" -n 2 127.0.0.1 >nul & goto wait)
 :move
 move /Y "%{SOURCE_ENV}%" "%{APP_ENV}%" >nul 2>&1 && goto done
 set /a tries+=1
 if %tries% GEQ 30 goto done
-ping -n 2 127.0.0.1 >nul
+"{system}\\ping.exe" -n 2 127.0.0.1 >nul
 goto move
 :done
 start "" "%{APP_ENV}%" {args}
@@ -874,6 +878,20 @@ class UpdateError(RuntimeError):
     pass
 
 
+def system_program(name: str) -> str:
+    """The full path of one of Windows' own programs, in System32.
+
+    Never start one by name alone: Windows looks for it first in the folder
+    of the program starting it, then in the current folder, and cmd.exe in
+    the current folder. The portable exe may sit in Downloads, and the
+    installed app's folder is one the user can write to, so a cmd.exe or
+    tasklist.bat put there would run instead."""
+    root = os.environ.get("SystemRoot", "")
+    if not ntpath.isabs(root) or not ntpath.splitdrive(root)[0]:
+        root = "C:\\Windows"
+    return ntpath.join(root, "System32", name)
+
+
 def start_windows_script(script: Path, text: str, app: Path, source: Path) -> None:
     """Write an update script as plain ASCII and run it detached, handing it
     the paths through its environment (see APP_ENV)."""
@@ -881,8 +899,9 @@ def start_windows_script(script: Path, text: str, app: Path, source: Path) -> No
         script.write_text(text, encoding="ascii")
     except (OSError, UnicodeError) as error:
         raise UpdateError("Couldn’t prepare the update.") from error
-    environment = {**os.environ, APP_ENV: str(app), SOURCE_ENV: str(source)}
-    subprocess.Popen(["cmd", "/c", str(script)], env=environment, creationflags=_detached_flags())
+    system = ntpath.dirname(system_program("cmd.exe"))
+    environment = {**os.environ, APP_ENV: str(app), SOURCE_ENV: str(source), SYSTEM_ENV: system}
+    subprocess.Popen([system_program("cmd.exe"), "/c", str(script)], env=environment, creationflags=_detached_flags())
 
 
 def _detached_flags() -> int:
