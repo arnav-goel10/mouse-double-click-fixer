@@ -2,19 +2,23 @@
 # Windows machine (CI). It installs, launches and replaces the app for real, so
 # never run it on a machine whose copy of DoubleClick Fixer you care about.
 #
-#   tools\windows_install_e2e.ps1 -OldSetup old\DoubleClickFixer-Setup.exe -NewSetup installer\Output\DoubleClickFixer-Setup.exe
+#   tools\windows_install_e2e.ps1 -OldSetup old\0.2.6\DoubleClickFixer-Setup.exe,old\0.5.3\DoubleClickFixer-Setup.exe -NewSetup installer\Output\DoubleClickFixer-Setup.exe
+#
+# Each old installer is installed in turn, left running and upgraded from
+# (the app is uninstalled between them). Run it from the folder the build was
+# made in: it compares the installed files with dist\onedir and build\notices.
 #
 # The app installs only signed updates, so the update leg needs a build that
 # trusts a key this run made: CI builds with DCF_CI_UPDATE_KEY and passes the
 # secret half as -SigningKey (see tools/ci_update_key.py). Without one, only
 # the leg that checks an unsigned update is refused runs.
 param(
-    [Parameter(Mandatory)] [string] $OldSetup,
+    [Parameter(Mandatory)] [string[]] $OldSetup,
     [Parameter(Mandatory)] [string] $NewSetup,
     [string] $SigningKey = ""
 )
 $ErrorActionPreference = "Stop"
-$OldSetup = (Resolve-Path $OldSetup).Path
+$OldSetup = @($OldSetup | ForEach-Object { (Resolve-Path $_).Path })
 $NewSetup = (Resolve-Path $NewSetup).Path
 if ($SigningKey) { $SigningKey = (Resolve-Path $SigningKey).Path }
 $UninstallKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{6B0E2F4C-3D7A-4E51-9A0B-DC1F1C5E7A21}_is1"
@@ -30,40 +34,139 @@ function Wait-For([scriptblock] $Condition, [int] $Seconds, [string] $What) {
     }
     Fail "timed out after $Seconds s waiting for: $What"
 }
-function Install($Setup, $Log) {
-    $process = Start-Process $Setup -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LOG=`"$Log`"" -Wait -PassThru
+# Runs an installer silently. Bounded: a setup that waits on something for
+# ever fails the run instead of hanging it.
+function Install($Setup, $Log, [int] $Seconds = 300) {
+    $process = Start-Process $Setup -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LOG=`"$Log`"" -PassThru
+    $null = $process.Handle  # keeps the exit code readable after WaitForExit
+    if (-not $process.WaitForExit($Seconds * 1000)) {
+        Get-CimInstance Win32_Process | Format-Table ProcessId, ParentProcessId, Name, CommandLine -AutoSize | Out-String -Width 300 | Write-Host
+        if (Test-Path $Log) { Get-Content $Log -Tail 40 | Write-Host }
+        Fail "$Setup was still running after $Seconds s"
+    }
     if ($process.ExitCode -ne 0) { Get-Content $Log -Tail 40 | Write-Host; Fail "$Setup exited with $($process.ExitCode)" }
 }
 function App-Path { (Get-ItemProperty $UninstallKey).InstallLocation.TrimEnd('\') + "\DoubleClickFixer.exe" }
-
-Step "Install the old version and leave it running in the notification area"
-Install $OldSetup "$env:TEMP\dcf-old.log"
-$app = App-Path
-Start-Process $app -ArgumentList "--minimized"
-Wait-For { (Get-Running).Count -gt 0 } 30 "the old copy to start"
-Start-Sleep -Seconds 5
-$oldIds = (Get-Running).ProcessId
-Write-Host "old copy running: $oldIds"
-
-Step "Install the new version over the running copy"
-Install $NewSetup "$env:TEMP\dcf-new.log"
-$still = Get-Running | Where-Object { $oldIds -contains $_.ProcessId }
-if ($still) { Fail "the old copy is still running after the upgrade" }
-if (Select-String -Path "$env:TEMP\dcf-new.log" -Pattern "in use|DeleteFile failed|Retrying" -Quiet) {
-    Get-Content "$env:TEMP\dcf-new.log" | Select-String "in use|failed|Retry" | Write-Host
-    Fail "the installer met a file in use"
+# What the installer logged about closing the running copy (see
+# AskRunningCopyToQuit in installer\windows.iss).
+function Quit-Lines($Log) { @(Select-String -Path $Log -Pattern "Quit: " | ForEach-Object { $_.Line }) }
+function Expect-Quit($Lines, [string[]] $Wanted, [string[]] $Unwanted = @()) {
+    foreach ($pattern in $Wanted) {
+        if (-not ($Lines -match $pattern)) { Fail "the setup log has no '$pattern' in:`n$($Lines -join "`n")" }
+    }
+    foreach ($pattern in $Unwanted) {
+        if ($Lines -match $pattern) { Fail "the setup log has '$pattern' in:`n$($Lines -join "`n")" }
+    }
 }
-# The installer ships the folder build, not the portable one-file exe.
-$expected = (Get-FileHash "dist\onedir\DoubleClickFixer\DoubleClickFixer.exe").Hash
-if ((Get-FileHash $app).Hash -ne $expected) { Fail "the installed exe is not the new build" }
-if (-not (Test-Path (Join-Path (Split-Path $app) "_internal"))) { Fail "the installed app has no _internal folder" }
-Write-Host "upgrade replaced the running copy cleanly"
 $version = (python -c "import app; print(app.__version__)").Trim()
-$fileVersion = (Get-Item $app).VersionInfo.ProductVersion
-$listed = (Get-ItemProperty $UninstallKey).DisplayVersion
-if ($fileVersion -ne $version) { Fail "the exe says version '$fileVersion', expected $version" }
-if ($listed -ne $version) { Fail "Installed apps lists version '$listed', expected $version" }
-Write-Host "exe and Installed apps both say $version"
+# The new build is installed whole: the folder build (not the portable
+# one-file exe), its runtime, and the notices beside it. Nothing it replaced
+# was in use.
+function Assert-NewBuild($Log) {
+    if (Select-String -Path $Log -Pattern "in use|DeleteFile failed|Retrying" -Quiet) {
+        Get-Content $Log | Select-String "in use|failed|Retry" | Write-Host
+        Fail "the installer met a file in use"
+    }
+    $app = App-Path
+    $folder = Split-Path $app
+    $expected = (Get-FileHash "dist\onedir\DoubleClickFixer\DoubleClickFixer.exe").Hash
+    if ((Get-FileHash $app).Hash -ne $expected) { Fail "the installed exe is not the new build" }
+    if (-not (Test-Path (Join-Path $folder "_internal"))) { Fail "the installed app has no _internal folder" }
+    $notices = Join-Path $folder "THIRD_PARTY_NOTICES.md"
+    if (-not (Test-Path $notices)) { Fail "THIRD_PARTY_NOTICES.md is not in the install folder" }
+    if ((Get-FileHash $notices).Hash -ne (Get-FileHash "build\notices\THIRD_PARTY_NOTICES.md").Hash) {
+        Fail "the installed THIRD_PARTY_NOTICES.md is not the one this build wrote"
+    }
+    $fileVersion = (Get-Item $app).VersionInfo.ProductVersion
+    $listed = (Get-ItemProperty $UninstallKey).DisplayVersion
+    if ($fileVersion -ne $version) { Fail "the exe says version '$fileVersion', expected $version" }
+    if ($listed -ne $version) { Fail "Installed apps lists version '$listed', expected $version" }
+}
+function Uninstall-App {
+    $app = App-Path
+    $uninstaller = (Get-ItemProperty $UninstallKey).UninstallString.Trim('"')
+    Start-Process $uninstaller -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -Wait
+    Wait-For { (Get-Running).Count -eq 0 } 30 "the app to be closed by the uninstaller"
+    Wait-For { -not (Test-Path $app) } 30 "the exe to be removed"
+    Wait-For { -not (Test-Path $UninstallKey) } 30 "the app to leave Installed apps"
+}
+
+$leg = 0
+foreach ($old in $OldSetup) {
+    $leg += 1
+    if (Test-Path $UninstallKey) { Uninstall-App }
+
+    Step "Install an old version and leave it running in the notification area ($old)"
+    Install $old "$env:TEMP\dcf-old-$leg.log"
+    $oldVersion = (Get-ItemProperty $UninstallKey).DisplayVersion
+    $app = App-Path
+    Start-Process $app -ArgumentList "--minimized"
+    Wait-For { (Get-Running).Count -gt 0 } 30 "the old copy to start"
+    Start-Sleep -Seconds 5
+    $oldIds = (Get-Running).ProcessId
+    Write-Host "$oldVersion running: $oldIds"
+
+    Step "Install the new version over the running $oldVersion"
+    $log = "$env:TEMP\dcf-new-$leg.log"
+    Install $NewSetup $log
+    $still = Get-Running | Where-Object { $oldIds -contains $_.ProcessId }
+    if ($still) { Fail "the old copy is still running after the upgrade" }
+    Assert-NewBuild $log
+    $quit = Quit-Lines $log
+    $quit | Write-Host
+    if ($oldVersion -and [version] $oldVersion -ge [version] "0.2.7") {
+        # The old copy's own --quit closed it: nothing was left for taskkill.
+        Expect-Quit $quit @("asking the installed copy", "--quit finished", "taskkill exit code 128 ") @("taskkill only")
+    } else {
+        # Too old to know --quit: taskkill closed it.
+        Expect-Quit $quit @("taskkill only", "taskkill exit code 0 ") @("asking the installed copy")
+    }
+    Write-Host "the upgrade from a running $oldVersion replaced it cleanly; exe and Installed apps both say $version"
+}
+
+$app = App-Path
+$folder = Split-Path $app
+
+Step "A folder install that lost its runtime is closed with taskkill, not run"
+# A failed update can leave the exe without _internal: [InstallDelete] runs
+# first, and rollback doesn't put it back. Such an exe can't start; run with
+# --quit, it would show "Failed to load Python DLL" and wait for a click. The
+# installer runs the installed copy only when it is a one-file build (before
+# 1.0) or still has _internal. Until the release bump this build says 0.x, so
+# it is listed as 1.0.0 here, as a released folder install is.
+Remove-Item -Recurse -Force (Join-Path $folder "_internal")
+Set-ItemProperty $UninstallKey -Name DisplayVersion -Value "1.0.0"
+$log = "$env:TEMP\dcf-no-runtime.log"
+$started = Get-Date
+Install $NewSetup $log 120
+$seconds = ((Get-Date) - $started).TotalSeconds
+$quit = Quit-Lines $log
+$quit | Write-Host
+Expect-Quit $quit @("has no _internal folder") @("asking the installed copy")
+if ((Get-Running).Count) { Fail "a copy was left running" }
+Assert-NewBuild $log
+Write-Host ("setup took {0:N1} s and put the runtime back" -f $seconds)
+
+Step "An installed copy that hangs on --quit holds the installer up for 20 s at most"
+# Its runtime is there but broken: without the Python DLL the copy setup runs
+# to ask for a quit shows "Failed to load Python DLL" and waits for a click
+# that never comes (its window is hidden, too).
+$dll = Get-ChildItem (Join-Path $folder "_internal") -Filter "python3*.dll" |
+    Where-Object { $_.Name -match '^python3\d+\.dll$' } | Select-Object -First 1
+if (-not $dll) { Fail "the folder build has no python3NN.dll in _internal" }
+Remove-Item $dll.FullName -Force
+$log = "$env:TEMP\dcf-hangs.log"
+$started = Get-Date
+Install $NewSetup $log 180
+$seconds = ((Get-Date) - $started).TotalSeconds
+$quit = Quit-Lines $log
+$quit | Write-Host
+Expect-Quit $quit @("asking the installed copy", "did not finish within 20 s; stopped it")
+if ($seconds -lt 20) { Fail ("setup took {0:N1} s: the hung copy wasn't what held it" -f $seconds) }
+if ((Get-Running).Count) { Fail "the hung copy was left running" }
+if (-not (Test-Path $dll.FullName)) { Fail "the Python DLL wasn't put back" }
+Assert-NewBuild $log
+Write-Host ("setup stopped the hung copy and finished in {0:N1} s" -f $seconds)
 
 Step "Opening the app twice in a row leaves one copy"
 Start-Process $app -ArgumentList "--minimized"
@@ -170,8 +273,6 @@ if ($SigningKey) {
 }
 
 Step "Uninstall closes the running copy and removes the app"
-$uninstaller = (Get-ItemProperty $UninstallKey).UninstallString.Trim('"')
-Start-Process $uninstaller -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART" -Wait
-Wait-For { (Get-Running).Count -eq 0 } 30 "the app to be closed by the uninstaller"
-Wait-For { -not (Test-Path $app) } 30 "the exe to be removed"
+Uninstall-App
+if (Test-Path (Join-Path $folder "THIRD_PARTY_NOTICES.md")) { Fail "the uninstaller left THIRD_PARTY_NOTICES.md behind" }
 Write-Host "`nALL WINDOWS INSTALL CHECKS PASSED"

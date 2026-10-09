@@ -1095,7 +1095,8 @@ class WindowsHook:
     the move follows it. A release that can't be delivered that way (the
     hand moved on before the timer delivered it, as when a drag ends while
     moving) is re-sent in one batch with motion that takes the pointer to
-    where the button came up and back again.
+    where the button came up and back again; while the pointer is still
+    inside the drag rectangle there, it goes out where the pointer is.
 
     A move held back leaves the pointer where it was, so Windows works out
     the next move from that stale spot. While motion is watched, `basis` is
@@ -1219,7 +1220,16 @@ class WindowsHook:
         if (flags & self.LLMHF_INJECTED and not self._filter_injected) or (
             extra & PEN_SIGNATURE_MASK
         ) == PEN_SIGNATURE:
-            return False  # another program's motion, or pen and touch: left alone
+            # Another program's motion, or pen and touch: left alone. It puts
+            # the pointer somewhere new, so the hand's next step is taken from
+            # there; and with none of the hand's moves held back, that is
+            # where the pointer stays, so a release still held goes back to
+            # where it happened rather than landing here.
+            if not self.known or self.virtual == self.basis:
+                self.virtual = (x, y)
+            self.basis = (x, y)
+            self.known = True
+            return False
         if not self.known:
             self.basis = self.virtual = (x, y)
             self.known = True
@@ -1253,24 +1263,35 @@ class WindowsHook:
         # Message times must not run backwards: once later motion has
         # reached apps, a release goes out stamped now.
         when = 0 if moved and not pressed else int(tick) & 0xFFFFFFFF
-        if pressed or not moved or not relocate or not api.relocation_allowed():
+        if (
+            pressed
+            or not moved
+            or not relocate
+            or not api.relocation_allowed()
+            or self._owner._is_near((x, y), here)
+        ):
             # A press goes where the pointer is: it is re-sent right after the
             # events that came before it, motion included. So does a release
-            # where the pointer still is, one made where the pointer's place
-            # means nothing (see button), and one whose way back isn't known.
+            # where the pointer still is, or still inside the drag rectangle
+            # around where the button came up (apps take that as the same
+            # spot, so the pointer needn't jump), one made where the
+            # pointer's place means nothing (see button), and one whose way
+            # back isn't known.
             return [(api.button_input(flags, when), button)]
         # The pointer has moved on: take it to where the button came up,
         # release it there and take it back, in one batch so the three arrive
         # in order. The way back counts as re-sent motion, so a real move that
         # comes between the release and it queues behind it rather than being
-        # undone by it.
-        with self._owner._lock:
-            self._owner._track(button, 1)
-        return [
+        # undone by it. It is counted only once the batch exists, so a batch
+        # that couldn't be made leaves nothing waiting for it.
+        batch = [
             (api.move_input(x, y, TELEPORT_MARK), None),
             (api.button_input(flags, when), button),
             (api.move_input(here[0], here[1], MOTION_MARK_FOR[button]), button),
         ]
+        with self._owner._lock:
+            self._owner._track(button, 1)
+        return batch
 
 
 def send_batch(api, batch: list, lost: Callable[[Button], object]) -> int:
@@ -1502,7 +1523,8 @@ class WindowsApi:
     def within_drag_rect(self, point: Optional[tuple], location: Optional[tuple]) -> bool:
         """Whether `location` is still on the spot `point`: inside the
         rectangle Windows itself uses to tell a click from a drag (DragDetect
-        starts a drag once the pointer leaves it). Runs on the hook thread."""
+        starts a drag once the pointer leaves it). Runs on the hook thread,
+        or inside physical_pixels() (a re-send deciding where to go)."""
         if point is None or location is None:
             return False
         try:
@@ -1559,6 +1581,7 @@ class SessionWindow:
     whatever fails to register.
     """
 
+    WM_CLOSE = 0x0010
     WM_WTSSESSION_CHANGE = 0x02B1
     WM_POWERBROADCAST = 0x0218
     #: WTS_CONSOLE_CONNECT, WTS_REMOTE_CONNECT, WTS_SESSION_UNLOCK.
@@ -1609,10 +1632,16 @@ class SessionWindow:
         kernel32.GetModuleHandleW.restype = wintypes.HMODULE
 
         session_events, resume_events = self.SESSION_EVENTS, self.RESUME_EVENTS
-        session_change, power = self.WM_WTSSESSION_CHANGE, self.WM_POWERBROADCAST
+        session_change, power, close = self.WM_WTSSESSION_CHANGE, self.WM_POWERBROADCAST, self.WM_CLOSE
 
         @WNDPROC
         def window_proc(hwnd, message, wparam, lparam):
+            if message == close:
+                # Restart Manager, and taskkill without /F, close every
+                # top-level window of the app. The default would destroy this
+                # one, and session notices would stop without a word: it goes
+                # only with the hook (see close()).
+                return 0
             try:
                 if (message == session_change and wparam in session_events) or (
                     message == power and wparam in resume_events
