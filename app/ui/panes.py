@@ -6,6 +6,7 @@ import platform
 import time
 from typing import Optional
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QComboBox, QFileDialog, QHBoxLayout, QMenu, QVBoxLayout, QWidget
 
 from .. import app_keys
@@ -17,6 +18,40 @@ from .charts import DailyRateChart, GapHistogram
 from .theme import IS_MAC
 from .widgets import Row, Switch, ValueLabel, wheel_needs_focus
 
+#: How often the History pane reads the counts again while it is on screen:
+#: the clicks someone makes to watch it are counted as they go.
+HISTORY_TICK_MS = 5000
+#: How often the Devices pane brings "seen 5 min ago" up to date while it is
+#: on screen; the times are in whole minutes.
+DEVICES_TICK_MS = 30000
+
+
+class LivePage(Page):
+    """A pane that reads its numbers again every so often while it is on
+    screen, and not at all while it is hidden."""
+
+    def __init__(self, title: str, interval_ms: int, parent: Optional[QWidget] = None) -> None:
+        super().__init__(title, parent)
+        self.ticker = QTimer(self)
+        self.ticker.setInterval(interval_ms)
+        self.ticker.timeout.connect(self._tick)
+
+    def refresh(self) -> None:
+        raise NotImplementedError
+
+    def _tick(self) -> None:
+        if not self.window().isMinimized():
+            self.refresh()
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        self.ticker.start()
+
+    def hideEvent(self, event) -> None:  # noqa: N802
+        super().hideEvent(event)
+        self.ticker.stop()
+
+
 # -- History -----------------------------------------------------------------------
 
 TREND_NOTES = {
@@ -27,13 +62,14 @@ TREND_NOTES = {
 }
 
 
-class HistoryPage(Page):
+class HistoryPage(LivePage):
     """How often each button has bounced over the last 30 days."""
 
     def __init__(self, controller, parent: Optional[QWidget] = None) -> None:
-        super().__init__("History", parent)
+        super().__init__("History", HISTORY_TICK_MS, parent)
         self.controller = controller
         self.button: Button = Button.LEFT
+        self._choices_shown: list[Button] = []
 
         picker = self.section()
         self.button_picker = QComboBox()
@@ -99,9 +135,13 @@ class HistoryPage(Page):
         if self.button not in choices:
             self.button = choices[0]
         self.button_picker.blockSignals(True)
-        self.button_picker.clear()
-        for button in choices:
-            self.button_picker.addItem(button_name(button), button.value)
+        if choices != self._choices_shown:
+            # Built again only when the buttons change: a refresh every few
+            # seconds must not close the list while someone has it open.
+            self._choices_shown = choices
+            self.button_picker.clear()
+            for button in choices:
+                self.button_picker.addItem(button_name(button), button.value)
         self.button_picker.setCurrentIndex(choices.index(self.button))
         self.button_picker.blockSignals(False)
 
@@ -233,14 +273,22 @@ def _seen(when: float) -> str:
         return "just now"
     if minutes < 60:
         return f"{minutes} min ago"
-    return f"{minutes // 60} h ago"
+    if minutes < 48 * 60:
+        return f"{minutes // 60} h ago"
+    return f"{minutes // (24 * 60)} days ago"
 
 
-class DevicesPage(Page):
+def _mouse_detail(key: str, kind: str, last_seen: float) -> str:
+    parts = [KIND_NAMES.get(kind, "Pointing device"), _transport(key)]
+    parts.append(f"seen {_seen(last_seen)}" if last_seen else "not seen since launch")
+    return " · ".join(part for part in parts if part)
+
+
+class DevicesPage(LivePage):
     """The pointing devices the filter has seen, and which it filters."""
 
     def __init__(self, controller, parent: Optional[QWidget] = None) -> None:
-        super().__init__("Devices", parent)
+        super().__init__("Devices", DEVICES_TICK_MS, parent)
         self.controller = controller
         self._shown: Optional[tuple] = None
 
@@ -251,6 +299,7 @@ class DevicesPage(Page):
         self.footnote(DEVICES_NOTE)
         self.body.addStretch(1)
         self.switches: dict[str, Switch] = {}
+        self.mouse_rows: dict[str, Row] = {}
 
     def _rows(self) -> tuple[list, list]:
         """(mice, touch devices): what the filter saw this run, plus any
@@ -268,13 +317,16 @@ class DevicesPage(Page):
         layout = (tuple(key for key, *_rest in mice), tuple(key for key, *_rest in touch))
         if layout == self._shown:
             # The same devices: only their switches and times may have moved.
-            for key, switch in self.switches.items():
-                switch.setChecked(key not in ignored, animate=False)
+            # The rows stay, and keyboard focus with them.
+            for key, _name, kind, last_seen in mice:
+                self.switches[key].setChecked(key not in ignored, animate=False)
+                self.mouse_rows[key].set_detail(_mouse_detail(key, kind, last_seen))
             return
         self._shown = layout
         self.mice.clear()
         self.touch.clear()
         self.switches = {}
+        self.mouse_rows = {}
         if not mice:
             self.mice.add(
                 Row(
@@ -290,9 +342,7 @@ class DevicesPage(Page):
             switch.clicked.connect(
                 lambda checked, device=key, title=name: self.controller.set_device_ignored(device, title, not checked)
             )
-            parts = [KIND_NAMES.get(kind, "Pointing device"), _transport(key)]
-            parts.append(f"seen {_seen(last_seen)}" if last_seen else "not seen since launch")
-            self.mice.add(Row(name, " · ".join(part for part in parts if part), switch, card_icon("mouse")))
+            self.mouse_rows[key] = self.mice.add(Row(name, _mouse_detail(key, kind, last_seen), switch, card_icon("mouse")))
             self.switches[key] = switch
         for key, name, kind, _last_seen in touch:
             value = ValueLabel("Never filtered")

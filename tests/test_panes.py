@@ -397,6 +397,27 @@ class HistoryPaneTests(PaneTestCase):
         self.assertFalse(page.wheel_section.isHidden())
         self.assertEqual(page.wheel_value.text(), "1 of 1 ticks")
 
+    def test_the_counts_move_while_the_pane_is_open(self) -> None:
+        from app.contracts import Button
+        from app.core import ClickEvent
+
+        self.show("history")
+        page = self.window.history
+        self.assertTrue(page.ticker.isActive())
+        self.assertEqual(page.clicks_value.text(), "0")
+        removed = []
+        page.button_picker.model().rowsRemoved.connect(lambda *_args: removed.append(1))
+        for _ in range(3):
+            self.controller.wear.note_event(ClickEvent(Button.LEFT, True, True, 400.0, None), 46)
+        page.ticker.timeout.emit()
+        self.assertEqual(page.clicks_value.text(), "3")
+        self.assertEqual(removed, [], "the picker isn't built again while its buttons stay the same")
+        self.show("filter")
+        self.assertFalse(page.ticker.isActive(), "it rests while another pane is in front")
+        self.show("history")
+        self.window.hide()
+        self.assertFalse(page.ticker.isActive(), "and while the window is closed")
+
     def test_hovering_a_column_says_its_value(self) -> None:
         from PySide6.QtCore import QEvent, QPoint
         from PySide6.QtGui import QHelpEvent
@@ -495,6 +516,27 @@ class DevicesPaneTests(PaneTestCase):
         self.assertIn("bt:05AC:0269:x", hook.updates[-1].ignored_devices)
         self.assertIs(page.switches["bt:05AC:0269:x"], switch, "the same row: focus stays where it was")
         self.assertFalse(switch.isChecked())
+
+    def test_the_time_since_a_mouse_was_seen_moves_on(self) -> None:
+        import time
+
+        page = self.window.devices
+        hook = self.hook()
+        hook.on_device(self.device("usb:03F0:0001:x", "HP 2.4G wireless and BT Mouse"))
+        self.show("devices")
+        row = page.mice.rows[0]
+        self.assertIn("seen just now", row.detail.text())
+        self.assertTrue(page.ticker.isActive())
+        later = time.time() + 2 * 3600 + 5
+        with mock.patch("app.ui.panes.time.time", return_value=later):
+            page.ticker.timeout.emit()  # the pane is still open
+        self.assertIn("seen 2 h ago", row.detail.text())
+        self.assertIs(page.mice.rows[0], row, "the same row: focus stays where it was")
+        with mock.patch("app.ui.panes.time.time", return_value=later + 3 * 86400):
+            self.window.refresh()
+        self.assertIn("seen 3 days ago", row.detail.text())
+        self.show("filter")
+        self.assertFalse(page.ticker.isActive())
 
     def test_an_ignored_mouse_not_seen_this_run_can_be_turned_back_on(self) -> None:
         self.controller.set_device_ignored("usb:046D:C08B:y", "G502 HERO", True)
