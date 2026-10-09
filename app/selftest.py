@@ -97,7 +97,15 @@ def check_child_processes() -> str:
 
     from . import main
 
-    others = main._other_copies_running()  # /usr/bin/pgrep in a built app
+    # The app's own call treats any failure as "no other copy", so run the
+    # same command here, where a failure shows: pgrep exits 0 when it found
+    # a process and 1 when it found none, and anything else when it couldn't
+    # look.
+    pgrep = subprocess.run(main._pgrep_command(), capture_output=True, text=True, timeout=10, check=False)
+    if pgrep.returncode not in (0, 1):
+        raise RuntimeError(f"pgrep exited {pgrep.returncode}: {pgrep.stderr.strip()}")
+    mine = {os.getpid(), os.getppid()}
+    others = [pid for pid in pgrep.stdout.split() if int(pid) not in mine]
     shell = subprocess.run(
         ["/bin/bash", "-p", "-c", "command -v sleep && sleep 0"],
         capture_output=True, text=True, timeout=10, check=False,
