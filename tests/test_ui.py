@@ -703,6 +703,124 @@ class AccessibilityTests(LiveWindowTests):
             self.assertFalse(self.window.filter_page.switch.grab().isNull())
 
 
+class CalibrationFlowTests(LiveWindowTests):
+    """Calibration UX: starting from the pad, pairing double-clicks, buttons."""
+
+    def to_double_phase(self):
+        from app.core import REQUIRED_SINGLE_CLICKS
+
+        page = self.window.calibrate
+        page._advance()
+        for _ in range(REQUIRED_SINGLE_CLICKS):
+            page._on_pad_press(900.0, 960.0)
+        self.assertEqual(page.phase, "double")
+        return page
+
+    def test_the_first_pad_press_starts_the_single_clicks(self) -> None:
+        page = self.window.calibrate
+        self.assertEqual(page.phase, "intro")
+        page._on_pad_press(None, None)
+        self.assertEqual(page.phase, "single")
+        self.assertEqual(page.calibrator.single_clicks, 1, "that press counts")
+        self.assertEqual(page.count_label.text(), "1 of 12")
+
+    def test_a_stale_gap_on_the_starting_press_is_not_taken_for_bounce(self) -> None:
+        page = self.window.calibrate
+        page._on_pad_press(8.0, 30.0)  # the pad timed it against a click on the intro
+        self.assertEqual(page.calibrator.single_clicks, 1)
+        self.assertEqual(page.calibrator.single_gaps_ms, [])
+
+    def test_a_pair_needs_a_first_press_and_a_second(self) -> None:
+        page = self.to_double_phase()
+        page._on_pad_press(1500.0, 1600.0)  # opens a pair
+        self.assertEqual(page.calibrator.double_clicks, 0)
+        self.assertEqual(page.pad._flash_tone, "neutral", "the first press isn't flashed as counted")
+        page._on_pad_press(150.0, 220.0)  # closes it
+        self.assertEqual(page.calibrator.double_clicks, 1)
+        self.assertEqual(page.pad._flash_tone, "good")
+
+    def test_a_triple_click_counts_once(self) -> None:
+        page = self.to_double_phase()
+        page._on_pad_press(1500.0, 1600.0)
+        page._on_pad_press(150.0, 220.0)
+        page._on_pad_press(150.0, 220.0)  # the third press opens a new pair
+        self.assertEqual(page.calibrator.double_clicks, 1)
+
+    def test_bounce_inside_a_pair_is_evidence_and_keeps_the_pair_open(self) -> None:
+        page = self.to_double_phase()
+        page._on_pad_press(1500.0, 1600.0)
+        page._on_pad_press(9.0, 60.0)  # chatter after the first release
+        self.assertIn("Bounce detected", page.step_row.detail.text())
+        page._on_pad_press(150.0, 220.0)
+        self.assertEqual(page.calibrator.double_clicks, 1)
+        self.assertEqual(page.calibrator.single_gaps_ms, [9.0])
+
+    def test_slow_double_clicks_count_when_the_system_accepts_them(self) -> None:
+        hints = mock.Mock()
+        hints.mouseDoubleClickInterval.return_value = 900
+        with mock.patch("app.ui.window.QGuiApplication.styleHints", return_value=hints):
+            page = self.to_double_phase()
+            for _ in range(5):
+                page._on_pad_press(1500.0, 1600.0)
+                page._on_pad_press(700.0, 790.0)
+        self.assertEqual(page.phase, "done")
+        self.assertIsNotNone(page.suggestion)
+
+    def test_too_slow_a_pair_says_so(self) -> None:
+        hints = mock.Mock()
+        hints.mouseDoubleClickInterval.return_value = 500
+        with mock.patch("app.ui.window.QGuiApplication.styleHints", return_value=hints):
+            page = self.to_double_phase()
+            page._on_pad_press(1500.0, 1600.0)
+            page._on_pad_press(700.0, 790.0)
+        self.assertEqual(page.calibrator.double_clicks, 0)
+        self.assertIn("Too slow", page.step_row.detail.text())
+        self.assertEqual(page.pad._flash_tone, "neutral", "not flashed as counted")
+
+    def test_a_pair_is_one_button(self) -> None:
+        from app.core import Button
+
+        page = self.to_double_phase()
+        page._on_pad_press(1500.0, 1600.0, Button.LEFT)
+        page._on_pad_press(150.0, 220.0, Button.RIGHT)  # a different button opens its own pair
+        self.assertEqual(page.calibrator.double_clicks, 0)
+        page._on_pad_press(150.0, 220.0, Button.RIGHT)
+        self.assertEqual(page.calibrator.double_clicks, 1)
+
+    def test_the_pad_times_each_button_against_its_own_release(self) -> None:
+        from PySide6.QtCore import QPoint, Qt
+        from PySide6.QtTest import QTest
+
+        from app.core import Button
+
+        pad = self.window.test_page.pad
+        self.window.show()
+        self.window._show_page(self.page_index("test"))
+        self.application.processEvents()
+        seen = []
+        pad.pressed_with_gap.connect(lambda gap, interval, button: seen.append((gap, button)))
+        middle = QPoint(pad.width() // 2, pad.height() // 2)
+        QTest.mouseClick(pad, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, middle)
+        QTest.mouseClick(pad, Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, middle)
+        QTest.mouseClick(pad, Qt.MouseButton.MiddleButton, Qt.KeyboardModifier.NoModifier, middle)
+        QTest.mouseClick(pad, Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, middle)
+        self.assertEqual([button for _gap, button in seen], [Button.LEFT, Button.RIGHT, Button.MIDDLE, Button.RIGHT])
+        self.assertEqual([gap is None for gap, _button in seen], [True, True, True, False],
+                         "a button's first press has no gap, whatever other buttons did")
+        self.assertEqual(self.window.test_page.clicks, 4)
+        self.assertTrue(self.window.test_page.last_value.text().endswith("(right)"))
+
+    def test_test_pane_shows_bounces_on_every_button(self) -> None:
+        from app.core import Button, ClickEvent
+
+        page = self.window.test_page
+        self.window.show()
+        self.window._show_page(self.page_index("test"))
+        for button in Button:
+            page.note_global_event(ClickEvent(button, True, False, 9.0, None))  # blocked
+        self.assertEqual(len(page.timeline._gaps), 3)
+
+
 class MenuBarItemTests(unittest.TestCase):
     """macOS uses a native status item; Qt's own crashes on macOS 27."""
 

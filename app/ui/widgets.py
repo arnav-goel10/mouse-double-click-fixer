@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..core import Button
 from . import symbols
 from .theme import IS_MAC, Look, current_look, font, with_alpha
 
@@ -557,14 +558,23 @@ class Sidebar(QListWidget):
 
 # -- click pad and timeline ------------------------------------------------------
 
+#: The mouse buttons the pad measures, as the filter names them.
+PAD_BUTTONS = {
+    Qt.MouseButton.LeftButton: Button.LEFT,
+    Qt.MouseButton.RightButton: Button.RIGHT,
+    Qt.MouseButton.MiddleButton: Button.MIDDLE,
+}
+
+
 class ClickPad(QWidget):
     """A surface that measures the user's own clicks.
 
     It reports the release-to-press gap, the same measurement the system-wide
-    filter uses.
+    filter uses, for the left, right and middle buttons, each timed against
+    its own last release.
     """
 
-    pressed_with_gap = Signal(object, object)  # gap_ms, interval_ms
+    pressed_with_gap = Signal(object, object, object)  # gap_ms, interval_ms, Button
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -572,10 +582,12 @@ class ClickPad(QWidget):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setAccessibleName("Click test area")
-        self._last_release: Optional[float] = None
-        self._last_press: Optional[float] = None
+        # A right-click here is a measurement, not a request for a menu.
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.PreventContextMenu)
+        self._last_release: dict[Button, float] = {}
+        self._last_press: dict[Button, float] = {}
         self._flash = 0.0
-        self._flash_bounce = False
+        self._flash_tone = "good"
         self._headline = "Click Here"
         self._caption = ""
 
@@ -585,12 +597,15 @@ class ClickPad(QWidget):
         self.update()
 
     def reset(self) -> None:
-        self._last_release = None
-        self._last_press = None
+        self._last_release.clear()
+        self._last_press.clear()
         self.update()
 
-    def flash(self, bounce: bool) -> None:
-        self._flash_bounce = bounce
+    def flash(self, bounce: bool, neutral: bool = False) -> None:
+        """Tint the pad briefly: red for a bounce, the accent colour for a
+        click that counted, grey for one that only started something (the
+        first press of a double-click)."""
+        self._flash_tone = "bounce" if bounce else "neutral" if neutral else "good"
         animation = QPropertyAnimation(self, b"flash_level", self)
         animation.setDuration(380)
         animation.setStartValue(1.0)
@@ -615,19 +630,23 @@ class ClickPad(QWidget):
         return stamp / 1000.0 if stamp else monotonic()
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
-        if event.button() != Qt.MouseButton.LeftButton:
+        button = PAD_BUTTONS.get(event.button())
+        if button is None:
             return
         now = self._event_time(event)
-        gap = None if self._last_release is None else (now - self._last_release) * 1000
-        interval = None if self._last_press is None else (now - self._last_press) * 1000
+        last_release = self._last_release.get(button)
+        last_press = self._last_press.get(button)
+        gap = None if last_release is None else (now - last_release) * 1000
+        interval = None if last_press is None else (now - last_press) * 1000
         if gap is not None and gap < 0:
             gap = interval = None  # the event clock wrapped; start afresh
-        self._last_press = now
-        self.pressed_with_gap.emit(gap, interval)
+        self._last_press[button] = now
+        self.pressed_with_gap.emit(gap, interval, button)
 
     def mouseReleaseEvent(self, event) -> None:  # noqa: N802
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._last_release = self._event_time(event)
+        button = PAD_BUTTONS.get(event.button())
+        if button is not None:
+            self._last_release[button] = self._event_time(event)
 
     def paintEvent(self, _event) -> None:  # noqa: N802
         lk = look()
@@ -638,7 +657,7 @@ class ClickPad(QWidget):
         path.addRoundedRect(rect, lk.radius, lk.radius)
         painter.fillPath(path, lk.section)
         if self._flash > 0.01:
-            tint = lk.red if self._flash_bounce else lk.accent
+            tint = {"bounce": lk.red, "neutral": lk.secondary, "good": lk.accent}[self._flash_tone]
             painter.fillPath(path, with_alpha(tint, 0.16 * self._flash))
         painter.setPen(QPen(lk.section_border, 1))
         painter.drawPath(path)

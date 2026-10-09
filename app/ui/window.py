@@ -6,7 +6,7 @@ import logging
 from typing import Optional
 
 from PySide6.QtCore import QByteArray, QEvent, QRect, QTimer, Qt, Signal
-from PySide6.QtGui import QPainter
+from PySide6.QtGui import QGuiApplication, QPainter
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 from .. import __version__, permissions
 from ..controller import AppController
 from ..core import (
+    BOUNCE_CANDIDATE_MS,
     MAX_THRESHOLD_MS,
     MIN_THRESHOLD_MS,
     REQUIRED_DOUBLE_CLICKS,
@@ -52,7 +53,8 @@ from .widgets import (
 
 log = logging.getLogger(__name__)
 
-#: A pause longer than this starts a new pair while calibrating double-clicks.
+#: The shortest release-to-press pause that still ends a double-click while
+#: calibrating. A slower system double-click setting widens it.
 PAIR_WINDOW_MS = 600.0
 
 #: A background launch whose filter fails to start tries again this many
@@ -362,12 +364,7 @@ class TestPage(Page):
     def note_global_event(self, event: ClickEvent) -> None:
         """A bounce the system-wide filter blocked. With the filter on, this
         pad never receives it, so show it here: proof the filter works."""
-        if (
-            self.isVisible()
-            and event.is_bounce
-            and event.button is Button.LEFT
-            and event.gap_ms is not None
-        ):
+        if self.isVisible() and event.is_bounce and event.gap_ms is not None:
             self.timeline.add(event.gap_ms, True)
             self.pad.flash(True)
 
@@ -380,7 +377,9 @@ class TestPage(Page):
         self.shortest_value.setText("—")
         self.count_value.setText("0")
 
-    def _on_pad_press(self, gap_ms: Optional[float], _interval_ms: Optional[float]) -> None:
+    def _on_pad_press(
+        self, gap_ms: Optional[float], _interval_ms: Optional[float], button: Button = Button.LEFT
+    ) -> None:
         self.clicks += 1
         self.count_value.setText(str(self.clicks))
         if gap_ms is None:
@@ -388,7 +387,9 @@ class TestPage(Page):
             return
         bounce = gap_ms <= self.controller.threshold_ms
         self.timeline.add(gap_ms, bounce)
-        self.last_value.setText(f"{gap_ms:.0f} ms")
+        # Each button is timed against its own release; say which one.
+        which = "" if button is Button.LEFT else f" ({button.label.lower()})"
+        self.last_value.setText(f"{gap_ms:.0f} ms{which}")
         if self.shortest_gap is None or gap_ms < self.shortest_gap:
             self.shortest_gap = gap_ms
             self.shortest_value.setText(f"{gap_ms:.0f} ms")
@@ -409,6 +410,9 @@ class CalibratePage(Page):
         self.calibrator = Calibrator()
         self.phase = "intro"
         self.suggestion = None
+        # The button whose first press of a double-click is waiting for its
+        # second, or None.
+        self._pair_button: Optional[Button] = None
 
         # The step and its progress bar are one row, so they share one box
         # (macOS) or one card (Windows).
@@ -475,6 +479,7 @@ class CalibratePage(Page):
     def restart(self) -> None:
         self.calibrator = Calibrator()
         self.suggestion = None
+        self._pair_button = None
         self.pad.reset()
         self._set_phase("intro")
         self._render()
@@ -500,31 +505,64 @@ class CalibratePage(Page):
         self._set_phase("done")
         self._render()
 
-    def _on_pad_press(self, gap_ms: Optional[float], _interval_ms: Optional[float]) -> None:
+    @staticmethod
+    def pair_window_ms() -> float:
+        """How long a double-click may pause between its release and second
+        press: at least PAIR_WINDOW_MS, and as long as the system's own
+        double-click setting, so a pair the system accepts counts here too."""
+        interval = QGuiApplication.styleHints().mouseDoubleClickInterval()
+        return max(PAIR_WINDOW_MS, float(interval))
+
+    def _on_pad_press(
+        self, gap_ms: Optional[float], _interval_ms: Optional[float], button: Button = Button.LEFT
+    ) -> None:
         note = ""
+        if self.phase == "intro":
+            # Clicking the pad is as good as Begin, and counts as the first
+            # single click. Its gap means nothing: it is the first.
+            self._advance()
+            gap_ms = None
         if self.phase == "single":
             counted = self.calibrator.add_single_click(gap_ms)
             self.pad.flash(not counted)
             if not counted:
                 note = f"Bounce detected ({gap_ms:.0f} ms)."
             if self.calibrator.has_enough_singles:
+                self._pair_button = None
                 self._set_phase("double")
                 self.pad.reset()
                 note = ""
         elif self.phase == "double":
-            if gap_ms is not None and gap_ms <= PAIR_WINDOW_MS:
-                recorded = self.calibrator.add_double_click(gap_ms)
-                self.pad.flash(not recorded)
-                if not recorded:
-                    note = f"Bounce detected ({gap_ms:.0f} ms)."
-            else:
-                self.pad.flash(False)
+            note = self._double_click_press(gap_ms, button)
             if self.calibrator.has_enough_doubles:
                 self._finish()
                 return
         else:
             return
         self._render(note)
+
+    def _double_click_press(self, gap_ms: Optional[float], button: Button) -> str:
+        """Pair presses into double-clicks: a first press opens a pair, and
+        the same button's next press within the pair window closes it and
+        counts. Anything else opens a new pair, so the third press of a
+        triple-click never counts as another double. Returns a note."""
+        if gap_ms is not None and gap_ms <= BOUNCE_CANDIDATE_MS:
+            # Chatter, wherever it lands, is evidence; the pair stays open.
+            self.calibrator.add_double_click(gap_ms)
+            self.pad.flash(True)
+            return f"Bounce detected ({gap_ms:.0f} ms)."
+        if self._pair_button is button and gap_ms is not None and gap_ms <= self.pair_window_ms():
+            self.calibrator.add_double_click(gap_ms)
+            self._pair_button = None
+            self.pad.flash(False)
+            return ""
+        too_slow = self._pair_button is button
+        self._pair_button = button
+        # Only the start of a pair: no "counted" flash.
+        self.pad.flash(False, neutral=True)
+        if too_slow:
+            return "Too slow for a double-click, so it wasn’t counted. Double-click a little faster."
+        return ""
 
     # -- rendering ---------------------------------------------------------------
     def _render(self, note: str = "") -> None:
@@ -540,7 +578,10 @@ class CalibratePage(Page):
 
         if self.phase == "intro":
             self.step_row.title.setText("Calibrate your mouse")
-            self.step_row.set_detail("Click once at a time, then double-click. Filtering pauses until you finish.")
+            self.step_row.set_detail(
+                "Click once at a time, then double-click. Filtering pauses while you do, "
+                "so the pad sees your mouse as it is."
+            )
             self.count_label.setText("")
             self.pad.set_text(label("Ready"), "")
             self.primary_button.setText(label("Begin"))
