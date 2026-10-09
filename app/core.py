@@ -120,10 +120,13 @@ class BounceFilter:
         self.hold_releases = hold_releases
         self._last_release_at: Optional[float] = None
         self._last_press_at: Optional[float] = None
-        # Every time the contact closed, including a press that only cancelled
-        # a held release, which apps never see and `_last_press_at` skips.
+        # When the contact last closed: every press except one that only
+        # cancelled a lift (see press()). A release too soon after it is held
+        # as "closing".
         self._last_close_at: Optional[float] = None
         self._held_release_at: Optional[float] = None
+        # The hold_reason of the release being held back.
+        self._held_reason: Optional[str] = None
         # Numbers each held release, so a timer settles only its own one.
         self._held_id = 0
         self._swallow_release = False
@@ -134,6 +137,7 @@ class BounceFilter:
         self._last_press_at = None
         self._last_close_at = None
         self._held_release_at = None
+        self._held_reason = None
         self._swallow_release = False
 
     @property
@@ -142,7 +146,6 @@ class BounceFilter:
 
     def press(self, timestamp: Optional[float] = None) -> ClickEvent:
         now = monotonic() if timestamp is None else float(timestamp)
-        self._last_close_at = now
         flush = False
         if self._held_release_at is not None:
             held_gap = max(0.0, (now - self._held_release_at) * 1000)
@@ -150,6 +153,13 @@ class BounceFilter:
                 # The contact dropped out mid-hold and came back: the button
                 # never really went up. Drop both; the drag continues, and the
                 # eventual real release must go through.
+                if self._held_reason == "closing":
+                    # Still bouncing as it closes: the contact settles from
+                    # here, so a second bounce soon after is closing too. A
+                    # comeback after a lift is the release chattering; the
+                    # next release is the finger letting go, not the contact
+                    # closing, and pointer motion may settle it.
+                    self._last_close_at = now
                 self._held_release_at = None
                 self._swallow_release = False
                 self.filtered_count += 1
@@ -159,6 +169,7 @@ class BounceFilter:
             self._held_release_at = None
             flush = True
 
+        self._last_close_at = now
         gap_ms = None if self._last_release_at is None else max(0.0, (now - self._last_release_at) * 1000)
         interval_ms = None if self._last_press_at is None else max(0.0, (now - self._last_press_at) * 1000)
         is_bounce = gap_ms is not None and gap_ms <= self.threshold_ms
@@ -191,6 +202,7 @@ class BounceFilter:
             self._held_id += 1
             closing = self._last_close_at is not None and (now - self._last_close_at) * 1000 < IMPOSSIBLE_TAP_MS
             reason = "closing" if closing else "lift"
+            self._held_reason = reason
             return ClickEvent(self.button, False, False, None, None, held=True, hold_reason=reason)
         self._last_release_at = now
         return ClickEvent(self.button, False, True, None, None)

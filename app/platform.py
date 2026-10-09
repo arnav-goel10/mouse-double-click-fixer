@@ -9,6 +9,7 @@ bounce through.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import platform
@@ -19,6 +20,8 @@ from typing import Callable, Iterable, Optional
 from dataclasses import replace
 
 from .core import BounceFilter, Button, ClickEvent, clamp_threshold
+
+log = logging.getLogger(__name__)
 
 #: Set to 1 to let the filter act on synthetic clicks. Only used by the
 #: automated end-to-end tests, which have no other way to produce input.
@@ -42,6 +45,10 @@ RESTORE_MARK = max(INJECTED_MOTION_MARKS) + 1
 #: where the button came up settles it; less is a hand resting on the mouse.
 STATIONARY_PX = 4.0
 
+#: A re-sent release takes the pointer back to where the button came up. If
+#: the pointer had moved on by more than this, it is put back again.
+RESTORE_MIN_PX = 0.5
+
 #: A re-sent event normally passes back through the hook within a millisecond
 #: or two. If one never does (it was blocked, or lost), stop waiting for it.
 IN_FLIGHT_TIMEOUT_S = 0.15
@@ -51,7 +58,10 @@ IN_FLIGHT_TIMEOUT_S = 0.15
 #: the system, so the filter stops and every click goes through untouched.
 TAP_DISABLE_LIMIT = 3
 TAP_DISABLE_WINDOW_S = 30.0
-TAP_DISABLED_MESSAGE = "macOS keeps disabling the filter. Turn it on again from the menu."
+TAP_DISABLED_MESSAGE = (
+    "macOS kept switching the filter off, so it has stopped and clicks now go through unfiltered. "
+    "Turn it on again from the menu bar."
+)
 
 #: How far an event's own timestamp may sit from `monotonic()` and still be
 #: believed. A tap sees an event within milliseconds of the driver making it.
@@ -60,6 +70,11 @@ CLOCK_TOLERANCE_S = 2.0
 #: The double-click interval is a user setting that can change at any time,
 #: so it is read live, but at most this often: the tap callback must stay cheap.
 CLICK_INTERVAL_CACHE_S = 2.0
+
+#: Where macOS keeps that setting (System Settings > Mouse > Double-click
+#: speed), in seconds, and what it is when the user never changed it.
+DOUBLE_CLICK_KEY = "com.apple.mouse.doubleClickThreshold"
+DEFAULT_DOUBLE_CLICK_S = 0.5
 
 
 class HookError(RuntimeError):
@@ -74,8 +89,36 @@ def _filter_injected() -> bool:
     return os.environ.get(FILTER_INJECTED_ENV, "") == "1"
 
 
+# Places that ignored an error and have logged it. Most run on every event,
+# so each logs its first error only. The app logs through a queue, so this is
+# safe from the hook thread and timer threads alike.
+_logged_sites: set[str] = set()
+_logged_sites_lock = threading.Lock()
+
+
+def _log_ignored(site: str) -> None:
+    """Call from an `except` block that carries on regardless."""
+    try:
+        with _logged_sites_lock:
+            if site in _logged_sites:
+                return
+            _logged_sites.add(site)
+        log.warning("Ignored an error in %s (later ones there are not logged)", site, exc_info=True)
+    except Exception:  # noqa: BLE001 - logging must never break the event stream
+        pass
+
+
 class GlobalClickFilter:
-    """Install a system-wide filter that suppresses switch bounce."""
+    """Install a system-wide filter that suppresses switch bounce.
+
+    `on_error` hears, from the hook thread, that the hook stopped on its own
+    after it had started. On macOS, `permission_ok` says whether the app may
+    still filter input (see permissions.event_tap_allowed); it is asked each
+    time macOS disables a tap, before the tap is re-armed. When it says no,
+    the filter fails open (whatever it holds back goes out, then the hook
+    ends) and calls `on_permission_lost` from the hook thread instead of
+    `on_error`.
+    """
 
     def __init__(
         self,
@@ -83,9 +126,13 @@ class GlobalClickFilter:
         buttons: Iterable[Button],
         on_event: Optional[Callable[[ClickEvent], None]] = None,
         on_error: Optional[Callable[[str], None]] = None,
+        permission_ok: Optional[Callable[[], bool]] = None,
+        on_permission_lost: Optional[Callable[[], None]] = None,
     ) -> None:
         self._on_event = on_event or (lambda _event: None)
         self._on_error = on_error or (lambda _message: None)
+        self._permission_ok = permission_ok or (lambda: True)
+        self._on_permission_lost = on_permission_lost or (lambda: None)
         self._lock = threading.Lock()
         self._filters = {
             button: BounceFilter(threshold_ms, enabled=True, button=button) for button in Button
@@ -101,6 +148,8 @@ class GlobalClickFilter:
         self._run_loop = None
         self._use_os_time: Optional[bool] = None
         self._started = False
+        # Why the hook last ended, for the log.
+        self._end_reason = "stopped"
         # Per button: the event kept for a release that is being held back.
         self._held_templates: dict = {}
         # Per button: whether the release being held landed where apps saw its
@@ -147,6 +196,7 @@ class GlobalClickFilter:
         self._startup_error = None
         self._use_os_time = None
         self._started = False
+        self._end_reason = "stopped"
         self._held_templates.clear()
         self._held_stationary.clear()
         self._held_points.clear()
@@ -210,6 +260,7 @@ class GlobalClickFilter:
 
             return bool(Quartz.CGEventTapIsEnabled(tap))
         except Exception:  # noqa: BLE001 - unsure: don't make a health check churn the filter
+            _log_ignored("the tap health check")
             return True
 
     def _request_thread_stop(self) -> None:
@@ -304,8 +355,8 @@ class GlobalClickFilter:
         self._update_motion_tap()
         try:
             self._on_event(event)
-        except Exception:  # a UI callback must never break the hook
-            pass
+        except Exception:  # noqa: BLE001 - a UI callback must never break the hook
+            _log_ignored("the click event callback")
         return event
 
     def _enqueue(self, button: Button, pressed: Optional[bool], template: object) -> None:
@@ -350,7 +401,7 @@ class GlobalClickFilter:
         self._held_points.pop(button, None)
 
     def _tap_disabled(self, now: Optional[float] = None) -> bool:
-        """macOS disabled one of the taps. Returns True when that has now
+        """macOS disabled the main tap. Returns True when that has now
         happened TAP_DISABLE_LIMIT times within TAP_DISABLE_WINDOW_S, and the
         filter should stop rather than re-arm it again."""
         now = monotonic() if now is None else now
@@ -418,7 +469,7 @@ class GlobalClickFilter:
             try:
                 self._set_motion_tap(wanted)
             except Exception:  # noqa: BLE001 - never break the event stream
-                pass
+                _log_ignored("switching the motion tap")
 
     # -- keeping re-sent events in order ------------------------------------
     def _track(self, button: Button, count: int) -> None:
@@ -472,6 +523,7 @@ class GlobalClickFilter:
         try:
             sent = self._inject(button, pressed, template) is not False
         except Exception:  # noqa: BLE001 - never break the event stream
+            _log_ignored("re-sending an event")
             sent = False
         if not sent:
             # It will never come back through the hook; don't wait for it.
@@ -507,8 +559,19 @@ class GlobalClickFilter:
                 # it here as well would show two dialogs for one failure.
                 self._startup_error = error
                 self._ready.set()
-            elif not self._stop_event.is_set():
-                self._on_error(str(error))
+            else:
+                if self._end_reason == "stopped":
+                    self._end_reason = f"failed: {error}"
+                if not self._stop_event.is_set():
+                    self._on_error(str(error))
+        finally:
+            if self._started:
+                log.info(
+                    "Hook ended, %s (tap resets %d, hook re-arms %d)",
+                    self._end_reason,
+                    self.tap_resets,
+                    self.hook_rearms,
+                )
 
     # -- Windows -----------------------------------------------------------
     def _run_windows(self) -> None:
@@ -720,16 +783,19 @@ class GlobalClickFilter:
             try:
                 return Quartz.CGEventGetLocation(Quartz.CGEventCreate(None)), Quartz.CGEventGetLocation(template)
             except Exception:  # noqa: BLE001 - the release must go out regardless
+                _log_ignored("reading the pointer before a re-sent release")
                 return None
 
         def restore_pointer(pointer: object, released_at: object) -> None:
             # A release posted where the button came up takes the pointer
-            # there. After a drag let go while moving, the hand has carried
-            # the pointer on since, so put it back. The move is not tracked:
-            # the motion tap is usually off then and would never see it come
-            # back, which would hold the next click for IN_FLIGHT_TIMEOUT_S.
+            # there. The hand may have carried the pointer on since: far, after
+            # a drag let go while moving, or a little, after a click whose
+            # small motion passed while its release was held. So put it back.
+            # The move is not tracked: the motion tap is usually off then and
+            # would never see it come back, which would hold the next click
+            # for IN_FLIGHT_TIMEOUT_S.
             try:
-                if math.hypot(pointer.x - released_at.x, pointer.y - released_at.y) < STATIONARY_PX:
+                if math.hypot(pointer.x - released_at.x, pointer.y - released_at.y) <= RESTORE_MIN_PX:
                     return
                 move = Quartz.CGEventCreateMouseEvent(
                     None, Quartz.kCGEventMouseMoved, pointer, Quartz.kCGMouseButtonLeft
@@ -737,25 +803,58 @@ class GlobalClickFilter:
                 Quartz.CGEventSetIntegerValueField(move, Quartz.kCGEventSourceUserData, RESTORE_MARK)
                 Quartz.CGEventPost(Quartz.kCGHIDEventTap, move)
             except Exception:  # noqa: BLE001 - the release itself already went out
-                pass
+                _log_ignored("putting the pointer back after a re-sent release")
 
         self._inject = inject
         click_counts = ClickCountRepair()
-        # The first read of the double-click interval loads AppKit; do it now,
-        # not inside the tap callback, where a slow call gets the tap disabled.
+        # The first read of the double-click interval is the slowest (it asks
+        # the preferences daemon); do it now, not inside the tap callback,
+        # where a slow call gets the tap disabled.
         click_counts.interval()
-        # Set when macOS keeps disabling the taps: the run loop then ends.
-        given_up: list[bool] = []
+        # Why the hook ends on its own, once it decides to: the run loop then
+        # stops and the filter fails open (see below).
+        PERMISSION_GONE, KEPT_DISABLED = "permission gone", "macOS kept disabling the tap"
+        ending: list[str] = []
 
-        def rearm(disabled_tap: object) -> None:
-            # macOS disables a tap that takes too long, or on some user input.
-            # Re-arm it instead of dying silently, unless it keeps happening.
+        def end_hook(reason: str) -> None:
+            ending.append(reason)
+            Quartz.CFRunLoopStop(self._run_loop)
+
+        def permission_still_ok() -> bool:
+            try:
+                return bool(self._permission_ok())
+            except Exception:  # noqa: BLE001 - unsure: re-arm, as before the check existed
+                _log_ignored("the permission check")
+                return True
+
+        def rearm_main() -> None:
+            # macOS disables a tap that takes too long, on some user input, or
+            # once the app has lost its permission. Re-arm it instead of dying
+            # silently, unless the permission is gone (a filtering tap left on
+            # a dead grant can stall input system-wide) or it keeps happening.
+            if not permission_still_ok():
+                end_hook(PERMISSION_GONE)
+                return
             if self._tap_disabled():
-                given_up.append(True)
-                Quartz.CFRunLoopStop(self._run_loop)
+                end_hook(KEPT_DISABLED)
                 return
             self.tap_resets += 1
-            Quartz.CGEventTapEnable(disabled_tap, True)
+            Quartz.CGEventTapEnable(tap, True)
+
+        def rearm_motion() -> None:
+            # Only a motion tap meant to be on is re-armed. Its disables don't
+            # count toward giving up: one system event can disable both taps,
+            # and the main tap's count already says how often that happens.
+            if not motion_state["enabled"]:
+                return
+            if not permission_still_ok():
+                end_hook(PERMISSION_GONE)
+                return
+            with self._motion_tap_lock:
+                # A timer thread may have switched it off in the meantime.
+                if motion_state["enabled"] and motion_state["tap"] is not None:
+                    self.tap_resets += 1
+                    Quartz.CGEventTapEnable(motion_state["tap"], True)
 
         def callback(proxy: object, event_type: int, event: object, refcon: object) -> object:
             # An exception here would make PyObjC return nothing, which drops
@@ -763,12 +862,12 @@ class GlobalClickFilter:
             try:
                 return decide(event_type, event)
             except Exception:  # noqa: BLE001
+                _log_ignored("the click tap")
                 return event
 
         def decide(event_type: int, event: object) -> object:
             if event_type in DISABLED:
-                if self._tap is not None:
-                    rearm(self._tap)
+                rearm_main()
                 return event
 
             entry = BUTTONS.get(event_type)
@@ -818,9 +917,11 @@ class GlobalClickFilter:
             None,
         )
         if tap is None:
+            from . import permissions
+
             self._startup_error = HookError(
-                "macOS refused the event tap. Grant Accessibility permission to DoubleClick Fixer "
-                "in System Settings > Privacy & Security > Accessibility, then try again."
+                "macOS refused the event tap. Allow DoubleClick Fixer in System Settings \u203a "
+                f"Privacy & Security \u203a {permissions.pane_name()}, then try again."
             )
             self._ready.set()
             return
@@ -834,12 +935,12 @@ class GlobalClickFilter:
             try:
                 return motion_decide(event_type, event)
             except Exception:  # noqa: BLE001 - never drop motion on a bug
+                _log_ignored("the motion tap")
                 return event
 
         def motion_decide(event_type: int, event: object) -> object:
             if event_type in DISABLED:
-                if motion_state["tap"] is not None and motion_state["enabled"]:
-                    rearm(motion_state["tap"])
+                rearm_motion()
                 return event
             mark = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventSourceUserData)
             if mark == RESTORE_MARK:
@@ -873,6 +974,15 @@ class GlobalClickFilter:
 
             self._set_motion_tap = set_motion_tap
 
+        def close_taps() -> None:
+            # Out of the event stream: from here on clicks pass untouched.
+            with self._motion_tap_lock:
+                self._set_motion_tap = lambda _wanted: None
+                if motion_tap is not None:
+                    Quartz.CGEventTapEnable(motion_tap, False)
+                    motion_state["enabled"] = False
+            Quartz.CGEventTapEnable(tap, False)
+
         self._tap = tap
         source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
         self._run_loop = Quartz.CFRunLoopGetCurrent()
@@ -883,33 +993,43 @@ class GlobalClickFilter:
         Quartz.CGEventTapEnable(tap, True)
         self._started = True
         self._ready.set()
+        failed_open = None
         try:
-            while not self._stop_event.is_set() and not given_up:
+            while not self._stop_event.is_set() and not ending:
                 # A bounded run keeps the stop flag responsive even when the
                 # run loop is woken for reasons of its own.
                 Quartz.CFRunLoopRunInMode(Quartz.kCFRunLoopDefaultMode, 0.25, False)
-            if given_up and not self._stop_event.is_set():
-                # Fail open: what is held back goes out now, every later click
-                # passes untouched, and the app is told the filter stopped.
+            if ending and not self._stop_event.is_set():
+                # Fail open. The taps go first: nothing answers them once the
+                # run loop has stopped, so an enabled one would stall every
+                # event, the releases about to be re-sent included. Then what
+                # is held back goes out, and every later click passes untouched.
+                close_taps()
                 for button in Button:
                     self._commit_held(button)
                     self._release_queue(button)
-                raise HookError(TAP_DISABLED_MESSAGE)
+                failed_open = ending[0]
         finally:
-            with self._motion_tap_lock:
-                self._set_motion_tap = lambda _wanted: None
+            close_taps()
             # Disabling a tap is not enough: macOS keeps it registered, for
             # the life of the process, until its port is invalidated.
             if motion_tap is not None:
-                Quartz.CGEventTapEnable(motion_tap, False)
                 Quartz.CFRunLoopRemoveSource(self._run_loop, motion_source, Quartz.kCFRunLoopCommonModes)
                 Quartz.CFMachPortInvalidate(motion_tap)
                 motion_state["tap"] = None
-                motion_state["enabled"] = False
-            Quartz.CGEventTapEnable(tap, False)
             Quartz.CFRunLoopRemoveSource(self._run_loop, source, Quartz.kCFRunLoopCommonModes)
             Quartz.CFMachPortInvalidate(tap)
             self._tap = None
+        if failed_open is not None:
+            self._end_reason = failed_open
+        if failed_open == PERMISSION_GONE:
+            # Not an error to report: the app asks for the permission again.
+            try:
+                self._on_permission_lost()
+            except Exception:  # noqa: BLE001 - the hook has ended either way
+                _log_ignored("the permission-lost callback")
+        elif failed_open == KEPT_DISABLED:
+            raise HookError(TAP_DISABLED_MESSAGE)
 
 
 class TickClock:
@@ -1094,7 +1214,7 @@ class ClickCountRepair:
     def __init__(self, interval: Optional[Callable[[], float]] = None) -> None:
         # Reads the user's double-click interval, in seconds.
         self._read_interval = interval or _double_click_interval
-        self._interval = 0.5  # Apple's default, until a read succeeds
+        self._interval = DEFAULT_DOUBLE_CLICK_S  # until a read succeeds
         self._interval_read_at: Optional[float] = None
         # Per button: (time, count) of the last press apps received, and of
         # the press being decided now.
@@ -1108,7 +1228,7 @@ class ClickCountRepair:
             try:
                 self._interval = float(self._read_interval())
             except Exception:  # noqa: BLE001 - keep the last good value
-                pass
+                _log_ignored("reading the double-click interval")
         return self._interval
 
     def correct(self, button: Button, pressed: bool, state: int, timestamp: float) -> int:
@@ -1137,10 +1257,19 @@ class ClickCountRepair:
 
 
 def _double_click_interval() -> float:
-    """The user's double-click speed (System Settings > Mouse), in seconds."""
-    from AppKit import NSEvent
+    """The user's double-click speed (System Settings > Mouse), in seconds.
 
-    return float(NSEvent.doubleClickInterval())
+    Read from the preference itself, as NSEvent.doubleClickInterval does,
+    rather than through AppKit: this runs on the hook thread, and AppKit is
+    the main thread's. An unset preference means macOS's default.
+    """
+    from CoreFoundation import CFPreferencesCopyAppValue, kCFPreferencesAnyApplication
+
+    value = CFPreferencesCopyAppValue(DOUBLE_CLICK_KEY, kCFPreferencesAnyApplication)
+    if value is None:
+        return DEFAULT_DOUBLE_CLICK_S
+    seconds = float(value)
+    return seconds if math.isfinite(seconds) and seconds > 0 else DEFAULT_DOUBLE_CLICK_S
 
 
 def _near(point: Optional[tuple[float, float]], location: Optional[tuple[float, float]]) -> bool:
@@ -1188,6 +1317,7 @@ def _timebase_ratio() -> tuple[int, int]:
     try:
         status = ctypes.CDLL("/usr/lib/libSystem.B.dylib").mach_timebase_info(ctypes.byref(info))
     except (OSError, AttributeError):
+        _log_ignored("reading the mach timebase")
         status = -1
     if status != 0 or not info.numer or not info.denom:
         return 1, 1  # ticks read as nanoseconds; posted events still time right
