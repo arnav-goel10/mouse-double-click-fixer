@@ -53,7 +53,7 @@ class SelfTestTests(unittest.TestCase):
         self.assertTrue(result["Qt platform plugin"].startswith("ok"))
         self.assertTrue(result["app icons"].startswith("ok"), result["app icons"])
         self.assertTrue(result["third-party notices"].startswith("ok"))
-        self.assertRegex(result["tls"], r"^ok \((schannel|openssl|securetransport), .+, TLS 1\.2")
+        self.assertRegex(result["tls"], r"^ok \((schannel|openssl|securetransport), .+, TLS 1\.2.*, [1-9]\d* root certificates")
         if sys.platform == "win32":
             self.assertTrue(result["tls"].startswith("ok (schannel, "), result["tls"])
         if IS_MAC:
@@ -151,7 +151,7 @@ def tls_facts(**changes):
     """What a built macOS app's tls check finds when all is well."""
     facts = dict(
         platform="darwin", frozen=True, available=["securetransport", "openssl", "cert-only"], active="openssl",
-        supports_ssl=True, library="OpenSSL 3.6.5 29 Sep 2026", protocols=["TLS 1.2", "TLS 1.3"],
+        supports_ssl=True, library="OpenSSL 3.6.5 29 Sep 2026", protocols=["TLS 1.2", "TLS 1.3"], roots=157,
         images=[
             "/usr/lib/libSystem.B.dylib",
             "/usr/lib/libcrypto.46.dylib",  # macOS's own, which system frameworks load
@@ -175,9 +175,47 @@ class TlsCheckTests(unittest.TestCase):
     def test_a_built_mac_app_on_its_own_openssl_passes(self) -> None:
         self.assertEqual(
             selftest.judge_tls(tls_facts()),
-            "openssl, OpenSSL 3.6.5 29 Sep 2026, TLS 1.2 and TLS 1.3; libcrypto.3.dylib, libssl.3.dylib from inside "
-            "the app, as Python's ssl (macOS's own libcrypto.46.dylib, libssl.48.dylib aside)",
+            "openssl, OpenSSL 3.6.5 29 Sep 2026, TLS 1.2 and TLS 1.3, 157 root certificates; libcrypto.3.dylib, "
+            "libssl.3.dylib from inside the app, as Python's ssl (macOS's own libcrypto.46.dylib, libssl.48.dylib aside)",
         )
+
+    def test_no_root_certificates_fails_on_macos_and_windows(self) -> None:
+        # Qt or macOS no longer handing over the Keychain's roots would fail
+        # every update check, and the fix would have to come through it.
+        for facts in (tls_facts(roots=0), tls_facts(frozen=False, bundle="", python_openssl="", roots=0)):
+            with self.subTest(frozen=facts.frozen), self.assertRaisesRegex(
+                    RuntimeError, "Qt's openssl backend loaded no root certificates from the Keychain"):
+                selftest.judge_tls(facts)
+        fallback = tls_facts(frozen=False, active="securetransport", library="Secure Transport", images=[],
+                             protocols=["TLS 1.2"], roots=0)
+        with self.assertRaisesRegex(RuntimeError, "securetransport backend loaded no root certificates"):
+            selftest.judge_tls(fallback)
+        for frozen in (True, False):
+            with self.subTest(platform="win32", frozen=frozen), self.assertRaisesRegex(
+                    RuntimeError, "Qt's schannel backend loaded no root certificates from Windows' certificate store"):
+                selftest.judge_tls(self.windows(frozen=frozen, roots=0))
+        self.assertIn(", 1 root certificates", selftest.judge_tls(self.windows(roots=1)))
+        # Elsewhere (Linux, from source) Qt may load them only when it needs them.
+        self.assertEqual(selftest.judge_tls(tls_facts(platform="linux", roots=0)),
+                         "openssl, OpenSSL 3.6.5 29 Sep 2026, TLS 1.2 and TLS 1.3, 0 root certificates")
+
+    def test_the_check_counts_the_root_certificates_qts_default_configuration_has(self) -> None:
+        from PySide6.QtNetwork import QSslConfiguration
+
+        class Configuration:
+            def __init__(self, count: int) -> None:
+                self.count = count
+
+            def caCertificates(self):  # noqa: N802
+                return [object()] * self.count
+
+        for count in (0, 3):
+            with self.subTest(count=count), \
+                    mock.patch.object(QSslConfiguration, "defaultConfiguration", return_value=Configuration(count)), \
+                    mock.patch.object(selftest, "judge_tls", side_effect=lambda facts: facts) as judge:
+                facts = selftest.check_tls()
+            judge.assert_called_once()
+            self.assertEqual(facts.roots, count)
 
     def test_openssl_from_outside_the_app_fails(self) -> None:
         for path in (
@@ -222,24 +260,25 @@ class TlsCheckTests(unittest.TestCase):
             "/opt/homebrew/Cellar/openssl@3/3.6.5/lib/libcrypto.3.dylib",
         ])
         self.assertTrue(selftest.judge_tls(facts).endswith(
-            "libcrypto.3.dylib, libssl.3.dylib from /opt/homebrew/Cellar/openssl@3/3.6.5/lib "
+            "157 root certificates; libcrypto.3.dylib, libssl.3.dylib from /opt/homebrew/Cellar/openssl@3/3.6.5/lib "
             "(macOS's own libssl.48.dylib aside)"))
         fallback = tls_facts(frozen=False, active="securetransport", library="Secure Transport", images=[],
                              protocols=["TLS 1.2"])
-        self.assertEqual(selftest.judge_tls(fallback), "securetransport, Secure Transport, TLS 1.2; no OpenSSL from nowhere")
+        self.assertEqual(selftest.judge_tls(fallback),
+                         "securetransport, Secure Transport, TLS 1.2, 157 root certificates; no OpenSSL from nowhere")
 
     def windows(self, **changes):
         facts = dict(platform="win32", frozen=True, available=["schannel", "cert-only"], active="schannel",
-                     library="Secure Channel, Windows 10.0.26100", protocols=["TLS 1.2", "TLS 1.3"], images=[],
-                     bundle="", python_openssl="OpenSSL 3.0.21 1 Jul 2026")
+                     library="Secure Channel, Windows 10.0.26100", protocols=["TLS 1.2", "TLS 1.3"], roots=58,
+                     images=[], bundle="", python_openssl="OpenSSL 3.0.21 1 Jul 2026")
         facts.update(changes)
         return tls_facts(**facts)
 
     def test_windows_uses_schannel(self) -> None:
         self.assertEqual(selftest.judge_tls(self.windows()), "schannel, Secure Channel, Windows 10.0.26100, TLS 1.2 "
-                         "and TLS 1.3; no OpenSSL backend in this build")
+                         "and TLS 1.3, 58 root certificates; no OpenSSL backend in this build")
         self.assertEqual(selftest.judge_tls(self.windows(frozen=False, available=["schannel", "openssl"])),
-                         "schannel, Secure Channel, Windows 10.0.26100, TLS 1.2 and TLS 1.3")
+                         "schannel, Secure Channel, Windows 10.0.26100, TLS 1.2 and TLS 1.3, 58 root certificates")
         with self.assertRaisesRegex(RuntimeError, "using its openssl backend, not Windows' own Schannel"):
             selftest.judge_tls(self.windows(active="openssl", available=["openssl", "schannel"]))
 

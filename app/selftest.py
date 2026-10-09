@@ -348,6 +348,7 @@ class TlsFacts:
     supports_ssl: bool
     library: str  # the TLS library's own version string
     protocols: List[str]  # "TLS 1.2", "TLS 1.3": the ones it supports of those
+    roots: int  # root certificates Qt loaded to check servers' certificates against
     images: List[str] = field(default_factory=list)  # macOS: every library loaded
     bundle: str = ""  # a built macOS app's Contents folder
     python_openssl: str = ""  # the OpenSSL Python's ssl module runs
@@ -359,12 +360,13 @@ def judge_tls(facts: TlsFacts) -> str:
         raise RuntimeError(f"Qt's {facts.active} backend can't make TLS connections")
     if not facts.protocols:
         raise RuntimeError(f"Qt's {facts.active} backend can't make TLS 1.2 or later connections")
-    detail = f"{facts.active}, {facts.library}, {' and '.join(facts.protocols)}"
+    detail = f"{facts.active}, {facts.library}, {' and '.join(facts.protocols)}, {facts.roots} root certificates"
     if facts.platform == "win32":
         if facts.active != "schannel":
             raise RuntimeError(f"Qt is using its {facts.active} backend, not Windows' own Schannel")
         if facts.frozen and "openssl" in facts.available:
             raise RuntimeError("this build has Qt's OpenSSL backend, which Windows builds leave out")
+        _require_roots(facts, "Windows' certificate store")
         return detail + ("; no OpenSSL backend in this build" if facts.frozen else "")
     if facts.platform != "darwin":
         return detail
@@ -385,11 +387,21 @@ def judge_tls(facts: TlsFacts) -> str:
         where = "inside the app, as Python's ssl"
     else:
         where = ", ".join(sorted({os.path.dirname(path) for path in others})) or "nowhere"
+    _require_roots(facts, "the Keychain")
     names = ", ".join(sorted({os.path.basename(path) for path in others})) or "no OpenSSL"
     detail += f"; {names} from {where}"
     if system:
         detail += f" (macOS's own {', '.join(sorted({os.path.basename(path) for path in system}))} aside)"
     return detail
+
+
+def _require_roots(facts: TlsFacts, where: str) -> None:
+    """Without root certificates no server's certificate can be checked,
+    so every update check would fail, and the fix couldn't reach anyone
+    through the updater."""
+    if facts.roots <= 0:
+        raise RuntimeError(f"Qt's {facts.active} backend loaded no root certificates from {where}, "
+                           "so it can't check any server's certificate")
 
 
 def loaded_images() -> List[str]:
@@ -410,7 +422,9 @@ def check_tls() -> str:
     and loads its library without touching the network. On Windows that is
     Schannel. A built macOS app runs Qt's OpenSSL backend on the OpenSSL
     inside it: every libssl and libcrypto loaded, macOS's own aside, must
-    lie inside the app, and be the version Python's ssl module runs."""
+    lie inside the app, and be the version Python's ssl module runs. On
+    both, the backend must have read root certificates from the system to
+    check servers' certificates against; the line says how many."""
     from PySide6.QtCore import QCoreApplication
     from PySide6.QtNetwork import QSsl, QSslConfiguration, QSslSocket
 
@@ -423,7 +437,9 @@ def check_tls() -> str:
             tls.use_preferred_backend()
         except tls.Unavailable as error:
             raise RuntimeError(str(error)) from None
-        QSslConfiguration.defaultConfiguration()  # the backend loads its library and sets itself up
+        # The backend loads its library, sets itself up and reads the system's
+        # root certificates (macOS's Keychain, Windows' certificate store).
+        roots = len(QSslConfiguration.defaultConfiguration().caCertificates())
         supported = QSslSocket.supportedProtocols()
         try:
             import _ssl
@@ -441,6 +457,7 @@ def check_tls() -> str:
             library=QSslSocket.sslLibraryVersionString(),
             protocols=[label for protocol, label in ((QSsl.SslProtocol.TlsV1_2, "TLS 1.2"),
                                                      (QSsl.SslProtocol.TlsV1_3, "TLS 1.3")) if protocol in supported],
+            roots=roots,
             images=loaded_images() if sys.platform == "darwin" else [],
             bundle=os.path.dirname(os.path.realpath(getattr(sys, "_MEIPASS", sys.executable))) if frozen else "",
             python_openssl=python_openssl,
