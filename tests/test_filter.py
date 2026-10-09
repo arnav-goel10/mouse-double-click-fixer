@@ -601,10 +601,61 @@ class QueuedReleaseTests(unittest.TestCase):
 
 
 class MacTimestampTests(unittest.TestCase):
-    def test_event_timestamps_are_nanoseconds(self) -> None:
+    """Hardware events carry mach ticks, posted ones nanoseconds."""
+
+    def setUp(self) -> None:
         from app.platform import _mach_timebase
 
-        self.assertEqual(_mach_timebase()(1_500_000_000), 1.5)
+        patch = mock.patch("app.platform._timebase_ratio", return_value=(125, 3))  # Apple silicon
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.to_seconds = _mach_timebase()
+        self.now = 50_000.0
+
+    def ticks(self, seconds: float) -> int:
+        return round(seconds * 1e9 * 3 / 125)
+
+    def ns(self, seconds: float) -> int:
+        return round(seconds * 1e9)
+
+    def test_both_units_land_on_the_monotonic_clock(self) -> None:
+        self.assertAlmostEqual(self.to_seconds(self.ticks(self.now - 0.01), self.now), self.now - 0.01, places=6)
+        self.assertAlmostEqual(self.to_seconds(self.ns(self.now - 0.01), self.now), self.now - 0.01, places=6)
+
+    def test_mixed_streams_measure_true_gaps(self) -> None:
+        stamps = [self.ticks(self.now - 0.300), self.ns(self.now - 0.250), self.ticks(self.now - 0.240)]
+        seconds = [self.to_seconds(stamp, self.now) for stamp in stamps]
+        self.assertAlmostEqual((seconds[1] - seconds[0]) * 1000, 50, places=3)
+        self.assertAlmostEqual((seconds[2] - seconds[1]) * 1000, 10, places=3)
+
+    def test_unusable_stamps_are_timed_on_arrival(self) -> None:
+        self.assertEqual(self.to_seconds(0, self.now), self.now)
+        self.assertEqual(self.to_seconds(self.ns(self.now - 30.0), self.now), self.now)
+
+    def test_a_posted_click_first_does_not_squeeze_later_real_ones(self) -> None:
+        # A software click (ns) is the first thing the filter sees; two real
+        # clicks (ticks) follow 300 ms apart and must not look like bounce.
+        click_filter = GlobalClickFilter(60, [Button.LEFT])
+        click_filter._use_os_time = True  # as _run_macos sets it
+
+        def at(seconds: float, stamp: int) -> float:
+            return self.to_seconds(stamp, self.now + seconds)
+
+        with mock.patch("app.platform.threading.Timer", FakeTimer):
+            click_filter._handle(Button.LEFT, True, at(0.0, self.ns(self.now)))
+            click_filter._handle(Button.LEFT, False, at(0.05, self.ns(self.now + 0.05)), allow_hold=False)
+            click_filter._handle(Button.LEFT, True, at(1.0, self.ticks(self.now + 1.0)))
+            click_filter._handle(Button.LEFT, False, at(1.08, self.ticks(self.now + 1.08)), allow_hold=False)
+            press = click_filter._handle(Button.LEFT, True, at(1.38, self.ticks(self.now + 1.38)))
+        self.assertTrue(press.accepted)
+        self.assertAlmostEqual(press.gap_ms or 0, 300, places=2)
+
+    def test_intel_ticks_are_nanoseconds(self) -> None:
+        from app.platform import _mach_timebase
+
+        with mock.patch("app.platform._timebase_ratio", return_value=(1, 1)):
+            to_seconds = _mach_timebase()
+        self.assertEqual(to_seconds(self.ns(self.now - 0.5), self.now), self.now - 0.5)
 
 
 if __name__ == "__main__":

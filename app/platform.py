@@ -42,6 +42,10 @@ STATIONARY_PX = 4.0
 #: or two. If one never does (it was blocked, or lost), stop waiting for it.
 IN_FLIGHT_TIMEOUT_S = 0.15
 
+#: How far an event's own timestamp may sit from `monotonic()` and still be
+#: believed. A tap sees an event within milliseconds of the driver making it.
+CLOCK_TOLERANCE_S = 2.0
+
 
 class HookError(RuntimeError):
     """The global hook could not be installed, or stopped unexpectedly."""
@@ -433,8 +437,10 @@ class GlobalClickFilter:
         Event records are stamped when the driver produced the event, which is
         what a gap should be measured from. Both platforms happen to count from
         boot like `monotonic()` does, but synthetic events can carry a zero or
-        otherwise unusable stamp, so the first event decides once whether these
-        numbers are trustworthy. Mixing two clocks would corrupt every gap.
+        otherwise unusable stamp, so on Windows the first event decides once
+        whether these numbers are trustworthy. Mixing two clocks would corrupt
+        every gap. macOS checks each stamp on its own instead (see
+        _mach_timebase) and settles this check up front.
         """
         now = monotonic()
         if timestamp is None:
@@ -632,6 +638,9 @@ class GlobalClickFilter:
             Quartz.kCGEventOtherMouseUp: (Button.MIDDLE, False),
         }
         to_seconds = _mach_timebase()
+        # Every stamp is checked on its own as it arrives (see _mach_timebase),
+        # so the once-per-run check in _normalise_time must not second-guess it.
+        self._use_os_time = True
         filter_injected = _filter_injected()
 
         DRAGGED = (
@@ -690,6 +699,7 @@ class GlobalClickFilter:
                 if number != 2:
                     return event  # a side button, not the middle one
 
+            timestamp = to_seconds(Quartz.CGEventGetTimestamp(event))
             # Repair the click count first, so the copy kept for a re-send
             # carries the corrected count too.
             state = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGMouseEventClickState)
@@ -700,7 +710,7 @@ class GlobalClickFilter:
             result = self._handle(
                 button,
                 pressed,
-                to_seconds(Quartz.CGEventGetTimestamp(event)),
+                timestamp,
                 Quartz.CGEventCreateCopy(event),
                 location=(location.x, location.y),
             )
@@ -995,12 +1005,45 @@ def _near(point: Optional[tuple[float, float]], location: Optional[tuple[float, 
     return math.hypot(location[0] - point[0], location[1] - point[1]) < STATIONARY_PX
 
 
-def _mach_timebase() -> Callable[[int], float]:
-    """Return a converter from a CGEvent timestamp to monotonic seconds.
+def _mach_timebase() -> Callable[..., float]:
+    """Return a converter from a CGEvent timestamp to `monotonic()` seconds.
 
-    CGEventGetTimestamp is in nanoseconds since boot (not mach ticks, which on
-    Apple silicon are 41.67 ns each): verified against mach_absolute_time on
-    macOS 27. `monotonic()` counts from boot too, so the two line up and
-    `_normalise_time` accepts the driver's own times.
+    CGEventGetTimestamp comes in two units. Events from real hardware, as a
+    kCGHIDEventTap sees them, carry mach ticks (41.67 ns each on Apple
+    silicon, 1 ns on Intel); events another program posted carry
+    nanoseconds. Both count from boot, leaving out sleep, as `monotonic()`
+    does. So each event is read both ways and whichever reading lands near
+    the current time is used; if neither does, the event is timed as it
+    arrives. Deciding once per run instead would let a single posted click
+    put every later real click on the wrong scale, 41.67 times too close.
     """
-    return lambda value: float(value) / 1_000_000_000
+    numer, denom = _timebase_ratio()
+    tick_seconds = numer / denom / 1_000_000_000
+
+    def to_seconds(value: int, now: Optional[float] = None) -> float:
+        now = monotonic() if now is None else now
+        best, best_error = now, CLOCK_TOLERANCE_S
+        for seconds in (float(value) * tick_seconds, float(value) / 1_000_000_000):
+            error = abs(seconds - now)
+            if error < best_error:
+                best, best_error = seconds, error
+        return best
+
+    return to_seconds
+
+
+def _timebase_ratio() -> tuple[int, int]:
+    """mach_timebase_info: one mach tick is numer/denom nanoseconds."""
+    import ctypes
+
+    class TimebaseInfo(ctypes.Structure):
+        _fields_ = [("numer", ctypes.c_uint32), ("denom", ctypes.c_uint32)]
+
+    info = TimebaseInfo()
+    try:
+        status = ctypes.CDLL("/usr/lib/libSystem.B.dylib").mach_timebase_info(ctypes.byref(info))
+    except (OSError, AttributeError):
+        status = -1
+    if status != 0 or not info.numer or not info.denom:
+        return 1, 1  # ticks read as nanoseconds; posted events still time right
+    return info.numer, info.denom
