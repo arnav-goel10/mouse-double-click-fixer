@@ -1,5 +1,10 @@
 """tools/sign_release.py: key files, release folders, and minisign compatibility."""
 
+try:
+    import _isolation  # noqa: F401  (first: keeps tests off the real machine)
+except ImportError:  # run as tests.<module> from the repository root
+    from tests import _isolation  # noqa: F401
+
 import base64
 import hashlib
 import io

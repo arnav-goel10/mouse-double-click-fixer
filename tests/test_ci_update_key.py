@@ -1,5 +1,10 @@
 """CI's throwaway update key: made, used and refused where it must be."""
 
+try:
+    import _isolation  # noqa: F401  (first: keeps tests off the real machine)
+except ImportError:  # run as tests.<module> from the repository root
+    from tests import _isolation  # noqa: F401
+
 import io
 import sys
 import tempfile

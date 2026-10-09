@@ -8,6 +8,11 @@ first, so anything the filter suppresses never reaches it, the same thing an
 application would see. Every system setting a test changes is put back.
 """
 
+try:
+    import _isolation  # noqa: F401  (first: keeps tests off the real machine)
+except ImportError:  # run as tests.<module> from the repository root
+    from tests import _isolation  # noqa: F401
+
 import faulthandler
 import os
 import platform

@@ -1,6 +1,11 @@
 """Third-party notices: the generator, the committed copy, finding the file in
 a build, and the General pane's Acknowledgements button."""
 
+try:
+    import _isolation  # noqa: F401  (first: keeps tests off the real machine)
+except ImportError:  # run as tests.<module> from the repository root
+    from tests import _isolation  # noqa: F401
+
 import os
 import re
 import sys

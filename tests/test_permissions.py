@@ -1,5 +1,10 @@
 """macOS permission helpers: the pane's name, the Settings button, the tap probe."""
 
+try:
+    import _isolation  # noqa: F401  (first: keeps tests off the real machine)
+except ImportError:  # run as tests.<module> from the repository root
+    from tests import _isolation  # noqa: F401
+
 import unittest
 from unittest import mock
 
