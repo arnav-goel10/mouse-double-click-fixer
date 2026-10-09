@@ -526,6 +526,46 @@ class EventTimeTests(unittest.TestCase):
                     (Button.RIGHT, False, "rup"),
                 ])
 
+    def left_on_its_way_and_right_waiting(self) -> None:
+        """Left: a release re-sent, still on its way. Right: one re-sent too,
+        a press queued behind it, and a release held where it was pressed."""
+        self.handle(Button.LEFT, True, 100.000, "ldown", at=(0, 0))
+        self.handle(Button.RIGHT, True, 100.010, "rdown1", at=(0, 0))
+        self.handle(Button.LEFT, False, 100.100, "lup", at=(0, 0))
+        self.handle(Button.RIGHT, False, 100.110, "rup1", at=(0, 0))
+        for timer in list(self.timers):
+            timer.fire()                                              # both re-sent
+        self.assertTrue(self.handle(Button.RIGHT, True, 100.150, "rdown2", at=(0, 0)).deferred)
+        self.assertTrue(self.handle(Button.RIGHT, False, 100.200, "rup2", at=(0, 0)).held)
+
+    def assert_motion_follows_the_right_queue(self) -> None:
+        self.filter._injected_passed(Button.LEFT)                     # lup delivered
+        self.assertEqual(self.sent, [(Button.LEFT, False, "lup"), (Button.RIGHT, False, "rup1")])
+        self.filter._injected_passed(Button.RIGHT)                    # rup1 delivered
+        self.assertEqual(self.sent[2:], [
+            (Button.RIGHT, True, "rdown2"),
+            (Button.RIGHT, False, "rup2"),
+            (Button.RIGHT, None, "m"),
+        ])
+
+    def test_motion_waits_where_the_release_it_settled_waits(self) -> None:
+        # Settled by leaving the click spot, or by its time, rup2 has to wait
+        # behind rdown2. The motion must wait there too, not behind the left
+        # release, which comes back first.
+        for stamp, at in ((100.210, (50, 0)), (100.245, (1, 0))):
+            with self.subTest(stamp=stamp, at=at):
+                self.timers.clear()
+                self.filter, self.sent = self.make_filter()
+                self.left_on_its_way_and_right_waiting()
+                self.assertFalse(self.move(stamp, "m", at))
+                self.assert_motion_follows_the_right_queue()
+
+    def test_motion_waits_behind_a_queued_release_before_one_on_its_way(self) -> None:
+        self.left_on_its_way_and_right_waiting()
+        self.timers[-1].fire()                                        # rup2 joins rdown2's queue
+        self.assertFalse(self.move(100.205, "m", (0, 0)))
+        self.assert_motion_follows_the_right_queue()
+
     def test_a_release_that_cannot_be_resent_is_never_held_behind_one(self) -> None:
         # Windows can't send input to a window running as administrator.
         self.handle(Button.LEFT, True, 100.000, "down")

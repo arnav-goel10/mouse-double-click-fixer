@@ -437,17 +437,11 @@ class GlobalClickFilter:
             _log_ignored("the click event callback")
         return event
 
-    def _settle_due(self, timestamp: float, located_only: bool = False) -> tuple[list, Optional[Button]]:
+    def _settle_due(self, timestamp: float) -> tuple[list, Optional[Button]]:
         """With the lock held: settle every held release that an event stamped
-        `timestamp` shows was real (see BounceFilter.due), with `located_only`
-        only those whose place is known. See _settle for what it returns."""
-        return self._settle(
-            [
-                button
-                for button, click_filter in self._filters.items()
-                if click_filter.due(timestamp) and not (located_only and self._held_points.get(button) is None)
-            ]
-        )
+        `timestamp` shows was real (see BounceFilter.due). See _settle for
+        what it returns."""
+        return self._settle([button for button, click_filter in self._filters.items() if click_filter.due(timestamp)])
 
     def _settle(self, buttons: list) -> tuple[list, Optional[Button]]:
         """With the lock held: these buttons' held releases were real. They go
@@ -568,21 +562,26 @@ class GlobalClickFilter:
         `location` where it took the pointer, and `timestamp` when it
         happened, if known).
 
-        Motion stamped past a held release's window settles that release
-        first (see _settle_due), as any event does, unless the release has no
-        known place (Windows: a hidden pointer, pen and touch, a remote
-        session). Motion then waits behind it, and there motion is never held
-        back: a re-sent move is absolute, and in a game's mouse-look it would
-        jump the view. Those are left to the timer and to button events. A
-        release held where its
-        press landed is settled sooner, once the pointer leaves the spot
-        where the button came up: a click made in place ends when the
-        pointer moves off, and apps must see its release where it happened,
-        before the motion. Smaller motion goes through and the hold stays: it
-        is a hand resting on the mouse, or a drag only starting, and the
-        contact may yet come back. Motion arriving while re-sent events are
-        still on their way waits behind them, so apps never see the pointer
-        leave before the click is over.
+        Motion settles a held release in two cases. Motion stamped past the
+        release's window shows the release was real, as any event does (see
+        _settle_due), but only for a release held at a known place. Where the
+        pointer's place means nothing (Windows: a hidden pointer, pen and
+        touch, a remote session), motion leaves the release held, so as not
+        to wait behind it: a re-sent move is absolute, and in a game's
+        mouse-look it would jump the view. The timer and button events settle
+        such a release. And a click made in place (a release held where its
+        press landed) is settled as soon as the pointer leaves the spot where
+        the button came up, inside the window or not: the click ends when the
+        pointer moves off, and apps must see its release there, before the
+        motion. Smaller motion passes and the hold stays: it is a hand
+        resting on the mouse, or a drag only starting, and the contact may
+        yet come back.
+
+        Motion then goes out behind the releases it settled, waiting where
+        the last of them waits if any had to wait in a queue (see _settle).
+        Otherwise it waits behind events still waiting to be re-sent, or else
+        behind events re-sent a moment ago that may still be on their way, so
+        apps never see the pointer leave before a click is over.
 
         Returns True to let the event through unchanged, False when the
         platform must drop it because it was queued to be re-sent.
@@ -590,33 +589,33 @@ class GlobalClickFilter:
         if timestamp is not None:
             timestamp = self._normalise_time(timestamp)
         resend: list = []
-        passes = True
         with self._lock:
             for button in Button:
                 resend += self._expire_in_flight(button)
-            if timestamp is not None:
-                settled, _waiting_on = self._settle_due(timestamp, located_only=True)
-                resend += settled
-            for button in Button:
-                click_filter = self._filters[button]
-                if click_filter.held_id is None or not self._held_stationary.get(button):
+            settle = []
+            for button, click_filter in self._filters.items():
+                if click_filter.held_id is None:
                     continue
-                if location is not None and self._is_near(self._held_points.get(button), location):
-                    continue
-                if click_filter.commit_held():
-                    held_template = self._held_templates.pop(button, None)
-                    if self._send_or_queue(button, held_template) is None:
-                        resend.append((button, False, held_template))
-                self._forget_held(button)
-            for button in Button:
-                if self._in_flight[button] or self._queued[button]:
-                    self._enqueue(button, None, template)
-                    passes = False
-                    break
+                place = self._held_points.get(button)
+                if place is not None and timestamp is not None and click_filter.due(timestamp):
+                    settle.append(button)
+                elif self._held_stationary.get(button) and (location is None or not self._is_near(place, location)):
+                    settle.append(button)
+            settled, queue = self._settle(settle)
+            resend += settled
+            if queue is None:
+                # None of the releases it settled had to wait in a queue. It
+                # waits behind events that do, which go out only when their
+                # queue does, or else behind events re-sent a moment ago.
+                waiting = [button for button in Button if self._queued[button]]
+                waiting = waiting or [button for button in Button if self._in_flight[button]]
+                queue = waiting[0] if waiting else None
+            if queue is not None:
+                self._enqueue(queue, None, template)
         for send_as, resend_pressed, resend_template in resend:
             self._safe_inject(send_as, resend_pressed, resend_template)
         self._update_motion_tap()
-        return passes
+        return queue is None
 
     def _update_motion_tap(self) -> None:
         """Judge pointer motion only while it matters: a release is held at a
