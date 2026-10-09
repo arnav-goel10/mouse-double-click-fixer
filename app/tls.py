@@ -17,11 +17,12 @@ name. So the app chooses, before its first request, and never lets Qt pick:
   folders itself: the app's Frameworks folder, then /usr/lib, /usr/local/lib
   and more. In a program with the hardened runtime, as every build is, dyld
   answers a bare name only with a library already loaded as @rpath/<name>,
-  or from the system (/usr/lib and the OS cryptex), never the current
-  folder. So the app loads its own copies first (load_bundled_openssl),
-  which are @rpath/libcrypto.3.dylib and @rpath/libssl.3.dylib, and Qt's
-  first try finds exactly those; the self-test checks what was loaded
-  (app/selftest.py). If Qt's OpenSSL backend can't start anyway, the app
+  from the LC_RPATH folders of Qt Core and the executable (a build has
+  none), or from the system (/usr/lib and the OS cryptex), never from the
+  current folder. So the app loads its own copies first
+  (load_bundled_openssl), which are @rpath/libcrypto.3.dylib and
+  @rpath/libssl.3.dylib, and Qt's first try finds exactly those; the
+  self-test checks what was loaded (app/selftest.py). If Qt's OpenSSL backend can't start anyway, the app
   uses Secure Transport: macOS's own TLS, deprecated and TLS 1.2 at most,
   which GitHub still accepts, but part of the system rather than a library
   found by searching.
