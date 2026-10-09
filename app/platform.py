@@ -124,6 +124,9 @@ RESTORE_MIN_PX = 0.5
 #: the second.
 IN_FLIGHT_TIMEOUT_S = 0.15
 IN_FLIGHT_MAX_TIMEOUT_S = 0.5
+#: How long stop() waits for a thread that is sending to finish, so that
+#: nothing it let go is still to go out when it returns.
+STOP_SEND_WAIT_S = 1.0
 #: The check that gives up on such an event runs this long after it is due,
 #: so that it finds it overdue.
 IN_FLIGHT_CHECK_SLACK_S = 0.005
@@ -356,7 +359,10 @@ class GlobalClickFilter:
         self._let_everything_go()
         self._stop_event.set()
         thread = self._thread
-        if thread is None or thread is threading.current_thread():
+        if thread is threading.current_thread():
+            return
+        if thread is None:
+            self._finish_sending(STOP_SEND_WAIT_S)
             return
         # Keep asking the thread to stop until it has. Its message queue (on
         # Windows) may not exist yet the first time, or its run loop may be
@@ -369,6 +375,7 @@ class GlobalClickFilter:
             # Never drop the handle to a live hook: `running` stays true, so
             # nothing starts a second hook on top of it, and a later stop()
             # can still reach it.
+            self._finish_sending(STOP_SEND_WAIT_S)
             return
         self._thread = None
         self._thread_id = None
@@ -377,6 +384,10 @@ class GlobalClickFilter:
         # queued since the flush above would be left to timers. Send it now,
         # and leave no timer behind.
         self._let_everything_go()
+        # A timer may have been sending when this ran, and so been left to
+        # send it all: wait for it, so that nothing is still to go out once
+        # stop() returns (the app may be quitting).
+        self._finish_sending(STOP_SEND_WAIT_S)
 
     def tap_alive(self) -> bool:
         """Whether the filter is still in the event stream. On macOS that is
@@ -799,6 +810,21 @@ class GlobalClickFilter:
             with self._lock:
                 if not self._outbox:
                     return
+
+    def _finish_sending(self, timeout: float) -> None:
+        """Send everything decided, waiting up to `timeout` for a thread
+        that is sending now to let go. Call without the lock held."""
+        if not self._send_lock.acquire(timeout=timeout):
+            return
+        try:
+            while True:
+                with self._lock:
+                    if not self._outbox:
+                        return
+                    button, pressed, template, seq = self._outbox.popleft()
+                self._safe_inject(button, pressed, template, seq)
+        finally:
+            self._send_lock.release()
 
     def _safe_inject(self, button: Button, pressed: Optional[bool], template: object, seq: int) -> None:
         try:

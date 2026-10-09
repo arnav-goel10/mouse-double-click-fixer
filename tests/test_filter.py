@@ -2629,5 +2629,43 @@ class MacTapTests(unittest.TestCase):
         )
 
 
+class StopWhileATimerSends(unittest.TestCase):
+    """stop() returns only once what it let go has been handed to the OS,
+    even while a timer thread is in the middle of sending."""
+
+    def test_stop_returns_after_what_it_let_go_is_sent(self) -> None:
+        f = GlobalClickFilter(40, [Button.LEFT, Button.RIGHT])
+        f._use_os_time = True
+        posting, finish, sent = threading.Event(), threading.Event(), []
+
+        def inject(_button, _pressed, template, _seq):
+            if template == "rup":
+                posting.set()
+                finish.wait(2)  # the post blocks, as when WindowServer is busy
+            sent.append(template)
+
+        f._inject = inject
+        self.assertTrue(f._handle(Button.LEFT, True, 100.000, "ldown", location=(0, 0)).accepted)
+        f._handle(Button.RIGHT, True, 100.010, "rdown", location=(5, 0))
+        f._handle(Button.RIGHT, False, 100.020, "rup", location=(5, 0))
+        timer = threading.Thread(target=f._commit_held, args=(Button.RIGHT,))  # rup's timer
+        timer.start()
+        self.assertTrue(posting.wait(2))
+        f._handle(Button.LEFT, False, 100.300, "lup", location=(0, 0))  # held when the app quits
+
+        class EndedHook:  # the hook thread, already ending
+            def is_alive(self) -> bool:
+                return False
+
+            def join(self, timeout=None) -> None:
+                pass
+
+        f._thread = EndedHook()
+        threading.Timer(0.05, finish.set).start()
+        f.stop()
+        self.assertEqual(sent, ["rup", "lup"], "nothing stop() let go is left to another thread")
+        timer.join(2)
+
+
 if __name__ == "__main__":
     unittest.main()
