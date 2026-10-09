@@ -136,7 +136,7 @@ def check_ctypes_callback() -> str:
 
 def check_pyobjc_callback() -> str:
     """PyObjC calls a Python function from a run loop, as it does for the
-    filter's event taps."""
+    filter's event tap."""
     if sys.platform != "darwin":
         raise Skipped("macOS only")
     import Quartz
