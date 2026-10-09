@@ -16,7 +16,8 @@ them listed, none missing, every hash right) and that the app inside the macOS
 zip says it is that version. It then signs SHA256SUMS.txt with the trusted
 comment "dcf 1.0.1", checks the signature against tools/keys/ and writes
 SHA256SUMS.txt.minisig. Upload the signature before taking the release out of
-draft: a published release without one is refused by every copy of the app.
+draft: every copy of the app that checks signatures refuses a release without
+one, and says so.
 
     --key PATH          sign with another secret key (default: the primary key)
     --requirement DR    for a release that moves the macOS app to a new signing

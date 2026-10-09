@@ -15,8 +15,8 @@ The files, as minisign writes them (https://jedisct1.github.io/minisign/):
                  trusted comment: <one line, signed>
                  base64(global signature: 64 bytes)
 
-The algorithm "ED" signs the BLAKE2b-512 hash of the file (minisign's default
-since 0.8); "Ed" is its legacy format and signs the file itself. The global
+The algorithm "ED" signs the BLAKE2b-512 hash of the file (what minisign
+writes by default); "Ed" is its legacy format and signs the file itself. The global
 signature covers the 64-byte signature followed by the trusted comment, so a
 comment can't be moved onto another file's signature. The untrusted comment
 lines carry nothing that is checked, so they are skipped.
@@ -25,9 +25,9 @@ The trusted comment says which release the signature is for: "dcf <version>",
 optionally followed by " dr=<designated requirement>" when a release moves the
 macOS app to a new signing identity (see `ReleaseClaim`).
 
-Ed25519 follows RFC 8032 and its reference code. Pure Python is slow, tens of
-milliseconds per signature, but an update checks one small file, and it needs
-nothing outside the standard library. tools/sign_release.py signs with the same
+Ed25519 follows RFC 8032 and its reference code. Pure Python is much slower
+than libsodium, a few milliseconds per signature, but an update checks one
+small file, and it needs nothing outside the standard library. tools/sign_release.py signs with the same
 curve arithmetic, which is why the point helpers here are public.
 """
 
