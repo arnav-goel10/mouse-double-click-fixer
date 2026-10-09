@@ -432,8 +432,9 @@ class WindowsHookLogicTests(unittest.TestCase):
 
     def test_an_unknown_pointer_position_sends_the_release_where_it_is(self) -> None:
         # Windows couldn't say where the pointer was as watching began
-        # (another desktop had the input), and no move of the hand has come
-        # since to tell: only another program moved it.
+        # (another desktop had the input), and no move has come through the
+        # hook since to tell: the pointer was put somewhere without input
+        # (SetCursorPos), which no hook sees.
         self.win.press()
         self.win.wait(50)
         self.win.move(100, 0)
@@ -441,8 +442,7 @@ class WindowsHookLogicTests(unittest.TestCase):
         self.win.cursor_known = False
         self.win.release()
         self.win.wait(1)
-        self.win.queue.append(("move", normalized_absolute(500, 200, *self.win.screen), 0))
-        self.win.run()
+        self.win.cursor = (500, 200)
         self.fire_timers()
         self.assertEqual(self.win.buttons()[1][:3], ("up", Button.LEFT, (500, 200)))
 
