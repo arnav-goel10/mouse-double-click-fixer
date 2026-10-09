@@ -550,6 +550,56 @@ class MotionFlushTests(unittest.TestCase):
         self.assertEqual(self.injected, [(False, "up")])
 
 
+class QueuedReleaseTests(unittest.TestCase):
+    """A held release that comes due while real events wait behind a re-sent
+    one goes out after them, so apps never see it before its own press."""
+
+    def setUp(self) -> None:
+        self.timers = FakeTimer.reset()
+        patch = mock.patch("app.platform.threading.Timer", FakeTimer)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.sent = []
+        self.filter = GlobalClickFilter(40, [Button.LEFT])
+        self.filter._use_os_time = True
+        self.filter._inject = lambda button, pressed, template: self.sent.append((pressed, template))
+
+    def queue_a_press(self) -> None:
+        self.filter._handle(Button.LEFT, True, 1.000, "down1", location=(0, 0))
+        self.filter._handle(Button.LEFT, False, 1.100, "up1", location=(0, 0))
+        self.timers[0].fire()                                         # up1 re-sent, still on its way
+        self.assertTrue(self.filter._handle(Button.LEFT, True, 1.150, "down2", location=(0, 0)).deferred)
+        self.assertTrue(self.filter._handle(Button.LEFT, False, 1.200, "up2", location=(0, 0)).held)
+
+    def test_stopping_sends_the_queued_press_before_the_release(self) -> None:
+        self.queue_a_press()
+        self.filter.stop()
+        self.assertEqual(self.sent, [(False, "up1"), (True, "down2"), (False, "up2")])
+
+    def test_the_timer_queues_the_release_behind_the_press(self) -> None:
+        self.queue_a_press()
+        self.timers[-1].fire()                                        # up2's window ends
+        self.assertEqual(self.sent, [(False, "up1")])
+        self.filter._injected_passed(Button.LEFT)                     # up1 delivered
+        self.assertEqual(self.sent, [(False, "up1"), (True, "down2"), (False, "up2")])
+
+    def test_motion_queues_the_release_behind_the_press(self) -> None:
+        self.queue_a_press()
+        self.assertFalse(self.filter._motion("m", (10, 0)))
+        self.assertEqual(self.sent, [(False, "up1")])
+        self.filter._injected_passed(Button.LEFT)
+        self.assertEqual(self.sent, [(False, "up1"), (True, "down2"), (False, "up2"), (None, "m")])
+
+    def test_a_late_press_queues_behind_the_press_already_waiting(self) -> None:
+        self.queue_a_press()
+        # The next press comes after up2's window, before its timer ran.
+        event = self.filter._handle(Button.LEFT, True, 1.300, "down3", location=(0, 0))
+        self.assertTrue(event.flush_held)
+        self.assertEqual(self.sent, [(False, "up1")])
+        self.filter._injected_passed(Button.LEFT)
+        self.assertEqual(self.sent, [(False, "up1"), (True, "down2"), (False, "up2"), (True, "down3")])
+
+
 class MacTimestampTests(unittest.TestCase):
     def test_event_timestamps_are_nanoseconds(self) -> None:
         from app.platform import _mach_timebase

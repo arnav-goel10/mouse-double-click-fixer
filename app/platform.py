@@ -240,7 +240,14 @@ class GlobalClickFilter:
                 # The held release was real after all: deliver it, then this.
                 replay = [(False, self._held_templates.pop(button, None)), (True, template)]
                 self._forget_held(button)
-                self._track(button, len(replay))
+                if self._queued[button]:
+                    # Real events already wait behind a re-sent one, and these
+                    # came after them.
+                    for entry in replay:
+                        self._enqueue(button, *entry)
+                    replay = []
+                else:
+                    self._track(button, len(replay))
             if event.accepted and (self._in_flight[button] or self._queued[button]):
                 # A release this app re-sent a moment ago may still be on its
                 # way. Letting this one through now could overtake it (apps
@@ -275,15 +282,27 @@ class GlobalClickFilter:
     def _commit_held(self, button: Button, expected: Optional[float] = None) -> None:
         """The threshold passed with no press: the held release was real.
         A timer passes the release it was started for; stop() passes none."""
+        send = False
         with self._lock:
             committed = self._filters[button].commit_held(expected)
             if committed:
                 template = self._held_templates.pop(button, None)
                 self._forget_held(button)
-                self._track(button, 1)
-        if committed:
+                send = self._send_or_queue(button, template)
+        if send:
             self._safe_inject(button, False, template)
         self._update_motion_tap()
+
+    def _send_or_queue(self, button: Button, template: object) -> bool:
+        """With the lock held: a held release is now to be delivered. Returns
+        True when the caller re-sends it now; otherwise it joins the real
+        events already queued behind a re-sent one, since it came after them
+        (sent first, apps could see this release before its own press)."""
+        if self._queued[button]:
+            self._enqueue(button, False, template)
+            return False
+        self._track(button, 1)
+        return True
 
     def _forget_held(self, button: Button) -> None:
         """With the lock held: the held release is settled one way or another."""
@@ -318,8 +337,9 @@ class GlobalClickFilter:
                 if location is not None and _near(self._held_points.get(button), location):
                     continue
                 if click_filter.commit_held():
-                    flushed.append((button, self._held_templates.pop(button, None)))
-                    self._track(button, 1)
+                    held_template = self._held_templates.pop(button, None)
+                    if self._send_or_queue(button, held_template):
+                        flushed.append((button, held_template))
                 self._forget_held(button)
             for button in Button:
                 if self._in_flight[button] or self._queued[button]:
