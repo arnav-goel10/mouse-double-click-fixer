@@ -13,11 +13,13 @@ from app.core import (
     MAX_THRESHOLD_MS,
     MIN_ALLOWANCE_MS,
     MIN_THRESHOLD_MS,
+    PEAK_WINDOW_S,
     REQUIRED_DOUBLE_CLICKS,
     BounceFilter,
     Button,
     Calibrator,
     DeliveryDelay,
+    PeakLateness,
     clamp_threshold,
 )
 
@@ -361,16 +363,6 @@ class DeliveryDelayTests(unittest.TestCase):
             delay.add(0.090 if index % 32 == 0 else 0.010)  # 2 of 64 slow
         self.assertAlmostEqual(delay.allowance_ms(), 10.0, places=6)
 
-    def test_the_worst_is_the_most_any_recent_event_was_late(self) -> None:
-        delay = DeliveryDelay()
-        self.assertEqual(delay.worst_ms(), 0.0)
-        delay.add(0.300)
-        for _ in range(LATENESS_SAMPLES - 1):
-            delay.add(0.010)
-        self.assertAlmostEqual(delay.worst_ms(), 300.0, places=6)
-        delay.add(0.010)  # the slow one ages out
-        self.assertAlmostEqual(delay.worst_ms(), 10.0, places=6)
-
     def test_stamps_from_another_clock_are_ignored(self) -> None:
         delay = DeliveryDelay()
         for seconds in (5_000.0, -3.0, float("nan"), float("inf")):
@@ -381,3 +373,43 @@ class DeliveryDelayTests(unittest.TestCase):
         delay = DeliveryDelay()
         delay.add(-0.0004)
         self.assertEqual(delay.allowance_ms(), MIN_ALLOWANCE_MS)
+
+
+class PeakLatenessTests(unittest.TestCase):
+    """How late any event reached the hook in the last two seconds: what the
+    wait for a re-sent event is learnt from."""
+
+    def test_before_any_event_it_is_nothing(self) -> None:
+        self.assertEqual(PeakLateness().worst_ms(10.0), 0.0)
+
+    def test_it_is_the_worst_of_the_last_two_seconds(self) -> None:
+        peak = PeakLateness()
+        peak.add(0.300, now=10.0)
+        for index in range(100):
+            peak.add(0.010, now=10.01 + index * 0.01)
+        self.assertAlmostEqual(peak.worst_ms(11.5), 300.0, places=6)
+        self.assertAlmostEqual(peak.worst_ms(10.0 + PEAK_WINDOW_S), 300.0, places=6)
+        self.assertAlmostEqual(peak.worst_ms(10.001 + PEAK_WINDOW_S), 10.0, places=6, msg="the slow one fades")
+        self.assertEqual(peak.worst_ms(11.1 + PEAK_WINDOW_S), 0.0, msg="then so does the rest")
+
+    def test_one_slow_event_counts_however_many_quick_ones_follow(self) -> None:
+        peak = PeakLateness()
+        peak.add(0.250, now=10.0)
+        for index in range(5000):  # an 8 kHz mouse for half a second
+            peak.add(0.001, now=10.0 + index / 8000)
+        self.assertAlmostEqual(peak.worst_ms(10.7), 250.0, places=6)
+
+    def test_a_later_worse_event_counts_from_its_own_arrival(self) -> None:
+        peak = PeakLateness()
+        peak.add(0.100, now=10.0)
+        peak.add(0.200, now=10.5)
+        self.assertAlmostEqual(peak.worst_ms(10.5 + PEAK_WINDOW_S), 200.0, places=6)
+        self.assertEqual(peak.worst_ms(10.6 + PEAK_WINDOW_S), 0.0)
+
+    def test_stamps_from_another_clock_are_ignored(self) -> None:
+        peak = PeakLateness()
+        for seconds in (5_000.0, -3.0, float("nan"), float("inf")):
+            peak.add(seconds, now=10.0)
+        self.assertEqual(peak.worst_ms(10.0), 0.0)
+        peak.add(-0.0004, now=10.0)
+        self.assertEqual(peak.worst_ms(10.0), 0.0, "a stamp a hair ahead is on time")

@@ -23,7 +23,7 @@ from typing import Callable, Iterable, NamedTuple, Optional
 
 from dataclasses import replace
 
-from .core import BounceFilter, Button, ClickEvent, DeliveryDelay, clamp_threshold
+from .core import BounceFilter, Button, ClickEvent, DeliveryDelay, PeakLateness, clamp_threshold
 
 log = logging.getLogger(__name__)
 
@@ -112,8 +112,9 @@ RESTORE_MIN_PX = 0.5
 #: reach it: a millisecond or two on an idle machine, far longer on a busy
 #: one. If one never does (another app's tap swallowed it, or it was lost),
 #: the events waiting behind it go out once it has been on its way twice as
-#: long as the worst lateness seen lately (see core.DeliveryDelay), but
-#: never sooner than the first bound or later than the second.
+#: long as any event in the last two seconds was late (see
+#: core.PeakLateness), but never sooner than the first bound or later than
+#: the second.
 IN_FLIGHT_TIMEOUT_S = 0.15
 IN_FLIGHT_MAX_TIMEOUT_S = 0.5
 #: The check that gives up on such an event runs this long after it is due,
@@ -242,9 +243,11 @@ class GlobalClickFilter:
         # Per button: the timer for its held release (see _handle).
         self._held_timers: dict[Button, threading.Timer] = {}
         # How late button events reach the hook here; sets how long the
-        # timer for a held release waits (see _fallback_delay), and how long
-        # to wait for a re-sent event to come back (see _in_flight_timeout).
+        # timer for a held release waits (see _fallback_delay).
         self._lateness = DeliveryDelay()
+        # How late any event reached it lately; sets how long to wait for a
+        # re-sent event to come back (see _in_flight_timeout).
+        self._peak_lateness = PeakLateness()
         # Per button: the events re-sent as it and not yet seen coming back
         # through the hook, oldest first, as (number, when sent). They come
         # back in the order sent, so once one does, those before it came
@@ -413,6 +416,7 @@ class GlobalClickFilter:
         timestamp = self._normalise_time(timestamp)
         with self._lock:
             self._lateness.add(arrived - timestamp)
+            self._peak_lateness.add(arrived - timestamp, arrived)
             self._give_up(button, timestamp)
             settled, behind = self._settle_due(timestamp)
             click_filter = self._filters[button]
@@ -610,10 +614,12 @@ class GlobalClickFilter:
         Returns True to let the event through unchanged, False when the
         platform must drop it because it was queued to be re-sent.
         """
+        arrived = monotonic()
         if timestamp is not None:
             timestamp = self._normalise_time(timestamp)
         with self._lock:
             if timestamp is not None:
+                self._peak_lateness.add(arrived - timestamp, arrived)
                 for button in Button:
                     self._give_up(button, timestamp)
             settle = []
@@ -790,7 +796,7 @@ class GlobalClickFilter:
     def _in_flight_timeout(self) -> float:
         """With the lock held: how long to wait for a re-sent event to come
         back before giving up on it (see IN_FLIGHT_TIMEOUT_S)."""
-        follows = 2 * self._lateness.worst_ms() / 1000
+        follows = 2 * self._peak_lateness.worst_ms(monotonic()) / 1000
         return max(IN_FLIGHT_TIMEOUT_S, min(IN_FLIGHT_MAX_TIMEOUT_S, follows))
 
     def _give_up(self, button: Button, stamp: Optional[float] = None) -> None:

@@ -15,11 +15,12 @@ from types import SimpleNamespace
 from typing import Optional
 from unittest import mock
 
-from app.core import Button, ClickEvent
+from app.core import PEAK_WINDOW_S, Button, ClickEvent
 from app.platform import (
     DEFAULT_DOUBLE_CLICK_S,
     DOUBLE_CLICK_KEY,
     IN_FLIGHT_CHECK_SLACK_S,
+    IN_FLIGHT_MAX_TIMEOUT_S,
     IN_FLIGHT_TIMEOUT_S,
     INJECTED_MARK,
     MARK_SEQ_SPAN,
@@ -660,7 +661,9 @@ class EventTimeTests(unittest.TestCase):
             with self.subTest(late_ms=late_ms):
                 self.timers.clear()
                 self.filter, self.sent = self.make_filter()
-                self.busy(late_ms=late_ms)
+                # A click of a button nobody filters, reaching the hook late
+                # just before.
+                self.handle(Button.MIDDLE, True, 99.900 - late_ms / 1000, "late", late_ms=late_ms)
                 self.resend_that_never_returns()
                 bound = bound_ms / 1000
                 self.assertAlmostEqual(self.check_due(), 100.200 + bound + IN_FLIGHT_CHECK_SLACK_S, places=9)
@@ -1010,6 +1013,36 @@ class SendOrderTests(unittest.TestCase):
             go.set()
             timer.join(5)
         self.assertEqual(sent, ["lup1", "rup", "ldown2"])
+
+
+class InFlightTimeoutTests(unittest.TestCase):
+    """How long to wait for a re-sent event: twice the worst lateness of any
+    event in the last two seconds, within 150-500 ms."""
+
+    def test_late_motion_lengthens_the_wait_too(self) -> None:
+        rig = Pipeline(self)
+        rig.round_trip = None
+        rig.handle(Button.LEFT, True, 100.000, "down1", late_ms=0)
+        rig.handle(Button.LEFT, False, 100.100, "up1", late_ms=0)
+        rig.run_until(100.150)                                        # up1 re-sent at 100.145
+        rig.handle(Button.LEFT, True, 100.210, "down2", late_ms=0)
+        # The hand moves on, and its motion reaches the hook 140 ms late:
+        # up1 may be as late.
+        self.assertFalse(rig.move(100.150, "m", (50, 0), late_ms=140))
+        self.assertAlmostEqual(rig.filter._in_flight_timeout(), 0.280, places=9)
+        rig.run_until(100.145 + 0.280 + IN_FLIGHT_CHECK_SLACK_S - 0.001)
+        self.assertEqual(rig.sent, [(Button.LEFT, False, "up1")])
+        rig.run_until(100.145 + 0.280 + IN_FLIGHT_CHECK_SLACK_S)
+        self.assertEqual(rig.sent[1:], [(Button.LEFT, True, "down2"), (Button.LEFT, None, "m")])
+
+    def test_a_lone_stall_stops_counting_after_two_seconds(self) -> None:
+        rig = Pipeline(self)
+        rig.handle(Button.MIDDLE, True, 97.500, "stalled", late_ms=400)
+        self.assertAlmostEqual(rig.filter._in_flight_timeout(), IN_FLIGHT_MAX_TIMEOUT_S, places=9)
+        rig.run_until(97.899 + PEAK_WINDOW_S)
+        self.assertAlmostEqual(rig.filter._in_flight_timeout(), IN_FLIGHT_MAX_TIMEOUT_S, places=9)
+        rig.run_until(97.901 + PEAK_WINDOW_S)
+        self.assertAlmostEqual(rig.filter._in_flight_timeout(), IN_FLIGHT_TIMEOUT_S, places=9)
 
 
 def quantized_tick(ms: float) -> int:

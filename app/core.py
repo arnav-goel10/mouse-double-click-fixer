@@ -283,8 +283,6 @@ class DeliveryDelay:
     made inside the window but delivered late finds its release already
     gone, and a drag breaks. The allowance is the 95th percentile of the
     latest events' lateness, within MIN_ALLOWANCE_MS and MAX_ALLOWANCE_MS.
-    The worst of them sets how long the hook waits for an event it re-sent
-    to come back (see GlobalClickFilter._in_flight_timeout).
     """
 
     def __init__(self, size: int = LATENESS_SAMPLES) -> None:
@@ -304,9 +302,49 @@ class DeliveryDelay:
         rank = max(0, math.ceil(LATENESS_SHARE * len(ordered)) - 1)
         return min(MAX_ALLOWANCE_MS, max(MIN_ALLOWANCE_MS, ordered[rank]))
 
-    def worst_ms(self) -> float:
-        """The most any of the latest events was late, 0 before any is seen."""
-        return max(self._samples, default=0.0)
+
+#: How long one late event keeps counting towards PeakLateness.
+PEAK_WINDOW_S = 2.0
+
+
+class PeakLateness:
+    """The worst lateness of any event that reached the hook lately.
+
+    An event the hook re-sends comes back about as late as real events reach
+    it, so this sets how long the hook waits for one before giving it up as
+    lost (see GlobalClickFilter._in_flight_timeout). Every timed event counts,
+    pointer motion as well as buttons: a pause in the event stream shows in
+    whichever event comes out of it. One slow event counts for PEAK_WINDOW_S
+    and no longer, so a lone stall cannot keep the wait long.
+    """
+
+    def __init__(self, window_s: float = PEAK_WINDOW_S) -> None:
+        self._window = window_s
+        # (when it arrived, how late in ms), each later one less late than
+        # the one before: an event no later than one after it can never be
+        # the worst again.
+        self._peaks: deque = deque()
+
+    def add(self, seconds: float, now: float) -> None:
+        """Record an event that arrived at `now`, `seconds` after its
+        timestamp; both on monotonic()'s clock."""
+        if not math.isfinite(seconds) or abs(seconds) > MAX_LATENESS_S:
+            return
+        late_ms = max(0.0, seconds * 1000)
+        while self._peaks and self._peaks[-1][1] <= late_ms:
+            self._peaks.pop()
+        self._peaks.append((now, late_ms))
+        self._forget(now)
+
+    def worst_ms(self, now: float) -> float:
+        """The most an event that arrived in the last PEAK_WINDOW_S before
+        `now` was late, 0 if none did."""
+        self._forget(now)
+        return self._peaks[0][1] if self._peaks else 0.0
+
+    def _forget(self, now: float) -> None:
+        while self._peaks and now - self._peaks[0][0] > self._window:
+            self._peaks.popleft()
 
 
 def clamp_threshold(value: float) -> int:
