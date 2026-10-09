@@ -1324,16 +1324,21 @@ class InFlightTimeoutTests(unittest.TestCase):
         self.assertEqual(rig.sent[1:], [(Button.LEFT, True, "down2")])
 
     def test_an_events_own_lateness_counts_before_it_gives_anything_up(self) -> None:
-        # down2 reaches the hook 200 ms late, stamped just after up1 went out
-        # (as Windows' coarse stamps can put an event made just before it):
-        # up1 may be as late, so it is not given up on yet.
-        rig = Pipeline(self)
-        rig.round_trip = None
-        rig.handle(Button.LEFT, True, 100.000, "down1", late_ms=0)
-        rig.handle(Button.LEFT, False, 100.100, "up1", late_ms=0)
-        rig.run_until(100.150)                                        # up1 re-sent at 100.145
-        self.assertTrue(rig.handle(Button.LEFT, True, 100.150, "down2", late_ms=200).deferred)
-        self.assertEqual(rig.sent, [(Button.LEFT, False, "up1")])
+        # A press, or motion, reaches the hook 200 ms late, stamped just after
+        # up1 went out (as Windows' coarse stamps can put an event made just
+        # before it): up1 may be as late, so it is not given up on yet.
+        for kind in ("press", "motion"):
+            with self.subTest(kind=kind):
+                rig = Pipeline(self)
+                rig.round_trip = None
+                rig.handle(Button.LEFT, True, 100.000, "down1", late_ms=0)
+                rig.handle(Button.LEFT, False, 100.100, "up1", late_ms=0)
+                rig.run_until(100.150)                                # up1 re-sent at 100.145
+                if kind == "press":
+                    self.assertTrue(rig.handle(Button.LEFT, True, 100.150, "down2", late_ms=200).deferred)
+                else:
+                    self.assertFalse(rig.move(100.150, "m", (50, 0), late_ms=200))
+                self.assertEqual(rig.sent, [(Button.LEFT, False, "up1")])
 
 
 def quantized_tick(ms: float) -> int:
