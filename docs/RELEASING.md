@@ -14,6 +14,11 @@ is refused (General says why), so nothing reaches users unsigned.
 
 ## Cutting a release
 
+<!-- TODO(v1/pipeline): the draft-then-sign flow, steps 3 to 6, the file
+table, the pinned build tools paragraph and "Checks before a release"
+describe the release flow on v1/pipeline. Check them against it once it is
+merged. -->
+
 1. Update `__version__` in `app/__init__.py` (three numbers, `1.2.3`), and add
    a `## 1.2.3 — <date>` entry at the top of `CHANGELOG.md`. That entry
    becomes the release page's "What's new", so write it for the people
@@ -27,12 +32,13 @@ is refused (General says why), so nothing reaches users unsigned.
 
 3. The release workflow (`.github/workflows/release.yml`) runs the whole CI
    workflow alongside the builds and publishes nothing unless it passes. It
-   checks that the tag matches `app/__init__.py`, builds and code-signs both
-   platforms with pinned build tools, has the built macOS app check itself
-   (`--self-test`), and creates a **draft** release with the files below and
-   their `SHA256SUMS.txt`.
-4. Try the draft's build on a Mac: a drag, a double-click, a click followed
-   by a quick move. CI can't send clicks through a real macOS event tap.
+   checks that the tag matches `app/__init__.py`, builds both platforms with
+   pinned build tools, code-signs the macOS app and runs its build's checks
+   (see [macOS signing](#macos-signing-and-why-it-matters-for-updates)), and
+   creates a **draft** release with the files below and their
+   `SHA256SUMS.txt`.
+4. Try the draft's build on a Mac with a real mouse: a drag, a double-click,
+   a click followed by a quick move.
 5. Sign the release on your Mac and upload the signature:
 
    ```bash
@@ -46,7 +52,9 @@ is refused (General says why), so nothing reaches users unsigned.
    macOS zip holds exactly one app of that version. It signs with the trusted
    comment `dcf 1.2.3` and checks the result against the keys built into the
    app. `python3 tools/sign_release.py verify 1.2.3 FOLDER` checks a signed
-   folder the way the app will. The tool runs on macOS's own `python3`.
+   folder the way the app will. The tool runs on macOS's own `python3`,
+   unless the key has a password (see
+   [Keys and certificates](#keys-and-certificates)).
 6. Publish the draft:
 
    ```bash
@@ -107,7 +115,9 @@ maintainer's Mac:
 
 Back the folder up somewhere offline, and keep a copy of the backup key off
 this Mac. The keys are files readable only by you, without a password;
-`minisign -C -s <key>` adds one, which `sign_release.py` then asks for.
+`minisign -C -s <key>` adds one, which `sign_release.py` then asks for. A key
+with a password needs Homebrew's `python3`: macOS's own `/usr/bin/python3`
+(3.9) has no `hashlib.scrypt` to decrypt it.
 
 - Losing the certificate means the next release is signed differently, and
   every user has to allow the app in Privacy & Security again.
@@ -139,10 +149,15 @@ The app is signed with the hardened runtime and one entitlement,
 (`installer/entitlements.plist`): the self-signed certificate has no Team ID,
 so library validation would refuse the bundled Python and Qt. A runtime hook
 (`installer/runtime_hooks/scrub_env.py`) clears the environment variables that
-would make those libraries load code from elsewhere. `installer/build_macos.sh`
-fails unless `codesign` reports the runtime flag, and runs the signed app's
-`--self-test` before packaging. `tools/macos_injection_check.sh` checks that a
-built app loads no code named in its environment.
+would make those libraries load code from elsewhere, and pins `PATH`.
+
+`installer/build_macos.sh` fails unless `codesign` reports the runtime flag.
+Before packaging, it then runs the signed app's `--self-test` twice, offscreen
+and with the real Cocoa platform plugin; runs `tools/macos_injection_check.sh`,
+which checks that the app loads no library and runs no program or shell
+start-up file named in its environment; and checks that the
+`THIRD_PARTY_NOTICES.md` it ships is exactly what its own files call for
+(`tools/make_notices.py --bundle --check`). Any failure stops the build.
 
 The certificate is self-signed, which is enough for the permission to carry
 over. A Developer ID certificate would also remove the Gatekeeper step on first
@@ -163,8 +178,8 @@ CI runs on every push to `main` and every pull request, and the release
 workflow runs it again:
 
 - **Unit tests** on Windows and macOS, Python 3.11 to 3.13. On macOS, where the
-  runner allows it, they also create and remove a real pass-through event tap;
-  nothing is sent through it.
+  runner allows it, two of them also start the real event tap and stop it
+  again; neither posts any input.
 - **Windows hook end-to-end** sends real clicks and moves through the real
   low-level hook (`DCF_E2E=1`).
 - **Windows install, quit and update end-to-end** installs 0.2.6 and 0.5.3,

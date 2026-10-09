@@ -6,9 +6,10 @@ Thanks for helping. Bug reports, fixes and improvements are all welcome.
 
 [Open an issue](https://github.com/arnav-goel10/doubleclick-fixer/issues/new/choose)
 using the bug template, and paste what **General › Troubleshooting › Copy
-Diagnostics** gives you: it has the app version, OS, the filter's state, the
-settings and the app's recent log. Your mouse model and what the **Test** pane
-shows help too. Security issues go through [SECURITY.md](SECURITY.md) instead.
+Diagnostics** (Windows: **Copy diagnostics**) gives you: it has the app
+version, OS, the filter's state, the settings and the app's recent log. Your
+mouse model and what the **Test** pane shows help too. Security issues go
+through [SECURITY.md](SECURITY.md) instead.
 
 ## Development setup
 
@@ -55,18 +56,23 @@ settings or quit the copy you have running. So:
 - Tests never post input, move the pointer, open System Settings or start
   the app. Patch the call that would, and check the patch is reached.
 
-Two kinds of test touch the system on purpose, and only in CI:
+Some tests touch the system on purpose, and only in CI:
 
 - `DCF_E2E=1` turns on the Windows hook tests in `tests/test_windows_hook.py`.
   They install the real low-level hook and inject real clicks and moves, so
   never set it on your own PC. CI runs them on a Windows machine.
+- The macOS event tap end-to-end test moves the pointer and posts real
+  clicks. It runs on CI's Macs; `DCF_E2E_ALLOW_LOCAL=1` would let it run
+  elsewhere, so never set that on your own Mac.
 - `tools/windows_install_e2e.ps1` installs, upgrades, updates and uninstalls
   the app for real. CI runs it; never run it on a PC whose copy of
   DoubleClick Fixer you care about.
 
 On a Mac where the Python running the tests is allowed to filter input, two
-tests create and remove a real pass-through event tap. Nothing is sent
-through it.
+unit tests start the real event tap and stop it again. While the first one
+runs, for a moment, it filters left clicks with a 60 ms window, as the app
+would; the second filters no button and only watches. Neither posts any
+input of its own.
 
 ## How the code is laid out
 

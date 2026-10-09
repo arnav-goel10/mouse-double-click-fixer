@@ -50,9 +50,10 @@ can move the app to a new signing certificate only by naming the new
 requirement in its signed comment (`dcf <version> dr=<requirement>`), and the
 new requirement must be certificate-based.
 
-Copies older than 1.0 don't check signatures. They verify the update that
-brings them to 1.0 against the release's checksums alone, which come from the
-same release as the files. From 1.0 on, every update is signature-checked.
+Copies older than 1.0 don't check minisign signatures. They verify the update
+that brings them to 1.0 against the release's checksums alone (on macOS, plus
+the code-signature check), and those come from the same release as the files.
+From 1.0 on, every update is signature-checked.
 
 To check a download by hand, with minisign installed:
 
@@ -77,12 +78,22 @@ could still load code named in an environment variable (OpenSSL's
 configuration, Qt's plugin paths and others), so the app clears those
 variables before any of its code runs.
 
+The programs the app starts run as the app too: `pgrep`, `codesign`, `ditto`,
+`open`, and `bash` for the update swap. It starts each by its full path, sets
+`PATH` to the system folders, and runs `bash` with `-p` and without `BASH_ENV`,
+`ENV` or exported functions, so nothing placed earlier on the `PATH` it was
+started with, and no start-up script, runs in their place.
+
 ## Windows
 
 The Windows builds are not signed with a code-signing certificate yet, so
 SmartScreen warns about an unknown publisher, and Smart App Control, where it
 is on, blocks them.
 Updates don't depend on that: the updater checks the minisign signature above.
+It starts `cmd.exe`, and the programs its update script runs, from System32 by
+full path: Windows looks for a program named alone in the starting program's
+folder and the current folder first, and the portable exe may sit in
+Downloads.
 The installer installs for the current user and needs no administrator rights.
 Windows doesn't let the app send input to windows running as administrator, so
 over those it never holds a release back.

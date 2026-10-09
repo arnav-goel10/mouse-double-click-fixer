@@ -65,13 +65,15 @@ With **General › Check for updates automatically** on, the app looks for a new
 release 20 seconds after it starts and every six hours. With **Install
 updates automatically** on as well, it downloads the update, verifies it,
 installs it and reopens itself, usually within a few seconds. If its window
-is open, it waits and installs when you close it; **Restart Now** installs it
-straight away. On macOS the permission carries over.
+is open, it waits and installs when you close it; **Restart Now** (Windows:
+**Restart now**) installs it straight away. On macOS the permission carries
+over.
 
 Every update must carry a signature from the project's release keys, which
 are built into the app; anything else is refused (see
 [SECURITY.md](../SECURITY.md)). Copies older than 1.0 check only the
-release's checksums for the update that brings them to 1.0.
+release's checksums (on macOS, plus the code-signature check) for the update
+that brings them to 1.0.
 
 To update by hand, turn off **Install updates automatically** and use
 **Check Now** (Windows: **Check now**), or choose **Check for Updates…**
@@ -85,13 +87,13 @@ To update by hand, turn off **Install updates automatically** and use
   Access** (**Accessibility** on macOS 26 and earlier) with the **−** button.
   Its settings and log stay in `~/Library/Application Support/DoubleClickFixer`
   until you delete that folder. Or run `bash installer/uninstall_macos.sh`
-  from a checkout of this repository, which removes the app, its login item,
-  settings and permission.
+  from a checkout of this repository: it quits the app and waits until it
+  has exited, then removes the app, its login item, settings and permission.
 - **Windows:** **Settings › Apps › Installed apps › DoubleClick Fixer ›
   Uninstall**. This closes the app if it is running, then removes it, its
   shortcuts, the startup entry, its settings and its log. For the portable
-  exe, choose **Exit** from its notification area icon, turn off **Open at
-  login** first if you turned it on, and delete the file and
+  exe, turn off **General › Open at login** if you turned it on, then choose
+  **Exit** from its notification area icon, then delete the file and
   `%APPDATA%\DoubleClickFixer`.
 
 ## From source

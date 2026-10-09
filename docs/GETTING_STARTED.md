@@ -53,6 +53,7 @@ says so and how to turn it back on.
 | 40–80 ms | Catches severe bounce; fine unless you double-click very fast. |
 | 80 ms + | Only for a badly worn switch; fast double-clicks may be dropped. |
 
-Every release waits for about the filter window before apps see it (sooner
-for a click when you move the pointer off), so a shorter window also means
-a quicker click. Presses are not delayed.
+Every release waits for the filter window before apps see it, a little
+longer on a still mouse, and a click made in place goes out as soon as you
+move the pointer off it. So a shorter window also means a quicker click.
+Presses are not held back.

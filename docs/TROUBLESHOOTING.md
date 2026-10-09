@@ -97,8 +97,10 @@ Some anti-cheat systems watch for software input; turn the filter off before
 playing those games.
 
 On Windows, while the pointer is hidden (a game's mouse-look), in a remote
-session, and for pen or touch input, a held release is delivered after the
-filter window wherever the pointer is; it is never moved.
+session, and for pen or touch input, pointer movement never waits behind a
+held release. The release goes out once the filter window has passed, with
+your next click or by a timer, wherever the pointer is then; the pointer is
+never moved.
 
 ## Open at login doesn't open the app
 
@@ -121,8 +123,9 @@ the app.
 
 Updates install by themselves while **General › Install updates
 automatically** is on. If the window is open when one is ready, it waits and
-installs when you close the window; **Restart Now** installs it straight
-away. After the app reopens, **General** says whether the update worked.
+installs when you close the window; **Restart Now** (Windows: **Restart
+now**) installs it straight away. After the app reopens, **General** says
+whether the update worked.
 
 What the messages in **General › Software update** mean:
 
@@ -132,17 +135,17 @@ What the messages in **General › Software update** mean:
   isn't valid, or is for another version.) The release doesn't carry a valid
   signature from the project's keys, so the app won't download it. If a
   release was published a moment ago, its signature may still be on its way:
-  **Try Again** later.
+  **Try Again** (Windows: **Try again**) later.
 - **Move DoubleClick Fixer to Applications to update it.** The app is running
   from the disk image or from where macOS put a downloaded copy it hasn't
   moved. Drag it to Applications and open it from there.
 - **Your account can't change apps in Applications.** Ask an administrator to
-  update the app, or install it again from the latest release.
+  update the app.
 - **No permission to replace the app in …** The folder the app runs from
   can't be written by your account. Move the app somewhere you can write, or
   install it again from the latest release.
 - An update that failed to install twice is not tried again by itself; choose
-  **Update Now** to try it.
+  **Update Now** (Windows: **Update now**) to try it.
 
 ## Settings, logs and crash reports
 

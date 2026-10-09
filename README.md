@@ -40,11 +40,11 @@ It happens to every brand sooner or later, Logitech, Razer, SteelSeries, Microso
 A bounce has a tell-tale signature: the extra press arrives a few milliseconds after the button was released, far faster than a finger can lift and press again. A deliberate double-click leaves the button up for much longer.
 
 - **Clicks.** A press that comes within your filter window (typically 25–60 ms) of the last release is dropped, along with its release, so apps never see half a click.
-- **Drags.** A worn switch can also lose contact for an instant while you hold it, which would end a drag. So every release is held back for the filter window. If the contact comes straight back, both are dropped and the drag simply continues; otherwise the release is delivered, where you let go of the button.
+- **Drags.** A worn switch can also lose contact for an instant while you hold it, which would end a drag. So every release is held back until the filter window has passed. If the contact comes straight back, both are dropped and the drag simply continues; otherwise the release is delivered, where you let go of the button.
 - **Clicks followed by a quick move.** When you click in place and move away, the release goes out as the pointer leaves the spot, before the movement reaches apps, so the click lands where you made it.
 - **Your double-clicks are untouched.** Calibration measures your own double-click speed and keeps the filter well below it.
 
-The filter sits in the system's own input path, an event tap on macOS and a low-level mouse hook on Windows, so every app sees the filtered clicks. Clicks are timed by the events' own timestamps on macOS and by a precise clock on Windows, so a busy computer doesn't distort the gaps. On macOS, clicks and pointer movement come through one event tap in the order they happened, so a move can never reach apps ahead of a click's release, and a held release is judged by the timestamps of the events that follow it. All of it happens on your computer.
+The filter sits in the system's own input path, an event tap on macOS and a low-level mouse hook on Windows, so every app sees the filtered clicks. Clicks are timed by the events' own timestamps on macOS and by a precise clock on Windows, so a busy computer doesn't distort the gaps. Events reach the filter in the order they happened, so a held release is settled by the time of the events that follow it: once one from after the filter window arrives, no press can still be on its way to cancel it. With nothing after it, as when you click and keep the mouse still, a timer settles it after the window plus an allowance for how late this computer delivers mouse events. On macOS, clicks and pointer movement come through one event tap, so a move can never reach apps ahead of a click's release. All of it happens on your computer.
 
 ## Features
 
@@ -91,7 +91,7 @@ Not once calibrated. Only a press within the filter window of the previous relea
 <details>
 <summary><b>Does it add input lag?</b></summary>
 
-Presses go straight through. The only press that waits is one that arrives while the app is re-sending a release: it waits for that release to go out, usually a millisecond or two, so apps see the two in order. Every release waits for about the filter window (typically 25–60 ms), so a contact dropout can't end a drag. A click made in place is released sooner, as soon as you move the pointer off it.
+Presses go straight through. The only press that waits is one that comes while a release is still on its way to apps: it goes out right after that release, usually within a millisecond or two, so apps see the two in order. Every release waits until the filter window (typically 25–60 ms) has passed, so a contact dropout can't end a drag. If you move the mouse or click again, it goes out as soon as the window is over. On a still mouse it waits longer: the window plus an allowance for how late your computer delivers mouse events, which the app measures as it runs and keeps between 5 and 150 ms. A click made in place is released sooner, as soon as you move the pointer off it.
 </details>
 
 <details>

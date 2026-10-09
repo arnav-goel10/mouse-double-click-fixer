@@ -17,8 +17,11 @@ Builds `dist/DoubleClick Fixer.app` (Apple silicon), the DMG and the zip the
 in-app updater downloads. It signs with the hardened runtime and the one
 entitlement in `entitlements.plist`, using the project's self-signed
 certificate from `~/.doubleclick-fixer-signing` when that exists, and ad-hoc
-otherwise. It fails unless the signature carries the runtime flag, and runs
-the signed app's `--self-test` before packaging.
+otherwise. It fails unless the signature carries the runtime flag. Before
+packaging it runs the signed app's `--self-test` offscreen and again with the
+Cocoa platform plugin, runs `tools/macos_injection_check.sh` (which needs
+clang, from the Xcode Command Line Tools), and checks the app's
+`THIRD_PARTY_NOTICES.md` against its files; any failure stops the build.
 
 An ad-hoc copy is fine for trying things out but not for installing: macOS
 ties the app's permission to the certificate, so updates to it would ask
@@ -47,11 +50,16 @@ The installer installs for the current user without administrator rights,
 refuses Windows older than 10 version 1809 and machines that can't run 64-bit
 x64 apps, and puts `THIRD_PARTY_NOTICES.md` in the install folder. Before it
 replaces files it asks a running copy to quit through the installed one, and
-ends it if that doesn't work within 20 seconds.
+ends it if that doesn't work within 20 seconds. That step runs in
+PowerShell's Constrained Language Mode, as it would on a PC with application
+control, and waits with `Wait-Process`. An installed copy from before 0.2.7,
+or an installed folder build (0.5.4 and later) that has lost its `_internal`
+folder, can't be asked, and is ended with `taskkill`.
 
 ## Uninstalling
 
 The Windows uninstaller closes a running copy, then removes the app, its
 shortcuts, the startup entry, its settings and its log. On macOS,
-`bash installer/uninstall_macos.sh` quits the app and removes it, its login
-item, settings and permission.
+`bash installer/uninstall_macos.sh` quits the app and waits until it has
+exited (it stops with a message if the app won't quit), then removes it, its
+login item, settings and permission.

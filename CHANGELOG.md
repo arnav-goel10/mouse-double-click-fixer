@@ -16,12 +16,26 @@ on Apple silicon, or 64-bit Windows 10 version 1809 or later, or Windows 11.
 - **A small movement no longer ends a drag.** Since 0.5.1 on macOS, a held
   release was settled by any pointer motion, even a hand resting on the
   mouse, and a dropout's comeback could make a drag look like a click made in
-  place. Now only a release made where its press landed is settled by
-  motion, and only once the pointer has moved a few pixels from where the
-  button came up.
+  place. Now motion inside the filter window settles only a release made
+  where its press landed, and only once the pointer has moved a few pixels
+  from where the button came up.
+- **A drag survives a busy computer.** A held release is now settled by
+  the time of the events that follow it, not by a timer started when it
+  arrived. Events reach the filter in the order they happened, so once one
+  from after the filter window arrives, no press can still be on its way to
+  cancel the release. Before, a dropout's comeback press that reached the
+  filter late could find its release already sent, and the drag broke. With
+  nothing after it, as on a still mouse, a timer settles the release after
+  the window plus an allowance for how late this computer has lately
+  delivered mouse button events, kept between 5 and 150 ms.
 - A held release that comes due while the app is still re-sending other
   input now waits behind it, so apps can never see a button come up before
   it went down.
+- The app waits for input it re-sent to come back through the filter for
+  as long as this computer has lately taken to deliver events (twice the
+  longest recent delay, from 150 ms up to half a second), so on a slow
+  machine a later click can't overtake a re-sent release. It used to stop
+  waiting after 150 ms.
 - Clicks and pointer moves no longer wait up to 5 ms for the app's own
   window to finish what it is doing.
 
@@ -39,11 +53,7 @@ on Apple silicon, or 64-bit Windows 10 version 1809 or later, or Windows 11.
   hands over strictly in order. The separate motion tap 0.5.1 added took
   effect too late, so the first moves after a click could overtake it. The
   app now receives every pointer move; it reads where the pointer is and
-  nothing else.
-- A held release is settled by the events' own timestamps: the first event
-  after it shows whether the filter window has passed, so a dropout macOS
-  delivers late still keeps the drag. A fallback timer, sized from how
-  quickly this Mac delivers events, settles it while the mouse is still.
+  when it moved, and nothing else.
 - Two separate clicks no longer become a double-click after a blocked
   bounce. macOS counts a suppressed press toward a double-click; the app now
   counts only the presses apps receive, by macOS's rule and your
@@ -67,11 +77,15 @@ on Apple silicon, or 64-bit Windows 10 version 1809 or later, or Windows 11.
   registered).
 - The app is signed with the hardened runtime and clears the environment
   variables that would make the libraries inside it load code from
-  elsewhere, so other programs can't use those routes to act with its
-  permission. Its signing requirement is unchanged, so the permission
-  carries over from 0.5.
+  elsewhere. It starts the programs it needs (pgrep, codesign, ditto, open,
+  and bash for an update) by full path, with PATH set to the system folders
+  and bash's start-up variables removed. So other programs can't use those
+  routes to act with its permission. Its signing requirement is unchanged,
+  so the permission carries over from 0.5.
 - A Window menu with Minimize (⌘M) and Zoom, and the menu bar icon keeps the
   place you drag it to.
+- `installer/uninstall_macos.sh` waits for the app to quit before it
+  removes anything, and stops with a message if the app won't quit.
 
 ### Windows
 
@@ -107,6 +121,12 @@ on Apple silicon, or 64-bit Windows 10 version 1809 or later, or Windows 11.
 - Updates now finish in folders whose names use characters outside the
   system's code page (a user name like Łukasz on an English system).
   Before, the app didn't come back after updating there.
+- The updater starts cmd.exe, and the programs its update script runs, from
+  System32 by full path. Named alone, Windows would look for them in the
+  app's own folder or the current folder first, so a file with one of their
+  names beside the portable exe (in Downloads, say) could have run instead.
+- Windows builds no longer carry Mesa's software OpenGL (opengl32sw.dll,
+  about 20 MB), which the app never used.
 
 ### Updates and security
 
@@ -116,8 +136,9 @@ on Apple silicon, or 64-bit Windows 10 version 1809 or later, or Windows 11.
   update is offered only when the signature checks out, names exactly that
   version, and that version is newer than yours; one that fails is never
   downloaded, and General says why.
-- Copies older than 1.0 trust checksums alone for the update that brings
-  them to 1.0. From 1.0 on, every update is signature-checked.
+- Copies older than 1.0 trust checksums alone (on macOS, plus the
+  code-signature check) for the update that brings them to 1.0. From 1.0
+  on, every update is signature-checked.
 - On macOS an update must also be the version it claims and keep the
   installed app's signing requirement, which the permission depends on. A
   move to a new signing certificate has to be named in a signed release.
@@ -130,17 +151,19 @@ on Apple silicon, or 64-bit Windows 10 version 1809 or later, or Windows 11.
   sign-in; it waits for you. A download waiting to install is no longer
   fetched again by the next check, and "Update to X" in the menu opens
   General so progress and any failure show.
-- Every build ships THIRD_PARTY_NOTICES.md, the licences of Qt, Python and
-  the other software the app is built on, including the LGPL and GPL texts.
+- Every build ships THIRD_PARTY_NOTICES.md, the licences of Qt, Python, the
+  code inside them and the other software the app is built on, including
+  the LGPL and GPL texts, worked out from the files that build ships.
   **General › Acknowledgements…** opens it, and on Windows it is also in the
   install folder.
 
 ### App
 
-- **Copy Diagnostics** in General copies the version, OS, the filter's
-  state, the settings and the end of the app's log, for a bug report. The
-  log records start-up, the filter starting and stopping, failures and
-  updates, never clicks; hard crashes go to crash.log beside it.
+- **Copy Diagnostics** (Windows: **Copy diagnostics**) in General copies
+  the version, OS, the filter's state, the settings and the end of the
+  app's log, for a bug report. The log records start-up, the filter
+  starting and stopping, failures and updates, never clicks; hard crashes
+  go to crash.log beside it.
 - Your "on" survives failures. A filter that can't start at login, or stops
   on its own, used to switch itself off for good. Now the menu's status line
   says what happened, a start the app makes itself retries at 1, 3, 8 and
