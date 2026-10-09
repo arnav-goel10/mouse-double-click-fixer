@@ -1,31 +1,88 @@
-"""Sign a release with the update key.
+"""Sign and publish a release with the update key.
 
 An installed copy of DoubleClick Fixer installs an update only when the
 release's SHA256SUMS.txt carries a minisign signature from one of the keys
 built into the app: RELEASE_KEYS in app/updater.py, which this tool reads too
 (tools/keys/ has copies for the minisign tool). The secret keys never go to
 GitHub or CI; they stay on the owner's Mac, and releases are signed there.
-Keep the release a draft until its signature is uploaded:
 
-    gh release download v1.0.1 --dir ~/dcf-release-1.0.1
-    python3 tools/sign_release.py sign 1.0.1 ~/dcf-release-1.0.1
-    gh release upload v1.0.1 ~/dcf-release-1.0.1/SHA256SUMS.txt.minisig
-    gh release edit v1.0.1 --draft=false
+Pushing a tag makes release.yml build, test and put up a draft release.
+Every step of a release, in order (`python3 tools/sign_release.py --help`
+prints them too):
 
-`sign` first checks every file in the folder against SHA256SUMS.txt (all of
-them listed, none missing, every hash right) and that the macOS zip holds
-exactly one app, of that version. It then signs SHA256SUMS.txt with the
-trusted comment "dcf 1.0.1", checks the signature against RELEASE_KEYS and
-writes SHA256SUMS.txt.minisig. Upload the signature before taking the release
-out of draft: copies of the app that check signatures don't offer a release
-without one, and say so.
+    # 1. Merge what is being released into main:
+    git switch main && git pull --ff-only
+    git merge --no-ff BRANCH
+    # 2. Set the version in app/__init__.py (__version__ = "1.0.1"), turn the
+    #    top of CHANGELOG.md into "## 1.0.1 — YYYY-MM-DD" (today's date), and
+    #    check both as release.yml will, then commit and push:
+    GITHUB_REF=refs/tags/v1.0.1 python3 -m unittest tests.test_release
+    git commit -am "DoubleClick Fixer 1.0.1"
+    git push origin main
+    # 3. Tag that commit and push the tag; release.yml builds it:
+    git tag -a v1.0.1 -m "DoubleClick Fixer 1.0.1"
+    git push origin v1.0.1
+    # 4. Wait until the tag's run exists (it can take a few seconds to
+    #    appear), then until it finishes; it puts up the draft:
+    until run="$(gh run list --workflow release.yml --branch v1.0.1 --event push --limit 1 --json databaseId --jq '.[].databaseId')" && [ -n "$run" ]; do sleep 5; done
+    gh run watch "$run" --exit-status
+    # 5. Check the draft, then sign and publish it, on this Mac (the one with
+    #    the update keys, System Integrity Protection on), still at the tag:
+    python3 tools/sign_release.py publish v1.0.1 --dry-run
+    python3 tools/sign_release.py publish v1.0.1
 
+`publish` downloads the draft's files and the artifacts of the release.yml
+run that built the tag (the push of that tag, at the commit it points at),
+and refuses unless:
+
+- the draft holds exactly the release's files, each byte for byte the file
+  the run built (and the digest GitHub lists for it);
+- SHA256SUMS.txt lists every file with the right hash, and the macOS zip holds
+  exactly one app, of the tag's version;
+- that app's signature is valid and its designated requirement is the one
+  installed copies have (APP_REQUIREMENT), so macOS keeps their Accessibility
+  permission;
+- its THIRD_PARTY_NOTICES.md is the draft's THIRD_PARTY_NOTICES-macos.md;
+- tools/macos_injection_check.sh passes on that app with all its legs, which
+  needs System Integrity Protection on (it is off on GitHub's Macs, so the
+  build there skips the leg that needs it): no library or program named in
+  the app's environment loads into it or runs as it. This needs clang, from
+  Xcode's command line tools.
+
+It then signs SHA256SUMS.txt with the trusted comment "dcf 1.0.1", checks the
+signature against RELEASE_KEYS, uploads SHA256SUMS.txt.minisig, checks that
+nothing on the draft changed meanwhile, and publishes the draft as the latest
+release. Publishing starts the Release pages workflow, which points the older
+release pages at the new one. --dry-run does every check and signs, uploads
+and publishes nothing. A tag with a suffix (v1.1.0-rc.1) is a pre-release:
+it is checked the same way but never signed, so installed copies, which only
+look at the latest full release anyway, can never install it.
+
+    --run ID            the run to compare with, when more than one built the tag
+    --workdir DIR       download into DIR (empty) instead of a temporary folder
     --key PATH          sign with another secret key (default: the primary key)
     --requirement DR    for a release that moves the macOS app to a new signing
                         identity: the new designated requirement, exactly as
                         `codesign -d -r- "DoubleClick Fixer.app"` prints it after
-                        "designated =>". The signed comment then names it, and
-                        installed copies accept the new signature.
+                        "designated =>". The app must have it, the signed
+                        comment then names it, and installed copies accept it.
+    --repo OWNER/NAME   another repository (default: the one copies update from)
+
+The steps `publish` takes, by hand (after comparing the files with the run's
+artifacts):
+
+    gh release download v1.0.1 --dir ~/dcf-release-1.0.1
+    ditto -x -k ~/dcf-release-1.0.1/DoubleClickFixer-macos.zip ~/dcf-app-1.0.1
+    bash tools/macos_injection_check.sh ~/dcf-app-1.0.1/"DoubleClick Fixer.app" --require-sip
+    python3 tools/sign_release.py sign 1.0.1 ~/dcf-release-1.0.1
+    gh release upload v1.0.1 ~/dcf-release-1.0.1/SHA256SUMS.txt.minisig
+    gh release edit v1.0.1 --draft=false --latest
+
+`sign` checks every file in the folder against SHA256SUMS.txt and the macOS
+zip's app version, as above, signs, checks the signature against RELEASE_KEYS
+and writes SHA256SUMS.txt.minisig (it takes --key and --requirement too).
+Upload the signature before taking the release out of draft: copies of the app
+that check signatures don't offer a release without one, and say so.
 
 Other commands:
 
@@ -69,9 +126,11 @@ import ast
 import base64
 import getpass
 import hashlib
+import json
 import os
 import plistlib
 import re
+import subprocess
 import sys
 import zipfile
 from pathlib import Path
@@ -403,14 +462,354 @@ def keygen(name: str, key_dir: Path = KEY_DIR, public_dir: Path = PUBLIC_KEY_DIR
     return secret_path, public_path
 
 
+# -- publishing a draft -------------------------------------------------------------
+
+#: The workflow that builds a tag and puts its draft release up.
+RELEASE_WORKFLOW = "release.yml"
+RELEASE_WORKFLOW_NAME = "Release"
+#: The third-party notices each platform's downloads ship: the macOS app's
+#: Contents/Resources/THIRD_PARTY_NOTICES.md, and the one the Windows
+#: installer puts beside the app.
+MAC_NOTICES = "THIRD_PARTY_NOTICES-macos.md"
+WINDOWS_NOTICES = "THIRD_PARTY_NOTICES-windows.md"
+#: Every file a release carries besides SHA256SUMS.txt, by the workflow
+#: artifact it was built into.
+ARTIFACTS = {
+    "DoubleClickFixer-windows": ("DoubleClickFixer.exe", "DoubleClickFixer-Setup.exe", WINDOWS_NOTICES),
+    "DoubleClickFixer-macos": ("DoubleClickFixer.dmg", MAC_ZIP, MAC_NOTICES),
+}
+RELEASE_FILES = tuple(sorted(name for names in ARTIFACTS.values() for name in names)) + (CHECKSUMS,)
+#: The macOS app's designated requirement. macOS keeps the Accessibility
+#: permission for an update only while it stays the same.
+APP_REQUIREMENT = (
+    'identifier "com.doubleclickfixer.app" and certificate root = H"81a512665a945aebb386f04541f5c41f341a6c31"'
+)
+#: Checks that nothing named in the app's environment loads into it or runs as
+#: it. --require-sip makes it run every leg, and fail where it can't.
+INJECTION_CHECK = ROOT / "tools" / "macos_injection_check.sh"
+TAG_PATTERN = re.compile(r"v(?P<version>\d+\.\d+\.\d+)(?P<suffix>-[0-9A-Za-z][0-9A-Za-z.-]*)?")
+
+
+def default_repository(source: Optional[Path] = None) -> str:
+    """REPOSITORY in app/updater.py: where installed copies look for updates."""
+    source = UPDATER_SOURCE if source is None else source
+    match = re.search(r'^REPOSITORY = "([^"]+)"', source.read_text(encoding="utf-8"), re.MULTILINE)
+    if match is None:
+        raise ReleaseError(f"{source} names no REPOSITORY.")
+    return match.group(1)
+
+
+def parse_tag(text: str) -> tuple[str, str, bool]:
+    """(tag, the app's version, pre-release) for 'v1.0.1' or 'v1.1.0-rc.1'."""
+    tag = text.strip()
+    tag = tag if tag.startswith("v") else "v" + tag
+    match = TAG_PATTERN.fullmatch(tag)
+    if match is None:
+        raise ReleaseError(f"{text!r} isn't a release tag like v1.0.1 or v1.1.0-rc.1.")
+    return tag, match.group("version"), match.group("suffix") is not None
+
+
+class Commands:
+    """Runs the programs publishing needs (gh, ditto, codesign). Tests swap
+    in a fake."""
+
+    def run(self, *command: str, both: bool = False) -> str:
+        """The command's output (with `both`, stderr after stdout); a
+        ReleaseError if it fails."""
+        try:
+            result = subprocess.run(list(command), capture_output=True, text=True, check=False)
+        except OSError as error:
+            raise ReleaseError(f"{command[0]} couldn't be run: {error}") from error
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            raise ReleaseError(f"`{' '.join(command)}` failed (exit {result.returncode}): {detail}")
+        return result.stdout + (result.stderr if both else "")
+
+
+class Publisher:
+    """Checks a draft release against what its workflow run built, signs it
+    and publishes it. See `publish` in the module docstring."""
+
+    def __init__(
+        self,
+        tag: str,
+        workdir: Path,
+        repository: str,
+        key_path: Path,
+        requirement: str = "",
+        run_id: Optional[int] = None,
+        dry_run: bool = False,
+        commands: Optional[Commands] = None,
+        keys: Optional[list[PublicKey]] = None,
+        password: Callable[[], str] = lambda: "",
+        say: Callable[[str], None] = print,
+    ) -> None:
+        self.tag, self.version, self.prerelease = parse_tag(tag)
+        self.workdir = workdir
+        self.repository = repository
+        self.key_path = key_path
+        self.requirement = requirement.strip()
+        self.run_id = run_id
+        self.dry_run = dry_run
+        self.commands = commands or Commands()
+        self.keys = keys
+        self.password = password
+        self.say = say
+
+    # -- GitHub ------------------------------------------------------------------
+    def gh(self, *arguments: str) -> str:
+        return self.commands.run("gh", *arguments)
+
+    def gh_json(self, *arguments: str) -> object:
+        output = self.gh(*arguments)
+        try:
+            return json.loads(output)
+        except ValueError as error:
+            raise ReleaseError(f"`gh {' '.join(arguments[:2])}` gave something that isn't JSON: {output[:200]!r}") from error
+
+    def draft_assets(self) -> dict[str, tuple[str, int, str]]:
+        """The draft's files, as name -> (asset id, size, GitHub's digest)."""
+        data = self.gh_json(
+            "release", "view", self.tag, "--repo", self.repository, "--json", "tagName,isDraft,isPrerelease,assets"
+        )
+        if not isinstance(data, dict) or data.get("tagName") != self.tag:
+            raise ReleaseError(f"GitHub returned another release when asked for {self.tag}.")
+        if not data.get("isDraft"):
+            raise ReleaseError(f"{self.tag} is already published. This only publishes drafts.")
+        if bool(data.get("isPrerelease")) != self.prerelease:
+            raise ReleaseError(
+                f"{self.tag} is {'not ' if self.prerelease else ''}marked as a pre-release, "
+                f"but a tag {'with' if self.prerelease else 'without'} a suffix should be."
+            )
+        assets = {}
+        for asset in data.get("assets") or []:
+            assets[str(asset.get("name"))] = (str(asset.get("id", "")), int(asset.get("size", 0)), str(asset.get("digest") or ""))
+        allowed = set(RELEASE_FILES) | {SIGNATURE}
+        problems = [f"The draft has no {name}." for name in RELEASE_FILES if name not in assets]
+        problems += [f"The draft has a file no release carries: {name}." for name in sorted(set(assets) - allowed)]
+        if problems:
+            raise ReleaseError("\n".join(problems))
+        return assets
+
+    def tag_commit(self) -> str:
+        commit = self.gh("api", f"repos/{self.repository}/commits/{self.tag}", "--jq", ".sha").strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", commit):
+            raise ReleaseError(f"Couldn't find the commit {self.tag} points at.")
+        return commit
+
+    def build_run(self, commit: str) -> int:
+        """The successful run of the release workflow that built this tag."""
+        fields = "databaseId,headBranch,headSha,event,conclusion,workflowName"
+        if self.run_id is not None:
+            runs = [self.gh_json("run", "view", str(self.run_id), "--repo", self.repository, "--json", fields)]
+        else:
+            runs = self.gh_json(
+                "run", "list", "--repo", self.repository, "--workflow", RELEASE_WORKFLOW, "--branch", self.tag,
+                "--event", "push", "--limit", "50", "--json", fields,
+            )
+        if not isinstance(runs, list):
+            raise ReleaseError("`gh run list` gave something that isn't a list of runs.")
+        matching = [
+            run for run in runs
+            if isinstance(run, dict)
+            and run.get("workflowName") == RELEASE_WORKFLOW_NAME
+            and run.get("headBranch") == self.tag
+            and run.get("event") == "push"
+            and run.get("headSha") == commit
+        ]
+        good = [run for run in matching if run.get("conclusion") == "success"]
+        if self.run_id is not None and not good:
+            raise ReleaseError(
+                f"Run {self.run_id} isn't a successful {RELEASE_WORKFLOW} run for the push of {self.tag} at {commit[:12]}."
+            )
+        if not good:
+            raise ReleaseError(f"No successful {RELEASE_WORKFLOW} run built {self.tag} ({commit[:12]}).")
+        if len(good) > 1:
+            numbers = ", ".join(str(run.get("databaseId")) for run in good)
+            raise ReleaseError(f"More than one run built {self.tag} ({numbers}); name the one to trust with --run.")
+        return int(good[0]["databaseId"])
+
+    # -- checks ------------------------------------------------------------------
+    def compare_with_artifacts(self, folder: Path, artifacts: Path, assets: dict) -> None:
+        """Every file on the draft is the one the workflow run built, byte for byte."""
+        problems = []
+        downloaded = {path.name for path in folder.iterdir() if path.is_file()}
+        if downloaded != set(assets):
+            problems.append(f"Downloading the draft gave {sorted(downloaded)}, not {sorted(assets)}.")
+        for name, (_id, _size, digest) in sorted(assets.items()):
+            if digest and (folder / name).is_file() and digest != "sha256:" + _sha256(folder / name):
+                problems.append(f"{name} doesn't match the digest GitHub lists for it.")
+        for artifact, names in ARTIFACTS.items():
+            root = artifacts / artifact
+            built = {str(path.relative_to(root)): path for path in root.rglob("*") if path.is_file()}
+            if set(built) != set(names):
+                problems.append(f"The {artifact} artifact holds {sorted(built)}, not {sorted(names)}.")
+            for name in names:
+                if name in built and (folder / name).is_file() and _sha256(built[name]) != _sha256(folder / name):
+                    problems.append(f"{name} on the draft isn't the file the run built ({artifact}).")
+        if problems:
+            raise ReleaseError("\n".join(problems))
+
+    def unpack_mac_app(self, folder: Path) -> Path:
+        """The app in the draft's macOS zip, unpacked."""
+        unpacked = self.workdir / "unpacked"
+        # ditto keeps the symlinks and extended attributes a signature needs.
+        self.commands.run("ditto", "-x", "-k", str(folder / MAC_ZIP), str(unpacked))
+        apps = sorted(path for path in unpacked.iterdir() if path.suffix == ".app")
+        if len(apps) != 1:
+            raise ReleaseError(f"{MAC_ZIP} unpacks to {len(apps)} apps, not one.")
+        return apps[0]
+
+    def check_mac_app(self, app: Path) -> str:
+        """The designated requirement of the app, once it is the one installed
+        copies expect (or the --requirement being moved to)."""
+        self.commands.run("codesign", "--verify", "--deep", "--strict", str(app))
+        output = self.commands.run("codesign", "-d", "-r-", str(app), both=True)
+        found = [line.split("=>", 1)[1].strip() for line in output.splitlines() if line.startswith("designated =>")]
+        expected = self.requirement or APP_REQUIREMENT
+        if found != [expected]:
+            hint = "" if self.requirement else (
+                " (Moving to a new signing identity on purpose? Name the new requirement with --requirement.)"
+            )
+            raise ReleaseError(
+                f"The app in {MAC_ZIP} has the designated requirement\n    {found[0] if found else '(none)'}\n"
+                f"not\n    {expected}\nmacOS would take the Accessibility permission away from every copy it "
+                f"updated.{hint}"
+            )
+        return found[0]
+
+    def check_mac_notices(self, app: Path, folder: Path) -> None:
+        """The draft's macOS notices are the ones inside the app."""
+        bundled = app / "Contents" / "Resources" / "THIRD_PARTY_NOTICES.md"
+        if not bundled.is_file() or bundled.read_bytes() != (folder / MAC_NOTICES).read_bytes():
+            raise ReleaseError(f"{MAC_NOTICES} on the draft isn't the THIRD_PARTY_NOTICES.md inside the app in {MAC_ZIP}.")
+
+    def check_injection(self, app: Path) -> None:
+        """tools/macos_injection_check.sh, every leg, on the release's own app."""
+        try:
+            self.commands.run("bash", str(INJECTION_CHECK), str(app), "--require-sip")
+        except ReleaseError as error:
+            raise ReleaseError(
+                f"The app in {MAC_ZIP} failed tools/macos_injection_check.sh, which needs System Integrity "
+                f"Protection on and clang (Xcode's command line tools):\n{error}"
+            ) from error
+
+    # -- the whole flow --------------------------------------------------------------
+    def publish(self) -> None:
+        say = self.say
+        assets = self.draft_assets()
+        commit = self.tag_commit()
+        run = self.build_run(commit)
+        say(f"{self.tag}: draft with {len(assets)} files; built by run {run} from {commit[:12]}")
+
+        folder, artifacts = self.workdir / "release", self.workdir / "artifacts"
+        folder.mkdir(parents=True)
+        self.gh("release", "download", self.tag, "--repo", self.repository, "--dir", str(folder))
+        for artifact in ARTIFACTS:
+            self.gh("run", "download", str(run), "--repo", self.repository, "--name", artifact, "--dir", str(artifacts / artifact))
+        self.compare_with_artifacts(folder, artifacts, assets)
+        say("Every file on the draft is the one the run built.")
+        check_release_folder(folder, self.version)
+        say(f"{CHECKSUMS} lists every file, each hash matches, and the macOS app is version {self.version}.")
+        app = self.unpack_mac_app(folder)
+        requirement = self.check_mac_app(app)
+        say(f"The macOS app is signed with: {requirement}")
+        self.check_mac_notices(app, folder)
+        say(f"{MAC_NOTICES} is the notices file inside the macOS app.")
+        say("Running tools/macos_injection_check.sh on the macOS app (every leg, SIP on)...")
+        self.check_injection(app)
+        say("No library or program named in the app's environment loads into it or runs as it.")
+
+        signed = SIGNATURE in assets
+        if self.prerelease:
+            if signed:
+                raise ReleaseError(f"A pre-release mustn't carry {SIGNATURE}: installed copies must never install it.")
+            say("A pre-release isn't signed, so installed copies never install it.")
+        elif signed:
+            claim = verify_release(folder, self.version, self.keys)
+            if claim.requirement != self.requirement:
+                raise ReleaseError(f"The draft's {SIGNATURE} says {claim.comment()!r}; delete it and run this again.")
+            say(f"The draft already carries a good signature: {claim.comment()!r}")
+        elif self.dry_run:
+            if not self.key_path.is_file():
+                raise ReleaseError(f"There's no secret key at {self.key_path}.")
+            claim = ReleaseClaim(self.version, self.requirement)
+            say(f"Would sign {CHECKSUMS} as {claim.comment()!r} with {self.key_path} and upload {SIGNATURE}.")
+        else:
+            claim = sign_release(folder, self.version, self.key_path, self.requirement, self.keys, self.password)
+            self.gh("release", "upload", self.tag, str(folder / SIGNATURE), "--repo", self.repository)
+            uploaded = self.workdir / "uploaded"
+            self.gh("release", "download", self.tag, "--repo", self.repository, "--pattern", SIGNATURE, "--dir", str(uploaded))
+            if (uploaded / SIGNATURE).read_bytes() != (folder / SIGNATURE).read_bytes():
+                raise ReleaseError(f"The {SIGNATURE} on the draft isn't the one just uploaded.")
+            say(f"Signed {CHECKSUMS} as {claim.comment()!r} and uploaded {SIGNATURE}.")
+
+        latest = "--latest=false" if self.prerelease else "--latest"
+        if self.dry_run:
+            say(f"Would publish {self.tag} ({'pre-release' if self.prerelease else 'latest release'}). Dry run: nothing changed.")
+            return
+        # Nothing on the draft may have changed since it was checked.
+        now = self.draft_assets()
+        changed = [name for name in RELEASE_FILES if now.get(name) != assets.get(name)]
+        if changed:
+            raise ReleaseError(f"{', '.join(changed)} changed on the draft while it was checked. Run this again.")
+        self.gh("release", "edit", self.tag, "--repo", self.repository, "--draft=false", latest)
+        say(
+            f"Published {self.tag}"
+            + (" as a pre-release." if self.prerelease else " as the latest release. The Release pages workflow now "
+               "points the older release pages at it.")
+        )
+
+
+def publish_release(
+    tag: str,
+    workdir: Optional[Path] = None,
+    repository: Optional[str] = None,
+    key_path: Optional[Path] = None,
+    requirement: str = "",
+    run_id: Optional[int] = None,
+    dry_run: bool = False,
+    commands: Optional[Commands] = None,
+    keys: Optional[list[PublicKey]] = None,
+    password: Callable[[], str] = lambda: "",
+    say: Callable[[str], None] = print,
+) -> Path:
+    """Check, sign and publish the draft for `tag`; returns the folder that
+    holds what was checked."""
+    _tag, version, _prerelease = parse_tag(tag)
+    if workdir is None:
+        import tempfile
+
+        workdir = Path(tempfile.mkdtemp(prefix=f"dcf-release-{version}-"))
+    elif workdir.exists() and any(workdir.iterdir()):
+        raise ReleaseError(f"{workdir} isn't empty.")
+    publisher = Publisher(
+        tag, workdir, repository or default_repository(), key_path or KEY_DIR / f"{PRIMARY}.key",
+        requirement, run_id, dry_run, commands, keys, password, say,
+    )
+    publisher.publish()
+    return workdir
+
+
 # -- command line -----------------------------------------------------------------
+
+def release_steps() -> str:
+    """Every step of a release, as the module docstring lists them (nothing
+    when Python was asked to drop docstrings)."""
+    doc = __doc__ or ""
+    start, end = doc.find("    # 1."), doc.find("\n\n`publish` downloads")
+    return "every step of a release:\n\n" + doc[start:end] if 0 <= start < end else ""
+
 
 def _ask_password() -> str:
     return getpass.getpass("Password for the secret key: ")
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description="Sign DoubleClick Fixer releases.")
+    parser = argparse.ArgumentParser(
+        description="Sign DoubleClick Fixer releases.", epilog=release_steps(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     sign = commands.add_parser("sign", help="sign a downloaded release folder")
     sign.add_argument("version")
@@ -422,9 +821,26 @@ def main(argv: Optional[list[str]] = None) -> int:
     check.add_argument("folder", type=Path)
     make = commands.add_parser("keygen", help="make a new key pair")
     make.add_argument("name")
+    release = commands.add_parser(
+        "publish", help="check, sign and publish a draft release", epilog=release_steps(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    release.add_argument("tag")
+    release.add_argument("--dry-run", action="store_true", help="check everything; sign, upload and publish nothing")
+    release.add_argument("--run", type=int, help="the release.yml run that built the tag, if more than one did")
+    release.add_argument("--workdir", type=Path, help="an empty folder to download into (default: a new temporary one)")
+    release.add_argument("--key", type=Path, default=KEY_DIR / f"{PRIMARY}.key")
+    release.add_argument("--requirement", default="")
+    release.add_argument("--repo", help="OWNER/NAME (default: the one installed copies update from)")
     arguments = parser.parse_args(argv)
     try:
-        if arguments.command == "sign":
+        if arguments.command == "publish":
+            folder = publish_release(
+                arguments.tag, arguments.workdir, arguments.repo, arguments.key, arguments.requirement,
+                arguments.run, arguments.dry_run, password=_ask_password,
+            )
+            print(f"What was checked is in {folder}")
+        elif arguments.command == "sign":
             claim = sign_release(
                 arguments.folder, arguments.version, arguments.key, arguments.requirement, password=_ask_password
             )

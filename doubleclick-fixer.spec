@@ -38,17 +38,18 @@ EXCLUDES = [
     "PySide6.QtPdfWidgets",
 ]
 
-datas = []
-ci_update_key = os.environ.get("DCF_CI_UPDATE_KEY", "")
-if ci_update_key:
-    # CI's end-to-end job only: the public half of a key made for that run, so
-    # its stand-in release can be signed (tools/ci_update_key.py). A release
-    # must never carry it; release.yml refuses to build with it set.
-    if os.environ.get("GITHUB_REF", "").startswith("refs/tags/"):
-        raise SystemExit("DCF_CI_UPDATE_KEY is set for a tag build: a release must never trust CI's key")
-    if sys.platform == "darwin" or Path(ci_update_key).name != "dcf-ci-update-key.pub":
-        raise SystemExit(f"DCF_CI_UPDATE_KEY must name a Windows build's dcf-ci-update-key.pub, not {ci_update_key}")
-    datas.append((ci_update_key, "."))
+import importlib.util
+
+
+def load_tool(name):
+    spec = importlib.util.spec_from_file_location(name, f"tools/{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+ci_update_key = load_tool("ci_update_key")
 
 hiddenimports = []
 if sys.platform == "darwin":
@@ -62,24 +63,24 @@ if sys.platform == "darwin":
 # macOS: drop environment variables that would load code from outside the
 # app, before any other code runs (see the hook for which and why).
 RUNTIME_HOOKS = ["installer/runtime_hooks/scrub_env.py"] if sys.platform == "darwin" else []
+# CI's end-to-end Windows build alone: with DCF_CI_UPDATE_KEY set, a hook frozen
+# in makes it trust a key made for that run, so its stand-in update can be
+# signed (tools/ci_update_key.py). No other build has the hook: release.yml
+# refuses the variable and checks its builds, and macOS ignores it.
+RUNTIME_HOOKS += ci_update_key.spec_runtime_hooks(os.environ, sys.platform, Path("build", "ci-update-key"))
 
 analysis = Analysis(
     ["run.py"],
     pathex=["."],
     binaries=[],
-    datas=datas,
+    datas=[],
     hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=RUNTIME_HOOKS,
     excludes=EXCLUDES,
 )
 
-import importlib.util
-
-_spec = importlib.util.spec_from_file_location("make_notices", "tools/make_notices.py")
-make_notices = importlib.util.module_from_spec(_spec)
-sys.modules["make_notices"] = make_notices
-_spec.loader.exec_module(make_notices)
+make_notices = load_tool("make_notices")
 
 # Leave out the Qt image-format and icon-engine plugins the app never uses
 # (it draws its icons in code and only round-trips PNG, which Qt GUI has

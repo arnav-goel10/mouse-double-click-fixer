@@ -21,7 +21,17 @@
 #            and the runtime hook must pin PATH and drop the rest.
 # Each canary file must stay absent, and the self-test must still pass.
 #
-# Usage: tools/macos_injection_check.sh [path/to/DoubleClick Fixer.app] [--expect-injection]
+# The dyld and cwd legs mean something only with System Integrity Protection
+# on: with it off, as on GitHub's Macs, dyld loads DYLD_INSERT_LIBRARIES into
+# any app, hardened runtime or not, and the cwd leg rests on the same dyld
+# policy (a hardened program may not load a library by relative path). So
+# when `csrutil status` reports SIP disabled, those two legs are skipped, with
+# a warning, and the openssl and path legs still run and must pass.
+# tools/sign_release.py runs the whole check, with --require-sip, on the
+# release's own app before publishing it.
+#
+# Usage: tools/macos_injection_check.sh [path/to/DoubleClick Fixer.app] [--require-sip] [--expect-injection]
+# --require-sip runs every leg, and fails unless SIP is reported enabled.
 # --expect-injection turns the check around, for a control build without the
 # hardening (and without the runtime hook): every canary must fire, which
 # shows the check can fail at all.
@@ -30,15 +40,46 @@ set -euo pipefail
 
 app="dist/DoubleClick Fixer.app"
 expect_injection=0
+require_sip=0
 for argument in "$@"; do
   case "$argument" in
     --expect-injection) expect_injection=1 ;;
+    --require-sip) require_sip=1 ;;
     *) app="$argument" ;;
   esac
 done
 binary="$app/Contents/MacOS/DoubleClickFixer"
 [[ -x "$binary" ]] || { echo "error: no app at $app" >&2; exit 2; }
 binary="$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")"  # the cwd run starts elsewhere
+
+# Whether dyld honours the hardened runtime here: only with SIP on.
+sip_status="$(csrutil status 2>&1 || true)"
+case "$sip_status" in
+  *"Protection status: enabled."*) sip=enabled ;;
+  *"Protection status: disabled."*) sip=disabled ;;
+  *) sip=unknown ;;
+esac
+printf '%s\n' "${sip_status:-csrutil printed nothing}"
+if [[ $require_sip == 1 && $sip != enabled ]]; then
+  echo "FAILED: System Integrity Protection isn't reported enabled ($sip), so the dyld and cwd legs can't be trusted here; run this on a Mac with SIP on" >&2
+  exit 1
+fi
+skip_dyld_legs=0
+if [[ $sip == disabled && $expect_injection == 0 ]]; then
+  skip_dyld_legs=1
+  {
+    echo "################################################################################"
+    echo "WARNING: System Integrity Protection is disabled on this Mac. dyld then loads"
+    echo "DYLD_INSERT_LIBRARIES into any app, hardened runtime or not, and need not refuse"
+    echo "a library by relative path, so the dyld and cwd legs prove nothing here and are"
+    echo "SKIPPED. The openssl and path legs still run and must pass."
+    echo "tools/sign_release.py runs every leg, with SIP on, before publishing."
+    echo "################################################################################"
+  } >&2
+  if [[ "${GITHUB_ACTIONS:-}" == true ]]; then
+    echo "::warning title=Injection check::SIP is disabled on this runner: the dyld and cwd legs were skipped; the openssl and path legs ran"
+  fi
+fi
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -114,7 +155,7 @@ done
 printf 'echo "BASH_ENV or ENV was read" >> "%s"\n' "$marks/dcf-canary-path" > "$work/startup.sh"
 rm -f "$marks/dcf-canary-path"
 
-failed=0
+failed=()
 run() {  # name, then the environment to run the self-test with
   local name="$1"
   shift
@@ -123,36 +164,43 @@ run() {  # name, then the environment to run the self-test with
   env "$@" "$binary" --self-test || status=$?
   if [[ -e "$marks/dcf-canary-$name" ]]; then
     printf -- '-> canary %s FIRED: %s\n' "$name" "$(cat "$marks/dcf-canary-$name")"
-    [[ $expect_injection == 1 ]] || failed=1
+    [[ $expect_injection == 1 ]] || failed+=("$name")
   else
     printf -- '-> canary %s did not fire\n' "$name"
-    [[ $expect_injection == 0 ]] || failed=1
+    [[ $expect_injection == 0 ]] || failed+=("$name")
   fi
   if [[ $expect_injection == 0 && $status != 0 ]]; then
     printf -- '-> the self-test failed (exit %s)\n' "$status"
-    failed=1
+    failed+=("$name self-test")
   fi
 }
 
 codesign -dv "$app" 2>&1 | grep -E '^CodeDirectory' || true
-run dyld DYLD_INSERT_LIBRARIES="$dyld_canary"
-pushd "$cwd_folder" >/dev/null
-run cwd
-popd >/dev/null
+if [[ $skip_dyld_legs == 1 ]]; then
+  printf '\n== dyld: SKIPPED (System Integrity Protection is disabled)\n'
+  printf '\n== cwd: SKIPPED (System Integrity Protection is disabled)\n'
+else
+  run dyld DYLD_INSERT_LIBRARIES="$dyld_canary"
+  pushd "$cwd_folder" >/dev/null
+  run cwd
+  popd >/dev/null
+fi
 run openssl OPENSSL_CONF="$work/openssl.cnf"
 run path PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" BASH_ENV="$work/startup.sh" ENV="$work/startup.sh" \
   "BASH_FUNC_sleep%%=() { echo 'exported function ran' >> '$marks/dcf-canary-path'; }"
 
-if [[ $failed != 0 ]]; then
+if [[ ${#failed[@]} != 0 ]]; then
   if [[ $expect_injection == 1 ]]; then
-    echo "FAILED: a canary did not fire in a build expected to run it; the check proves nothing" >&2
+    echo "FAILED (${failed[*]}): a canary did not fire in a build expected to run it; the check proves nothing" >&2
   else
-    echo "FAILED: the app loaded or ran code named in its environment, or its self-test failed" >&2
+    echo "FAILED (${failed[*]}): the app loaded or ran code named in its environment, or its self-test failed" >&2
   fi
   exit 1
 fi
 if [[ $expect_injection == 1 ]]; then
   echo "OK: every canary fired in this unhardened build, as expected"
+elif [[ $skip_dyld_legs == 1 ]]; then
+  echo "OK, WITHOUT THE DYLD AND CWD LEGS (SIP is disabled): the openssl and path canaries did not fire and the self-test passed"
 else
-  echo "OK: no canary fired and the self-test passed"
+  echo "OK: no canary fired and the self-test passed, with System Integrity Protection $sip"
 fi
