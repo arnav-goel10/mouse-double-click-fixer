@@ -1,5 +1,200 @@
 # Changelog
 
+## 1.0.0 — 2026-10-10
+
+1.0 closes the remaining gaps around drags and clicks followed by a quick
+move, on both platforms, and signs every update. Requires macOS 13 or later
+on Apple silicon, or 64-bit Windows 10 version 1809 or later, or Windows 11.
+
+### Filtering
+
+- **Drags are protected from the first moment.** Every release is now held
+  for the filter window, however short the click. A release 12–30 ms after
+  its press used to go straight through, so a contact that bounced twice as
+  it closed could turn the start of a drag into a click. Very short taps now
+  wait like any other click.
+- **A small movement no longer ends a drag.** Since 0.5.1 on macOS, a
+  release held in place was settled by any pointer motion, even a hand
+  resting on the mouse, and a dropout's comeback could make a drag look like
+  a click made in place. Now motion inside the filter window settles such a
+  release only once the pointer has moved a few pixels from where the button
+  came up.
+- **A drag survives a busy computer.** A held release is now settled by
+  the time of the events that follow it, not by a timer started when it
+  arrived. Events reach the filter in the order they happened, so once one
+  from after the filter window arrives, no press can still be on its way to
+  cancel the release. Before, a dropout's comeback press that reached the
+  filter late could find its release already sent, and the drag broke. With
+  nothing after it, as on a still mouse, a timer settles the release after
+  the window plus an allowance for how late this computer has lately
+  delivered mouse button events, kept between 5 and 150 ms.
+- A held release that comes due while the app is still re-sending other
+  input now waits behind it, so apps can never see a button come up before
+  it went down.
+- The app waits for input it re-sent to come back through the filter for
+  as long as this computer has lately taken to deliver events (twice the
+  longest recent delay, from 150 ms up to half a second), so on a slow
+  machine a later click can't overtake a re-sent release. It used to stop
+  waiting after 150 ms.
+- Clicks and pointer moves no longer wait up to 5 ms for the app's own
+  window to finish what it is doing.
+
+### macOS
+
+- **Correction to 0.5.3.** 0.5.3 said the driver stamps clicks in
+  nanoseconds. Real clicks, where the filter sees them, carry mach ticks;
+  only clicks other programs post carry nanoseconds. So 0.5.3 still timed
+  real clicks by when its own code ran, and a posted click seen first after
+  the filter started could have put every later click 41.67 times too close
+  together, so clicks seconds apart were dropped as bounce. Each event's
+  timestamp is now read in whichever unit it carries.
+- **A pointer move can no longer reach apps ahead of a click's release.**
+  Clicks and pointer motion now come through one event tap, which macOS
+  hands over strictly in order. The separate motion tap 0.5.1 added took
+  effect too late, so the first moves after a click could overtake it. The
+  app now receives every pointer move; it reads where the pointer is and
+  when it moved, and nothing else.
+- Two separate clicks no longer become a double-click after a blocked
+  bounce. macOS counts a suppressed press toward a double-click; the app now
+  counts only the presses apps receive, by macOS's rule and your
+  double-click speed.
+- After a drag let go while moving, the pointer no longer stays behind where
+  the button came up; it is put back where your hand has taken it.
+- Removing the app's permission while it filters stops the filter within a
+  second, and clicks go through untouched. macOS can keep reporting the app
+  as allowed after it is removed from the list, so the app checks by asking
+  for an event tap. It starts again by itself once allowed, and your "on" is
+  kept.
+- The permission list is named as System Settings names it: **Device
+  Control and Data Access** on macOS 27 and later, **Accessibility** on 26
+  and earlier. **Open Settings…** in General now always opens it.
+- If macOS switches the filter off three times within 30 seconds, the filter
+  stops and says so instead of fighting the system; turn it on again from
+  the menu bar.
+- The filter is rebuilt after sleep and when its tap is found switched off,
+  pauses while your session is in the background with fast user switching,
+  and releases its event tap when it stops (each stop used to leave one
+  registered).
+- The app is signed with the hardened runtime and clears the environment
+  variables that would make the libraries inside it load code from
+  elsewhere. It starts the programs it needs (pgrep, codesign, ditto, open,
+  and bash for an update) by full path, with PATH set to the system folders
+  and bash's start-up variables removed. So other programs can't use those
+  routes to act with its permission. Its signing requirement is unchanged,
+  so the permission carries over from 0.5.
+- A Window menu with Minimize (⌘M) and Zoom, and the menu bar icon keeps the
+  place you drag it to.
+- `installer/uninstall_macos.sh` waits for the app to quit before it
+  removes anything, and stops with a message if the app won't quit.
+
+### Windows
+
+- **Fixed: a click followed by a quick move was lost or became a drag.**
+  This is the Windows fix 0.5.1 promised. While a release is held, the first
+  move off the spot waits, the release goes out where you clicked, and the
+  move follows. A drag let go while moving drops where the button came up.
+  Pen and touch, a hidden pointer (a game's mouse-look) and remote sessions
+  keep the old timed delivery.
+- Clicks are timed on the precise clock as they arrive, not by Windows'
+  15.6 ms tick, which was coarser than the gaps being judged. A bounce at
+  the start of a drag is told apart again, a calibrated window near 30 ms no
+  longer lets 20–30 ms chatter through, the Test pane and calibration show
+  real gaps (they only ever showed 0, 15, 16 or 31 ms), and the first click
+  after weeks without one is no longer swallowed.
+- With the buttons swapped for left-handed use, a re-sent release now comes
+  back as the same button; it came back as the other one.
+- The mouse hook is re-installed every 15 seconds (was every minute) and
+  whenever the session is unlocked or reconnected or the PC wakes, when
+  Windows most often drops it.
+- Re-sent input goes out from a thread of its own. Sending it from inside
+  the hook could stall all input on the PC.
+- One copy runs per user and session. With fast user switching, a second
+  user's copy used to start unreachable, and their later launches showed
+  nothing.
+- The installer installs a folder, which starts without unpacking itself at
+  every launch and sign-in; the portable exe stays one file. It needs
+  64-bit Windows 10 version 1809 or later and says so instead of installing
+  something that can't start. It closes a running copy through the installed
+  one and never waits on it for more than 20 seconds.
+- Ticking "Start DoubleClick Fixer when I sign in" clears an earlier "off"
+  in Task Manager's Startup apps; uninstalling removes both.
+- Updates now finish in folders whose names use characters outside the
+  system's code page (a user name like Łukasz on an English system).
+  Before, the app didn't come back after updating there.
+- The updater starts cmd.exe, and the Windows programs its update script
+  runs, from System32 by full path. Named alone, Windows would look for them
+  in the app's own folder or the current folder first, so a file with one of
+  their names beside the portable exe (in Downloads, say) could have run
+  instead.
+- Windows builds no longer carry Mesa's software OpenGL (opengl32sw.dll,
+  about 20 MB), which the app never used.
+- Update checks and downloads go through Windows' own TLS (Schannel). The
+  build no longer ships Qt's OpenSSL plugin and the copy of OpenSSL it picked
+  up from another program on the build machine, nor a copy of the Universal
+  C Runtime, which Windows 10 and later have built in and keep updated.
+
+### Updates and security
+
+- **Updates are signed.** A release's SHA256SUMS.txt carries a minisign
+  (Ed25519) signature made with a release key that never goes to GitHub or
+  CI. The app has two public keys built in, a primary and a backup. An
+  update is offered only when the signature checks out, names exactly that
+  version, and that version is newer than yours; one that fails is never
+  downloaded, and General says why.
+- Copies older than 1.0 trust checksums alone (on macOS, plus the
+  code-signature check) for the update that brings them to 1.0. From 1.0
+  on, every update is signature-checked.
+- On macOS an update must also be the version it claims and keep the
+  installed app's signing requirement, which the permission depends on. A
+  move to a new signing certificate has to be named in a signed release.
+- Releases are now built by CI as drafts. Before one is published, it is
+  checked against CI's build and signed on the maintainer's Mac.
+- Checking for updates and installing them have separate switches, so
+  turning off automatic installs no longer stops the checks. If you turned
+  updates off before 1.0, both stay off.
+- A copy that can't replace itself says so before downloading anything, for
+  example "Move DoubleClick Fixer to Applications to update it."
+- A version that failed to install twice is no longer retried at every
+  sign-in; it waits for you. A download waiting to install is no longer
+  fetched again by the next check, and "Update to X" in the menu opens
+  General so progress and any failure show.
+- Every build ships THIRD_PARTY_NOTICES.md, the licences of Qt, Python, the
+  code inside them and the other software the app is built on, including
+  the LGPL and GPL texts, worked out from the files that build ships.
+  **General › Acknowledgements…** opens it, and on Windows it is also in the
+  install folder. Each release also carries both platforms' copies, as
+  THIRD_PARTY_NOTICES-macos.md and THIRD_PARTY_NOTICES-windows.md.
+
+### App
+
+- **Copy Diagnostics** (Windows: **Copy diagnostics**) in General copies
+  the version, OS, the filter's state, the settings and the end of the
+  app's log, for a bug report. The log records start-up, the filter
+  starting and stopping, failures and updates, never clicks; hard crashes
+  go to crash.log beside it.
+- Your "on" survives failures. A filter that can't start at login, or stops
+  on its own, used to switch itself off for good. Now the menu's status line
+  says what happened, a start the app makes itself retries at 1, 3, 8 and
+  20 seconds, and the menu item turns it off rather than trying again.
+- Calibration starts with the first click on the pad (Begin is optional).
+  Double-clicks count as pairs within your system's double-click speed, up
+  to a second, and a pair that is too slow says so. The pad measures left,
+  right and middle clicks, and the Test pane shows all of them.
+- Filtering pauses only while Calibrate is measuring with its window in
+  front. Reading the intro, switching to another app or leaving a result
+  unapplied no longer leaves clicks unfiltered, and the menu can turn
+  filtering on from the result screen.
+- Open at login says when the system has it turned off (macOS Login Items,
+  or Task Manager's Startup apps) and how to turn it back on. A copy run
+  from the disk image no longer sets itself to open from there.
+- Settings survive a crash mid-save and a file that can't be read: the last
+  good copy is kept as settings.json.bak and used if settings.json is
+  damaged.
+- Switches read as named checkboxes and the sidebar as a list to VoiceOver
+  and Narrator, and keyboard focus is shown.
+- The first window fits the screen, and the Windows "still running"
+  notification shows once rather than at every sign-in.
+
 ## 0.5.3 — 2026-10-08
 
 - macOS: the filter now measures click timing from the driver's own

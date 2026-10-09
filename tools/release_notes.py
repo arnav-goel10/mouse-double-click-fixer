@@ -10,10 +10,11 @@ older release says that a newer one exists. A pre-release (1.1.0-rc.1) shows
 its own section if the changelog has one, else its version's, else the
 "Unreleased" one, under a line saying installed copies won't update to it.
 
---point-older rewrites every published release page older than the latest
-release, so each says a newer version exists; a page for a later version (a
-pre-release of the next one, say) is left alone. Without --apply it only
-prints what it would write. The Release pages workflow runs it when a release
+--point-older puts a line at the top of every published release page older
+than the latest release saying that a newer version exists (replacing the
+line an earlier run put there) and leaves the rest of each page as it was
+published; a page for a later version (a pre-release of the next one, say)
+is left alone. Without --apply it only prints what it would change. The Release pages workflow runs it when a release
 is published; it needs `gh`, signed in with permission to edit releases.
 """
 
@@ -31,6 +32,10 @@ ROOT = Path(__file__).resolve().parents[1]
 UNRELEASED = "Unreleased"
 #: The first version whose release carries the notices files.
 NOTICES_SINCE = (1, 0, 0)
+#: The first version whose releases carry SHA256SUMS.txt.minisig (pre-releases never do).
+SIGNED_SINCE = (1, 0, 0)
+#: The line --point-older puts at the top of an older page.
+NEWER_BANNER = re.compile(r"\A> \*\*A newer version is available:\*\*[^\n]*\n+")
 #: The third-party notices a release carries, one per platform's downloads,
 #: with the label its page gives each (tools/sign_release.py's MAC_NOTICES
 #: and WINDOWS_NOTICES).
@@ -105,15 +110,24 @@ def notes(version: str, repo: str, latest: Optional[str] = None) -> str:
     section = release_section(version, changelog)
     parts = []
     if latest and latest != version:
+        parts.append(newer_banner(latest, repo))
+    pre_release = "-" in version
+    if pre_release:
         parts.append(
-            f"> **A newer version is available:** [DoubleClick Fixer {latest}]"
-            f"(https://github.com/{repo}/releases/latest). Download that one instead.\n"
+            "> **This is a pre-release, for testing.** Installed copies of DoubleClick Fixer don't update to it."
         )
-    if "-" in version:
-        parts.append(
-            "> **This is a pre-release, for testing.** Installed copies of DoubleClick Fixer don't update to it.\n"
-        )
-    parts.append(template.replace("__VERSION__", version).replace("__REPO__", repo).strip())
+    if pre_release:
+        updates = ""
+    else:
+        updates = "Already using DoubleClick Fixer? It updates itself; there is nothing to download."
+    if not pre_release and version_tuple(version) >= SIGNED_SINCE:
+        checksums = "The files are listed in `SHA256SUMS.txt`, signed in `SHA256SUMS.txt.minisig`; "
+    else:
+        checksums = "The files are listed in `SHA256SUMS.txt`; "
+    checksums += f"[SECURITY.md](https://github.com/{repo}/blob/main/SECURITY.md#how-updates-are-verified) says how to check them."
+    page = template.replace("__VERSION__", version).replace("__REPO__", repo)
+    page = page.replace("__UPDATES__", updates).replace("__CHECKSUMS__", checksums)
+    parts.append(re.sub(r"\n{3,}", "\n\n", page).strip())
     parts.append(f"## What's new\n\n{unwrap(section)}")
     if version_tuple(version) >= NOTICES_SINCE:
         links = " and ".join(
@@ -127,6 +141,19 @@ def notes(version: str, repo: str, latest: Optional[str] = None) -> str:
     if previous:
         parts.append(f"**All changes:** https://github.com/{repo}/compare/v{previous}...v{version}")
     return "\n\n".join(parts) + "\n"
+
+
+def newer_banner(latest: str, repo: str) -> str:
+    return (
+        f"> **A newer version is available:** [DoubleClick Fixer {latest}]"
+        f"(https://github.com/{repo}/releases/latest). Download that one instead."
+    )
+
+
+def point_at(body: str, latest: str, repo: str) -> str:
+    """An older page as published, with the newer-version line at the top
+    (replacing one an earlier run put there)."""
+    return newer_banner(latest, repo) + "\n\n" + NEWER_BANNER.sub("", body.lstrip("\ufeff"), count=1).lstrip("\n")
 
 
 # -- refreshing older release pages ----------------------------------------------------
@@ -152,10 +179,10 @@ def point_older(
     gh: Callable[..., str] = _gh,
     say: Callable[[str], None] = print,
 ) -> list[str]:
-    """Rewrite every published release page older than the latest release so
-    that it points at the latest. A page for a later version (a pre-release
-    of the next one) is left alone. Returns the tags rewritten (or that
-    would be)."""
+    """Point every published release page older than the latest release at
+    the latest, leaving the rest of each page as it was published. A page
+    for a later version (a pre-release of the next one) is left alone.
+    Returns the tags changed (or that would be)."""
     latest_tag = gh("api", f"repos/{repo}/releases/latest", "--jq", ".tag_name").strip()
     if not re.fullmatch(r"v\d+(?:\.\d+)+", latest_tag):
         raise SystemExit(f"The latest release's tag isn't a version: {latest_tag!r}")
@@ -172,10 +199,10 @@ def point_older(
         if not is_older(tag[1:], latest):
             say(f"{tag}: left alone (later than the latest release, {latest})")
             continue
-        try:
-            body = notes(tag[1:], repo, latest)
-        except SystemExit as error:
-            say(f"{tag}: left alone ({error})")
+        published = gh("release", "view", tag, "--repo", repo, "--json", "body", "--jq", ".body")
+        body = point_at(published.rstrip("\n") + "\n", latest, repo)
+        if body.rstrip() == published.rstrip():
+            say(f"{tag}: already points at {latest}")
             continue
         changed.append(tag)
         if not apply:
