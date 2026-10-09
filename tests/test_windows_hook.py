@@ -360,6 +360,20 @@ class WindowsHookLogicTests(unittest.TestCase):
                 self.assertEqual(self.win.buttons()[1][:3], ("up", Button.LEFT, (300, 200)))
                 self.assertEqual(self.win.cursor, (510, 200))
 
+    def test_a_teleport_that_cannot_be_made_leaves_nothing_in_flight(self) -> None:
+        self.drag_and_let_go_while_moving()
+        real_move_input = self.win.move_input
+
+        def move_input(x, y, mark):
+            if mark == MOTION_MARK_FOR[Button.LEFT]:
+                raise OSError("no virtual screen")
+            return real_move_input(x, y, mark)
+
+        self.win.move_input = move_input
+        with mock.patch("app.platform._logged_sites", set()), self.assertLogs("app.platform", "WARNING"):
+            self.fire_timers()
+        self.assertEqual(self.filter._in_flight[Button.LEFT], 0, "a way back never sent is still awaited")
+
     def test_a_second_click_while_motion_is_held_lands_where_the_hand_was(self) -> None:
         # Windows' queue is backed up (the hook's thread was busy): moves and
         # a new click all wait behind the first click's release.

@@ -1317,14 +1317,16 @@ class WindowsHook:
         # release it there and take it back, in one batch so the three arrive
         # in order. The way back counts as re-sent motion, so a real move that
         # comes between the release and it queues behind it rather than being
-        # undone by it.
-        with self._owner._lock:
-            self._owner._track(button, 1)
-        return [
+        # undone by it. It is counted only once the batch exists, so a batch
+        # that couldn't be made leaves nothing waiting for it.
+        batch = [
             (api.move_input(x, y, TELEPORT_MARK), None),
             (api.button_input(flags, when), button),
             (api.move_input(here[0], here[1], MOTION_MARK_FOR[button]), button),
         ]
+        with self._owner._lock:
+            self._owner._track(button, 1)
+        return batch
 
 
 def send_batch(api, batch: list, lost: Callable[[Button], object]) -> int:
