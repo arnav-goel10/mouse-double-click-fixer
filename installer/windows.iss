@@ -129,12 +129,12 @@ begin
     // Before 0.2.7 "--quit" is unknown: run with it, such a copy may start a
     // second one that never exits.
     Log('Quit: taskkill only: no installed copy, or one before 0.2.7 (' + Version + ')')
-  else if VersionAtLeast(Version, 1, 0, 0) and not DirExists(ExpandConstant('{app}\_internal')) then
-    // From 1.0 the installed app is a folder build, and its exe can't start
-    // without _internal: a failed update may have removed it
+  else if VersionAtLeast(Version, 0, 5, 4) and not DirExists(ExpandConstant('{app}\_internal')) then
+    // Every release after 0.5.3 installs a folder build, and its exe can't
+    // start without _internal: a failed update may have removed it
     // ([InstallDelete] runs first, and rollback doesn't restore it). Run, it
-    // would show "Failed to load Python DLL" and wait for a click. Before
-    // 1.0 it was one self-contained file.
+    // would show "Failed to load Python DLL" and wait for a click. 0.5.3 and
+    // earlier were one self-contained file, which has no _internal.
     Log('Quit: taskkill only: the installed ' + Version + ' has no _internal folder, so it can''t start')
   else
     Result := ExpandConstant('{app}\DoubleClickFixer.exe');
@@ -155,11 +155,18 @@ begin
     // all, and a copy that can't start or hangs would hold this installer
     // (a silent update, with the app already closed) for ever. The exe is
     // found from the folder PowerShell starts in, so no path is ever
-    // quoted into the command.
-    Script := '$ErrorActionPreference = ''Stop''; ' +
+    // quoted into the command. It uses cmdlets only, no .NET methods: where
+    // application control puts PowerShell in Constrained Language Mode, a
+    // method call fails. It switches itself to that mode first, so every
+    // machine (and the end-to-end test) runs it the way those do.
+    // Wait-Process fails both when time is up and when the copy is already
+    // gone; which one it was is told by whether the copy is still there.
+    Script := 'try { $ExecutionContext.SessionState.LanguageMode = ''ConstrainedLanguage'' } catch { }; ' +
+      '$ErrorActionPreference = ''Stop''; ' +
       'try { $p = Start-Process -FilePath (Join-Path -Path (Get-Location).ProviderPath -ChildPath ''' +
       ExtractFileName(Exe) + ''') -ArgumentList ''--quit'' -WindowStyle Hidden -PassThru } catch { exit 4 }; ' +
-      'if ($p.WaitForExit(' + IntToStr(QuitWaitSeconds * 1000) + ')) { exit 0 }; ' +
+      '$done = $true; try { Wait-Process -Id $p.Id -Timeout ' + IntToStr(QuitWaitSeconds) + ' } ' +
+      'catch { $done = -not (Get-Process -Id $p.Id -ErrorAction SilentlyContinue) }; if ($done) { exit 0 }; ' +
       'Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; exit 3';
     Log('Quit: asking the installed copy: ' + Exe + ' --quit');
     if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
