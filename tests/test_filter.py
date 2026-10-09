@@ -857,12 +857,15 @@ class FakeQuartz:
         self.taps_enabled_at_post = []
         self.pointer = (0.0, 0.0)
         self.pointer_error = None  # raised when the pointer is read, if set
+        self.refuse_taps = False  # as macOS does without the permission
         self._wake = threading.Event()
 
     def CGEventMaskBit(self, kind):
         return 1 << kind
 
     def CGEventTapCreate(self, where, place, options, mask, callback, refcon):
+        if self.refuse_taps:
+            return None
         tap = SimpleNamespace(mask=mask, callback=callback, enabled=False, invalidated=False)
         self.taps.append(tap)
         return tap
@@ -1198,6 +1201,18 @@ class MacTapTests(unittest.TestCase):
         with self.assertLogs("app.platform", "INFO") as logged:
             self.filter.stop()
         self.assertIn("tap resets 1, hook re-arms 0", "\n".join(logged.output))
+
+    def test_a_refused_tap_says_where_to_allow_the_app(self) -> None:
+        self.filter.stop()
+        self.quartz.refuse_taps = True
+        with mock.patch("app.permissions.pane_name", return_value="Device Control and Data Access"):
+            with self.assertRaises(HookError) as raised:
+                GlobalClickFilter(60, [Button.LEFT]).start()
+        self.assertEqual(
+            str(raised.exception),
+            "macOS refused the event tap. Allow DoubleClick Fixer in System Settings \u203a Privacy & Security "
+            "\u203a Device Control and Data Access, then try again.",
+        )
 
 
 if __name__ == "__main__":

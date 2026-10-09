@@ -58,7 +58,10 @@ IN_FLIGHT_TIMEOUT_S = 0.15
 #: the system, so the filter stops and every click goes through untouched.
 TAP_DISABLE_LIMIT = 3
 TAP_DISABLE_WINDOW_S = 30.0
-TAP_DISABLED_MESSAGE = "macOS keeps disabling the filter. Turn it on again from the menu."
+TAP_DISABLED_MESSAGE = (
+    "macOS kept switching the filter off, so it has stopped and clicks now go through unfiltered. "
+    "Turn it on again from the menu bar."
+)
 
 #: How far an event's own timestamp may sit from `monotonic()` and still be
 #: believed. A tap sees an event within milliseconds of the driver making it.
@@ -914,9 +917,11 @@ class GlobalClickFilter:
             None,
         )
         if tap is None:
+            from . import permissions
+
             self._startup_error = HookError(
-                "macOS refused the event tap. Grant Accessibility permission to DoubleClick Fixer "
-                "in System Settings > Privacy & Security > Accessibility, then try again."
+                "macOS refused the event tap. Allow DoubleClick Fixer in System Settings \u203a "
+                f"Privacy & Security \u203a {permissions.pane_name()}, then try again."
             )
             self._ready.set()
             return
