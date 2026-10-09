@@ -611,7 +611,7 @@ class Publisher:
                 problems.append(f"The {artifact} artifact holds {sorted(built)}, not {sorted(names)}.")
             for name in names:
                 if name in built and (folder / name).is_file() and _sha256(built[name]) != _sha256(folder / name):
-                    problems.append(f"{name} on the draft isn't the file run built ({artifact}).")
+                    problems.append(f"{name} on the draft isn't the file the run built ({artifact}).")
         if problems:
             raise ReleaseError("\n".join(problems))
 
@@ -629,10 +629,13 @@ class Publisher:
         found = [line.split("=>", 1)[1].strip() for line in output.splitlines() if line.startswith("designated =>")]
         expected = self.requirement or APP_REQUIREMENT
         if found != [expected]:
+            hint = "" if self.requirement else (
+                " (Moving to a new signing identity on purpose? Name the new requirement with --requirement.)"
+            )
             raise ReleaseError(
                 f"The app in {MAC_ZIP} has the designated requirement\n    {found[0] if found else '(none)'}\n"
                 f"not\n    {expected}\nmacOS would take the Accessibility permission away from every copy it "
-                "updated. (Moving to a new signing identity on purpose? Pass the new requirement with --requirement.)"
+                f"updated.{hint}"
             )
         return found[0]
 

@@ -470,7 +470,7 @@ class PublishTests(unittest.TestCase):
 
     def test_a_file_the_run_didnt_build_is_refused(self) -> None:
         self.github.put("DoubleClickFixer.exe", b"swapped")
-        self.refused(r"DoubleClickFixer.exe on the draft isn't the file run built")
+        self.refused(r"DoubleClickFixer.exe on the draft isn't the file the run built")
 
     def test_a_draft_with_files_missing_or_extra_is_refused(self) -> None:
         del self.github.assets["THIRD_PARTY_NOTICES.md"]
