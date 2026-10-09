@@ -853,6 +853,7 @@ class FakeQuartz:
         self.taps = []
         self.posted = []
         self.pointer = (0.0, 0.0)
+        self.pointer_error = None  # raised when the pointer is read, if set
         self._wake = threading.Event()
 
     def CGEventMaskBit(self, kind):
@@ -916,6 +917,8 @@ class FakeQuartz:
         self.posted.append(event.copy())
 
     def CGEventCreate(self, source):
+        if self.pointer_error is not None:
+            raise self.pointer_error
         return FakeCGEvent(0, *self.pointer)
 
     def CGEventCreateMouseEvent(self, source, kind, point, button):
@@ -988,9 +991,30 @@ class MacTapTests(unittest.TestCase):
     def test_a_release_made_in_place_posts_no_restore(self) -> None:
         self.button(self.Q.kCGEventLeftMouseDown, (10, 10), 0.0)
         self.button(self.Q.kCGEventLeftMouseUp, (10, 10), 0.1)
-        self.quartz.pointer = (11.0, 10.0)
+        self.quartz.pointer = (10.3, 10.0)
         self.timers[-1].fire()
         self.assertEqual([event.kind for event in self.quartz.posted], [self.Q.kCGEventLeftMouseUp])
+
+    def test_a_click_whose_small_motion_passed_gets_the_pointer_back(self) -> None:
+        # A nudge under the click radius reaches apps while the release is
+        # held; the release, re-sent where the button came up, must not
+        # leave the pointer behind the hand.
+        self.button(self.Q.kCGEventLeftMouseDown, (10, 10), 0.0)
+        self.button(self.Q.kCGEventLeftMouseUp, (10, 10), 0.1)
+        self.assertIsNotNone(self.motion((12, 10)), "a nudge passes")
+        self.quartz.pointer = (12.0, 10.0)
+        self.timers[-1].fire()
+        release, restore = self.quartz.posted
+        self.assertEqual((release.kind, release.location.x), (self.Q.kCGEventLeftMouseUp, 10))
+        self.assertEqual((restore.kind, restore.location.x, self.mark(restore)), (self.Q.kCGEventMouseMoved, 12, RESTORE_MARK))
+
+    def test_the_release_goes_out_when_the_pointer_cannot_be_read(self) -> None:
+        self.button(self.Q.kCGEventLeftMouseDown, (0, 0), 0.0)
+        self.button(self.Q.kCGEventLeftMouseUp, (50, 0), 0.5)
+        self.quartz.pointer_error = RuntimeError("no event")
+        with fresh_error_log(), self.assertLogs("app.platform", "WARNING"):
+            self.timers[-1].fire()
+        self.assertEqual([(event.kind, self.mark(event)) for event in self.quartz.posted], [(self.Q.kCGEventLeftMouseUp, INJECTED_MARK)])
 
     def test_the_motion_tap_judges_motion_by_where_it_went(self) -> None:
         self.button(self.Q.kCGEventLeftMouseDown, (100, 100), 0.0)

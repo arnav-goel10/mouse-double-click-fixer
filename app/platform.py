@@ -45,6 +45,10 @@ RESTORE_MARK = max(INJECTED_MOTION_MARKS) + 1
 #: where the button came up settles it; less is a hand resting on the mouse.
 STATIONARY_PX = 4.0
 
+#: A re-sent release takes the pointer back to where the button came up. If
+#: the pointer had moved on by more than this, it is put back again.
+RESTORE_MIN_PX = 0.5
+
 #: A re-sent event normally passes back through the hook within a millisecond
 #: or two. If one never does (it was blocked, or lost), stop waiting for it.
 IN_FLIGHT_TIMEOUT_S = 0.15
@@ -768,12 +772,14 @@ class GlobalClickFilter:
 
         def restore_pointer(pointer: object, released_at: object) -> None:
             # A release posted where the button came up takes the pointer
-            # there. After a drag let go while moving, the hand has carried
-            # the pointer on since, so put it back. The move is not tracked:
-            # the motion tap is usually off then and would never see it come
-            # back, which would hold the next click for IN_FLIGHT_TIMEOUT_S.
+            # there. The hand may have carried the pointer on since: far, after
+            # a drag let go while moving, or a little, after a click whose
+            # small motion passed while its release was held. So put it back.
+            # The move is not tracked: the motion tap is usually off then and
+            # would never see it come back, which would hold the next click
+            # for IN_FLIGHT_TIMEOUT_S.
             try:
-                if math.hypot(pointer.x - released_at.x, pointer.y - released_at.y) < STATIONARY_PX:
+                if math.hypot(pointer.x - released_at.x, pointer.y - released_at.y) <= RESTORE_MIN_PX:
                     return
                 move = Quartz.CGEventCreateMouseEvent(
                     None, Quartz.kCGEventMouseMoved, pointer, Quartz.kCGMouseButtonLeft
