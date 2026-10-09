@@ -13,17 +13,9 @@ from PySide6.QtCore import QObject, Signal
 from . import DISPLAY_NAME, permissions
 from . import settings as settings_store
 from . import startup
-from .contracts import (
-    SIDE_BUTTONS,
-    TOUCH_KINDS,
-    Button,
-    DeviceInfo,
-    FilterConfig,
-    GlobalClickFilter,
-    as_button,
-    button_name,
-)
+from .contracts import SIDE_BUTTONS, Button, DeviceInfo, FilterConfig, GlobalClickFilter
 from .core import ClickEvent, clamp_threshold
+from .inputs import TOUCH_KINDS, as_button, button_name
 from .platform import HookError, is_supported
 from .wear import WearHistory
 

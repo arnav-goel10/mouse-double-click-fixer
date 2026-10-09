@@ -550,41 +550,5 @@ class ControllerFeatureTests(unittest.TestCase):
                          "only the report leaves them out")
 
 
-@unittest.skipUnless(__import__("app.contracts", fromlist=["STAND_IN"]).STAND_IN, "the real filter has landed")
-class StandInFilterTests(unittest.TestCase):
-    """Until INPUT's filter lands, today's filter runs behind the 1.0 interface."""
-
-    def test_it_takes_the_left_windows_and_the_buttons_it_knows(self) -> None:
-        from app import contracts, core
-
-        made = []
-
-        class Legacy:
-            def __init__(self, threshold_ms, buttons, **callbacks):
-                made.append((threshold_ms, buttons, callbacks))
-                self.updates = []
-
-            def update(self, threshold_ms=None, buttons=None):
-                self.updates.append((threshold_ms, buttons))
-
-            running = True
-
-        config = contracts.FilterConfig(
-            thresholds={button: 30 if button is contracts.Button.LEFT else 80 for button in contracts.Button},
-            buttons=frozenset({contracts.Button.LEFT, contracts.Button.BACK, contracts.Button.MIDDLE}),
-        )
-        with mock.patch.object(contracts._platform, "GlobalClickFilter", Legacy):
-            hook = contracts.GlobalClickFilter(config, on_event=print, on_device=print, on_wheel=print)
-        threshold, buttons, callbacks = made[0]
-        self.assertEqual(threshold, 30)
-        self.assertEqual(sorted(buttons), [core.Button.LEFT, core.Button.MIDDLE])
-        self.assertNotIn("on_device", callbacks)
-        self.assertTrue(hook.running, "everything else is the real filter's")
-        self.assertEqual(hook.seen_devices(), [])
-        hook.update(contracts.FilterConfig(thresholds={**config.thresholds, contracts.Button.LEFT: 40},
-                                           buttons=frozenset({contracts.Button.RIGHT})))
-        self.assertEqual(hook._inner.updates, [(40, [core.Button.RIGHT])])
-
-
 if __name__ == "__main__":
     unittest.main()

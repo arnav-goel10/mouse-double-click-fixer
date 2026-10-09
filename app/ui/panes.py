@@ -9,7 +9,8 @@ from typing import Optional
 from PySide6.QtWidgets import QComboBox, QFileDialog, QHBoxLayout, QMenu, QVBoxLayout, QWidget
 
 from .. import app_keys
-from ..contracts import TOUCH_KINDS, Button, as_button, button_name
+from ..contracts import Button
+from ..inputs import TOUCH_KINDS, as_button, button_name
 from ..wear import SHOWN_DAYS
 from .base import Page, card_icon, label, make_button
 from .charts import DailyRateChart, GapHistogram
