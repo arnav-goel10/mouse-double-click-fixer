@@ -186,9 +186,10 @@ jobs:
           echo "DCF_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
       - name: Show whether this Mac enforces code signatures
         # With System Integrity Protection off, as on GitHub's Macs, dyld loads
-        # DYLD_INSERT_LIBRARIES into any app, so the build's injection check
-        # skips that one leg here; tools/sign_release.py runs it in full, with
-        # SIP on, before a release is published.
+        # DYLD_INSERT_LIBRARIES into any app and need not refuse relative
+        # paths, so the build's injection check skips its dyld and cwd legs
+        # here; tools/sign_release.py runs it in full, with SIP on, before a
+        # release is published.
         run: csrutil status || true
       - name: Build macOS app, DMG and update archive
         run: bash installer/build_macos.sh

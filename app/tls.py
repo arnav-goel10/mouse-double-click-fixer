@@ -11,21 +11,32 @@ name. So the app chooses, before its first request, and never lets Qt pick:
   unused_qt_file, which the spec reads). Without Schannel the update check
   fails and says so: there is no other library it may use.
 * macOS: Qt's OpenSSL backend, on the OpenSSL that ships inside the app for
-  Python (its ssl and hashlib modules use the very same files). Qt asks dyld
-  for it by bare name first (libcrypto.so.3, libcrypto.3.bundle,
-  libcrypto.3.dylib, ...; then libssl), and only if that fails searches
-  folders itself: the app's Frameworks folder, then /usr/lib, /usr/local/lib
-  and more. In a program with the hardened runtime, as every build is, dyld
-  answers a bare name only with a library already loaded as @rpath/<name>,
-  from the LC_RPATH folders of Qt Core and the executable (a build has
-  none), or from the system (/usr/lib and the OS cryptex), never from the
-  current folder. So the app loads its own copies first
-  (load_bundled_openssl), which are @rpath/libcrypto.3.dylib and
-  @rpath/libssl.3.dylib, and Qt's first try finds exactly those; the
-  self-test checks what was loaded (app/selftest.py). If Qt's OpenSSL backend can't start anyway, the app
-  uses Secure Transport: macOS's own TLS, deprecated and TLS 1.2 at most,
-  which GitHub still accepts, but part of the system rather than a library
-  found by searching.
+  Python (its ssl and hashlib modules use the very same files). Qt first
+  asks dyld for each library by bare name: libcrypto.so.3, then
+  libcrypto.3.bundle, then libcrypto.3.dylib (and the same for libssl).
+  dyld answers a bare name with a library already loaded as @rpath/<name>,
+  or from the LC_RPATH folders of the program (a build's has none) and of
+  Qt Core (@loader_path/../../../../../.., which is the app's
+  Contents/Frameworks), or from the OS cryptex and /usr/lib. An ordinary
+  program would also take it from the current folder, so a libcrypto.so.3
+  there would load before the app's copy is ever reached. What prevents
+  that is the hardened runtime every build is signed with: dyld then
+  refuses relative paths, which holds while System Integrity Protection is
+  on (tools/macos_injection_check.sh's cwd leg checks it). Loading the
+  app's own copies first (load_bundled_openssl, as @rpath/libcrypto.3.dylib
+  and @rpath/libssl.3.dylib) is a correctness aid on top: Qt then binds to
+  the very files Python uses, which the self-test checks (app/selftest.py).
+  Only if no bare name loads does Qt search folders itself, by absolute
+  path: the app's Frameworks folder, then /lib, /usr/lib, /usr/local/lib
+  and more. If Qt's OpenSSL backend can't start at all, the app uses
+  Secure Transport: macOS's own TLS, deprecated and TLS 1.2 at most, which
+  GitHub still accepts, but part of the system rather than a library found
+  by searching. A build's self-test fails on Secure Transport, and on any
+  OpenSSL loaded from outside the app.
+
+Qt's OpenSSL backend doesn't check whether a certificate has been revoked;
+an update installs only with a valid Ed25519 signature regardless
+(app/update_signature.py).
 """
 
 from __future__ import annotations

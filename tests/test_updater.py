@@ -538,10 +538,42 @@ class NetworkTests(unittest.TestCase):
                 mock.patch.dict(os.environ, {updater.URL_OVERRIDE_ENV: f"{base}/latest"}), \
                 self.assertLogs("app.updater", "ERROR") as logged:
             instance.check(user_initiated=True)
-        self.assertEqual((instance.state, instance.message), (instance.FAILED, updater.NO_SECURE_CONNECTION))
+        self.assertEqual((instance.state, instance.message), (instance.FAILED, updater.no_secure_connection()))
         self.assertIn("only openssl, cert-only", logged.output[0])
         self.settle()
         self.assertEqual(self.requested, [], "nothing is fetched over another library")
+
+    def test_the_message_without_a_tls_backend_says_what_to_do_on_windows(self) -> None:
+        # There it means Qt's Schannel plugin is gone from the app's folder.
+        self.assertTrue(updater.no_secure_connection("win32").endswith("Reinstall DoubleClick Fixer."))
+        self.assertNotIn("Reinstall", updater.no_secure_connection("darwin"))
+
+    def test_a_check_after_one_without_a_tls_backend_can_succeed(self) -> None:
+        # A failed choice is not remembered: the next check (Try Again, or
+        # the next automatic one) chooses again, and goes ahead if it can.
+        base = self.matching_files()
+        instance = self.make_updater(f"{base}/latest")
+        choose = updater.tls.use_preferred_backend
+        answers = iter([updater.tls.Unavailable("Qt has no schannel TLS backend here, only cert-only"), None])
+
+        def choosing() -> str:
+            error = next(answers)
+            if error is not None:
+                raise error
+            return choose()
+
+        with mock.patch.object(updater.tls, "use_preferred_backend", side_effect=choosing) as chosen, \
+                mock.patch.dict(os.environ, {updater.URL_OVERRIDE_ENV: f"{base}/latest"}), \
+                self.assertLogs("app.updater", "ERROR"):
+            instance.check(user_initiated=True)
+            self.assertEqual(instance.state, instance.FAILED)
+            self.settle()
+            self.assertEqual(self.requested, [])
+            instance.check(user_initiated=True)
+            self.wait_for(instance, {instance.AVAILABLE, instance.FAILED})
+        self.assertEqual(instance.state, instance.AVAILABLE, instance.message)
+        self.assertEqual(chosen.call_count, 2)
+        self.assertTrue(self.requested)
 
     def test_finds_a_newer_release(self) -> None:
         base = self.matching_files()

@@ -100,9 +100,16 @@ SMALL_FILE_LIMIT = 64 * 1024
 UNSIGNED = "This update isn’t signed, so it can’t be installed."
 MOVE_TO_APPLICATIONS = "Move DoubleClick Fixer to Applications to update it."
 CHECK_FAILED = "Couldn’t check for updates."
-#: Qt has none of the TLS backends the app may use (app/tls.py).
-NO_SECURE_CONNECTION = "Couldn’t check for updates: the app can’t make a secure connection here."
 INSTALL_FAILED = "The update didn’t install. Try again."
+
+
+def no_secure_connection(platform: str = sys.platform) -> str:
+    """What the check says when Qt has none of the TLS backends the app may
+    use (app/tls.py). On Windows that means Qt's Schannel plugin is missing
+    from the app's folder, which installing the app again puts back."""
+    if platform == "win32":
+        return "Couldn’t check for updates: the app can’t make a secure connection. Reinstall DoubleClick Fixer."
+    return "Couldn’t check for updates: the app can’t make a secure connection here."
 
 
 # -- pure helpers (unit tested) ---------------------------------------------------
@@ -503,7 +510,7 @@ class Updater(QObject):
             tls.use_preferred_backend()
         except tls.Unavailable as error:
             log.error("No TLS backend the app may use: %s", error)
-            self._set(self.FAILED, NO_SECURE_CONNECTION)
+            self._set(self.FAILED, no_secure_connection())
             return
         self._set(self.CHECKING, "")
         request = self._request(os.environ.get(URL_OVERRIDE_ENV) or LATEST_URL)
