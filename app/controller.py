@@ -456,7 +456,7 @@ class AppController(QObject):
         except OSError:
             # The disk is full or the file is locked (a sync tool, antivirus).
             # Keep running on the new values; the next write tries again.
-            self.settings = settings_store.coerce({**self.settings, **values})
+            self.settings = settings_store.merge(values, self.settings)
 
     def flush_stats(self) -> None:
         """Write the running count to disk. Called from the UI thread only."""

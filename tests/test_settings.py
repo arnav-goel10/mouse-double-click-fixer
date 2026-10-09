@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from app import settings
-from app.core import DEFAULT_THRESHOLD_MS, Button
+from app.contracts import DEFAULT_THRESHOLD_MS, Button
 
 
 class SettingsTests(unittest.TestCase):
@@ -102,6 +102,186 @@ class SettingsTests(unittest.TestCase):
     def test_buttons_from_returns_enum_members(self) -> None:
         values = settings.save({"buttons": ["left", "middle"]})
         self.assertEqual(settings.buttons_from(values), [Button.LEFT, Button.MIDDLE])
+
+
+#: The owner's own settings.json from 0.5.3, as it was on 9 October 2026.
+OWNER_0_5_3 = """{
+  "version": 2,
+  "threshold_ms": 59,
+  "fix_enabled": true,
+  "buttons": [
+    "left"
+  ],
+  "start_at_login": true,
+  "start_minimized": false,
+  "calibrated": true,
+  "filtered_total": 529,
+  "window_geometry": "",
+  "auto_update": true,
+  "last_update_check": 1791560448.171617,
+  "pending_update": "",
+  "tray_hint_shown": false
+}"""
+
+
+def coerce_as_0_5_3(values: dict) -> dict:
+    """What a 0.5.3 copy makes of a settings file after a downgrade: its
+    coerce(), cut to the keys this cares about. It merges onto its defaults,
+    keeping keys it doesn't know, and knows three buttons."""
+    merged = {"threshold_ms": 60, "buttons": ["left"], "calibrated": False, **values}
+    try:
+        merged["threshold_ms"] = max(5, min(200, int(round(float(merged["threshold_ms"])))))
+    except (TypeError, ValueError, OverflowError):
+        merged["threshold_ms"] = 60
+    merged["buttons"] = [name for name in merged["buttons"] if name in ("left", "right", "middle")] or ["left"]
+    merged["calibrated"] = bool(merged["calibrated"])
+    merged["version"] = 2
+    return merged
+
+
+class MigrationTests(unittest.TestCase):
+    """Schema 3 (1.0): a window per button, and what becomes of older files."""
+
+    def setUp(self) -> None:
+        self.directory = Path(tempfile.mkdtemp())
+        for target, value in (("config_dir", mock.Mock(return_value=self.directory)),
+                              ("LEGACY_PATH", self.directory / "absent.json")):
+            patcher = mock.patch.object(settings, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def write(self, values) -> None:
+        text = values if isinstance(values, str) else json.dumps(values)
+        (self.directory / "settings.json").write_text(text)
+
+    def stored(self) -> dict:
+        return json.loads((self.directory / "settings.json").read_text())
+
+    def test_the_owners_settings_keep_their_calibrated_window(self) -> None:
+        self.write(OWNER_0_5_3)
+        values = settings.load()
+        self.assertEqual(values["version"], settings.SCHEMA_VERSION)
+        self.assertEqual(values["thresholds"]["left"], 59)
+        self.assertEqual(values["calibrated_buttons"], ["left"])
+        self.assertEqual(set(values["thresholds"].values()), {59}, "every button took the one window")
+        self.assertEqual(values["buttons"], ["left"], "side buttons stay off")
+        # Everything else is as it was.
+        original = json.loads(OWNER_0_5_3)
+        for key in ("fix_enabled", "start_at_login", "start_minimized", "filtered_total",
+                    "window_geometry", "auto_update", "last_update_check", "pending_update", "tray_hint_shown"):
+            self.assertEqual(values[key], original[key], key)
+        self.assertTrue(values["auto_check"], "updates were on, so checks stay on")
+        self.assertEqual((values["threshold_ms"], values["calibrated"]), (59, True), "kept for a downgrade")
+        self.assertFalse(values["wheel_fix"])
+        self.assertEqual((values["excluded_apps"], values["ignored_devices"]), ([], []))
+
+    def test_the_owners_settings_survive_a_save_and_a_second_load(self) -> None:
+        self.write(OWNER_0_5_3)
+        first = settings.load()
+        settings.save({"filtered_total": 530}, current=first)
+        stored = self.stored()
+        self.assertEqual(stored["thresholds"]["left"], 59)
+        self.assertEqual(stored["calibrated_buttons"], ["left"])
+        self.assertEqual(stored["version"], 3)
+        second = settings.load()
+        self.assertEqual({**first, "filtered_total": 530}, second)
+        self.assertEqual(settings.migrate(second), second, "a 1.0 file is left as it is")
+        self.assertEqual(settings.coerce(second), second)
+
+    def test_a_downgraded_copy_reads_the_left_buttons_window(self) -> None:
+        self.write(OWNER_0_5_3)
+        values = settings.load()
+        settings.save({"thresholds": {**values["thresholds"], "right": 30}, "buttons": ["left", "back"]}, current=values)
+        old = coerce_as_0_5_3(self.stored())
+        self.assertEqual(old["threshold_ms"], 59)
+        self.assertTrue(old["calibrated"])
+        self.assertEqual(old["buttons"], ["left"], "it knows nothing of back, and drops it")
+        values = settings.save({"thresholds": {**settings.load()["thresholds"], "left": 72},
+                                "calibrated_buttons": ["right"]}, current=settings.load())
+        old = coerce_as_0_5_3(self.stored())
+        self.assertEqual(old["threshold_ms"], 72, "follows the left button's window")
+        self.assertFalse(old["calibrated"], "and its calibration")
+
+    def test_upgrading_again_after_a_downgrade_keeps_both_copies_work(self) -> None:
+        settings.save({"thresholds": {"left": 59, "right": 30}, "calibrated_buttons": ["right"],
+                       "buttons": ["left", "right", "back"]}, current=settings.load())
+        # The old copy moves its slider to 70 and saves, keeping the keys it
+        # doesn't know (version 2 again).
+        old = coerce_as_0_5_3(self.stored())
+        old.update(threshold_ms=70, calibrated=True)
+        self.write(old)
+        values = settings.load()
+        self.assertEqual(values["thresholds"]["left"], 70, "the old copy's window was the left button's")
+        self.assertEqual(values["thresholds"]["right"], 30, "1.0's own windows are kept")
+        self.assertEqual(values["calibrated_buttons"], ["left", "right"])
+        self.assertEqual(values["buttons"], ["left", "right"], "back was dropped by the old copy")
+
+    def test_an_uncalibrated_install_at_the_old_default_takes_the_new_one(self) -> None:
+        self.write({"version": 2, "threshold_ms": 60, "calibrated": False, "buttons": ["left", "right"]})
+        values = settings.load()
+        self.assertEqual(values["thresholds"], {button.value: 46 for button in Button})
+        self.assertEqual(values["calibrated_buttons"], [])
+        self.assertEqual(values["buttons"], ["left", "right"])
+
+    def test_a_window_moved_by_hand_is_kept(self) -> None:
+        self.write({"version": 2, "threshold_ms": 80, "calibrated": False})
+        self.assertEqual(settings.load()["thresholds"]["middle"], 80)
+
+    def test_a_calibrated_window_of_60_is_kept(self) -> None:
+        self.write({"version": 2, "threshold_ms": 60, "calibrated": True})
+        values = settings.load()
+        self.assertEqual(values["thresholds"]["left"], 60)
+        self.assertEqual(values["calibrated_buttons"], ["left"])
+
+    def test_a_new_install(self) -> None:
+        values = settings.load()
+        self.assertEqual(DEFAULT_THRESHOLD_MS, 46)
+        self.assertEqual(values["thresholds"], {button.value: 46 for button in Button})
+        self.assertEqual(values["buttons"], ["left"])
+        self.assertEqual(values["calibrated_buttons"], [])
+        self.assertFalse(values["wheel_fix"])
+        from app.contracts import WHEEL_DEFAULT_MS
+
+        self.assertEqual(values["wheel_window_ms"], WHEEL_DEFAULT_MS)
+
+    def test_damaged_values_are_repaired(self) -> None:
+        self.write({
+            "version": 3,
+            "thresholds": {"left": "45", "right": None, "middle": True, "back": float("inf"), "forward": 9000, "x9": 3},
+            "buttons": ["forward", "back", "left", "left", "nonsense"],
+            "calibrated_buttons": "left",
+            "wheel_fix": 1,
+            "wheel_window_ms": 2,
+            "excluded_apps": [{"key": "cs2.exe", "name": "CS2"}, {"key": "cs2.exe", "name": "again"},
+                              {"key": ""}, 7, "com.valvesoftware.steam", {"key": "x.exe", "name": 5}],
+            "ignored_devices": "not a list",
+        })  # json writes infinity as Infinity, which it reads back
+        values = settings.load()
+        self.assertEqual(values["thresholds"], {"left": 45, "right": 46, "middle": 46, "back": 46, "forward": 200})
+        self.assertEqual(values["buttons"], ["left", "back", "forward"], "known, once, in order")
+        self.assertEqual(values["calibrated_buttons"], [])
+        self.assertIs(values["wheel_fix"], True)
+        self.assertEqual(values["wheel_window_ms"], settings.WHEEL_MIN_MS)
+        self.assertEqual(values["excluded_apps"], [
+            {"key": "cs2.exe", "name": "CS2"},
+            {"key": "com.valvesoftware.steam", "name": "com.valvesoftware.steam"},
+            {"key": "x.exe", "name": "x.exe"},
+        ])
+        self.assertEqual(values["ignored_devices"], [])
+
+    def test_writing_the_old_keys_alone_sets_the_left_button(self) -> None:
+        values = settings.save({"thresholds": {"right": 30}}, current=settings.load())
+        values = settings.save({"threshold_ms": 52, "calibrated": True}, current=values)
+        self.assertEqual(values["thresholds"]["left"], 52)
+        self.assertEqual(values["thresholds"]["right"], 30)
+        self.assertEqual(values["calibrated_buttons"], ["left"])
+        values = settings.save({"calibrated": False}, current=values)
+        self.assertEqual(values["calibrated_buttons"], [])
+
+    def test_buttons_and_thresholds_come_back_as_buttons(self) -> None:
+        values = settings.save({"buttons": ["back", "left"], "thresholds": {"back": 20}}, current=settings.load())
+        self.assertEqual(settings.buttons_from(values), [Button.LEFT, Button.BACK])
+        self.assertEqual(settings.thresholds_from(values)[Button.BACK], 20)
 
 
 class DurabilityTests(unittest.TestCase):
