@@ -606,13 +606,18 @@ class SignPathDecisionTests(unittest.TestCase):
         self.script = run_block(step(job(release, "windows"), "Decide whether SignPath signs this build"))
         self.folder = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.folder, True)
+        # A checkout as the Windows runner makes it, with CRLF line endings.
+        self.checkout = self.folder / "checkout"
+        (self.checkout / "app").mkdir(parents=True)
+        source = (ROOT / "app" / "__init__.py").read_text(encoding="utf-8")
+        (self.checkout / "app" / "__init__.py").write_bytes(source.replace("\n", "\r\n").encode("utf-8"))
 
     def decide(self, event: str, ref: str, **values: str) -> tuple[int, str, dict]:
         output = self.folder / "output"
         output.write_text("", encoding="utf-8")
         environ = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "GITHUB_OUTPUT": str(output),
                    "EVENT": event, "REF": ref, **values}
-        done = subprocess.run(["bash", "-c", self.script], cwd=ROOT, env=environ, capture_output=True, text=True)
+        done = subprocess.run(["bash", "-c", self.script], cwd=self.checkout, env=environ, capture_output=True, text=True)
         outputs = dict(line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines())
         return done.returncode, done.stdout + done.stderr, outputs
 
@@ -630,6 +635,12 @@ class SignPathDecisionTests(unittest.TestCase):
         code, said, outputs = self.decide("push", "refs/tags/v1.0.0", **self.every())
         self.assertEqual(code, 0, said)
         self.assertEqual(outputs, {"sign": "true", "version": app.__version__})
+
+    def test_signing_needs_the_version_signpath_checks(self) -> None:
+        (self.checkout / "app" / "__init__.py").write_text('"""No version here."""\n', encoding="utf-8")
+        code, said, outputs = self.decide("push", "refs/tags/v1.0.0", **self.every())
+        self.assertEqual((code, outputs), (1, {}))
+        self.assertIn("::error::app/__init__.py gives no __version__", said)
 
     def test_half_set_up_stops_the_build_and_names_what_is_missing(self) -> None:
         for missing in SIGNPATH_NAMES:

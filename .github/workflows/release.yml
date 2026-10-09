@@ -118,7 +118,8 @@ jobs:
           for name in $names; do
             if [ -z "$(printenv "$name" || true)" ]; then missing="$missing $name"; fi
           done
-          version="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' app/__init__.py)"
+          # Windows checkouts have CRLF line endings.
+          version="$(tr -d '\r' < app/__init__.py | sed -n 's/^__version__ = "\(.*\)"$/\1/p')"
           if [ "$EVENT" != push ] || [ "${REF#refs/tags/}" = "$REF" ]; then
             echo "Not signed: only the push of a release tag is signed, and this is a $EVENT run of $REF."
             echo "sign=false" >> "$GITHUB_OUTPUT"
@@ -127,6 +128,9 @@ jobs:
             echo "sign=false" >> "$GITHUB_OUTPUT"
           elif [ -n "$missing" ]; then
             echo "::error::SignPath is only partly set up. Missing:$missing (docs/DISTRIBUTION.md)."
+            exit 1
+          elif [ -z "$version" ]; then
+            echo "::error::app/__init__.py gives no __version__ for SignPath's version check."
             exit 1
           else
             echo "Signing the Windows files of $version with SignPath."
