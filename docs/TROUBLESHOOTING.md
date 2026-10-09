@@ -89,13 +89,14 @@ window still let go, run Mouse Double-Click Fixer as administrator as well.
 
 ## Games
 
-The app never invents a click, but it re-sends some input: a release it held
-back, a press or pointer movement that waited behind it, and a move that puts
-the pointer back after a drag let go while moving. Games receive these as
-software input; on Windows they are marked as injected, and games that read
-raw input see them as injected input rather than as coming from your mouse.
-Some anti-cheat systems watch for software input; turn the filter off before
-playing those games.
+The app never invents a click, but it re-sends some input: a release held
+back for the filter window, whatever comes while that release is on its way
+(a press, another button's click, pointer movement), so that games see them in
+the order they happened, and a move that puts the pointer back after a drag
+let go while moving. Games receive these as software input; on Windows they
+are marked as injected, and games that read raw input see them as injected
+input rather than as coming from your mouse. Some anti-cheat systems watch for
+software input; turn the filter off before playing those games.
 
 On Windows, while the pointer is hidden (a game's mouse-look), in a remote
 session, and for pen or touch input, pointer movement never waits behind a

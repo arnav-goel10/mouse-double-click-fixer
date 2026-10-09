@@ -110,7 +110,7 @@ Blocking a click before other apps see it requires an event tap, and macOS only 
 <details>
 <summary><b>Will it get me flagged in games?</b></summary>
 
-The app never invents a click, but it does re-send some input: a release it held back, a press or pointer movement that waited behind it, and a move that puts the pointer back after a drag let go while moving. Apps receive these as software input (on Windows, marked as injected). Most games don't care, but some anti-cheat systems watch for software input; turn the filter off before playing those.
+The app never invents a click, but it does re-send some input: a release it held back for the filter window, whatever comes while that release is on its way to apps (a press, another button's click, pointer movement), so that apps see them in the order they happened, and a move that puts the pointer back after a drag let go while moving. Apps receive these as software input (on Windows, marked as injected). Most games don't care, but some anti-cheat systems watch for software input; turn the filter off before playing those.
 </details>
 
 ## Privacy

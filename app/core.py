@@ -12,6 +12,8 @@ too.
 
 from __future__ import annotations
 
+import math
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from statistics import median
@@ -67,11 +69,17 @@ class ClickEvent:
     #: A press that cancelled a held release: the contact dropped out and came
     #: back, so neither the release nor this press ever reach applications.
     cancels_held: bool = False
-    #: A press that arrived after a held release had already expired: the
-    #: caller must deliver that release first, then this press.
+    #: A press that found a held release it does not cancel, because its
+    #: button is no longer filtered or the window had passed: the caller must
+    #: deliver that release first, then this press. (The hook settles a
+    #: release by any event stamped past its window first, so a press there
+    #: comes back `deferred` instead; see GlobalClickFilter._handle.)
     flush_held: bool = False
-    #: Real, but held back by the hook so it reaches apps after an event the
-    #: app re-sent just before it (see GlobalClickFilter._defer).
+    #: Real, but held back by the hook to reach apps behind events that came
+    #: before it and have not reached them yet: events the app re-sent and
+    #: still waits to see come back, the held releases its timestamp settled
+    #: (its own button's among them), or another button's earlier release
+    #: still waiting or on its way (see GlobalClickFilter._handle).
     deferred: bool = False
     #: Why a release was held: "closing" when it came too soon after the
     #: contact closed to be a finger letting go (the contact is still
@@ -105,6 +113,12 @@ class BounceFilter:
       late by the caller (see `commit_held`). Worn switches drop contact as
       early as 60 ms into a drag, and bounce as they close, so no length of
       press is safe to skip.
+
+    "In time" is judged by the events' own timestamps, never by when they
+    reach the filter: events can arrive tens of milliseconds late, but they
+    arrive in the order they happened, so once any event stamped past the
+    window has been seen, no press inside it can still be on its way (see
+    `due`).
     """
 
     def __init__(
@@ -208,6 +222,23 @@ class BounceFilter:
         return ClickEvent(self.button, False, True, None, None)
 
     @property
+    def held_at(self) -> Optional[float]:
+        """When the release being held back happened, or None."""
+        return self._held_release_at
+
+    def due(self, timestamp: float) -> bool:
+        """Whether an event stamped `timestamp` settles the held release.
+
+        It does once it comes more than the threshold after the release:
+        events reach the filter in the order they happened, so a press that
+        would have cancelled the release, being earlier, would already have
+        been seen. That holds however late the events arrive, which a timer
+        started on arrival cannot promise.
+        """
+        held = self._held_release_at
+        return held is not None and (float(timestamp) - held) * 1000 > self.threshold_ms
+
+    @property
     def held_id(self) -> Optional[int]:
         """Identifies the release being held back, or None. A counter rather
         than its timestamp: Windows stamps events in ~16 ms ticks, so two
@@ -230,6 +261,103 @@ class BounceFilter:
         self._last_release_at = self._held_release_at
         self._held_release_at = None
         return True
+
+
+#: The delivery allowance is judged from this many of the latest events, and
+#: covers this share of them.
+LATENESS_SAMPLES = 64
+LATENESS_SHARE = 0.95
+#: The allowance stays within these bounds, and is this before any event has
+#: been measured.
+MIN_ALLOWANCE_MS = 5.0
+MAX_ALLOWANCE_MS = 150.0
+DEFAULT_ALLOWANCE_MS = 30.0
+#: A measured lateness beyond this is no delivery delay: the event's stamp
+#: came from another clock (see GlobalClickFilter._normalise_time).
+MAX_LATENESS_S = 2.0
+
+
+class DeliveryDelay:
+    """How late events reach the filter on this machine.
+
+    An event is stamped when the hardware made it and reaches the filter
+    later: a millisecond or two on an idle machine, tens of milliseconds and
+    now and then well over a hundred on a busy one. A held release that no
+    later event settles (see BounceFilter.due) is settled by a timer, and the
+    timer must wait out the window and then this lateness too, or a press
+    made inside the window but delivered late finds its release already
+    gone, and a drag breaks. The allowance is the 95th percentile of the
+    latest events' lateness, within MIN_ALLOWANCE_MS and MAX_ALLOWANCE_MS.
+    """
+
+    def __init__(self, size: int = LATENESS_SAMPLES) -> None:
+        self._samples: deque = deque(maxlen=size)
+
+    def add(self, seconds: float) -> None:
+        """Record one event: how long after its timestamp it arrived."""
+        if not math.isfinite(seconds) or abs(seconds) > MAX_LATENESS_S:
+            return
+        # A stamp a hair ahead of the clock read on arrival is on time.
+        self._samples.append(max(0.0, seconds * 1000))
+
+    def allowance_ms(self) -> float:
+        if not self._samples:
+            return DEFAULT_ALLOWANCE_MS
+        ordered = sorted(self._samples)
+        rank = max(0, math.ceil(LATENESS_SHARE * len(ordered)) - 1)
+        return min(MAX_ALLOWANCE_MS, max(MIN_ALLOWANCE_MS, ordered[rank]))
+
+
+#: How long one late event keeps counting towards PeakLateness.
+PEAK_WINDOW_S = 2.0
+
+
+class PeakLateness:
+    """The worst lateness of any event that reached the hook lately.
+
+    An event the hook re-sends comes back about as late as real events reach
+    it, so this sets how long the hook waits for one before giving it up as
+    lost (see GlobalClickFilter._in_flight_timeout). Every button event
+    counts, and pointer motion whenever the hook judges it: while a release
+    is held at a known place, or while re-sent events are on their way, which
+    is when the wait matters. A pause in the event stream shows in whichever
+    event comes out of it. One slow event counts for PEAK_WINDOW_S and no
+    longer, so a lone stall cannot keep the wait long.
+    """
+
+    def __init__(self, window_s: float = PEAK_WINDOW_S) -> None:
+        self._window = window_s
+        # (when it arrived, how late in ms), each later one less late than
+        # the one before: an event no later than one after it can never be
+        # the worst again.
+        self._peaks: deque = deque()
+
+    def add(self, seconds: float, now: float) -> None:
+        """Record an event that arrived at `now`, `seconds` after its
+        timestamp; both on monotonic()'s clock."""
+        if not math.isfinite(seconds) or abs(seconds) > MAX_LATENESS_S:
+            return
+        late_ms = max(0.0, seconds * 1000)
+        while self._peaks and self._peaks[-1][1] <= late_ms:
+            self._peaks.pop()
+        self._peaks.append((now, late_ms))
+        self._forget(now)
+
+    def worst_ms(self, now: float) -> float:
+        """The most an event that arrived in the last PEAK_WINDOW_S before
+        `now` was late, 0 if none did."""
+        self._forget(now)
+        return self._peaks[0][1] if self._peaks else 0.0
+
+    def counts_until(self, now: float) -> float:
+        """Until when the worst lateness counted at `now` keeps counting (see
+        worst_ms); `now` if none does. Something less late may count after."""
+        self._forget(now)
+        return self._peaks[0][0] + self._window if self._peaks else now
+
+    def _forget(self, now: float) -> None:
+        while self._peaks and now - self._peaks[0][0] > self._window:
+            self._peaks.popleft()
 
 
 def clamp_threshold(value: float) -> int:
