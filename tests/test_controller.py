@@ -28,10 +28,13 @@ class FakeFilter:
     fail_with = None
     instances = []
 
-    def __init__(self, threshold_ms, buttons, on_event=None, on_error=None) -> None:
+    def __init__(self, threshold_ms, buttons, on_event=None, on_error=None,
+                 permission_ok=None, on_permission_lost=None) -> None:
         self.started = False
         self.stopped = False
         self.on_error = on_error
+        self.permission_ok = permission_ok
+        self.on_permission_lost = on_permission_lost
         self.tap_resets = 0
         self.hook_rearms = 0
         FakeFilter.instances.append(self)
@@ -177,6 +180,22 @@ class ControllerStateTests(unittest.TestCase):
         self.assertTrue(self.controller.settings["fix_enabled"], "the user's choice is kept")
         self.controller.set_session_active(True)
         self.assertTrue(self.controller.set_active(True))
+
+    def test_the_filter_checks_access_and_reports_losing_it(self) -> None:
+        from app import permissions
+
+        lost = []
+        self.controller.permission_lost.connect(lambda: lost.append(True))
+        with mock.patch.object(permissions, "needs_accessibility", return_value=True):
+            self.controller.set_active(True)
+        hook = self.controller._filter
+        self.assertIs(hook.permission_ok, permissions.event_tap_allowed, "re-armed only while access is there")
+        hook.on_permission_lost()
+        self.assertEqual(lost, [True])
+        self.controller.set_active(False)
+        with mock.patch.object(permissions, "needs_accessibility", return_value=False):
+            self.controller.set_active(True)
+        self.assertIsNone(self.controller._filter.permission_ok, "nothing to check without a permission")
 
     def test_tap_check_defaults_to_alive(self) -> None:
         self.assertTrue(self.controller.tap_alive(), "no filter: nothing to check")

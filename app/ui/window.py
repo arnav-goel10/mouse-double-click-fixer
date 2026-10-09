@@ -914,6 +914,8 @@ class MainWindow(QWidget):
         controller.global_event.connect(self.test_page.note_global_event)
         self.filter_page.calibrate_requested.connect(self.show_calibration)
         controller.hook_failed.connect(self._on_hook_failed)
+        # Reported from the hook's thread; handled here, on the UI thread.
+        controller.permission_lost.connect(self._on_permission_lost, Qt.ConnectionType.QueuedConnection)
 
         self._save_timer = QTimer(self)
         self._save_timer.setInterval(20000)
@@ -1123,12 +1125,33 @@ class MainWindow(QWidget):
             self._enable_when_granted = False
             self._on_switch(True, prompt=False)
         elif not granted and self.controller.active:
-            # Without permission the tap cannot block anything, so an "on"
-            # switch would be lying. The saved choice stays on, so the filter
-            # returns by itself once access is back, even after a restart.
-            self.controller.stop_for_permission()
-            self._enable_when_granted = True
+            self._wait_for_permission()
         self.refresh()
+
+    def _wait_for_permission(self) -> None:
+        """Access is gone while the user has the filter on. Without it the
+        tap cannot block anything, so an "on" switch would be lying: stop
+        it, and wait. The saved choice stays on, so the filter returns by
+        itself once access is back, even after a restart."""
+        self._permission_granted = False
+        self._enable_when_granted = True
+        self.controller.stop_for_permission()
+
+    def _on_permission_lost(self) -> None:
+        """The filter found its access withdrawn when macOS disabled its
+        tap, let every click through and stopped. Wait for access to come
+        back, as when the permission poll is first to notice."""
+        if not self.controller.settings["fix_enabled"]:
+            return
+        log.warning("The filter lost its permission")
+        self._wait_for_permission()
+        self.refresh()
+
+    def _access_withdrawn(self) -> bool:
+        """macOS: whether a filtering tap would be refused right now. Asked
+        when a start fails, since AXIsProcessTrusted can still say yes for an
+        app removed from the list."""
+        return permissions.needs_accessibility() and not permissions.event_tap_allowed()
 
     def check_permission_soon(self) -> None:
         """The Accessibility list just changed. macOS posts that a moment
@@ -1165,6 +1188,16 @@ class MainWindow(QWidget):
         self.refresh()
 
     def _on_filter_state(self, _active: bool, error: str) -> None:
+        if error and self._access_withdrawn():
+            # The tap was refused because access is gone, though macOS may
+            # still report the app as allowed (at launch, say). That is a
+            # wait for permission, which the permission row explains and the
+            # poll ends, not a failure with a dialog and retries.
+            log.warning("The filter couldn't start without access; waiting for it")
+            self._permission_granted = False
+            self._enable_when_granted = True
+            self.controller.clear_failure()
+            error = ""
         if self.controller.active:
             self._health_timer.start()
         else:

@@ -1,5 +1,6 @@
 """Offscreen tests for the window, including a full calibration run."""
 
+import contextlib
 import os
 import tempfile
 import unittest
@@ -242,8 +243,10 @@ class FakeFilter:
 
     fail_with = None
 
-    def __init__(self, *_args, **_kwargs) -> None:
+    def __init__(self, threshold_ms, buttons, on_event=None, on_error=None,
+                 permission_ok=None, on_permission_lost=None) -> None:
         self.started = self.stopped = False
+        self.on_permission_lost = on_permission_lost
 
     @property
     def running(self) -> bool:
@@ -444,6 +447,72 @@ class KeepFilterAliveTests(LiveWindowTests):
         with mock.patch("app.permissions.needs_accessibility", return_value=True), \
                 mock.patch("app.permissions.has_accessibility", return_value=True), \
                 mock.patch("app.permissions.event_tap_allowed", return_value=True):
+            self.window._check_permission()
+            self.assertTrue(self.controller.active, "back on once access returns")
+
+    def mac_access(self, ax: bool, tap: bool):
+        """macOS permission answers: AXIsProcessTrusted, then the tap probe."""
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch("app.permissions.needs_accessibility", return_value=True))
+        stack.enter_context(mock.patch("app.permissions.has_accessibility", return_value=ax))
+        stack.enter_context(mock.patch("app.permissions.event_tap_allowed", return_value=tap))
+        return stack
+
+    def test_a_tap_refused_at_launch_for_lack_of_access_waits_for_it(self) -> None:
+        from app import permissions
+
+        # macOS still reports the app as allowed, but the grant is dead, so
+        # the tap is refused.
+        self.controller._store(fix_enabled=True)
+        self.window.show()
+        FakeFilter.fail_with = "macOS refused the event tap."
+        with self.mac_access(ax=True, tap=False):
+            self.window._permission_granted = True
+            self.window.restore_filter(background=False)
+            self.assertTrue(self.controller.waiting_for_permission)
+            self.assertEqual(self.controller.failure, "", "a wait, not a failure")
+            self.assertEqual(self.controller.status_text(), f"Waiting for {permissions.pane_name()} permission")
+            self.assertFalse(self.window.filter_page.permission.isHidden(), "the permission row explains it")
+            self.assertFalse(self.window._retry_timer.isActive(), "the permission poll takes it from here")
+            self.window._check_permission()
+            self.assertFalse(self.controller.active)
+        self.dialog.assert_not_called()
+        FakeFilter.fail_with = None
+        with self.mac_access(ax=True, tap=True):
+            self.window._check_permission()
+            self.assertTrue(self.controller.active, "starts once access is back")
+            self.assertFalse(self.controller.waiting_for_permission)
+
+    def test_a_tap_refused_with_access_in_place_is_a_failure(self) -> None:
+        self.controller._store(fix_enabled=True)
+        self.window.show()
+        FakeFilter.fail_with = "The window server isn't ready."
+        with self.mac_access(ax=True, tap=True):
+            self.window._permission_granted = True
+            self.window.restore_filter(background=False)
+        self.assertFalse(self.controller.waiting_for_permission)
+        self.assertEqual(self.controller.failure_detail, "The window server isn't ready.")
+        self.dialog.assert_called_once()
+
+    def test_a_filter_that_lost_its_access_is_stopped_and_waits(self) -> None:
+        import threading
+
+        self.controller.set_active(True)
+        filter_ = self.controller._filter
+        with self.mac_access(ax=True, tap=False):
+            self.window._permission_granted = True
+            hook = threading.Thread(target=filter_.on_permission_lost)
+            hook.start()
+            hook.join()
+            self.assertFalse(filter_.stopped, "handled on the UI thread, not the hook's")
+            self.application.processEvents()
+            self.assertTrue(filter_.stopped)
+            self.assertFalse(self.controller.active)
+            self.assertTrue(self.controller.waiting_for_permission)
+            self.assertTrue(self.controller.settings["fix_enabled"], "the user's choice is kept")
+            self.window._check_permission()  # still refused: nothing starts
+            self.assertFalse(self.controller.active)
+        with self.mac_access(ax=True, tap=True):
             self.window._check_permission()
             self.assertTrue(self.controller.active, "back on once access returns")
 
