@@ -51,8 +51,8 @@ class AppController(QObject):
         # Turned on, but macOS hasn't granted Accessibility yet (set by the window).
         self.waiting_for_permission = False
         # Bounces counted on the hook thread since the last flush. Kept apart
-        # from `settings`, which every settings write replaces with what is on
-        # disk, so an unrelated write can never lose them.
+        # from `settings`, which every settings write replaces, so an
+        # unrelated write can never lose them.
         self._count_lock = threading.Lock()
         self._pending_filtered = 0
         self.session_filtered = 0
@@ -245,7 +245,10 @@ class AppController(QObject):
 
     def _store(self, **values: object) -> None:
         try:
-            self.settings = settings_store.save(values)
+            # Merged onto what the app holds, never onto a fresh read of the
+            # file: a read that fails for a moment would otherwise reset
+            # every other setting to its default.
+            self.settings = settings_store.save(values, current=self.settings)
         except OSError:
             # The disk is full or the file is locked (a sync tool, antivirus).
             # Keep running on the new values; the next write tries again.
