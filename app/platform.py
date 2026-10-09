@@ -46,6 +46,13 @@ STATIONARY_PX = 4.0
 #: or two. If one never does (it was blocked, or lost), stop waiting for it.
 IN_FLIGHT_TIMEOUT_S = 0.15
 
+#: macOS disables an event tap that it judges too slow. If it does so this
+#: many times within this many seconds, re-arming the tap would only fight
+#: the system, so the filter stops and every click goes through untouched.
+TAP_DISABLE_LIMIT = 3
+TAP_DISABLE_WINDOW_S = 30.0
+TAP_DISABLED_MESSAGE = "macOS keeps disabling the filter. Turn it on again from the menu."
+
 #: How far an event's own timestamp may sit from `monotonic()` and still be
 #: believed. A tap sees an event within milliseconds of the driver making it.
 CLOCK_TOLERANCE_S = 2.0
@@ -103,6 +110,8 @@ class GlobalClickFilter:
         self._held_points: dict[Button, Optional[tuple[float, float]]] = {}
         # Per button: where the last press that reached apps landed.
         self._press_points: dict[Button, Optional[tuple[float, float]]] = {}
+        # When macOS disabled a tap lately (see _tap_disabled).
+        self._tap_disables: list[float] = []
         self.tap_resets = 0  # times macOS disabled the tap and it was re-armed
         self.hook_rearms = 0  # times the Windows hook was re-installed
         self._timers: list[threading.Timer] = []
@@ -142,6 +151,7 @@ class GlobalClickFilter:
         self._held_stationary.clear()
         self._held_points.clear()
         self._press_points.clear()
+        self._tap_disables.clear()
         for button in Button:
             self._in_flight[button] = 0
             self._queued[button].clear()
@@ -183,6 +193,24 @@ class GlobalClickFilter:
         self._thread = None
         self._thread_id = None
         self._run_loop = None
+
+    def tap_alive(self) -> bool:
+        """Whether the filter is still in the event stream. On macOS that is
+        whether the main tap is enabled: the system can disable it, or drop
+        it with the Accessibility grant, while the hook thread lives on."""
+        if not self.running:
+            return False
+        if platform.system() != "Darwin":
+            return True
+        tap = self._tap
+        if tap is None:
+            return False
+        try:
+            import Quartz
+
+            return bool(Quartz.CGEventTapIsEnabled(tap))
+        except Exception:  # noqa: BLE001 - unsure: don't make a health check churn the filter
+            return True
 
     def _request_thread_stop(self) -> None:
         if platform.system() == "Windows" and self._thread_id is not None:
@@ -320,6 +348,16 @@ class GlobalClickFilter:
         """With the lock held: the held release is settled one way or another."""
         self._held_stationary.pop(button, None)
         self._held_points.pop(button, None)
+
+    def _tap_disabled(self, now: Optional[float] = None) -> bool:
+        """macOS disabled one of the taps. Returns True when that has now
+        happened TAP_DISABLE_LIMIT times within TAP_DISABLE_WINDOW_S, and the
+        filter should stop rather than re-arm it again."""
+        now = monotonic() if now is None else now
+        with self._lock:
+            recent = [moment for moment in self._tap_disables if now - moment < TAP_DISABLE_WINDOW_S]
+            self._tap_disables = recent + [now]
+            return len(self._tap_disables) >= TAP_DISABLE_LIMIT
 
     def _motion(self, template: object, location: Optional[tuple[float, float]] = None) -> bool:
         """The pointer moved (`template` is a copy of the motion event, and
@@ -656,6 +694,7 @@ class GlobalClickFilter:
             Quartz.kCGEventRightMouseDragged,
             Quartz.kCGEventOtherMouseDragged,
         )
+        DISABLED = (Quartz.kCGEventTapDisabledByTimeout, Quartz.kCGEventTapDisabledByUserInput)
 
         def inject(button: Button, pressed: Optional[bool], template: object) -> bool:
             # Re-post the kept copy of a suppressed event, tagged so this app's
@@ -702,6 +741,19 @@ class GlobalClickFilter:
 
         self._inject = inject
         click_counts = ClickCountRepair()
+        # Set when macOS keeps disabling the taps: the run loop then ends.
+        given_up: list[bool] = []
+
+        def rearm(disabled_tap: object) -> None:
+            # macOS disables a tap that takes too long, or on some user input.
+            # Re-arm it instead of dying silently, unless it keeps happening.
+            if self._tap_disabled():
+                given_up.append(True)
+                Quartz.CFRunLoopStop(self._run_loop)
+                return
+            self.tap_resets += 1
+            Quartz.CGEventTapEnable(disabled_tap, True)
+
         def callback(proxy: object, event_type: int, event: object, refcon: object) -> object:
             # An exception here would make PyObjC return nothing, which drops
             # the click. Whatever goes wrong, the event goes through untouched.
@@ -711,12 +763,9 @@ class GlobalClickFilter:
                 return event
 
         def decide(event_type: int, event: object) -> object:
-            # macOS disables a tap that takes too long, or when the user
-            # revokes permission. Re-arm it instead of dying silently.
-            if event_type in (Quartz.kCGEventTapDisabledByTimeout, Quartz.kCGEventTapDisabledByUserInput):
-                self.tap_resets += 1
+            if event_type in DISABLED:
                 if self._tap is not None:
-                    Quartz.CGEventTapEnable(self._tap, True)
+                    rearm(self._tap)
                 return event
 
             entry = BUTTONS.get(event_type)
@@ -785,9 +834,9 @@ class GlobalClickFilter:
                 return event
 
         def motion_decide(event_type: int, event: object) -> object:
-            if event_type in (Quartz.kCGEventTapDisabledByTimeout, Quartz.kCGEventTapDisabledByUserInput):
+            if event_type in DISABLED:
                 if motion_state["tap"] is not None and motion_state["enabled"]:
-                    Quartz.CGEventTapEnable(motion_state["tap"], True)
+                    rearm(motion_state["tap"])
                 return event
             mark = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventSourceUserData)
             if mark == RESTORE_MARK:
@@ -832,17 +881,31 @@ class GlobalClickFilter:
         self._started = True
         self._ready.set()
         try:
-            while not self._stop_event.is_set():
+            while not self._stop_event.is_set() and not given_up:
                 # A bounded run keeps the stop flag responsive even when the
                 # run loop is woken for reasons of its own.
                 Quartz.CFRunLoopRunInMode(Quartz.kCFRunLoopDefaultMode, 0.25, False)
+            if given_up and not self._stop_event.is_set():
+                # Fail open: what is held back goes out now, every later click
+                # passes untouched, and the app is told the filter stopped.
+                for button in Button:
+                    self._commit_held(button)
+                    self._release_queue(button)
+                raise HookError(TAP_DISABLED_MESSAGE)
         finally:
-            self._set_motion_tap = lambda _wanted: None
+            with self._motion_tap_lock:
+                self._set_motion_tap = lambda _wanted: None
+            # Disabling a tap is not enough: macOS keeps it registered, for
+            # the life of the process, until its port is invalidated.
             if motion_tap is not None:
                 Quartz.CGEventTapEnable(motion_tap, False)
                 Quartz.CFRunLoopRemoveSource(self._run_loop, motion_source, Quartz.kCFRunLoopCommonModes)
+                Quartz.CFMachPortInvalidate(motion_tap)
+                motion_state["tap"] = None
+                motion_state["enabled"] = False
             Quartz.CGEventTapEnable(tap, False)
             Quartz.CFRunLoopRemoveSource(self._run_loop, source, Quartz.kCFRunLoopCommonModes)
+            Quartz.CFMachPortInvalidate(tap)
             self._tap = None
 
 

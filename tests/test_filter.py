@@ -12,6 +12,7 @@ from app.core import Button, ClickEvent
 from app.platform import (
     INJECTED_MARK,
     RESTORE_MARK,
+    TAP_DISABLED_MESSAGE,
     ClickCountRepair,
     GlobalClickFilter,
     HookError,
@@ -663,6 +664,21 @@ class QueuedReleaseTests(unittest.TestCase):
         self.assertEqual(self.sent, [(False, "up1"), (True, "down2"), (False, "up2"), (True, "down3")])
 
 
+class TapBreakerTests(unittest.TestCase):
+    """macOS disabling the tap over and over stops the filter, failing open."""
+
+    def test_the_third_disable_within_the_window_gives_up(self) -> None:
+        click_filter = GlobalClickFilter(60, [Button.LEFT])
+        self.assertFalse(click_filter._tap_disabled(100.0))
+        self.assertFalse(click_filter._tap_disabled(110.0))
+        self.assertTrue(click_filter._tap_disabled(120.0))
+
+    def test_disables_spread_out_keep_being_rearmed(self) -> None:
+        click_filter = GlobalClickFilter(60, [Button.LEFT])
+        for moment in (0.0, 20.0, 40.0, 60.0, 80.0, 100.0):
+            self.assertFalse(click_filter._tap_disabled(moment))
+
+
 class MacTimestampTests(unittest.TestCase):
     """Hardware events carry mach ticks, posted ones nanoseconds."""
 
@@ -899,6 +915,44 @@ class MacTapTests(unittest.TestCase):
         self.assertIsNotNone(self.motion((300, 100), mark=RESTORE_MARK))
         self.assertEqual(self.quartz.posted, [])
         self.assertTrue(self.filter._filters[Button.LEFT].holding_release)
+
+    def test_stopping_invalidates_both_taps(self) -> None:
+        self.filter.stop()
+        self.assertFalse(self.filter.running)
+        for tap in (self.main_tap, self.motion_tap):
+            self.assertTrue(tap.invalidated, "a disabled tap stays registered until invalidated")
+            self.assertFalse(tap.enabled)
+        self.assertFalse(self.filter.tap_alive())
+
+    def test_tap_alive_follows_the_main_tap(self) -> None:
+        self.assertTrue(self.filter.tap_alive())
+        self.main_tap.enabled = False  # macOS disabled it
+        self.assertFalse(self.filter.tap_alive())
+
+    def disable(self, tap) -> object:
+        tap.enabled = False
+        return tap.callback(None, self.Q.kCGEventTapDisabledByTimeout, None, None)
+
+    def test_a_disabled_tap_is_rearmed(self) -> None:
+        self.disable(self.main_tap)
+        self.assertTrue(self.main_tap.enabled)
+        self.assertEqual(self.filter.tap_resets, 1)
+        self.assertTrue(self.filter.running)
+
+    def test_macos_disabling_the_tap_again_and_again_stops_the_filter(self) -> None:
+        self.button(self.Q.kCGEventLeftMouseDown, (0, 0), 0.0)
+        self.button(self.Q.kCGEventLeftMouseUp, (30, 0), 0.4)          # held when it happens
+        self.disable(self.main_tap)
+        self.disable(self.main_tap)
+        self.assertEqual(self.errors, [])
+        self.disable(self.main_tap)
+        self.filter._thread.join(2)
+        self.assertFalse(self.filter.running)
+        self.assertEqual(self.errors, [TAP_DISABLED_MESSAGE])
+        self.assertFalse(self.main_tap.enabled, "not re-armed a third time")
+        self.assertTrue(self.main_tap.invalidated and self.motion_tap.invalidated)
+        released = [event for event in self.quartz.posted if event.kind == self.Q.kCGEventLeftMouseUp]
+        self.assertEqual(len(released), 1, "the held release still reaches apps")
 
 
 if __name__ == "__main__":
