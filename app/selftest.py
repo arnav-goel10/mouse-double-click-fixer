@@ -249,6 +249,53 @@ def check_qt_platform() -> str:
     return f"{name} plugin loaded and unloaded, Qt {qVersion()}"
 
 
+def check_app_icons() -> str:
+    """The app's icons draw with the Qt that shipped: the application icon,
+    the menu bar (tray) icon in both states, and the PNG round trip that the
+    checkbox tick and the SF Symbol glyphs go through. PNG is built into Qt
+    GUI, so none of this needs the image-format plugins the build leaves out."""
+    from PySide6.QtCore import QBuffer, QCoreApplication, QIODevice
+    from PySide6.QtGui import QGuiApplication, QImage, QImageReader
+
+    running = QCoreApplication.instance()
+    if running is not None and not isinstance(running, QGuiApplication):
+        raise Skipped("a non-GUI Qt application is running")
+    application = QGuiApplication(["DoubleClickFixer"]) if running is None else None
+    try:
+        from .ui import icons
+
+        drawn = []
+        for name, icon, size in (
+            ("app", icons.app_icon(), 64),
+            ("tray", icons.tray_icon(False), 18),
+            ("tray active", icons.tray_icon(True), 18),
+        ):
+            image = icon.pixmap(size, size).toImage()
+            painted = _painted_pixels(image)
+            if not painted:
+                raise RuntimeError(f"the {name} icon drew nothing")
+            drawn.append(f"{name} {image.width()}px ({painted} px painted)")
+        png = QBuffer()
+        png.open(QIODevice.OpenModeFlag.WriteOnly)
+        if not image.save(png, "PNG"):
+            raise RuntimeError("couldn't write a PNG")
+        again = QImage()
+        if not again.loadFromData(png.data(), "PNG") or again.size() != image.size():
+            raise RuntimeError("couldn't read back the PNG it wrote")
+        formats = sorted(bytes(name).decode() for name in QImageReader.supportedImageFormats())
+    finally:
+        if application is not None:
+            application.shutdown()
+            del application
+    return f"{', '.join(drawn)}; PNG round trip; image formats: {' '.join(formats)}"
+
+
+def _painted_pixels(image) -> int:
+    return sum(
+        1 for y in range(image.height()) for x in range(image.width()) if image.pixelColor(x, y).alpha()
+    )
+
+
 def _platform_plugin(name: str):
     from PySide6.QtCore import QCoreApplication
 
@@ -301,6 +348,7 @@ CHECKS: List[Tuple[str, Callable[[], str]]] = [
     ("PyObjC callback", check_pyobjc_callback),
     ("event tap", check_event_tap),
     ("Qt platform plugin", check_qt_platform),
+    ("app icons", check_app_icons),
     ("app modules", check_app_modules),
     ("child processes", check_child_processes),
     ("third-party notices", check_notices),

@@ -46,6 +46,7 @@ class SelfTestTests(unittest.TestCase):
         self.assertTrue(result["update signatures"].startswith("ok"))
         self.assertTrue(result["app modules"].startswith("ok"))
         self.assertTrue(result["Qt platform plugin"].startswith("ok"))
+        self.assertTrue(result["app icons"].startswith("ok"), result["app icons"])
         self.assertTrue(result["third-party notices"].startswith("ok"))
         if IS_MAC:
             self.assertTrue(result["PyObjC callback"].startswith("ok"))
@@ -71,6 +72,19 @@ class SelfTestTests(unittest.TestCase):
         with mock.patch.object(selftest, "APP_MODULES", selftest.APP_MODULES + ("app.gone",)):
             with self.assertRaisesRegex(RuntimeError, "not found in the app package: app.gone"):
                 selftest.check_app_modules()
+
+    def test_the_icons_are_drawn_and_png_round_trips(self) -> None:
+        detail = selftest.check_app_icons()
+        self.assertRegex(detail, r"^app 64px \(\d+ px painted\), tray 18px \(\d+ px painted\), tray active 18px")
+        self.assertIn("PNG round trip", detail)
+        self.assertIn("png", detail.split("image formats: ")[1].split())
+
+    def test_an_icon_that_draws_nothing_fails(self) -> None:
+        from PySide6.QtGui import QIcon
+
+        with mock.patch("app.ui.icons.tray_icon", return_value=QIcon()):
+            with self.assertRaisesRegex(RuntimeError, "the tray icon drew nothing"):
+                selftest.check_app_icons()
 
     def test_a_failed_check_fails_the_run_and_the_rest_still_run(self) -> None:
         ran = []
