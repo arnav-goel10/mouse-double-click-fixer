@@ -10,7 +10,11 @@ AppVersion={#AppVersion}
 DefaultDirName={autopf}\DoubleClick Fixer
 DefaultGroupName=DoubleClick Fixer
 OutputBaseFilename=DoubleClickFixer-Setup
+; The app is a 64-bit build, and Qt 6 needs Windows 10 1809 or later: say so
+; up front rather than install something that can't start.
+ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
+MinVersion=10.0.17763
 AppPublisher=DoubleClick Fixer
 AppSupportURL=https://github.com/arnav-goel10/doubleclick-fixer
 UninstallDisplayIcon={app}\DoubleClickFixer.exe
@@ -24,8 +28,15 @@ PrivilegesRequired=lowest
 ; Ask the running copy to close, so the file is never locked during an update.
 CloseApplications=yes
 
+[InstallDelete]
+; The runtime beside the exe is replaced whole, so an update that moves to a
+; newer Qt or Python leaves none of the old one behind.
+Type: filesandordirs; Name: "{app}\_internal"
+
 [Files]
-Source: "..\dist\DoubleClickFixer.exe"; DestDir: "{app}"; Flags: ignoreversion
+; A folder, not the portable one-file exe: launching it (and every sign-in)
+; unpacks nothing.
+Source: "..\dist\onedir\DoubleClickFixer\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\DoubleClick Fixer"; Filename: "{app}\DoubleClickFixer.exe"
@@ -74,9 +85,10 @@ end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
-  // The copy being replaced may predate "--quit", so use the new one.
-  ExtractTemporaryFile('DoubleClickFixer.exe');
-  AskRunningCopyToQuit(ExpandConstant('{tmp}\DoubleClickFixer.exe'));
+  // The installed copy knows how to reach a running one of its own version.
+  // One too old for "--quit", or none installed here, is left to taskkill.
+  // (The new exe can't run on its own from {tmp}: it needs its folder.)
+  AskRunningCopyToQuit(ExpandConstant('{app}\DoubleClickFixer.exe'));
   Result := '';
 end;
 
@@ -106,6 +118,11 @@ end;
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "DoubleClickFixer"; ValueData: """{app}\DoubleClickFixer.exe"" ""--minimized"""; Tasks: startup
 ; The app writes this itself when "start at login" is ticked; clear it on uninstall.
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueName: "DoubleClickFixer"; Flags: dontcreatekey uninsdeletevalue
+; Turning the app off in Task Manager's Startup apps is kept here, and outlives
+; the Run value. Ticking "Start when I sign in" clears an old "off" (updates
+; leave the user's choice alone), and uninstalling leaves nothing behind.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"; ValueType: none; ValueName: "DoubleClickFixer"; Flags: deletevalue dontcreatekey; Tasks: startup
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"; ValueType: none; ValueName: "DoubleClickFixer"; Flags: dontcreatekey uninsdeletevalue
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{userappdata}\DoubleClickFixer"

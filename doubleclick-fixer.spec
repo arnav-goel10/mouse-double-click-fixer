@@ -1,4 +1,10 @@
 # PyInstaller build recipe for both platforms.
+#
+# Windows builds one of two shapes: by default the portable DoubleClickFixer.exe,
+# one file that unpacks itself at each launch; with DCF_ONEDIR=1 the folder the
+# installer ships, which launches (and starts at every sign-in) without
+# unpacking anything. installer/build_windows.ps1 builds both.
+import os
 import sys
 
 import re
@@ -32,6 +38,18 @@ EXCLUDES = [
     "PySide6.QtPdfWidgets",
 ]
 
+datas = []
+ci_update_key = os.environ.get("DCF_CI_UPDATE_KEY", "")
+if ci_update_key:
+    # CI's end-to-end job only: the public half of a key made for that run, so
+    # its stand-in release can be signed (tools/ci_update_key.py). A release
+    # must never carry it; release.yml refuses to build with it set.
+    if os.environ.get("GITHUB_REF", "").startswith("refs/tags/"):
+        raise SystemExit("DCF_CI_UPDATE_KEY is set for a tag build: a release must never trust CI's key")
+    if sys.platform == "darwin" or Path(ci_update_key).name != "dcf-ci-update-key.pub":
+        raise SystemExit(f"DCF_CI_UPDATE_KEY must name a Windows build's dcf-ci-update-key.pub, not {ci_update_key}")
+    datas.append((ci_update_key, "."))
+
 hiddenimports = []
 if sys.platform == "darwin":
     # The event tap is reached through PyObjC at runtime.
@@ -45,7 +63,7 @@ analysis = Analysis(
     ["run.py"],
     pathex=["."],
     binaries=[],
-    datas=[],
+    datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=[],
@@ -120,15 +138,32 @@ else:
             VarFileInfo([VarStruct("Translation", [0x0409, 1200])]),
         ],
     )
-    # One portable executable; the installer copies it as is.
-    exe = EXE(
-        pyz,
-        analysis.scripts,
-        analysis.binaries,
-        analysis.datas,
-        [],
-        name="DoubleClickFixer",
-        console=False,
-        icon="installer/assets/icon.ico",
-        version=version_info,
-    )
+    if os.environ.get("DCF_ONEDIR") == "1":
+        # What the installer ships: the exe beside its libraries, in
+        # dist/DoubleClickFixer/ (build_windows.ps1 points --distpath at
+        # dist/onedir). The exe keeps its name: the login item, the shortcuts,
+        # the installer's taskkill and the updater all find it by it.
+        exe = EXE(
+            pyz,
+            analysis.scripts,
+            [],
+            exclude_binaries=True,
+            name="DoubleClickFixer",
+            console=False,
+            icon="installer/assets/icon.ico",
+            version=version_info,
+        )
+        collected = COLLECT(exe, analysis.binaries, analysis.datas, name="DoubleClickFixer")
+    else:
+        # The portable release asset: one executable.
+        exe = EXE(
+            pyz,
+            analysis.scripts,
+            analysis.binaries,
+            analysis.datas,
+            [],
+            name="DoubleClickFixer",
+            console=False,
+            icon="installer/assets/icon.ico",
+            version=version_info,
+        )
