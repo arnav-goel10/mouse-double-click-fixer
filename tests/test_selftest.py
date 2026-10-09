@@ -46,6 +46,7 @@ class SelfTestTests(unittest.TestCase):
         self.assertTrue(result["update signatures"].startswith("ok"))
         self.assertTrue(result["app modules"].startswith("ok"))
         self.assertTrue(result["Qt platform plugin"].startswith("ok"))
+        self.assertTrue(result["third-party notices"].startswith("ok"))
         if IS_MAC:
             self.assertTrue(result["PyObjC callback"].startswith("ok"))
             self.assertIn(result["event tap"].split(" ")[0], ("ok", "skipped:"))
@@ -87,6 +88,13 @@ class SelfTestTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"QT_QPA_PLATFORM": "minimal"}):
             selftest.use_default_qt_platform()
             self.assertEqual(os.environ["QT_QPA_PLATFORM"], "minimal")
+
+    def test_a_build_without_its_notices_fails(self) -> None:
+        from app import notices
+
+        with mock.patch.object(notices, "notices_path", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "no THIRD_PARTY_NOTICES.md"):
+                selftest.check_notices()
 
     def test_a_missing_platform_plugin_is_reported_rather_than_aborting(self) -> None:
         from PySide6.QtCore import QCoreApplication

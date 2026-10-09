@@ -226,6 +226,17 @@ def _platform_plugin(name: str):
     return None
 
 
+def check_notices() -> str:
+    """The third-party notices (Qt's LGPL among them) shipped, where the
+    Acknowledgements button looks for them."""
+    from . import notices
+
+    path = notices.notices_path()
+    if path is None:
+        raise RuntimeError(f"no {notices.NOTICES_FILE} in " + ", ".join(str(p) for p in notices.candidates()))
+    return f"{path}, {path.stat().st_size:,} bytes"
+
+
 def check_app_modules() -> str:
     import importlib
 
@@ -245,6 +256,7 @@ CHECKS: List[Tuple[str, Callable[[], str]]] = [
     ("event tap", check_event_tap),
     ("Qt platform plugin", check_qt_platform),
     ("app modules", check_app_modules),
+    ("third-party notices", check_notices),
 ]
 
 
