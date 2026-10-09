@@ -130,6 +130,9 @@ class RealHttpsTests(unittest.TestCase):
         request = QNetworkRequest(QUrl("https://api.github.com/zen"))
         request.setRawHeader(b"User-Agent", f"DoubleClickFixer/{__version__} (CI)".encode())
         request.setTransferTimeout(30_000)
+        token = os.environ.get("GITHUB_TOKEN", "")
+        if token:  # GitHub limits unauthenticated calls per address, and CI's Macs share theirs
+            request.setRawHeader(b"Authorization", f"Bearer {token}".encode())
         reply = manager.get(request)
         deadline = time.time() + 60
         while not reply.isFinished() and time.time() < deadline:
