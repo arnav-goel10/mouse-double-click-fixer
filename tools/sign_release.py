@@ -102,6 +102,7 @@ import json
 import os
 import plistlib
 import re
+import subprocess
 import sys
 import zipfile
 from pathlib import Path
@@ -479,8 +480,6 @@ class Commands:
     def run(self, *command: str, both: bool = False) -> str:
         """The command's output (with `both`, stderr after stdout); a
         ReleaseError if it fails."""
-        import subprocess
-
         try:
             result = subprocess.run(list(command), capture_output=True, text=True, check=False)
         except OSError as error:

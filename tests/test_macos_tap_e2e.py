@@ -29,7 +29,7 @@ import sys
 import threading
 import time
 import unittest
-from typing import Callable, NamedTuple, Optional
+from typing import Callable, NamedTuple
 from unittest import mock
 
 RUN = (
