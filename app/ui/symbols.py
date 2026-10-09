@@ -31,6 +31,7 @@ SYMBOLS = {
     "chart": ("chart.bar", "", "#8e8e93"),
     "sync": ("arrow.triangle.2.circlepath", "", "#8e8e93"),
     "copy": ("doc.on.clipboard", "", "#8e8e93"),
+    "info": ("info.circle", "\ue946", "#8e8e93"),
 }
 
 

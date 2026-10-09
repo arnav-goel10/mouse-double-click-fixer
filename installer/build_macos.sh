@@ -55,15 +55,31 @@ if [[ -z "$identity" && -f "$LOCAL_SIGNING/signing.keychain-db" ]]; then
   security unlock-keychain -p "$(cat "$LOCAL_SIGNING/keychain.password")" "$keychain"
   identity="$(security find-identity -p codesigning "$keychain" | awk '/DoubleClick Fixer Signing/ {print $2; exit}')"
 fi
+# The hardened runtime makes dyld ignore DYLD_INSERT_LIBRARIES and the like,
+# so no other program can load its code into this one and borrow its
+# Accessibility permission. The entitlements file says what it still allows
+# and why. It changes nothing in the designated requirement, so the
+# permission carries over from earlier versions.
+hardening=(--options runtime --entitlements installer/entitlements.plist)
 if [[ -n "$identity" ]]; then
   # --keychain only when one is named; otherwise the default search list.
-  codesign --force --deep --timestamp=none ${keychain:+--keychain "$keychain"} --sign "$identity" "$signed"
+  codesign --force --deep --timestamp=none "${hardening[@]}" ${keychain:+--keychain "$keychain"} --sign "$identity" "$signed"
   printf 'Signed with %s\n' "$identity"
 else
-  codesign --force --deep --sign - "$signed"
+  codesign --force --deep "${hardening[@]}" --sign - "$signed"
   printf 'warning: ad-hoc signed; Accessibility permission will not carry over to updates\n' >&2
 fi
 codesign --verify --deep --strict "$signed"
+signature="$(codesign -dv "$signed" 2>&1)"
+if ! grep -Eq 'flags=0x[0-9a-f]+\([^)]*runtime' <<<"$signature"; then
+  printf '%s\nerror: the app is not signed with the hardened runtime\n' "$signature" >&2
+  exit 1
+fi
+
+# Launch the signed app's self-test: it catches a build that crashes at
+# launch, or that the hardened runtime breaks, before anything is packaged.
+# It never starts the app itself (see app/selftest.py).
+"$signed/Contents/MacOS/DoubleClickFixer" --self-test
 
 # The disk image opens to a designed window: the app, an arrow and the
 # Applications folder, so installing is one drag. dmgbuild writes Finder's
