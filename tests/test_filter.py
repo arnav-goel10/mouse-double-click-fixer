@@ -435,6 +435,36 @@ class EventTimeTests(unittest.TestCase):
         ])
         self.assertEqual((self.filter._in_flight[Button.LEFT], self.filter._in_flight[Button.RIGHT]), (2, 1))
 
+    def test_a_buttons_later_events_follow_one_parked_in_another_queue(self) -> None:
+        # rdown settles up2, which waits behind down2 in the left queue, so
+        # rdown waits there too. rup must not overtake it, filtered or not,
+        # or apps would see the right button go up before it went down.
+        for active in ([Button.LEFT, Button.RIGHT], [Button.LEFT]):
+            with self.subTest(active=active):
+                self.timers.clear()
+                self.filter, self.sent = self.make_filter()
+                self.filter.update(buttons=active)
+                self.handle(Button.LEFT, True, 100.000, "down1")
+                self.handle(Button.LEFT, False, 100.100, "up1")
+                self.timers[-1].fire()                                # up1 re-sent, still on its way
+                self.assertTrue(self.handle(Button.LEFT, True, 100.150, "down2").deferred)
+                self.assertTrue(self.handle(Button.LEFT, False, 100.200, "up2").held)
+                self.assertTrue(self.handle(Button.RIGHT, True, 100.250, "rdown").deferred)
+                rup = self.handle(Button.RIGHT, False, 100.300, "rup")
+                if rup.held:
+                    self.timers[-1].fire()                            # its window ends
+                else:
+                    self.assertTrue(rup.deferred)
+                self.assertEqual(self.sent, [(Button.LEFT, False, "up1")])
+                self.filter._injected_passed(Button.LEFT)             # up1 delivered
+                self.assertEqual(self.sent, [
+                    (Button.LEFT, False, "up1"),
+                    (Button.LEFT, True, "down2"),
+                    (Button.LEFT, False, "up2"),
+                    (Button.RIGHT, True, "rdown"),
+                    (Button.RIGHT, False, "rup"),
+                ])
+
     def test_a_release_that_cannot_be_resent_is_never_held_behind_one(self) -> None:
         # Windows can't send input to a window running as administrator.
         self.handle(Button.LEFT, True, 100.000, "down")
