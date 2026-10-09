@@ -1112,6 +1112,55 @@ class SendOrderTests(unittest.TestCase):
             timer.join(5)
         self.assertEqual(sent, ["lup1", "rup", "ldown2"])
 
+    def test_an_event_decided_as_the_sender_lets_go_is_sent_too(self) -> None:
+        # The timer's thread has sent lup and is letting go of the send lock
+        # when the hook decides rup is to be re-sent: the hook finds the lock
+        # still taken and leaves rup to the sender, which looks again.
+        click_filter = GlobalClickFilter(40, [Button.LEFT, Button.RIGHT])
+        click_filter._use_os_time = True
+        sent = []
+        click_filter._inject = lambda button, pressed, template, _seq: sent.append(template)
+        lock = click_filter._send_lock
+
+        class LetGo:
+            hook_runs = True
+
+            def acquire(self, blocking=True) -> bool:
+                return lock.acquire(blocking)
+
+            def release(self) -> None:
+                if self.hook_runs:
+                    self.hook_runs = False
+                    with click_filter._lock:
+                        click_filter._resend(Button.RIGHT, False, "rup")
+                    click_filter._send_outbox()
+                lock.release()
+
+        click_filter._send_lock = LetGo()
+        with click_filter._lock:
+            click_filter._resend(Button.LEFT, False, "lup")
+        click_filter._send_outbox()
+        self.assertEqual(sent, ["lup", "rup"])
+        self.assertEqual(list(click_filter._outbox), [])
+
+    def test_motion_is_judged_from_the_moment_a_resend_is_decided(self) -> None:
+        # The macOS tap reads the flag without the lock: a move it sees after
+        # the timer decided to re-send a release must not pass straight
+        # through before that release goes out.
+        timers = FakeTimer.reset()
+        click_filter = GlobalClickFilter(40, [Button.LEFT])
+        click_filter._use_os_time = True
+        click_filter._inject = lambda _button, _pressed, _template, _seq: None
+        with mock.patch("app.platform.threading.Timer", FakeTimer):
+            click_filter._handle(Button.LEFT, True, 100.000, "down")
+            click_filter._handle(Button.LEFT, False, 100.100, "up")     # held at no known place
+            self.assertFalse(click_filter._motion_wanted)
+            seen = []
+            send = click_filter._send_outbox
+            click_filter._send_outbox = lambda: (seen.append(click_filter._motion_wanted), send())
+            timers[-1].fire()
+        self.assertEqual(seen, [True])
+
 
 class CrossButtonOrderTests(unittest.TestCase):
     """An event never reaches apps before another button's release that
