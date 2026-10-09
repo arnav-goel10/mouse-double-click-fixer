@@ -30,13 +30,16 @@ from tools.sign_release import (
 )
 
 
-def app_zip(version: str) -> bytes:
-    """A stand-in for DoubleClickFixer-macos.zip whose app is `version`."""
+def app_zip(version: str, apps: tuple = ("DoubleClick Fixer.app",)) -> bytes:
+    """A stand-in for DoubleClickFixer-macos.zip whose apps are `version`."""
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
         info = plistlib.dumps({"CFBundleShortVersionString": version})
-        archive.writestr("DoubleClick Fixer.app/Contents/Info.plist", info)
-        archive.writestr("DoubleClick Fixer.app/Contents/MacOS/DoubleClickFixer", b"binary")
+        for app in apps:
+            archive.writestr(f"{app}/Contents/Info.plist", info)
+            archive.writestr(f"{app}/Contents/MacOS/DoubleClickFixer", b"binary")
+        if not apps:
+            archive.writestr("README.txt", b"no app here")
     return buffer.getvalue()
 
 
@@ -173,6 +176,31 @@ class ReleaseFolderTests(unittest.TestCase):
             with self.assertRaisesRegex(ReleaseError, "isn't a release version"):
                 self.sign(version)
 
+    def test_the_mac_zip_must_hold_exactly_one_app(self) -> None:
+        # The updater refuses any other number, so the release would never install.
+        for apps, message in (
+            ((), "There's no app in DoubleClickFixer-macos.zip"),
+            (("DoubleClick Fixer.app", "Other.app"), "There are 2 apps in DoubleClickFixer-macos.zip"),
+        ):
+            self.add("DoubleClickFixer-macos.zip", app_zip("1.0.1", apps))
+            self.write_checksums()
+            with self.assertRaisesRegex(ReleaseError, message):
+                self.sign()
+            self.assertFalse((self.folder / SIGNATURE).exists())
+
+    def test_an_app_without_a_version_or_a_broken_zip_is_refused(self) -> None:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("DoubleClick Fixer.app/Contents/MacOS/DoubleClickFixer", b"binary")
+        self.add("DoubleClickFixer-macos.zip", buffer.getvalue())
+        self.write_checksums()
+        with self.assertRaisesRegex(ReleaseError, r"is version \(none\), not 1.0.1"):
+            self.sign()
+        self.add("DoubleClickFixer-macos.zip", b"not a zip")
+        self.write_checksums()
+        with self.assertRaisesRegex(ReleaseError, "can't be read as a zip"):
+            self.sign()
+
     def test_a_key_the_app_doesnt_trust_is_refused(self) -> None:
         other, _ = keygen("other", self.root / "keys", self.root / "public")
         with self.assertRaisesRegex(ReleaseError, "wouldn't accept"):
@@ -206,13 +234,39 @@ class ReleaseFolderTests(unittest.TestCase):
         self.assertIn("dcf 1.0.1", output.getvalue())
         self.assertIn("error:", errors.getvalue())
 
-    def test_the_published_keys_are_the_ones_signatures_are_checked_against(self) -> None:
-        published = sign_release.PUBLIC_KEY_DIR.glob("*.pub")
-        self.assertEqual(
-            sorted(key.key_id_text for key in sign_release.trusted_keys()),
-            sorted(parse_public_key(path.read_text()).key_id_text for path in published),
-        )
-        self.assertEqual(len(sign_release.trusted_keys()), 2)
+    def test_signatures_are_checked_against_the_keys_built_into_the_app(self) -> None:
+        from app.updater import RELEASE_KEYS
+
+        built_in = [parse_public_key(text) for text in RELEASE_KEYS]
+        self.assertEqual(sign_release.trusted_keys(), built_in)
+        self.assertEqual(len(built_in), 2)
+        # tools/keys/ holds copies for the minisign tool, and only those.
+        published = [parse_public_key(path.read_text()) for path in sign_release.PUBLIC_KEY_DIR.glob("*.pub")]
+        self.assertEqual(sorted(key.key_id_text for key in published), sorted(key.key_id_text for key in built_in))
+
+    def test_a_new_key_isnt_trusted_until_it_is_built_into_the_app(self) -> None:
+        # keygen publishes the key next to the others, but installed copies
+        # wouldn't accept it, so neither does the tool.
+        secret, public = keygen("third", self.root / "keys", self.root / "public")
+        with self.assertRaisesRegex(ReleaseError, "wouldn't accept"):
+            sign_folder(self.folder, "1.0.1", secret)
+        self.assertFalse((self.folder / SIGNATURE).exists())
+
+        source = self.root / "updater.py"
+        key_line = public.read_text().splitlines()[1]
+        source.write_text(f'"""An updater."""\n\nRELEASE_KEYS = (\n    "{key_line}",  # third\n)\n')
+        self.assertEqual(sign_release.trusted_keys(source), [parse_public_key(key_line)])
+        with mock.patch.object(sign_release, "UPDATER_SOURCE", source):
+            self.assertEqual(sign_folder(self.folder, "1.0.1", secret).comment(), "dcf 1.0.1")
+
+    def test_a_key_list_that_cant_be_read_is_an_error(self) -> None:
+        source = self.root / "updater.py"
+        for text in ("OTHER = 1\n", "RELEASE_KEYS = tuple(KEYS)\n", "RELEASE_KEYS = ('not a key',)\n", "RELEASE_KEYS = (\n"):
+            source.write_text(text)
+            with self.assertRaises(ReleaseError, msg=text):
+                sign_release.trusted_keys(source)
+        with self.assertRaisesRegex(ReleaseError, "can't be read"):
+            sign_release.trusted_keys(self.root / "missing.py")
 
 
 @unittest.skipUnless(shutil.which("minisign"), "minisign isn't installed")

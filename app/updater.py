@@ -57,10 +57,13 @@ WINDOWS_PORTABLE_ASSET = "DoubleClickFixer.exe"
 CHECKSUM_ASSET = "SHA256SUMS.txt"
 SIGNATURE_ASSET = CHECKSUM_ASSET + ".minisig"
 
-#: The minisign public keys a release must be signed with (the same keys are
-#: in tools/keys/). The owner keeps the secret keys offline. The backup key is
-#: built in from the start, so a lost or retired primary key can be replaced
-#: without stranding every installed copy.
+#: The minisign public keys a release must be signed with. tools/sign_release.py
+#: reads this list too, and tools/keys/ has copies for the minisign tool. The
+#: secret keys never go to GitHub or CI: they are files on the owner's Mac, in
+#: ~/.doubleclick-fixer-signing/update-keys/ with owner-only permissions, and
+#: releases are signed there. The backup key is built in from the start, so a
+#: lost or retired primary key can be replaced without stranding every
+#: installed copy.
 RELEASE_KEYS = (
     "RWR9XcCRL9bZ1OD22V5J6uVhJgblDA9o4UFwJBjMU6CtTyqCeWOC6jDf",  # primary, D4D9D62F91C05D7D
     "RWTUZv3t2LmICpA6R0C6kmRCHkbU8DUvmw5kDkjIXZ1yJnUNuTXlEq7Z",  # backup, 0A88B9D8EDFD66D4

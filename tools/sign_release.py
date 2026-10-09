@@ -1,10 +1,11 @@
-"""Sign a release with the offline update key.
+"""Sign a release with the update key.
 
 An installed copy of DoubleClick Fixer installs an update only when the
-release's SHA256SUMS.txt carries a minisign signature from one of the two keys
-built into the app (RELEASE_KEYS in app/updater.py; the same keys are in
-tools/keys/). The secret keys never go to GitHub. CI publishes the release as a
-draft, and the owner signs it on their own Mac:
+release's SHA256SUMS.txt carries a minisign signature from one of the keys
+built into the app: RELEASE_KEYS in app/updater.py, which this tool reads too
+(tools/keys/ has copies for the minisign tool). The secret keys never go to
+GitHub or CI; they stay on the owner's Mac, and releases are signed there.
+Keep the release a draft until its signature is uploaded:
 
     gh release download v1.0.1 --dir ~/dcf-release-1.0.1
     python3 tools/sign_release.py sign 1.0.1 ~/dcf-release-1.0.1
@@ -12,12 +13,12 @@ draft, and the owner signs it on their own Mac:
     gh release edit v1.0.1 --draft=false
 
 `sign` first checks every file in the folder against SHA256SUMS.txt (all of
-them listed, none missing, every hash right) and that the app inside the macOS
-zip says it is that version. It then signs SHA256SUMS.txt with the trusted
-comment "dcf 1.0.1", checks the signature against tools/keys/ and writes
-SHA256SUMS.txt.minisig. Upload the signature before taking the release out of
-draft: every copy of the app that checks signatures refuses a release without
-one, and says so.
+them listed, none missing, every hash right) and that the macOS zip holds
+exactly one app, of that version. It then signs SHA256SUMS.txt with the
+trusted comment "dcf 1.0.1", checks the signature against RELEASE_KEYS and
+writes SHA256SUMS.txt.minisig. Upload the signature before taking the release
+out of draft: copies of the app that check signatures don't offer a release
+without one, and say so.
 
     --key PATH          sign with another secret key (default: the primary key)
     --requirement DR    for a release that moves the macOS app to a new signing
@@ -34,8 +35,10 @@ Other commands:
         Make a key pair: the secret key goes to
         ~/.doubleclick-fixer-signing/update-keys/NAME.key, readable only by
         you, and the public key to tools/keys/NAME.pub. It never replaces an
-        existing key. A new key is trusted only by app versions that embed it,
-        so the backup key must already be in the app before it is needed.
+        existing key. Neither the app nor this tool trusts the new key until
+        its key line is added to RELEASE_KEYS, and then only app versions
+        built with it, so the backup key must be in the app before it is
+        needed.
 
 Keep a copy of both secret keys somewhere offline. Losing both means installed
 copies can't be updated again; anyone who gets one can sign updates.
@@ -62,6 +65,7 @@ zero, as `minisign -G -W` makes them), so they rely on the file's permissions.
 from __future__ import annotations
 
 import argparse
+import ast
 import base64
 import getpass
 import hashlib
@@ -72,6 +76,7 @@ import sys
 import zipfile
 from pathlib import Path
 from typing import Callable, Optional
+from xml.parsers.expat import ExpatError
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -98,9 +103,13 @@ from app.update_signature import (  # noqa: E402
 
 KEY_DIR = Path.home() / ".doubleclick-fixer-signing" / "update-keys"
 PUBLIC_KEY_DIR = ROOT / "tools" / "keys"
+#: Where the keys the app trusts are listed (RELEASE_KEYS).
+UPDATER_SOURCE = ROOT / "app" / "updater.py"
 PRIMARY = "primary"
 CHECKSUMS = "SHA256SUMS.txt"
 SIGNATURE = CHECKSUMS + ".minisig"
+#: The macOS update: the updater installs it only if it holds exactly one app.
+MAC_ZIP = "DoubleClickFixer-macos.zip"
 
 KDF_NONE = b"\0\0"
 KDF_SCRYPT = b"Sc"
@@ -227,8 +236,30 @@ def signature_text(message: bytes, key_id: bytes, seed: bytes, trusted_comment: 
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
-def trusted_keys(folder: Path = PUBLIC_KEY_DIR) -> list[PublicKey]:
-    return [parse_public_key(path.read_text(encoding="ascii")) for path in sorted(folder.glob("*.pub"))]
+def trusted_keys(source: Optional[Path] = None) -> list[PublicKey]:
+    """The keys installed copies trust: RELEASE_KEYS in app/updater.py.
+
+    Read from the source rather than imported, because the updater needs
+    PySide6 and this tool runs on a plain python3. Keeping no second list
+    means the tool can't accept a key that installed copies would refuse.
+    """
+    source = UPDATER_SOURCE if source is None else source
+    try:
+        tree = ast.parse(source.read_text(encoding="utf-8"), str(source))
+    except (OSError, SyntaxError, ValueError) as error:
+        raise ReleaseError(f"{source} can't be read: {error}") from error
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "RELEASE_KEYS" for target in node.targets
+        ):
+            try:
+                texts = ast.literal_eval(node.value)
+                if not isinstance(texts, (tuple, list)) or not all(isinstance(text, str) for text in texts):
+                    raise ValueError("it isn't a list of key lines")
+                return [parse_public_key(text) for text in texts]
+            except (ValueError, SignatureError) as error:
+                raise ReleaseError(f"RELEASE_KEYS in {source} can't be read: {error}") from error
+    raise ReleaseError(f"{source} has no RELEASE_KEYS.")
 
 
 # -- release folders --------------------------------------------------------------
@@ -248,13 +279,39 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _zipped_app_versions(path: Path) -> list[str]:
+def _zipped_apps(path: Path) -> dict[str, str]:
+    """Each app at the top of a zip, with the version its Info.plist gives
+    ("" when it gives none). The updater unpacks the zip and looks for apps
+    at the top of it in the same way."""
     with zipfile.ZipFile(path) as archive:
-        return [
-            str(plistlib.loads(archive.read(name)).get("CFBundleShortVersionString", ""))
-            for name in archive.namelist()
-            if re.fullmatch(r"[^/]+\.app/Contents/Info\.plist", name)
-        ]
+        top = {name.split("/", 1)[0] for name in archive.namelist()}
+        apps: dict[str, str] = {}
+        for app in sorted(name for name in top if name.endswith(".app")):
+            try:
+                info = plistlib.loads(archive.read(f"{app}/Contents/Info.plist"))
+            except (KeyError, ValueError, ExpatError):  # no Info.plist, or not a plist
+                info = {}
+            apps[app] = str(info.get("CFBundleShortVersionString", "")) if isinstance(info, dict) else ""
+        return apps
+
+
+def _zip_problems(path: Path, version: str) -> list[str]:
+    try:
+        apps = _zipped_apps(path)
+    except (zipfile.BadZipFile, OSError) as error:
+        return [f"{path.name} can't be read as a zip: {error}"]
+    problems = []
+    if path.name == MAC_ZIP and len(apps) != 1:
+        # Installed copies refuse any other number, so the release would
+        # never install.
+        problems.append(
+            f"There's no app in {path.name}." if not apps
+            else f"There are {len(apps)} apps in {path.name}; installed copies accept exactly one."
+        )
+    for found in apps.values():
+        if found != version:
+            problems.append(f"The app in {path.name} is version {found or '(none)'}, not {version}.")
+    return problems
 
 
 def check_release_folder(folder: Path, version: str) -> bytes:
@@ -281,9 +338,7 @@ def check_release_folder(folder: Path, version: str) -> bytes:
         elif _sha256(path) != digest:
             problems.append(f"{name} doesn't match its checksum.")
         elif name.endswith(".zip"):
-            for found in _zipped_app_versions(path):
-                if found != version:
-                    problems.append(f"The app in {name} is version {found or '(none)'}, not {version}.")
+            problems.extend(_zip_problems(path, version))
     for path in sorted(folder.iterdir()):
         if path.name not in listed and path.name not in (CHECKSUMS, SIGNATURE) and not path.name.startswith("."):
             problems.append(f"{path.name} isn't in {CHECKSUMS}.")
@@ -380,7 +435,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         else:
             secret_path, public_path = keygen(arguments.name)
             key = parse_public_key(public_path.read_text(encoding="ascii"))
-            print(f"Key {key.key_id_text}\n  secret: {secret_path}\n  public: {public_path}")
+            print(
+                f"Key {key.key_id_text}\n  secret: {secret_path}\n  public: {public_path}\n"
+                "Not trusted yet: add its key line to RELEASE_KEYS in app/updater.py. Only app\n"
+                "versions built with it accept its signatures."
+            )
     except (ReleaseError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
