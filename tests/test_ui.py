@@ -973,6 +973,18 @@ class CalibrationFlowTests(LiveWindowTests):
         self.assertEqual(page.phase, "done")
         self.assertIsNotNone(page.suggestion)
 
+    def test_a_long_system_setting_still_needs_a_quick_pair(self) -> None:
+        hints = mock.Mock()
+        hints.mouseDoubleClickInterval.return_value = 5000  # the slowest macOS allows
+        with mock.patch("app.ui.window.QGuiApplication.styleHints", return_value=hints):
+            page = self.to_double_phase()
+            page._on_pad_press(1500.0, 1600.0)
+            page._on_pad_press(1500.0, 1600.0)  # two separate slow clicks
+            self.assertEqual(page.calibrator.double_clicks, 0)
+            self.assertIn("Too slow", page.step_row.detail.text())
+            page._on_pad_press(900.0, 990.0)  # within a second of the last
+        self.assertEqual(page.calibrator.double_clicks, 1)
+
     def test_too_slow_a_pair_says_so(self) -> None:
         hints = mock.Mock()
         hints.mouseDoubleClickInterval.return_value = 500

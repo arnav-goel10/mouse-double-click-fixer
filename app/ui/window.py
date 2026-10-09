@@ -54,9 +54,10 @@ from .widgets import (
 
 log = logging.getLogger(__name__)
 
-#: The shortest release-to-press pause that still ends a double-click while
-#: calibrating. A slower system double-click setting widens it.
-PAIR_WINDOW_MS = 600.0
+#: The longest release-to-press pause that still ends a double-click while
+#: calibrating, whatever the system's own setting (macOS allows 5 s, which
+#: would count two separate slow clicks as a double-click).
+PAIR_WINDOW_MAX_MS = 1000.0
 
 #: A background launch whose filter fails to start tries again this many
 #: seconds later: at login the window server or the permission database can
@@ -514,10 +515,10 @@ class CalibratePage(Page):
     @staticmethod
     def pair_window_ms() -> float:
         """How long a double-click may pause between its release and second
-        press: at least PAIR_WINDOW_MS, and as long as the system's own
-        double-click setting, so a pair the system accepts counts here too."""
+        press: the system's own double-click setting, so a pair counts here
+        when the system would take it for one, up to PAIR_WINDOW_MAX_MS."""
         interval = QGuiApplication.styleHints().mouseDoubleClickInterval()
-        return max(PAIR_WINDOW_MS, float(interval))
+        return min(float(interval), PAIR_WINDOW_MAX_MS)
 
     def _on_pad_press(
         self, gap_ms: Optional[float], _interval_ms: Optional[float], button: Button = Button.LEFT
