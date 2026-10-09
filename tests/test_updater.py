@@ -219,6 +219,13 @@ class InstallLocationTests(unittest.TestCase):
         with mock.patch.object(updater, "bundle_path", return_value=None):
             self.assertIn("Couldn’t find", updater.install_location_problem("mac"))
 
+    def test_mac_copy_in_the_users_own_applications_folder(self) -> None:
+        # Their own folder: no administrator to ask, and nowhere to move it.
+        own = Path.home() / "Applications"
+        with mock.patch.object(updater, "bundle_path", return_value=own / "DoubleClick Fixer.app"), \
+                mock.patch.object(updater.os, "access", return_value=False):
+            self.assertEqual(updater.install_location_problem("mac"), f"No permission to replace the app in {own}.")
+
     def test_windows_folder_is_probed_by_writing(self) -> None:
         exe = self.root / "DoubleClickFixer.exe"
         with mock.patch.object(updater.sys, "executable", str(exe)):

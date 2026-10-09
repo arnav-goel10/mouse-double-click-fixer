@@ -242,8 +242,12 @@ def install_location_problem(kind: str) -> str:
         # which access() reports too.
         if os.access(bundle.parent, os.W_OK):
             return ""
-        if bundle.parent in (Path("/Applications"), Path.home() / "Applications"):
+        if bundle.parent == Path("/Applications"):
             return "Your account can’t change apps in Applications. Ask an administrator to update it."
+        if bundle.parent == Path.home() / "Applications":
+            # The user's own folder: moving the app wouldn't help, and only
+            # its permissions stand in the way.
+            return f"No permission to replace the app in {bundle.parent}."
         return MOVE_TO_APPLICATIONS
     if kind in ("windows-installed", "windows-portable"):
         folder = Path(sys.executable).parent
