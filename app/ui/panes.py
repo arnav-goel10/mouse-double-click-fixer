@@ -14,7 +14,7 @@ from ..wear import SHOWN_DAYS
 from .base import Page, card_icon, label, make_button
 from .charts import DailyRateChart, GapHistogram
 from .theme import IS_MAC
-from .widgets import Row, Switch, ValueLabel
+from .widgets import Row, Switch, ValueLabel, wheel_needs_focus
 
 # -- History -----------------------------------------------------------------------
 
@@ -37,6 +37,7 @@ class HistoryPage(Page):
         picker = self.section()
         self.button_picker = QComboBox()
         self.button_picker.setAccessibleName("Button to show")
+        wheel_needs_focus(self.button_picker)  # the wheel scrolls the pane
         self.button_picker.activated.connect(self._on_pick)
         picker.add(Row("Button", "", self.button_picker, card_icon("mouse")))
 

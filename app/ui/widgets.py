@@ -12,7 +12,9 @@ from typing import Optional
 from PySide6.QtCore import (
     Property,
     QEasingCurve,
+    QEvent,
     QItemSelectionModel,
+    QObject,
     QPointF,
     QPropertyAnimation,
     QRectF,
@@ -237,6 +239,35 @@ class Switch(QAbstractButton):
 
 
 # -- sections and rows -----------------------------------------------------------
+
+class _WheelNeedsFocus(QObject):
+    """The event filter behind wheel_needs_focus."""
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:  # noqa: N802
+        if event.type() == QEvent.Type.Wheel and not watched.hasFocus():
+            # Not for this control: ignored, Qt hands the turn on to the
+            # control's parents, and the pane's scroll area scrolls.
+            event.ignore()
+            return True
+        return False
+
+
+def wheel_needs_focus(control: QWidget) -> QWidget:
+    """Let a spin box or combo box take wheel turns only once it has focus.
+
+    Qt's default lets the wheel change a control the pointer merely passes
+    over, and gives it focus as it does: scrolling a pane past a filter
+    window would change that window, and save it. Here a turn over an
+    unfocused control scrolls the pane instead, as it does in the platforms'
+    own settings; a click or Tab gives the control focus (as the platform
+    decides: a macOS pop-up button takes it from Tab only), and then the wheel
+    changes it.
+    """
+    if control.focusPolicy() == Qt.FocusPolicy.WheelFocus:
+        control.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+    control.installEventFilter(_WheelNeedsFocus(control))
+    return control
+
 
 class Section(QWidget):
     """A group of rows.

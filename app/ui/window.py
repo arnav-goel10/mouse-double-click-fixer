@@ -64,6 +64,7 @@ from .widgets import (
     ValueLabel,
     look,
     set_look,
+    wheel_needs_focus,
 )
 
 # Older name, kept for callers.
@@ -120,6 +121,8 @@ def window_box(low: int, high: int, accessible_name: str) -> QSpinBox:
     box.setKeyboardTracking(False)
     box.setAccessibleName(accessible_name)
     box.setMinimumWidth(78)
+    # The Filter pane scrolls, and these boxes sit where the pointer passes.
+    wheel_needs_focus(box)
     return box
 
 
@@ -376,6 +379,9 @@ class CalibratePage(Page):
         for button in Button:
             self.button_picker.addItem(button_name(button), button.value)
         self.button_picker.setAccessibleName("Button to calibrate")
+        # A wheel turn on the way down the pane would pick another button and
+        # throw away a measurement under way.
+        wheel_needs_focus(self.button_picker)
         # activated, not currentIndexChanged: only the user's own choice.
         self.button_picker.activated.connect(lambda index: self.set_button(list(Button)[index]))
         self.picker_row = picker.add(Row("Button", "", self.button_picker, card_icon("mouse")))

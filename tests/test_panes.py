@@ -24,6 +24,7 @@ from run import _unhide_qt_plugins
 
 _unhide_qt_plugins()
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 
 
@@ -163,6 +164,93 @@ class FilterPaneTests(PaneTestCase):
         self.assertEqual(self.controller.wheel_window_ms, 35)
         self.assertTrue(hook.updates[-1].wheel_fix)
         self.assertEqual(hook.updates[-1].wheel_window_ms, 35)
+
+
+    def wheel(self, widget, notches: int) -> None:
+        """Turn the wheel over the middle of `widget` the way the system does
+        (QTest.wheelEvent goes through the window, so Qt picks the widget
+        under the pointer, gives focus by policy and passes an ignored turn
+        on to the parents)."""
+        from PySide6.QtCore import QPoint, QPointF
+        from PySide6.QtTest import QTest
+
+        centre = widget.mapTo(self.window, QPoint(widget.width() // 2, widget.height() // 2))
+        QTest.wheelEvent(self.window.windowHandle(), QPointF(centre), QPoint(0, 120 * notches))
+        self.application.processEvents()
+
+    def scrolling_pane(self, key: str, height: int = 480):
+        """The pane `key` on screen at `height` (480: the window's minimum),
+        where it has to scroll, and its scroll area."""
+        self.show(key)
+        self.window.resize(self.window.width(), height)
+        self.application.processEvents()
+        area = self.window.stack.currentWidget()
+        self.assertGreater(area.verticalScrollBar().maximum(), 0, f"the {key} pane scrolls at this size")
+        return area
+
+    def test_scrolling_over_a_window_box_scrolls_the_pane_and_keeps_the_window(self) -> None:
+        from app.contracts import Button
+
+        hook = self.hook()
+        self.controller.set_buttons(list(Button))  # every box enabled: the worst case
+        self.controller.set_wheel_fix(True)
+        area = self.scrolling_pane("filter")
+        page = self.window.filter_page
+        bar = area.verticalScrollBar()
+        saved = (self.directory / "settings.json").read_text()
+        updates = len(hook.updates)
+        for box in [*page.window_boxes.values(), page.wheel_box]:
+            name = box.accessibleName()
+            self.assertNotEqual(box.focusPolicy(), Qt.FocusPolicy.WheelFocus, f"{name}: the wheel gives no focus")
+            area.ensureWidgetVisible(box)
+            self.application.processEvents()
+            before, position = box.value(), bar.value()
+            notches = 1 if position == bar.maximum() else -1
+            self.wheel(box, notches)
+            self.assertEqual(box.value(), before, name)
+            self.assertFalse(box.hasFocus(), name)
+            self.assertNotEqual(bar.value(), position, f"{name}: the turn scrolls the pane instead")
+        self.assertEqual([self.controller.threshold_for(button) for button in Button], [46] * 5)
+        self.assertEqual(self.controller.wheel_window_ms, 50)
+        self.assertEqual((self.directory / "settings.json").read_text(), saved, "nothing saved")
+        self.assertEqual(len(hook.updates), updates, "nothing reached the filter")
+
+    def test_the_wheel_still_changes_a_window_box_with_focus(self) -> None:
+        from app.contracts import Button
+
+        self.scrolling_pane("filter")
+        box = self.window.filter_page.window_boxes[Button.LEFT]
+        self.window.activateWindow()
+        box.setFocus(Qt.FocusReason.MouseFocusReason)
+        self.application.processEvents()
+        self.assertTrue(box.hasFocus())
+        self.wheel(box, -1)
+        self.assertEqual(box.value(), 45)
+        self.assertEqual(self.controller.threshold_for(Button.LEFT), 45, "chosen on purpose, so saved")
+
+    def test_scrolling_over_a_button_picker_keeps_the_button(self) -> None:
+        from app.contracts import Button
+
+        self.seed_side_history()
+        for key, page in (("calibrate", self.window.calibrate), ("history", self.window.history)):
+            area = self.scrolling_pane(key, 300)
+            picker = page.button_picker
+            self.assertNotEqual(picker.focusPolicy(), Qt.FocusPolicy.WheelFocus, key)
+            area.ensureWidgetVisible(picker)
+            self.application.processEvents()
+            position = area.verticalScrollBar().value()
+            self.wheel(picker, -1)
+            self.assertIs(page.button, Button.LEFT, key)
+            self.assertEqual(picker.currentIndex(), 0, key)
+            self.assertNotEqual(area.verticalScrollBar().value(), position, f"{key}: the turn scrolls the pane")
+
+    def seed_side_history(self) -> None:
+        """History for the back button too, so the History picker has a
+        second button to turn to."""
+        from app.contracts import Button
+        from app.core import ClickEvent
+
+        self.controller.wear.note_event(ClickEvent(Button.BACK, True, True, 400.0, None), 46)
 
 
 class CalibrateEachButtonTests(PaneTestCase):
