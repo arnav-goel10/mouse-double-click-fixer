@@ -403,6 +403,8 @@ class CalibrationPauseTests(LiveWindowTests):
         self.assertFalse(self.controller.active, "the pad keeps measuring raw clicks")
         self.assertTrue(self.controller.wanted)
         self.assertTrue(self.window.filter_page.switch.isChecked())
+        # The same words as the menus' status line.
+        self.assertEqual(self.window.filter_page.status_row.detail.text(), f"{self.controller.status_text()}.")
         page._finish()
         self.assertTrue(self.controller.active)
 
@@ -536,7 +538,7 @@ class KeepFilterAliveTests(LiveWindowTests):
         FakeFilter.fail_with = "macOS refused the event tap."
         self.window.request_filter(True)
         self.dialog.assert_not_called()
-        self.assertEqual(self.controller.status_text(), "Couldn't start the filter")
+        self.assertEqual(self.controller.status_text(), "Couldn’t start the filter")
         self.window.show()
         self.assertIn("refused", self.window.filter_page.status_row.detail.text())
         self.window.request_filter(True)
@@ -641,7 +643,7 @@ class KeepFilterAliveTests(LiveWindowTests):
         FakeFilter.fail_with = "The window server isn't ready."
         self.window.system_woke()
         self.dialog.assert_not_called()
-        self.assertEqual(self.controller.status_text(), "Couldn't start the filter")
+        self.assertEqual(self.controller.status_text(), "Couldn’t start the filter")
         self.assertTrue(self.window._retry_timer.isActive())
 
     def test_wake_leaves_an_off_filter_off(self) -> None:

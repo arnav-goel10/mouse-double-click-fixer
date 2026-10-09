@@ -88,7 +88,7 @@ class ControllerStateTests(unittest.TestCase):
         self.assertFalse(self.controller.set_active(True))
         self.assertTrue(self.controller.settings["fix_enabled"], "a refused tap is not the user's off")
         self.assertEqual(self.states, [(False, "macOS refused the event tap.")])
-        self.assertEqual(self.controller.status_text(), "Couldn't start the filter")
+        self.assertEqual(self.controller.status_text(), "Couldn’t start the filter")
         self.assertIn("refused", self.controller.failure_detail)
 
     def test_a_failed_turn_on_from_the_menu_is_explained(self) -> None:
@@ -97,7 +97,7 @@ class ControllerStateTests(unittest.TestCase):
         self.controller.set_active(True)
         self.assertFalse(self.controller.settings["fix_enabled"], "never got as far as on")
         self.assertFalse(self.controller.wanted, "so choosing the item again tries again")
-        self.assertEqual(self.controller.status_text(), "Couldn't start the filter")
+        self.assertEqual(self.controller.status_text(), "Couldn’t start the filter")
         self.controller.set_active(False)
         self.assertEqual(self.controller.status_text(), "Off")
 

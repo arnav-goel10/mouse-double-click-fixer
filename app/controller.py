@@ -161,7 +161,7 @@ class AppController(QObject):
         except HookError as error:
             self._filter = None
             log.warning("The filter couldn't start: %s", error)
-            self.failure, self.failure_detail = "Couldn't start the filter", str(error)
+            self.failure, self.failure_detail = "Couldn’t start the filter", str(error)
             self.filter_state_changed.emit(False, str(error))
             return False
         self.failure = self.failure_detail = ""

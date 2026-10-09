@@ -264,7 +264,7 @@ class FilterPage(Page):
         # permission or calibration has it paused.
         self.switch.setChecked(controller.wanted, animate=self.isVisible())
         if controller.suspended and controller.settings["fix_enabled"]:
-            self.status_row.set_detail("Paused during calibration.")
+            self.status_row.set_detail("Paused for calibration.")
         elif waiting_for_permission:
             self.status_row.set_detail(f"Waiting for {permissions.pane_name()} permission.")
         elif controller.failure and not controller.active:
