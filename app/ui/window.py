@@ -233,7 +233,7 @@ class FilterPage(Page):
         self.button_switches: dict[Button, Switch] = {}
         for button in Button:
             switch = Switch(accessible_name=f"Filter the {button.label.lower()} button")
-            switch.toggled.connect(self._on_buttons)
+            switch.clicked.connect(self._on_buttons)
             self.button_switches[button] = switch
             buttons.add(Row(f"{button.label} button", "", switch, card_icon("mouse")))
 
@@ -612,7 +612,7 @@ class GeneralPage(Page):
         self.login_row = startup.add(
             Row("Open at login", f"Starts in the {where}.", self.login_switch, card_icon("power"))
         )
-        self.login_switch.toggled.connect(self._on_login)
+        self.login_switch.clicked.connect(self._on_login)
 
         self.permission_row: Optional[Row] = None
         if permissions.needs_accessibility():
@@ -627,7 +627,7 @@ class GeneralPage(Page):
         self.update_header = self.header("Software update")
         self.update_section = self.section()
         self.auto_update_switch = Switch(accessible_name="Install updates automatically")
-        self.auto_update_switch.toggled.connect(self._on_auto_update)
+        self.auto_update_switch.clicked.connect(self._on_auto_update)
         self.update_section.add(Row("Install updates automatically", "", self.auto_update_switch, card_icon("sync")))
         self.update_button = _button("Check Now")
         self.update_button.clicked.connect(self._on_update_button)
@@ -781,6 +781,10 @@ class MainWindow(QWidget):
         for page in self.pages:
             area = QScrollArea()
             area.setWidgetResizable(True)
+            # Not a Tab stop of its own: it shows no focus, so Tab would seem
+            # to do nothing. The wheel still scrolls it, and so does moving
+            # focus to a control inside it.
+            area.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             area.setFrameShape(QFrame.Shape.NoFrame)
             area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             # The pane colour is painted once by the window; the scroll area,
@@ -798,7 +802,9 @@ class MainWindow(QWidget):
         root.addWidget(content, 1)
 
         self.sidebar.current_changed.connect(self._show_page)
-        self.filter_page.switch.toggled.connect(self._on_switch)
+        # clicked, not toggled: refresh() sets the switch, and must not echo
+        # back into a request.
+        self.filter_page.switch.clicked.connect(self._on_switch)
         self.calibrate.threshold_chosen.connect(self._apply_calibration)
         self.calibrate.phase_changed.connect(lambda _phase: self._sync_pause())
         controller.filter_state_changed.connect(self._on_filter_state)
@@ -886,8 +892,7 @@ class MainWindow(QWidget):
 
     def changeEvent(self, event) -> None:  # noqa: N802
         if event.type() == QEvent.Type.ActivationChange:
-            self.sidebar.window_active = self.isActiveWindow()
-            self.sidebar.update()
+            self.sidebar.set_window_active(self.isActiveWindow())
             # Calibrating in a window left behind another app would leave
             # every click in that app unfiltered.
             self._sync_pause()

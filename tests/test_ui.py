@@ -137,12 +137,12 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(self.controller.threshold_ms, 35)
         self.assertEqual(page.value.text(), "35 ms")
 
-        page.button_switches[Button.RIGHT]._flip()
+        page.button_switches[Button.RIGHT].click()
         self.assertIn(Button.RIGHT, self.controller.buttons)
 
         # The last button cannot be turned off; something must stay protected.
-        page.button_switches[Button.RIGHT]._flip()
-        page.button_switches[Button.LEFT]._flip()
+        page.button_switches[Button.RIGHT].click()
+        page.button_switches[Button.LEFT].click()
         self.assertEqual(self.controller.buttons, [Button.LEFT])
         self.assertTrue(page.button_switches[Button.LEFT].isChecked())
 
@@ -551,6 +551,156 @@ class KeepFilterAliveTests(LiveWindowTests):
         self.window.system_woke()
         self.assertFalse(self.controller.active)
         self.assertTrue(self.controller.suspended)
+
+
+class AccessibilityTests(LiveWindowTests):
+    """What VoiceOver and Narrator are told, and where keyboard focus shows."""
+
+    def accessible(self, widget):
+        from PySide6.QtGui import QAccessible
+
+        return QAccessible.queryAccessibleInterface(widget)
+
+    def test_switch_is_a_named_toggle_with_its_state(self) -> None:
+        from PySide6.QtGui import QAccessible
+
+        switch = self.window.filter_page.switch
+        interface = self.accessible(switch)
+        self.assertEqual(interface.role(), QAccessible.Role.CheckBox)
+        self.assertEqual(interface.text(QAccessible.Text.Name), "Bounce filter")
+        self.assertTrue(interface.state().checkable)
+        self.assertFalse(interface.state().checked)
+        self.assertIn("Toggle", interface.actionInterface().actionNames())
+        switch.setChecked(True, animate=False)
+        self.assertTrue(interface.state().checked)
+
+    def test_every_switch_is_accessible_by_name(self) -> None:
+        from PySide6.QtGui import QAccessible
+
+        from app.ui.widgets import Switch
+
+        for switch in self.window.findChildren(Switch):
+            interface = self.accessible(switch)
+            self.assertEqual(interface.role(), QAccessible.Role.CheckBox)
+            self.assertTrue(interface.text(QAccessible.Text.Name), "every switch has a name")
+
+    def test_setting_a_switch_from_code_never_reaches_its_handler(self) -> None:
+        switch = self.window.filter_page.switch
+        with mock.patch.object(self.controller, "set_active") as set_active:
+            switch.setChecked(True, animate=False)
+            self.window.refresh()  # sets it back to off, the real state
+            set_active.assert_not_called()
+            self.assertFalse(switch.isChecked())
+            switch.click()  # the user
+            set_active.assert_called_once_with(True)
+
+    def test_the_users_click_on_a_switch_turns_the_filter_on(self) -> None:
+        self.window.filter_page.switch.click()
+        self.assertTrue(self.controller.active)
+        self.assertTrue(self.window.filter_page.switch.isChecked())
+
+    def test_space_flips_a_focused_switch(self) -> None:
+        from PySide6.QtCore import Qt
+        from PySide6.QtTest import QTest
+
+        switch = self.window.general.auto_update_switch
+        self.window.show()
+        before = switch.isChecked()
+        QTest.keyClick(switch, Qt.Key.Key_Space)
+        self.assertNotEqual(switch.isChecked(), before)
+        self.assertEqual(self.controller.settings["auto_update"], switch.isChecked())
+
+    def test_sidebar_is_a_list_of_its_panes(self) -> None:
+        from PySide6.QtGui import QAccessible
+
+        from app.ui.window import PAGES
+
+        interface = self.accessible(self.window.sidebar)
+        self.assertEqual(interface.role(), QAccessible.Role.List)
+        self.assertEqual(interface.childCount(), len(PAGES))
+        names = [interface.child(index).text(QAccessible.Text.Name) for index in range(interface.childCount())]
+        self.assertEqual(names, [title for _key, title in PAGES])
+        for index in range(interface.childCount()):
+            item = interface.child(index)
+            self.assertEqual(item.role(), QAccessible.Role.ListItem)
+            self.assertTrue(item.state().selectable)
+        self.assertTrue(interface.child(0).state().selected)
+        self.window.sidebar.set_current(self.page_index("calibrate"))
+        selected = [interface.child(index).state().selected for index in range(interface.childCount())]
+        self.assertEqual(selected, [index == self.page_index("calibrate") for index in range(len(PAGES))])
+
+    def test_sidebar_keys_move_between_panes(self) -> None:
+        from PySide6.QtCore import Qt
+        from PySide6.QtTest import QTest
+
+        from app.ui.window import PAGES
+
+        sidebar = self.window.sidebar
+        self.window.show()
+        self.window.activateWindow()
+        self.application.processEvents()
+        sidebar.setFocus()
+        QTest.keyClick(sidebar, Qt.Key.Key_Down)
+        self.assertEqual(self.window.stack.currentIndex(), 1)
+        QTest.keyClick(sidebar, Qt.Key.Key_End)
+        self.assertEqual(self.window.stack.currentIndex(), len(PAGES) - 1)
+        QTest.keyClick(sidebar, Qt.Key.Key_Home)
+        self.assertEqual(self.window.stack.currentIndex(), 0)
+        self.assertTrue(sidebar.shows_focus(), "keyboard use shows where focus is")
+
+    def test_sidebar_clicks_select_and_nothing_deselects(self) -> None:
+        from PySide6.QtCore import QPoint, Qt
+        from PySide6.QtTest import QTest
+
+        sidebar = self.window.sidebar
+        self.window.show()
+        self.application.processEvents()
+        general = sidebar.visualItemRect(sidebar.item(self.page_index("general"))).center()
+        QTest.mouseClick(sidebar.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, general)
+        self.assertEqual(self.window.stack.currentIndex(), self.page_index("general"))
+        QTest.mouseClick(sidebar.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.ControlModifier, general)
+        self.assertTrue(sidebar.item(self.page_index("general")).isSelected())
+        below = QPoint(20, sidebar.viewport().height() - 2)
+        QTest.mouseClick(sidebar.viewport(), Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, below)
+        self.assertTrue(sidebar.item(self.page_index("general")).isSelected(), "a click below the entries changes nothing")
+        self.assertFalse(sidebar.shows_focus(), "a click shows no keyboard focus")
+
+    def test_scroll_areas_are_not_tab_stops(self) -> None:
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QScrollArea
+
+        areas = self.window.findChildren(QScrollArea)
+        self.assertEqual(len(areas), 4)
+        for area in areas:
+            self.assertEqual(area.focusPolicy(), Qt.FocusPolicy.NoFocus)
+
+    def test_switch_keeps_its_focus_ring_across_window_switches(self) -> None:
+        from PySide6.QtCore import QEvent, Qt
+        from PySide6.QtGui import QFocusEvent
+
+        switch = self.window.filter_page.switch
+        switch.focusInEvent(QFocusEvent(QEvent.Type.FocusIn, Qt.FocusReason.TabFocusReason))
+        self.assertTrue(switch._keyboard_focus)
+        switch.focusOutEvent(QFocusEvent(QEvent.Type.FocusOut, Qt.FocusReason.ActiveWindowFocusReason))
+        switch.focusInEvent(QFocusEvent(QEvent.Type.FocusIn, Qt.FocusReason.ActiveWindowFocusReason))
+        self.assertTrue(switch._keyboard_focus, "back from another app: the ring is still there")
+        switch.focusOutEvent(QFocusEvent(QEvent.Type.FocusOut, Qt.FocusReason.MouseFocusReason))
+        self.assertFalse(switch._keyboard_focus)
+        switch.focusInEvent(QFocusEvent(QEvent.Type.FocusIn, Qt.FocusReason.MouseFocusReason))
+        self.assertFalse(switch._keyboard_focus, "a click earns no ring")
+
+    def test_switch_and_sidebar_render_in_both_looks(self) -> None:
+        from app.ui import widgets
+        from app.ui.theme import current_look
+
+        self.window.show()
+        self.window.sidebar.setFocus()
+        self.window.sidebar._keyboard_focus = True
+        for dark in (True, False):
+            widgets.set_look(current_look(dark))
+            self.window.apply_look()
+            self.assertFalse(self.window.sidebar.grab().isNull())
+            self.assertFalse(self.window.filter_page.switch.grab().isNull())
 
 
 class MenuBarItemTests(unittest.TestCase):

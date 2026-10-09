@@ -12,6 +12,7 @@ from typing import Optional
 from PySide6.QtCore import (
     Property,
     QEasingCurve,
+    QItemSelectionModel,
     QPointF,
     QPropertyAnimation,
     QRectF,
@@ -21,9 +22,16 @@ from PySide6.QtCore import (
 )
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
+    QAbstractButton,
+    QAbstractItemView,
+    QFrame,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QSizePolicy,
+    QStyle,
+    QStyledItemDelegate,
     QVBoxLayout,
     QWidget,
 )
@@ -70,18 +78,28 @@ class TextLabel(QLabel):
 #: Room for the "On"/"Off" text before a Windows toggle, gap included.
 WIN_STATE_WIDTH = 40
 
+#: Focus that leaves and comes back with the window or a menu, not by the
+#: user moving it.
+_RESTORED_FOCUS = (Qt.FocusReason.ActiveWindowFocusReason, Qt.FocusReason.PopupFocusReason)
 
-class Switch(QWidget):
-    """NSSwitch on macOS, the WinUI ToggleSwitch on Windows."""
 
-    toggled = Signal(bool)
+class Switch(QAbstractButton):
+    """NSSwitch on macOS, the WinUI ToggleSwitch on Windows.
+
+    A checkable button underneath, so VoiceOver and Narrator hear a toggle
+    with its state ("Bounce filter, on"), can flip it, and are told when it
+    changes. Listen to `clicked(bool)` for the user's own changes: `toggled`
+    also fires when code sets the state, which would echo a refresh back
+    into the handler.
+    """
 
     def __init__(self, parent: Optional[QWidget] = None, accessible_name: str = "") -> None:
         super().__init__(parent)
-        self._checked = False
+        self.setCheckable(True)
         self._position = 0.0
         self._hovered = False
         self._keyboard_focus = False
+        self._animate_next = True
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         # Windows puts the state ("On"/"Off") before the toggle, as WinUI does.
@@ -90,22 +108,25 @@ class Switch(QWidget):
         self._animation = QPropertyAnimation(self, b"position", self)
         self._animation.setDuration(150)
         self._animation.setEasingCurve(QEasingCurve.Type.OutCubic)
-
-    def isChecked(self) -> bool:  # noqa: N802 - Qt naming
-        return self._checked
+        self.toggled.connect(self._follow)
 
     def setChecked(self, value: bool, animate: bool = True) -> None:  # noqa: N802 - Qt naming
-        value = bool(value)
-        if value == self._checked:
-            return
-        self._checked = value
+        """Set the state from code. Emits `toggled`, never `clicked`."""
+        self._animate_next = animate
+        try:
+            super().setChecked(bool(value))
+        finally:
+            self._animate_next = True
+
+    def _follow(self, checked: bool) -> None:
+        # The knob slides for a click, and jumps for a state loaded quietly.
         self._animation.stop()
-        if animate and self.isVisible():
+        if self._animate_next and self.isVisible():
             self._animation.setStartValue(self._position)
-            self._animation.setEndValue(1.0 if value else 0.0)
+            self._animation.setEndValue(1.0 if checked else 0.0)
             self._animation.start()
         else:
-            self._position = 1.0 if value else 0.0
+            self._position = 1.0 if checked else 0.0
             self.update()
 
     def get_position(self) -> float:
@@ -117,29 +138,25 @@ class Switch(QWidget):
 
     position = Property(float, get_position, set_position)
 
-    def _flip(self) -> None:
-        if not self.isEnabled():
-            return
-        self.setChecked(not self._checked)
-        self.toggled.emit(self._checked)
-
-    def mouseReleaseEvent(self, event) -> None:  # noqa: N802
-        if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(event.position().toPoint()):
-            self._flip()
+    def sizeHint(self) -> QSize:  # noqa: N802
+        return self.minimumSize()
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
-        if event.key() in (Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            self._flip()
+        # Space is the button's own; Return flips it too, as it always has.
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not event.isAutoRepeat():
+            self.click()
             return
         super().keyPressEvent(event)
 
     def enterEvent(self, event) -> None:  # noqa: N802
         self._hovered = True
         self.update()
+        super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:  # noqa: N802
         self._hovered = False
         self.update()
+        super().leaveEvent(event)
 
     def paintEvent(self, _event) -> None:  # noqa: N802
         lk = look()
@@ -152,7 +169,7 @@ class Switch(QWidget):
             painter.setFont(font("body"))
             painter.setPen(lk.text)
             state = QRectF(0, 0, WIN_STATE_WIDTH - 12, self.height())
-            painter.drawText(state, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, "On" if self._checked else "Off")
+            painter.drawText(state, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter, "On" if self.isChecked() else "Off")
             rect.setLeft(rect.left() + WIN_STATE_WIDTH)
         radius = rect.height() / 2
         p = self._position
@@ -200,16 +217,20 @@ class Switch(QWidget):
             painter.drawRoundedRect(rect.adjusted(-1, -1, 1, 1), radius + 1, radius + 1)
 
     def focusInEvent(self, event) -> None:  # noqa: N802
-        # Only keyboard focus earns a ring, as with native controls.
-        self._keyboard_focus = event.reason() in (
-            Qt.FocusReason.TabFocusReason,
-            Qt.FocusReason.BacktabFocusReason,
-        )
+        # Only keyboard focus earns a ring, as with native controls. Coming
+        # back to the window (or out of a menu) restores focus without a key
+        # press, but the ring the user had stays: Space still acts on this.
+        reason = event.reason()
+        if reason in (Qt.FocusReason.TabFocusReason, Qt.FocusReason.BacktabFocusReason):
+            self._keyboard_focus = True
+        elif reason not in _RESTORED_FOCUS:
+            self._keyboard_focus = False
         super().focusInEvent(event)
         self.update()
 
     def focusOutEvent(self, event) -> None:  # noqa: N802
-        self._keyboard_focus = False
+        if event.reason() not in _RESTORED_FOCUS:
+            self._keyboard_focus = False
         super().focusOutEvent(event)
         self.update()
 
@@ -351,99 +372,187 @@ class AppIconView(QWidget):
 
 # -- sidebar ---------------------------------------------------------------------
 
-class Sidebar(QWidget):
-    """The navigation list: System Settings on macOS, Settings on Windows."""
+class _SidebarDelegate(QStyledItemDelegate):
+    """Paints each sidebar entry: a rounded selection pill, the system icon
+    and the title, as System Settings and Windows Settings draw theirs."""
+
+    def __init__(self, sidebar: "Sidebar") -> None:
+        super().__init__(sidebar)
+        self.sidebar = sidebar
+
+    def sizeHint(self, option, index) -> QSize:  # noqa: N802
+        return QSize(self.sidebar.width(), self.sidebar.item_height + self.sidebar.item_gap)
+
+    def paint(self, painter: QPainter, option, index) -> None:
+        sidebar = self.sidebar
+        lk = look()
+        name, title = sidebar.items[index.row()]
+        inset = 10 if IS_MAC else 6
+        row = QRectF(option.rect)
+        rect = QRectF(row.left() + inset, row.top(), row.width() - inset * 2, sidebar.item_height)
+        radius = 7 if IS_MAC else 4
+        selected = bool(option.state & QStyle.StateFlag.State_Selected)
+        hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
+        focused = selected and sidebar.shows_focus()
+        ink = lk.text
+
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        if selected:
+            if focused and IS_MAC:
+                # macOS marks the focused list by drawing its selection in
+                # the accent colour.
+                painter.setBrush(lk.accent)
+                ink = QColor("#ffffff")
+            else:
+                painter.setBrush(lk.selection)
+            painter.drawRoundedRect(rect, radius, radius)
+            if not IS_MAC:
+                bar = QRectF(rect.left(), rect.center().y() - 8, 3, 16)
+                painter.setBrush(lk.accent)
+                painter.drawRoundedRect(bar, 1.5, 1.5)
+        elif hovered and not IS_MAC:
+            painter.setBrush(lk.hover)
+            painter.drawRoundedRect(rect, radius, radius)
+        if focused and not IS_MAC:
+            # Windows draws a 2 px focus rectangle around the focused entry.
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(lk.text, 2))
+            painter.drawRoundedRect(rect.adjusted(1, 1, -1, -1), radius, radius)
+
+        icon_size = 20 if IS_MAC else 16
+        icon_left = rect.left() + (6 if IS_MAC else 14)
+        icon = QRectF(icon_left, rect.center().y() - icon_size / 2, icon_size, icon_size)
+        symbols.paint_sidebar_icon(painter, name, icon, ink, sidebar.window_active)
+        painter.setFont(font("body"))
+        painter.setPen(ink)
+        text_rect = QRectF(icon.right() + (8 if IS_MAC else 14), rect.top(), rect.width(), rect.height())
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, title)
+        painter.restore()
+
+
+class Sidebar(QListWidget):
+    """The navigation list: System Settings on macOS, Settings on Windows.
+
+    A real list underneath, so VoiceOver and Narrator find its entries
+    ("Calibrate, 3 of 4, selected") and announce each move; a delegate keeps
+    the platform look.
+    """
 
     current_changed = Signal(int)
 
     def __init__(self, items: list[tuple[str, str]], top_inset: int = 0, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.items = items  # (symbol name, title)
-        self.current = 0
         self.top_inset = top_inset
-        self._hover = -1
         self.window_active = True
         self.paint_background = False
-        self.setMouseTracking(True)
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self._keyboard_focus = False
+        self._emit = True
         self.setFixedWidth(look().sidebar_width)
         self.setAccessibleName("Sidebar")
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        # The selection shows focus; macOS's ring around the whole list would
+        # draw over the sidebar material.
+        self.setAttribute(Qt.WidgetAttribute.WA_MacShowFocusRect, False)
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.setUniformItemSizes(True)
+        self.setMouseTracking(True)
+        self.viewport().setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        # The window paints the sidebar (or the system material shows through).
+        self.setAutoFillBackground(False)
+        self.viewport().setAutoFillBackground(False)
+        self.setViewportMargins(0, top_inset + (8 if IS_MAC else 12), 0, 0)
+        self.setItemDelegate(_SidebarDelegate(self))
+        for _name, title in items:
+            QListWidgetItem(title, self)
+        self.setCurrentRow(0)
+        self.currentRowChanged.connect(self._on_row)
 
     @property
     def item_height(self) -> int:
         return 32 if IS_MAC else 38
 
-    def _item_rect(self, index: int) -> QRectF:
-        top = self.top_inset + (8 if IS_MAC else 12) + index * (self.item_height + (2 if IS_MAC else 4))
-        inset = 10 if IS_MAC else 6
-        return QRectF(inset, top, self.width() - inset * 2, self.item_height)
+    @property
+    def item_gap(self) -> int:
+        return 2 if IS_MAC else 4
 
-    def _index_at(self, point) -> int:
-        for index in range(len(self.items)):
-            if self._item_rect(index).contains(QPointF(point)):
-                return index
-        return -1
+    @property
+    def current(self) -> int:
+        return self.currentRow()
 
     def set_current(self, index: int, emit: bool = True) -> None:
-        if 0 <= index < len(self.items) and index != self.current:
-            self.current = index
-            self.update()
-            if emit:
-                self.current_changed.emit(index)
+        if 0 <= index < self.count() and index != self.currentRow():
+            self._emit = emit
+            try:
+                self.setCurrentRow(index)
+            finally:
+                self._emit = True
+
+    def set_window_active(self, active: bool) -> None:
+        """macOS greys the icons of a window in the background."""
+        self.window_active = active
+        self.viewport().update()
+
+    def shows_focus(self) -> bool:
+        return self.hasFocus() and self._keyboard_focus
+
+    def _on_row(self, row: int) -> None:
+        self.viewport().update()
+        if self._emit and row >= 0:
+            self.current_changed.emit(row)
+
+    def selectionCommand(self, index, event=None):  # noqa: N802
+        # One entry is always selected: nothing deselects it (a Cmd or Ctrl
+        # click would), and a click between entries changes nothing.
+        if not index.isValid():
+            return QItemSelectionModel.SelectionFlag.NoUpdate
+        return QItemSelectionModel.SelectionFlag.ClearAndSelect
 
     def mousePressEvent(self, event) -> None:  # noqa: N802
-        index = self._index_at(event.position())
-        if index >= 0:
-            self.set_current(index)
+        self._keyboard_focus = False
+        if self.indexAt(event.position().toPoint()).isValid():
+            super().mousePressEvent(event)
+        else:
+            self.setFocus(Qt.FocusReason.MouseFocusReason)
+        self.viewport().update()
 
     def mouseMoveEvent(self, event) -> None:  # noqa: N802
-        index = self._index_at(event.position())
-        if index != self._hover:
-            self._hover = index
-            self.update()
-
-    def leaveEvent(self, _event) -> None:  # noqa: N802
-        self._hover = -1
-        self.update()
+        # Dragging across the list doesn't flip through the panes.
+        if not event.buttons():
+            super().mouseMoveEvent(event)
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
-        if event.key() == Qt.Key.Key_Down:
-            self.set_current(min(len(self.items) - 1, self.current + 1))
-        elif event.key() == Qt.Key.Key_Up:
-            self.set_current(max(0, self.current - 1))
-        else:
-            super().keyPressEvent(event)
+        self._keyboard_focus = True
+        super().keyPressEvent(event)
+        self.viewport().update()
 
-    def paintEvent(self, _event) -> None:  # noqa: N802
-        lk = look()
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    def focusInEvent(self, event) -> None:  # noqa: N802
+        reason = event.reason()
+        if reason in (Qt.FocusReason.TabFocusReason, Qt.FocusReason.BacktabFocusReason):
+            self._keyboard_focus = True
+        elif reason not in _RESTORED_FOCUS:
+            self._keyboard_focus = False
+        super().focusInEvent(event)
+        self.viewport().update()
+
+    def focusOutEvent(self, event) -> None:  # noqa: N802
+        if event.reason() not in _RESTORED_FOCUS:
+            self._keyboard_focus = False
+        super().focusOutEvent(event)
+        self.viewport().update()
+
+    def paintEvent(self, event) -> None:  # noqa: N802
         if self.paint_background:
-            painter.fillRect(self.rect(), lk.sidebar)
-        painter.setFont(font("body"))
-        for index, (name, title) in enumerate(self.items):
-            rect = self._item_rect(index)
-            selected = index == self.current
-            if selected:
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(lk.selection)
-                painter.drawRoundedRect(rect, 7 if IS_MAC else 4, 7 if IS_MAC else 4)
-                if not IS_MAC:
-                    bar = QRectF(rect.left(), rect.center().y() - 8, 3, 16)
-                    painter.setBrush(lk.accent)
-                    painter.drawRoundedRect(bar, 1.5, 1.5)
-            elif index == self._hover and not IS_MAC:
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(lk.hover)
-                painter.drawRoundedRect(rect, 4, 4)
-
-            icon_size = 20 if IS_MAC else 16
-            icon_left = rect.left() + (6 if IS_MAC else 14)
-            icon = QRectF(icon_left, rect.center().y() - icon_size / 2, icon_size, icon_size)
-            symbols.paint_sidebar_icon(painter, name, icon, lk.text, self.window_active)
-            painter.setPen(lk.text)
-            text_rect = QRectF(icon.right() + (8 if IS_MAC else 14), rect.top(), rect.width(), rect.height())
-            painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, title)
+            painter = QPainter(self.viewport())
+            painter.fillRect(self.viewport().rect(), look().sidebar)
+            painter.end()
+        super().paintEvent(event)
 
 
 # -- click pad and timeline ------------------------------------------------------
