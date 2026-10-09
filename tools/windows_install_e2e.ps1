@@ -36,8 +36,8 @@ function Wait-For([scriptblock] $Condition, [int] $Seconds, [string] $What) {
 }
 # Runs an installer silently. Bounded: a setup that waits on something for
 # ever fails the run instead of hanging it.
-function Install($Setup, $Log, [int] $Seconds = 300) {
-    $process = Start-Process $Setup -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LOG=`"$Log`"" -PassThru
+function Install($Setup, $Log, [int] $Seconds = 300, [string[]] $Extra = @()) {
+    $process = Start-Process $Setup -ArgumentList (@("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LOG=`"$Log`"") + $Extra) -PassThru
     $null = $process.Handle  # keeps the exit code readable after WaitForExit
     if (-not $process.WaitForExit($Seconds * 1000)) {
         Get-CimInstance Win32_Process | Format-Table ProcessId, ParentProcessId, Name, CommandLine -AutoSize | Out-String -Width 300 | Write-Host
@@ -60,10 +60,13 @@ function Expect-Quit($Lines, [string[]] $Wanted, [string[]] $Unwanted = @()) {
 }
 $version = (python -c "import app; print(app.__version__)").Trim()
 # Every old installer here is from before 1.0, when the app was DoubleClick
-# Fixer: the Start menu entry it made, in the user's Programs folder.
+# Fixer: the Start menu folder its shortcut went in by default, in the user's
+# Programs folder. The first leg is installed into a folder of the user's
+# choosing instead, which the update keeps.
 $Programs = [Environment]::GetFolderPath("Programs")
-$OldShortcut = Join-Path $Programs "DoubleClick Fixer\DoubleClick Fixer.lnk"
-$NewShortcut = Join-Path $Programs "Mouse Double-Click Fixer\Mouse Double-Click Fixer.lnk"
+$OldGroup = "DoubleClick Fixer"
+$NewGroup = "Mouse Double-Click Fixer"
+$ChosenGroup = "Mouse Tools"
 # The new build is installed whole: the folder build (not the portable
 # one-file exe), its runtime, and the notices beside it. Nothing it replaced
 # was in use.
@@ -117,9 +120,16 @@ foreach ($old in $OldSetup) {
     if (Test-Path $UninstallKey) { Uninstall-App }
 
     Step "Install an old version and leave it running in the notification area ($old)"
-    Install $old "$env:TEMP\dcf-old-$leg.log"
+    if ($leg -eq 1) {
+        $group = $ChosenGroup
+        Install $old "$env:TEMP\dcf-old-$leg.log" -Extra @("/GROUP=`"$group`"")
+    } else {
+        $group = $OldGroup
+        Install $old "$env:TEMP\dcf-old-$leg.log"
+    }
     $oldVersion = (Get-ItemProperty $UninstallKey).DisplayVersion
     $app = App-Path
+    $OldShortcut = Join-Path $Programs "$group\DoubleClick Fixer.lnk"
     if (-not (Test-Path $OldShortcut)) { Fail "$oldVersion made no $OldShortcut" }
     Start-Process $app -ArgumentList "--minimized"
     Wait-For { (Get-Running).Count -gt 0 } 30 "the old copy to start"
@@ -134,10 +144,18 @@ foreach ($old in $OldSetup) {
     if ($still) { Fail "the old copy is still running after the upgrade" }
     Assert-NewBuild $log
     # The new name: the update stays in the folder the old copy was in, and
-    # its Start menu entry and Installed apps name are the new ones.
+    # its Start menu entry and Installed apps name are the new ones. The
+    # entry moves out of the old default folder, which goes, but stays in a
+    # folder the user chose.
     if ((App-Path) -ne $app) { Fail "the upgrade moved the app from $app to $(App-Path)" }
     if (Test-Path $OldShortcut) { Fail "the Start menu still has $OldShortcut" }
-    if (Test-Path (Split-Path $OldShortcut)) { Fail "the old Start menu folder is still there" }
+    if ($group -eq $OldGroup) {
+        if (Test-Path (Join-Path $Programs $OldGroup)) { Fail "the old Start menu folder is still there" }
+        $NewShortcut = Join-Path $Programs "$NewGroup\Mouse Double-Click Fixer.lnk"
+    } else {
+        if (Test-Path (Join-Path $Programs $NewGroup)) { Fail "the update left the Start menu folder '$group' for '$NewGroup'" }
+        $NewShortcut = Join-Path $Programs "$group\Mouse Double-Click Fixer.lnk"
+    }
     if (-not (Test-Path $NewShortcut)) { Fail "the Start menu has no $NewShortcut" }
     $listed = (Get-ItemProperty $UninstallKey).DisplayName
     if ($listed -notlike "Mouse Double-Click Fixer*") { Fail "Installed apps lists the app as '$listed'" }

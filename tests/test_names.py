@@ -111,19 +111,29 @@ class PackagingTests(unittest.TestCase):
             f"AppVerName={DISPLAY_NAME} {{#AppVersion}}",
             f"DefaultDirName={{autopf}}\\{DISPLAY_NAME}",
             f"DefaultGroupName={DISPLAY_NAME}",
-            "UsePreviousGroup=no",
+            # An update keeps a Start menu folder the user chose, moves the
+            # default one from before 1.0, and never asks for one again.
+            "UsePreviousGroup=not PreviousGroupIsFormerDefault",
+            f"  Result := CompareText(Group, '{FORMER_DISPLAY_NAME}') = 0;",
+            "  Result := (PageID = wpSelectProgramGroup) and IsUpgrade;",
             f'Name: "{{group}}\\{DISPLAY_NAME}"; Filename: "{{app}}\\DoubleClickFixer.exe"',
             f'Name: "{{autodesktop}}\\{DISPLAY_NAME}"; Filename: "{{app}}\\DoubleClickFixer.exe"; Tasks: desktopicon',
             # An update removes the shortcuts from before 1.0.
             f'Type: files; Name: "{{autoprograms}}\\{FORMER_DISPLAY_NAME}\\{FORMER_DISPLAY_NAME}.lnk"',
             f'Type: dirifempty; Name: "{{autoprograms}}\\{FORMER_DISPLAY_NAME}"',
+            f'Type: files; Name: "{{group}}\\{FORMER_DISPLAY_NAME}.lnk"',
             f'Type: files; Name: "{{autodesktop}}\\{FORMER_DISPLAY_NAME}.lnk"; Tasks: desktopicon',
         ):
             self.assertIn(line, iss)
         # Upgrades keep the folder they were installed in (UsePreviousAppDir
         # is on unless turned off).
         self.assertIsNone(re.search(r"(?mi)^UsePreviousAppDir\s*=", iss))
-        directives = [line for line in iss.splitlines() if not line.startswith((";", "Type:"))]
+        # Nothing else in it names the app the old way: only comments, the
+        # [InstallDelete] lines and the check above may.
+        compat = f"  Result := CompareText(Group, '{FORMER_DISPLAY_NAME}') = 0;"
+        directives = [
+            line for line in iss.splitlines() if not line.lstrip().startswith((";", "//", "Type:")) and line != compat
+        ]
         self.assertEqual([line for line in directives if FORMER_DISPLAY_NAME in line], [])
 
     def test_the_mac_uninstaller_removes_the_app_under_either_name(self) -> None:

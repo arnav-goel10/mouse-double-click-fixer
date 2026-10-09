@@ -13,9 +13,11 @@ AppVersion={#AppVersion}
 ; that folder from the running exe or the uninstall entry, never by name.
 DefaultDirName={autopf}\Mouse Double-Click Fixer
 DefaultGroupName=Mouse Double-Click Fixer
-; Updates move the Start menu entry to the new name too ([InstallDelete]
-; removes the one from before 1.0) instead of reusing the old folder.
-UsePreviousGroup=no
+; An update keeps the Start menu folder the app was installed in, unless it
+; is the one named after the app before 1.0: that one moves to the new name
+; ([InstallDelete] removes the old shortcuts, ShouldSkipPage keeps the
+; folder page away from updates).
+UsePreviousGroup=not PreviousGroupIsFormerDefault
 OutputBaseFilename=DoubleClickFixer-Setup
 ; The app is a 64-bit build, and Qt 6 needs Windows 10 1809 or later: say so
 ; up front rather than install something that can't start.
@@ -39,10 +41,12 @@ CloseApplications=yes
 ; The runtime beside the exe is replaced whole, so an update that moves to a
 ; newer Qt or Python leaves none of the old one behind.
 Type: filesandordirs; Name: "{app}\_internal"
-; The shortcuts from before 1.0, when the app was called DoubleClick Fixer.
-; The desktop one goes only when the new one replaces it.
+; The shortcuts from before 1.0, when the app was called DoubleClick Fixer:
+; in the folder of that name, or in one the user chose, which the update
+; keeps. The desktop one goes only when the new one replaces it.
 Type: files; Name: "{autoprograms}\DoubleClick Fixer\DoubleClick Fixer.lnk"
 Type: dirifempty; Name: "{autoprograms}\DoubleClick Fixer"
+Type: files; Name: "{group}\DoubleClick Fixer.lnk"
 Type: files; Name: "{autodesktop}\DoubleClick Fixer.lnk"; Tasks: desktopicon
 
 [Files]
@@ -79,6 +83,28 @@ end;
 function IsUpgrade: Boolean;
 begin
   Result := RegKeyExists(HKCU, UninstallKey) or RegKeyExists(HKLM, UninstallKey);
+end;
+
+// Whether the installed copy's Start menu folder is "DoubleClick Fixer", the
+// default before 1.0. Such a folder moves to the new name; one the user
+// chose is kept (UsePreviousGroup).
+function PreviousGroupIsFormerDefault: Boolean;
+var
+  Group: String;
+begin
+  Group := '';
+  if not RegQueryStringValue(HKCU, UninstallKey, 'Inno Setup: Icon Group', Group) then
+    RegQueryStringValue(HKLM, UninstallKey, 'Inno Setup: Icon Group', Group);
+  Result := CompareText(Group, 'DoubleClick Fixer') = 0;
+end;
+
+// An update never asks for a Start menu folder: it takes the installed
+// copy's, or the new one for a copy from before 1.0 (UsePreviousGroup).
+// Inno would show that page again for such a copy, whose folder it doesn't
+// reuse.
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := (PageID = wpSelectProgramGroup) and IsUpgrade;
 end;
 
 // The version installed now, or '' when there is none.
