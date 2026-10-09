@@ -491,7 +491,9 @@ class EventTimeTests(unittest.TestCase):
         self.assertFalse(self.move(100.150, "m", (40, 0)), "waits behind the release on its way")
         self.assertTrue(self.handle(Button.LEFT, True, 100.400, "down2").deferred)
         self.filter._injected_passed(Button.LEFT)
-        self.assertEqual(self.sent, [(Button.LEFT, False, "up"), (Button.LEFT, None, "m"), (Button.LEFT, True, "down2")])
+        self.assertEqual(
+            self.sent, [(Button.LEFT, False, "up"), (Button.LEFT, None, "m"), (Button.LEFT, True, "down2")]
+        )
 
     def test_a_real_race_between_the_timer_and_an_event_delivers_once(self) -> None:
         for _round in range(300):
