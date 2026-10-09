@@ -918,8 +918,9 @@ class GlobalClickFilter:
 
     def _give_up_all(self) -> None:
         """Give up on every re-sent event in flight, and send every event
-        waiting behind them in the order they came: the filter stops or fails
-        open."""
+        waiting behind them in the order they came: when the filter stops or
+        fails open, and when macOS re-enables a tap it had disabled (events
+        posted meanwhile went past it, and never come back)."""
         with self._lock:
             waiting = sorted((entry for button in Button for entry in self._queued[button]), key=lambda entry: entry[0])
             for button in Button:
@@ -1267,6 +1268,10 @@ class GlobalClickFilter:
                 return
             self.tap_resets += 1
             Quartz.CGEventTapEnable(tap, True)
+            # Whatever this app posted while the tap was off went past it and
+            # never comes back: stop waiting for it, and send what waits
+            # behind it, now that the tap sees it come back.
+            self._give_up_all()
 
         def callback(proxy: object, event_type: int, event: object, refcon: object) -> object:
             # An exception here would make PyObjC return nothing, which drops

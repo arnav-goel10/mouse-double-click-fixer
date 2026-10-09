@@ -2243,6 +2243,27 @@ class MacTapTests(unittest.TestCase):
         self.assertTrue(self.tap.enabled)
         self.assertEqual(self.filter.tap_resets, 1)
 
+    def test_a_rearmed_tap_gives_up_on_what_was_posted_while_it_was_off(self) -> None:
+        # A click made in place, then motion leaving it: the release is
+        # re-sent and the motion waits behind it. Before the release comes
+        # back, macOS disables the tap: posted meanwhile, it went past, and
+        # never comes back.
+        self.button(self.Q.kCGEventLeftMouseDown, (100, 100), 0.0)
+        self.button(self.Q.kCGEventLeftMouseUp, (100, 100), 0.1)
+        self.quartz.pointer = (100.0, 100.0)
+        self.assertIsNone(self.motion((106, 100)))
+        release = self.quartz.posted[0]
+        self.assertEqual([self.mark(event) for event in self.quartz.posted], [INJECTED_MARK])
+        self.disable()
+        self.assertTrue(self.tap.enabled)
+        moved = self.quartz.posted[-1]
+        self.assertEqual((moved.location.x, self.mark(moved)), (106, MOTION_MARK_FOR[Button.LEFT]), "sent at once")
+        self.assertEqual(self.quartz.taps_enabled_at_post[-1], [True], "once the tap is back to see it")
+        self.assertIs(self.pass_back(release), release, "if it turns up after all, it passes")
+        self.assertTrue(self.filter._motion_wanted, "the motion is still on its way")
+        self.pass_back(moved)
+        self.assertFalse(self.filter._motion_wanted)
+
     def test_macos_disabling_the_tap_again_and_again_stops_the_filter(self) -> None:
         self.button(self.Q.kCGEventLeftMouseDown, (0, 0), 0.0)
         self.button(self.Q.kCGEventLeftMouseUp, (30, 0), 0.4)          # held when it happens
