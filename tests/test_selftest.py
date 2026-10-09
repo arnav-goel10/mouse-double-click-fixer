@@ -1,4 +1,5 @@
-"""The --self-test a release runs on the built app."""
+"""The --self-test a release runs on the built app, and the macOS runtime hook
+that cleans its environment."""
 
 import contextlib
 import io
@@ -16,6 +17,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from app import selftest
 
 ROOT = Path(__file__).resolve().parent.parent
+SCRUB_HOOK = ROOT / "installer" / "runtime_hooks" / "scrub_env.py"
 IS_MAC = platform.system() == "Darwin"
 
 
@@ -168,6 +170,59 @@ class RunScriptTests(unittest.TestCase):
         )
         self.assertEqual(finished.returncode, 0, finished.stdout + finished.stderr)
         self.assertIn("Qt platform plugin: ok (offscreen plugin loaded and unloaded", finished.stdout)
+
+
+class ScrubHookTests(unittest.TestCase):
+    def run_hook(self, environment, argv=("DoubleClickFixer",)):
+        with mock.patch.dict(os.environ, environment, clear=True), mock.patch.object(sys, "argv", list(argv)):
+            runpy.run_path(str(SCRUB_HOOK))
+            return dict(os.environ)
+
+    def test_variables_that_load_outside_code_are_removed(self) -> None:
+        left = self.run_hook({
+            "HOME": "/Users/someone",
+            "PATH": "/usr/bin:/bin",
+            "TMPDIR": "/var/folders/x/T/",
+            "OPENSSL_CONF": "/tmp/evil.cnf",
+            "OPENSSL_MODULES": "/tmp/evil",
+            "OPENSSL_ENGINES": "/tmp/evil",
+            "SSL_CERT_FILE": "/tmp/ca.pem",
+            "SSL_CERT_DIR": "/tmp/certs",
+            "QT_PLUGIN_PATH": "/tmp/evil",
+            "QT_QPA_PLATFORM_PLUGIN_PATH": "/tmp/evil",
+            "QT_QPA_PLATFORM": "cocoa",
+            "QML2_IMPORT_PATH": "/tmp/evil",
+            "PYTHONPATH": "/tmp/evil",
+            "PYTHONHOME": "/tmp/evil",
+            "DYLD_INSERT_LIBRARIES": "/tmp/evil.dylib",
+            "DYLD_LIBRARY_PATH": "/tmp/evil",
+            "_PYI_APPLICATION_HOME_DIR": "/Applications/Example.app/Contents/Frameworks",
+            "PYINSTALLER_RESET_ENVIRONMENT": "1",
+        })
+        self.assertEqual(left, {
+            "HOME": "/Users/someone",
+            "PATH": "/usr/bin:/bin",
+            "TMPDIR": "/var/folders/x/T/",
+            # What PyInstaller's bootloader itself uses stays.
+            "_PYI_APPLICATION_HOME_DIR": "/Applications/Example.app/Contents/Frameworks",
+            "PYINSTALLER_RESET_ENVIRONMENT": "1",
+            # OpenSSL's compiled-in config may sit in a user-writable folder.
+            "OPENSSL_CONF": os.devnull,
+        })
+
+    def test_the_self_test_keeps_its_choice_of_qt_platform(self) -> None:
+        left = self.run_hook(
+            {"QT_QPA_PLATFORM": "offscreen", "QT_QPA_PLATFORM_PLUGIN_PATH": "/tmp/evil"},
+            argv=("DoubleClickFixer", "--self-test"),
+        )
+        self.assertEqual(left, {"QT_QPA_PLATFORM": "offscreen", "OPENSSL_CONF": os.devnull})
+
+    def test_the_hook_is_wired_into_the_macos_build_only(self) -> None:
+        spec = (ROOT / "doubleclick-fixer.spec").read_text(encoding="utf-8")
+        self.assertIn(
+            'RUNTIME_HOOKS = ["installer/runtime_hooks/scrub_env.py"] if sys.platform == "darwin" else []', spec
+        )
+        self.assertIn("runtime_hooks=RUNTIME_HOOKS", spec)
 
 
 if __name__ == "__main__":

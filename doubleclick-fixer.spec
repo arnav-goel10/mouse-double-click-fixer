@@ -41,6 +41,10 @@ if sys.platform == "darwin":
         collect_submodules("Quartz") + collect_submodules("AppKit") + collect_submodules("Foundation")
     )
 
+# macOS: drop environment variables that would load code from outside the
+# app, before any other code runs (see the hook for which and why).
+RUNTIME_HOOKS = ["installer/runtime_hooks/scrub_env.py"] if sys.platform == "darwin" else []
+
 analysis = Analysis(
     ["run.py"],
     pathex=["."],
@@ -48,7 +52,7 @@ analysis = Analysis(
     datas=[],
     hiddenimports=hiddenimports,
     hookspath=[],
-    runtime_hooks=[],
+    runtime_hooks=RUNTIME_HOOKS,
     excludes=EXCLUDES,
 )
 
