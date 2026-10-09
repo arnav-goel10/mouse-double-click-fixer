@@ -29,6 +29,7 @@ from app.platform import (
     INJECTED_MARK,
     MOTION_MARK_FOR,
     TELEPORT_MARK,
+    WINDOWS_STAMP_ERROR_S,
     GlobalClickFilter,
     InputSender,
     WindowsHook,
@@ -131,6 +132,7 @@ class FakeWindows:
         self.now_ms = 10_000.0
         self.hook = WindowsHook(click_filter, self, accepts_injection=lambda _x, _y: True)
         click_filter._use_os_time = True
+        click_filter._stamp_error_s = WINDOWS_STAMP_ERROR_S
         click_filter._inject = self.hook.inject
         click_filter._is_near = self.within_drag_rect
         click_filter._set_motion_tap = self.hook.set_watch
@@ -737,6 +739,9 @@ class WindowsHookTests(RealWindows):
 
     def messages(self) -> list:
         return [entry[0] for entry in self.observed_buttons()]
+
+    def test_the_filter_allows_for_how_late_a_stamp_can_say_an_event_came(self) -> None:
+        self.assertEqual(self.filter._stamp_error_s, WINDOWS_STAMP_ERROR_S)
 
     def test_bounce_is_blocked_and_real_clicks_survive(self) -> None:
         self.observed.clear()

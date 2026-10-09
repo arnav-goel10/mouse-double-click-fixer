@@ -29,6 +29,7 @@ from app.platform import (
     TELEPORT_MARK,
     TAP_DISABLE_LIMIT,
     TAP_DISABLED_MESSAGE,
+    WINDOWS_STAMP_ERROR_S,
     ClickCountRepair,
     GlobalClickFilter,
     HookError,
@@ -1073,6 +1074,28 @@ class ResendNumberTests(unittest.TestCase):
         come_back(rig.filter, Button.LEFT)
         self.assertEqual(rig.sent[1:], [(Button.LEFT, None, "m"), (Button.LEFT, True, "down2")])
 
+    def test_a_windows_stamp_a_tick_or_two_late_never_gives_up_a_later_resend(self) -> None:
+        # down2 was made 3 ms before up1 was re-sent, so it is ahead of up1 on
+        # the way, and the hook stalls for 520 ms. Windows stamps it by the
+        # tick, as having come 2 ms after up1 went out (see
+        # windows_event_time): that says nothing of up1.
+        rig = Pipeline(self)
+        rig.filter._stamp_error_s = WINDOWS_STAMP_ERROR_S             # as _run_windows sets it
+        rig.round_trip = None
+        rig.handle(Button.LEFT, True, 100.000, "down1", late_ms=0)
+        rig.handle(Button.LEFT, False, 100.100, "up1", late_ms=0)
+        rig.run_until(100.200)
+        self.assertEqual(rig.sent, [(Button.LEFT, False, "up1")])
+        sent_at = rig.filter._in_flight[Button.LEFT][0][1]
+        arrival = sent_at - 0.003 + 0.520
+        stamp = windows_event_time(arrival, 1_000_531, 1_000_000)     # its tick 531 ms old
+        self.assertAlmostEqual(stamp - sent_at, 0.002, places=9)
+        rig.run_until(arrival)
+        down2 = rig.filter._handle(Button.LEFT, True, stamp, "down2", location=(0, 0))
+        self.assertTrue(down2.deferred, "down2 waits behind up1")
+        come_back(rig.filter, Button.LEFT)
+        self.assertEqual(rig.sent[1:], [(Button.LEFT, True, "down2")])
+
 
 class SendOrderTests(unittest.TestCase):
     """Re-sent events go out in the order they were decided, whichever
@@ -1384,6 +1407,26 @@ class WindowsEventTimeTests(unittest.TestCase):
 
     def test_an_absurd_lateness_is_capped(self) -> None:
         self.assertAlmostEqual(windows_event_time(5.0, 0x7FFFFFFF, 0), 3.0, places=9)
+
+    def test_an_event_is_never_placed_later_than_the_stamp_error_allows(self) -> None:
+        # GetTickCount holds the millisecond count at the last clock
+        # interrupt, one every 15.625 ms. Every phase of the tick, every
+        # moment within two ticks, and every lateness up to 100 ms.
+        period = 15.625
+
+        def tick_count(ms: float, phase: float) -> int:
+            return math.floor(math.floor((ms - phase) / period) * period + phase)
+
+        worst = 0.0
+        for phase in (0.0, 2.5, 6.25, 10.0, 15.5):
+            for step in range(128):
+                happened = 1_000_000 + step / 4
+                for late in range(0, 200):
+                    arrival = happened + late / 2
+                    stamp = windows_event_time(arrival / 1000, tick_count(arrival, phase), tick_count(happened, phase))
+                    worst = max(worst, stamp - happened / 1000)
+        self.assertLessEqual(worst, WINDOWS_STAMP_ERROR_S)
+        self.assertGreater(worst, WINDOWS_STAMP_ERROR_S - 0.001, "and no more than it needs")
 
     def test_a_long_idle_is_just_a_long_gap(self) -> None:
         # 30 days without a click (time asleep counts): nothing is carried

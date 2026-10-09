@@ -97,6 +97,11 @@ PEN_SIGNATURE = 0xFF515700
 #: sees it may still have come at once.
 TICK_MS = 16
 
+#: How much after an event really happened windows_event_time can place it:
+#: up to TICK_MS of lateness is left on, and the tick the event is stamped
+#: with can trail it by another tick and the millisecond GetTickCount drops.
+WINDOWS_STAMP_ERROR_S = (2 * TICK_MS + 1) / 1000
+
 #: Windows silently removes a low-level hook it judges too slow, and says
 #: nothing. The hook is re-installed this often in case that happened unseen.
 WINDOWS_REARM_INTERVAL_MS = 15_000
@@ -250,6 +255,11 @@ class GlobalClickFilter:
         # How late any event reached it lately; sets how long to wait for a
         # re-sent event to come back (see _in_flight_timeout).
         self._peak_lateness = PeakLateness()
+        # How much after an event happened its timestamp can say it did:
+        # nothing on macOS, up to two ticks on Windows (see _run_windows). An
+        # event stamped less than this after a re-send went out may have been
+        # made before it (see _give_up).
+        self._stamp_error_s = 0.0
         # Per button: the events re-sent as it and not yet seen coming back
         # through the hook, oldest first, as (number, when sent). They come
         # back in the order sent, so once one does, those before it came
@@ -877,14 +887,16 @@ class GlobalClickFilter:
         tap swallowed them, or they were lost. When an event stamped `stamp`
         is the reason to look, only those re-sent before it happened count:
         one re-sent after it was behind it on the way, so the event's arrival
-        says nothing of it. Once none is left, the queue goes out."""
+        says nothing of it. Since a stamp can say an event happened up to
+        _stamp_error_s after it did, only those re-sent that much before it
+        count. Once none is left, the queue goes out."""
         in_flight = self._in_flight[button]
         if not in_flight:
             return
         due = monotonic() - self._in_flight_timeout()
         number = None
         for seq, sent_at in in_flight:
-            if sent_at >= due or (stamp is not None and sent_at >= stamp):
+            if sent_at >= due or (stamp is not None and sent_at >= stamp - self._stamp_error_s):
                 break
             number = seq
         if number is not None:
@@ -1070,6 +1082,8 @@ class GlobalClickFilter:
         # Every stamp is on monotonic()'s clock (see WindowsHook.button), so
         # the once-per-run check in _normalise_time must not second-guess it.
         self._use_os_time = True
+        # But one can say an event happened up to two ticks after it did.
+        self._stamp_error_s = WINDOWS_STAMP_ERROR_S
         self._thread_id = kernel32.GetCurrentThreadId()
 
         # Windows silently removes a low-level hook whose callback runs past
