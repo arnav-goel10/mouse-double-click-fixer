@@ -10,6 +10,7 @@ import contextlib
 import io
 import os
 import platform
+import re
 import runpy
 import subprocess
 import sys
@@ -56,6 +57,10 @@ class SelfTestTests(unittest.TestCase):
         self.assertRegex(result["tls"], r"^ok \((schannel|openssl|securetransport), .+, TLS 1\.2.*, [1-9]\d* root certificates")
         if sys.platform == "win32":
             self.assertTrue(result["tls"].startswith("ok (schannel, "), result["tls"])
+        # From source an OpenSSL older than the floor is a skip: CI also tests
+        # on Pythons that ship one (python.org's 3.13 ships OpenSSL 3.0).
+        self.assertRegex(result["openssl"], r"^(ok \(OpenSSL \d+\.\d+\.\d+ in Python's ssl and hashlib.*; "
+                         r"\d+\.\d+ or later required\)|skipped: not a built app, and a build would fail: .+)$")
         if IS_MAC:
             self.assertTrue(result["PyObjC callback"].startswith("ok"))
             self.assertIn(result["event tap"].split(" ")[0], ("ok", "skipped:"))
@@ -293,6 +298,185 @@ class TlsCheckTests(unittest.TestCase):
         from PySide6 import QtCore
 
         self.assertIn(os.path.realpath(QtCore.__file__), {os.path.realpath(path) for path in images})
+
+
+def openssl_facts(**changes):
+    """What a built macOS app's openssl check finds on python.org's 3.14.8."""
+    facts = dict(
+        frozen=True,
+        running=[("Python's ssl and hashlib", (3, 5, 4)), ("Qt's TLS", (3, 5, 4))],
+        files=[("Frameworks/libcrypto.3.dylib", (3, 5, 4)), ("Frameworks/libssl.3.dylib", (3, 5, 4))],
+    )
+    facts.update(changes)
+    return selftest.OpenSSLFacts(**facts)
+
+
+def libcrypto(text: bytes = b"OpenSSL 3.5.4 30 Sep 2025") -> bytes:
+    """A stand-in libcrypto: binary noise around OPENSSL_VERSION_TEXT."""
+    return b"\xcf\xfa\xed\xfe" + b"\x00" * 64 + text + b"\x00" + b"OpenSSL %s\x00" + b"\x00" * 64
+
+
+class OpenSSLCheckTests(unittest.TestCase):
+    """The openssl check: every OpenSSL a build runs or ships is at least
+    OPENSSL_FLOOR."""
+
+    def test_the_floor_is_the_lts_python_org_ships_with_3_14(self) -> None:
+        # OpenSSL 3.0 reached end of life on 2026-09-07; 3.5 is the LTS.
+        self.assertGreaterEqual(selftest.OPENSSL_FLOOR, (3, 5))
+        self.assertIn("2030-04-08", Path(selftest.__file__).read_text())  # 3.5's end of life, beside the constant
+
+    def test_a_built_app_on_openssl_3_5_passes(self) -> None:
+        self.assertEqual(
+            selftest.judge_openssl(openssl_facts()),
+            "OpenSSL 3.5.4 in Python's ssl and hashlib, Qt's TLS, Frameworks/libcrypto.3.dylib, "
+            "Frameworks/libssl.3.dylib; 3.5 or later required",
+        )
+        windows = openssl_facts(running=[("Python's ssl and hashlib", (3, 5, 4))],
+                                files=[("libcrypto-3.dll", (3, 5, 4)), ("libssl-3.dll", (3, 5, 4))])
+        self.assertEqual(selftest.judge_openssl(windows), "OpenSSL 3.5.4 in Python's ssl and hashlib, "
+                         "libcrypto-3.dll, libssl-3.dll; 3.5 or later required")
+        newer = openssl_facts(running=[("Python's ssl and hashlib", (3, 6, 5))], files=[("libcrypto-3.dll", (4, 0, 1))])
+        self.assertEqual(selftest.judge_openssl(newer), "OpenSSL 3.6.5 in Python's ssl and hashlib; "
+                         "OpenSSL 4.0.1 in libcrypto-3.dll; 3.5 or later required")
+
+    def test_a_built_app_on_openssl_3_0_fails(self) -> None:
+        # What setup-python's 3.13 (python.org's 3.13.15) ships.
+        old = openssl_facts(running=[("Python's ssl and hashlib", (3, 0, 21))],
+                            files=[("libcrypto-3.dll", (3, 0, 21)), ("libssl-3.dll", (3, 0, 21))])
+        with self.assertRaises(RuntimeError) as failed:
+            selftest.judge_openssl(old)
+        self.assertEqual(str(failed.exception), "OpenSSL 3.0.21 in Python's ssl and hashlib, libcrypto-3.dll, "
+                         "libssl-3.dll is older than 3.5, and out of support. A build must ship OpenSSL 3.5 or later "
+                         "(OPENSSL_FLOOR)")
+
+    def test_each_copy_is_held_to_the_floor(self) -> None:
+        cases = {
+            "Qt's TLS": openssl_facts(running=[("Python's ssl and hashlib", (3, 5, 4)), ("Qt's TLS", (3, 0, 13))]),
+            "libcrypto-3-x64.dll": openssl_facts(files=[("libcrypto-3.dll", (3, 5, 4)),
+                                                        ("libcrypto-3-x64.dll", (3, 0, 13))]),
+            "Python's ssl and hashlib": openssl_facts(running=[("Python's ssl and hashlib", (1, 1, 1))]),
+        }
+        for what, facts in cases.items():
+            with self.subTest(what=what), self.assertRaisesRegex(RuntimeError, rf"in {re.escape(what)} is older than 3\.5"):
+                selftest.judge_openssl(facts)
+
+    def test_a_copy_whose_version_cant_be_told_fails(self) -> None:
+        facts = openssl_facts(files=[("Frameworks/libcrypto.3.dylib", None), ("Frameworks/libssl.3.dylib", None)])
+        with self.assertRaisesRegex(RuntimeError, "can't tell which OpenSSL Frameworks/libcrypto.3.dylib, "
+                                                  "Frameworks/libssl.3.dylib are"):
+            selftest.judge_openssl(facts)
+        with self.assertRaisesRegex(RuntimeError, "can't tell which OpenSSL Qt's TLS is"):
+            selftest.judge_openssl(openssl_facts(running=[("Python's ssl and hashlib", (3, 5, 4)), ("Qt's TLS", None)]))
+
+    def test_a_built_app_with_no_openssl_file_to_read_fails(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "found no OpenSSL library inside the app"):
+            selftest.judge_openssl(openssl_facts(files=[]))
+
+    def test_from_source_an_old_openssl_is_a_skip_that_says_why(self) -> None:
+        facts = openssl_facts(frozen=False, running=[("Python's ssl and hashlib", (3, 0, 21))], files=[])
+        with self.assertRaisesRegex(selftest.Skipped, r"^not a built app, and a build would fail: OpenSSL 3\.0\.21 in "
+                                                      r"Python's ssl and hashlib is older than 3\.5"):
+            selftest.judge_openssl(facts)
+        fine = openssl_facts(frozen=False, files=[])
+        self.assertEqual(selftest.judge_openssl(fine), "OpenSSL 3.5.4 in Python's ssl and hashlib, Qt's TLS; "
+                         "3.5 or later required")
+
+    def test_the_floor_is_one_constant(self) -> None:
+        with mock.patch.object(selftest, "OPENSSL_FLOOR", (3, 6)):
+            with self.assertRaisesRegex(RuntimeError, r"OpenSSL 3\.5\.4 in .* is older than 3\.6.*ship OpenSSL 3\.6"):
+                selftest.judge_openssl(openssl_facts())
+
+    def test_versions_from_python_and_qt(self) -> None:
+        self.assertEqual(selftest.openssl_version_from_info((3, 5, 0, 4, 0)), (3, 5, 4))
+        self.assertEqual(selftest.openssl_version_from_info((3, 0, 0, 21, 0)), (3, 0, 21))
+        self.assertEqual(selftest.openssl_version_from_info((1, 1, 1, 23, 15)), (1, 1, 1))  # 1.1.1w
+        self.assertEqual(selftest.openssl_version_from_number(0x30500040), (3, 5, 4))
+        self.assertEqual(selftest.openssl_version_from_number(0x300000D0), (3, 0, 13))
+        self.assertEqual(selftest.openssl_version_from_number(0x40000010), (4, 0, 1))
+        self.assertEqual(selftest.openssl_version_from_number(0x1010117F), (1, 1, 1))
+        import ssl
+
+        # The two agree on this Python's own OpenSSL.
+        self.assertEqual(selftest.openssl_version_from_info(ssl.OPENSSL_VERSION_INFO),
+                         selftest.openssl_version_from_number(ssl.OPENSSL_VERSION_NUMBER))
+        self.assertTrue(ssl.OPENSSL_VERSION.startswith(
+            "OpenSSL " + ".".join(map(str, selftest.openssl_version_from_info(ssl.OPENSSL_VERSION_INFO)))))
+
+    def test_library_files_are_found_and_read(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "Frameworks" / "python3.14" / "lib-dynload").mkdir(parents=True)
+            (root / "Resources").mkdir()
+            (root / "Frameworks" / "libcrypto.3.dylib").write_bytes(libcrypto() + libcrypto(b"OpenSSL 3.5.4 30 Sep 2025"))
+            (root / "Frameworks" / "libssl.3.dylib").write_bytes(b"\xcf\xfa\xed\xfe no version of its own")
+            # PyInstaller links Resources to Frameworks: one copy, counted once.
+            os.symlink("../Frameworks/libcrypto.3.dylib", root / "Resources" / "libcrypto.3.dylib")
+            # Not OpenSSL's libraries: Python's modules, a static archive, an unversioned link.
+            (root / "Frameworks" / "python3.14" / "lib-dynload" / "_ssl.cpython-314-darwin.so").write_bytes(b"x")
+            (root / "Frameworks" / "libcrypto.a").write_bytes(libcrypto(b"OpenSSL 3.0.1 14 Dec 2021"))
+            os.symlink("libcrypto.3.dylib", root / "Frameworks" / "libcrypto.dylib")
+            self.assertEqual(selftest.openssl_files(str(root)), [
+                ("Frameworks/libcrypto.3.dylib", (3, 5, 4)), ("Frameworks/libssl.3.dylib", (3, 5, 4)),
+            ])
+            # A universal binary's slices disagreeing: the older counts.
+            (root / "Frameworks" / "libcrypto.3.dylib").write_bytes(libcrypto() + libcrypto(b"OpenSSL 3.0.21 1 Jul 2026"))
+            self.assertEqual(selftest.openssl_files(str(root))[0], ("Frameworks/libcrypto.3.dylib", (3, 0, 21)))
+
+    def test_windows_names_and_a_libssl_without_its_libcrypto(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "libcrypto-3.dll").write_bytes(b"MZ" + libcrypto(b"OpenSSL 3.5.4 30 Sep 2025"))
+            (root / "libssl-3.dll").write_bytes(b"MZ")
+            (root / "libssl-3-x64.dll").write_bytes(b"MZ")  # whose libcrypto isn't there
+            (root / "libcrypto.so.3").write_bytes(b"\x7fELF" + libcrypto(b"OpenSSL 3.6.0 1 Oct 2025"))
+            (root / "libcrypto-3-x64.dll").write_bytes(b"MZ nothing to read")
+            self.assertEqual(selftest.openssl_files(str(root)), [
+                ("libcrypto-3-x64.dll", None), ("libcrypto-3.dll", (3, 5, 4)), ("libcrypto.so.3", (3, 6, 0)),
+                ("libssl-3-x64.dll", None), ("libssl-3.dll", (3, 5, 4)),
+            ])
+
+    def check(self, frozen: bool, backend: str = "openssl", qt_number: int = 0x30500040, root: str = ""):
+        """check_openssl with Qt's backend and number made up, and, frozen,
+        `root` as the built app's files."""
+        from PySide6.QtNetwork import QSslSocket
+
+        from app import tls
+
+        frozen_app = mock.patch.object(sys, "frozen", True, create=True) if frozen else contextlib.nullcontext()
+        with frozen_app, mock.patch.object(tls, "use_preferred_backend", return_value=backend), \
+                mock.patch.object(QSslSocket, "sslLibraryVersionNumber", return_value=qt_number), \
+                mock.patch.object(selftest, "built_app_files", return_value=root), \
+                mock.patch.object(selftest, "judge_openssl", side_effect=lambda facts: facts):
+            return selftest.check_openssl()
+
+    def test_the_check_asks_python_and_qt_and_reads_a_built_apps_files(self) -> None:
+        import ssl
+        import tempfile
+
+        python = selftest.openssl_version_from_info(ssl.OPENSSL_VERSION_INFO)
+        facts = self.check(frozen=False)
+        self.assertEqual(facts.running, [("Python's ssl and hashlib", python), ("Qt's TLS", (3, 5, 4))])
+        self.assertFalse(facts.frozen)
+        self.assertEqual(facts.files, [])
+        # Schannel (Windows) runs no OpenSSL; Qt's number then means nothing.
+        self.assertEqual(self.check(frozen=False, backend="schannel").running, [("Python's ssl and hashlib", python)])
+        self.assertEqual(self.check(frozen=False, qt_number=0).running[1], ("Qt's TLS", None))
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / "libcrypto-3.dll").write_bytes(b"MZ" + libcrypto())
+            facts = self.check(frozen=True, backend="schannel", root=folder)
+        self.assertTrue(facts.frozen)
+        self.assertEqual(facts.files, [("libcrypto-3.dll", (3, 5, 4))])
+
+    def test_a_built_apps_files_are_its_contents_or_what_pyinstaller_unpacked(self) -> None:
+        with mock.patch.object(sys, "_MEIPASS", "/Applications/Example.app/Contents/Frameworks", create=True), \
+                mock.patch.object(sys, "platform", "darwin"):
+            self.assertEqual(selftest.built_app_files(), os.path.realpath("/Applications/Example.app/Contents"))
+        with mock.patch.object(sys, "_MEIPASS", "/tmp/_MEI12345", create=True), mock.patch.object(sys, "platform", "win32"):
+            self.assertEqual(selftest.built_app_files(), os.path.realpath("/tmp/_MEI12345"))
 
 
 @unittest.skipUnless(IS_MAC, "the built-app checks are macOS only")

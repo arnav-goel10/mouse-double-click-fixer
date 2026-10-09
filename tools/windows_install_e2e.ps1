@@ -175,7 +175,7 @@ foreach ($old in $OldSetup) {
 $app = App-Path
 $folder = Split-Path $app
 
-Step "The installed app's self-test passes, its TLS going through Schannel"
+Step "The installed app's self-test passes, its TLS going through Schannel, its OpenSSL supported"
 # It loads Qt and every module of the app and starts the TLS backend, without
 # touching the network or any running copy (app/selftest.py).
 $selfTest = Join-Path $env:TEMP "dcf-self-test.txt"
@@ -184,6 +184,9 @@ $process = Start-Process $app -ArgumentList "--self-test" -Wait -PassThru -NoNew
 Get-Content $selfTest, "$selfTest.err" | Write-Host
 if ($process.ExitCode -ne 0) { Fail "the installed app's self-test failed (exit $($process.ExitCode))" }
 if (-not (Select-String -Path $selfTest -Pattern "^tls: ok \(schannel, " -Quiet)) { Fail "the self-test reported no TLS through Schannel" }
+# Python's OpenSSL (hashlib, ssl) and its files in the install folder, at
+# least app/selftest.py's OPENSSL_FLOOR; a built app fails rather than skips.
+if (-not (Select-String -Path $selfTest -Pattern "^openssl: ok \(OpenSSL " -Quiet)) { Fail "the self-test reported no supported OpenSSL" }
 # Left out of every Windows build (tools/make_notices.py, unused_qt_file).
 $leftOut = '^(qopensslbackend|lib(crypto|ssl)-\d+-(x64|arm64|arm)|ucrtbase|api-ms-win-.+)\.dll$'
 $shipped = @(Get-ChildItem $folder -Recurse -File | Where-Object Name -match $leftOut)

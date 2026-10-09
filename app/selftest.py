@@ -19,7 +19,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass, field
-from typing import Callable, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 #: The Qt platform the check loads unless the caller names another one (a
 #: CI job with a window server can ask for "cocoa", say). Offscreen needs no
@@ -469,6 +469,169 @@ def check_tls() -> str:
     return judge_tls(facts)
 
 
+#: The oldest OpenSSL a build may ship, as (major, minor). Every copy of
+#: OpenSSL inside a built app must be this series or newer: each libcrypto
+#: and libssl file it carries, the one Python's ssl and hashlib modules run,
+#: and, where Qt's TLS goes through OpenSSL (macOS), the one Qt runs.
+#: OpenSSL 3.0, which python.org's CPython 3.13 still ships, reached end of
+#: life on 2026-09-07. 3.5 is the long-term support release python.org's
+#: CPython ships from 3.14.6, supported until 2030-04-08. OpenSSL makes an
+#: LTS every other April (the next in April 2027) and supports the releases
+#: in between for about 13 months only, so release builds should run on an
+#: LTS. Raise this to the next LTS once the Python the release workflow
+#: builds with ships it, and in any case before 2030-04-08
+#: (https://openssl-library.org/policies/releasestrat/).
+OPENSSL_FLOOR: Tuple[int, int] = (3, 5)
+
+#: OpenSSL's library files as builds carry them: libcrypto.3.dylib and
+#: libssl.3.dylib (macOS), libcrypto-3.dll and libssl-3.dll (Python's, on
+#: Windows), libcrypto-3-x64.dll (the name Qt's backend looks for), and
+#: libcrypto.so.3.
+OPENSSL_FILE = re.compile(r"^lib(crypto|ssl)(?:[-.]\d|\.so\.\d)", re.IGNORECASE)
+#: OPENSSL_VERSION_TEXT, which every libcrypto carries ("OpenSSL 3.5.4 30
+#: Sep 2025"); libssl carries none, and goes with the libcrypto beside it.
+OPENSSL_VERSION_TEXT = re.compile(rb"OpenSSL (\d+)\.(\d+)\.(\d+)[a-z]? +\d{1,2} [A-Z][a-z]{2} \d{4}\x00")
+
+#: An OpenSSL version as (major, minor, patch).
+Version = Tuple[int, int, int]
+
+
+def openssl_version_from_number(number: int) -> Version:
+    """(major, minor, patch) from an OPENSSL_VERSION_NUMBER, as
+    OpenSSL_version_num() and Qt's sslLibraryVersionNumber() give it:
+    0xMNN00PP0 from OpenSSL 3 on, 0xMNNFFPPS before (FF the third number,
+    PP its patch letter)."""
+    major, minor = (number >> 28) & 0xF, (number >> 20) & 0xFF
+    third = (number >> 4) & 0xFF if major >= 3 else (number >> 12) & 0xFF
+    return (major, minor, third)
+
+
+def openssl_version_from_info(info: Tuple[int, ...]) -> Version:
+    """(major, minor, patch) from ssl.OPENSSL_VERSION_INFO, which splits the
+    number the pre-3 way: (3, 5, 0, 4, 0) is OpenSSL 3.5.4."""
+    major, minor, fix, patch = info[:4]
+    return (major, minor, patch if major >= 3 else fix)
+
+
+def _dotted(version: Tuple[int, ...]) -> str:
+    return ".".join(str(part) for part in version)
+
+
+@dataclass
+class OpenSSLFacts:
+    """What the openssl check finds, gathered apart from judging it."""
+
+    frozen: bool
+    #: Who runs OpenSSL in this process and which version (None when it
+    #: can't be told): Python's ssl and hashlib, and Qt's TLS if it uses it.
+    running: List[Tuple[str, Optional[Version]]]
+    #: Each OpenSSL library file inside a built app, and its version.
+    files: List[Tuple[str, Optional[Version]]] = field(default_factory=list)
+
+
+def judge_openssl(facts: OpenSSLFacts) -> str:
+    """The openssl line for `facts`. A built app fails if it runs or carries
+    an OpenSSL older than OPENSSL_FLOOR, or one whose version can't be told;
+    from source that is a skip, which says what a build would fail on."""
+    floor = _dotted(OPENSSL_FLOOR)
+    copies = facts.running + facts.files
+    problems = []
+    unknown = [what for what, version in copies if version is None]
+    if unknown:
+        problems.append(f"can't tell which OpenSSL {', '.join(unknown)} {'is' if len(unknown) == 1 else 'are'}")
+    old: Dict[Version, List[str]] = {}
+    for what, version in copies:
+        if version is not None and version[:2] < OPENSSL_FLOOR:
+            old.setdefault(version, []).append(what)
+    problems += [f"OpenSSL {_dotted(version)} in {', '.join(whats)} is older than {floor}, and out of support"
+                 for version, whats in sorted(old.items())]
+    if facts.frozen and not facts.files:
+        problems.append("found no OpenSSL library inside the app to read the version of")
+    if problems:
+        if not facts.frozen:
+            raise Skipped(f"not a built app, and a build would fail: {'; '.join(problems)}")
+        raise RuntimeError(f"{'; '.join(problems)}. A build must ship OpenSSL {floor} or later (OPENSSL_FLOOR)")
+    groups: Dict[Version, List[str]] = {}
+    for what, version in copies:
+        groups.setdefault(version, []).append(what)
+    found = "; ".join(f"OpenSSL {_dotted(version)} in {', '.join(whats)}" for version, whats in sorted(groups.items()))
+    return f"{found or 'no OpenSSL'}; {floor} or later required"
+
+
+def openssl_files(root: str) -> List[Tuple[str, Optional[Version]]]:
+    """Each OpenSSL library file under `root`, as its path from `root` (a
+    link counts once, as the file it points to), and the version its own text
+    says: a libcrypto's, or for a libssl, that of the libcrypto beside it."""
+    root = os.path.realpath(root)
+    found = set()
+    for folder, _folders, names in os.walk(root):
+        for name in names:
+            real = os.path.realpath(os.path.join(folder, name))
+            if OPENSSL_FILE.match(name) and os.path.isfile(real):
+                found.add(real)
+    named = []
+    for real in found:
+        name = os.path.basename(real)
+        library = real
+        if OPENSSL_FILE.match(name).group(1).lower() == "ssl":
+            library = os.path.join(os.path.dirname(real), name[:3] + "crypto" + name[6:])
+        version = _libcrypto_version(library) if os.path.isfile(library) else None
+        where = os.path.relpath(real, root) if real.startswith(root + os.sep) else real
+        named.append((where.replace(os.sep, "/"), version))
+    return sorted(named)
+
+
+def _libcrypto_version(path: str) -> Optional[Version]:
+    """The oldest OPENSSL_VERSION_TEXT in a library (a universal binary has
+    one per architecture); None for one that has none."""
+    with open(path, "rb") as file:
+        versions = [tuple(int(part) for part in found.groups()) for found in OPENSSL_VERSION_TEXT.finditer(file.read())]
+    return min(versions) if versions else None
+
+
+def built_app_files() -> str:
+    """Where a built app's own files are: macOS's Contents folder, or the
+    folder PyInstaller unpacked to (Windows: the installed copy's _internal,
+    or the portable exe's temporary folder)."""
+    files = os.path.realpath(getattr(sys, "_MEIPASS", os.path.dirname(sys.executable)))
+    return os.path.dirname(files) if sys.platform == "darwin" else files
+
+
+def check_openssl() -> str:
+    """No OpenSSL the app runs or ships is older than OPENSSL_FLOOR: the one
+    Python's ssl and hashlib run (ssl.OPENSSL_VERSION_INFO), the one Qt's TLS
+    backend runs where that is OpenSSL (macOS; Windows uses Schannel), and
+    every OpenSSL library file inside a built app."""
+    from PySide6.QtCore import QCoreApplication
+    from PySide6.QtNetwork import QSslSocket
+
+    from . import tls
+
+    running: List[Tuple[str, Optional[Version]]] = []
+    try:
+        import ssl
+
+        running.append(("Python's ssl and hashlib", openssl_version_from_info(ssl.OPENSSL_VERSION_INFO)))
+    except ImportError:
+        running.append(("Python's ssl and hashlib", None))
+    # Qt's plugin loader expects an application, as in the tls check.
+    application = QCoreApplication(["DoubleClickFixer"]) if QCoreApplication.instance() is None else None
+    try:
+        try:
+            backend = tls.use_preferred_backend()
+        except tls.Unavailable:
+            backend = ""  # the tls check reports this
+        if backend == "openssl":
+            number = QSslSocket.sslLibraryVersionNumber()
+            running.append(("Qt's TLS", openssl_version_from_number(number) if number > 0 else None))
+    finally:
+        if application is not None:
+            application.shutdown()
+            del application
+    frozen = bool(getattr(sys, "frozen", False))
+    return judge_openssl(OpenSSLFacts(frozen, running, openssl_files(built_app_files()) if frozen else []))
+
+
 def check_app_modules() -> str:
     """Every module of the app imports: walked from the package itself, so a
     module imported only later (by a menu, or an update) is checked too."""
@@ -501,6 +664,7 @@ CHECKS: List[Tuple[str, Callable[[], str]]] = [
     ("Qt platform plugin", check_qt_platform),
     ("app icons", check_app_icons),
     ("tls", check_tls),
+    ("openssl", check_openssl),
     ("app modules", check_app_modules),
     ("child processes", check_child_processes),
     ("third-party notices", check_notices),
