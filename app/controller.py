@@ -33,19 +33,19 @@ class AppController(QObject):
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
         self.settings = settings_store.load()
-        # The login item can be changed outside the app (the Windows
-        # installer, System Settings), so the system is the source of truth.
+        self.login_item_state = startup.ON if self.settings["start_at_login"] else startup.OFF
         if startup.is_supported():
-            try:
-                actual = startup.is_enabled()
-            except OSError:
-                actual = self.settings["start_at_login"]
-            if actual != self.settings["start_at_login"]:
-                self._store(start_at_login=actual)
-            if actual and getattr(sys, "frozen", False):
+            self.refresh_login_item()
+            if (
+                self.login_item_state == startup.ON
+                and getattr(sys, "frozen", False)
+                and not startup.running_from_temporary_location()
+            ):
                 # Rewrite the entry so it points at this copy of the app and
                 # carries the current format (an older one may lack the app's
-                # name and icon in Login Items).
+                # name and icon in Login Items). Never from a disk image or a
+                # translocated copy: that path is gone after an eject or a
+                # reboot, and the installed copy would stop opening at login.
                 try:
                     startup.set_enabled(True)
                 except (OSError, RuntimeError):
@@ -285,12 +285,35 @@ class AppController(QObject):
 
     def set_start_at_login(self, enabled: bool) -> str:
         """Returns an error message, or an empty string on success."""
+        if enabled and startup.running_from_temporary_location():
+            return (
+                "DoubleClick Fixer is running from the disk image or a temporary copy, "
+                "which won’t be there at your next login. Move it to Applications, open "
+                "it from there, and turn this on again."
+            )
         try:
             startup.set_enabled(enabled)
         except (OSError, RuntimeError) as error:
             return str(error)
         self._store(start_at_login=bool(enabled))
+        self.refresh_login_item()
         return ""
+
+    def refresh_login_item(self) -> str:
+        """Read the login item from the system, which is the source of truth:
+        the Windows installer, System Settings and Task Manager all change it
+        behind the app's back. Returns startup.ON, OFF or BLOCKED."""
+        if not startup.is_supported():
+            return self.login_item_state
+        try:
+            state = startup.status()
+        except OSError:
+            return self.login_item_state
+        self.login_item_state = state
+        actual = state == startup.ON
+        if actual != self.settings["start_at_login"]:
+            self._store(start_at_login=actual)
+        return state
 
     def set_window_geometry(self, encoded: str) -> None:
         if encoded != self.settings.get("window_geometry"):

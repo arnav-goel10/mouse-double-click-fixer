@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import __version__, permissions
+from .. import __version__, permissions, startup
 from ..controller import AppController
 from ..core import (
     BOUNCE_CANDIDATE_MS,
@@ -647,11 +647,21 @@ class GeneralPage(Page):
         self.updater = updater
         self._loading = False
 
-        startup = self.section()
+        startup_section = self.section()
         self.login_switch = Switch(accessible_name="Open at login")
-        where = "menu bar" if IS_MAC else "notification area"
-        self.login_row = startup.add(
-            Row("Open at login", f"Starts in the {where}.", self.login_switch, card_icon("power"))
+        # Shown when the user switched the app off in System Settings › Login
+        # Items: only there can it be switched back on.
+        self.login_items_button = _button("Open Login Items…")
+        self.login_items_button.clicked.connect(lambda: startup.open_login_items_settings())
+        self.login_items_button.setVisible(False)
+        login_controls = QWidget()
+        login_layout = QHBoxLayout(login_controls)
+        login_layout.setContentsMargins(0, 0, 0, 0)
+        login_layout.setSpacing(10)
+        login_layout.addWidget(self.login_items_button)
+        login_layout.addWidget(self.login_switch)
+        self.login_row = startup_section.add(
+            Row("Open at login", self._login_detail(startup.ON), login_controls, card_icon("power"))
         )
         self.login_switch.clicked.connect(self._on_login)
 
@@ -661,7 +671,8 @@ class GeneralPage(Page):
             section = self.section()
             self.permission_icon = SymbolView("ok", 20, "symbol")
             button = _button("Open Settings…")
-            button.clicked.connect(permissions.open_accessibility_settings)
+            button.clicked.connect(lambda: permissions.open_accessibility_settings())
+            self.permission_button = button
             # The name System Settings itself uses, which macOS 27 changed.
             self.permission_row = section.add(Row(permissions.pane_name(), "", button, self.permission_icon))
 
@@ -693,10 +704,16 @@ class GeneralPage(Page):
         version.setContentsMargins(0, 24, 0, 0)
         self.body.addWidget(version)
 
+    @staticmethod
+    def _login_detail(state: str) -> str:
+        if state == startup.BLOCKED:
+            if IS_MAC:
+                return "Turned off in System Settings › General › Login Items."
+            return "Turned off in Task Manager › Startup apps. Turn it on here to allow it again."
+        return f"Starts in the {'menu bar' if IS_MAC else 'notification area'}."
+
     def refresh(self, granted: bool) -> None:
-        self._loading = True
-        self.login_switch.setChecked(bool(self.controller.settings["start_at_login"]), animate=False)
-        self._loading = False
+        self.refresh_login()
         if self.permission_row is not None:
             self.permission_icon.name = "ok" if granted else "warning"
             self.permission_icon.update()
@@ -745,6 +762,12 @@ class GeneralPage(Page):
         if not self._loading:
             self.controller.set_auto_update(checked)
 
+    def refresh_login(self) -> None:
+        self.login_switch.setChecked(bool(self.controller.settings["start_at_login"]), animate=False)
+        state = self.controller.login_item_state
+        self.login_row.set_detail(self._login_detail(state))
+        self.login_items_button.setVisible(IS_MAC and state == startup.BLOCKED)
+
     def _on_login(self, checked: bool) -> None:
         if self._loading:
             return
@@ -752,6 +775,9 @@ class GeneralPage(Page):
         if error:
             self.login_switch.setChecked(not checked)
             QMessageBox.warning(self, "Couldn’t change the login item", error)
+            return
+        # Still off if macOS keeps it switched off in Login Items; say so.
+        self.refresh_login()
 
     def _confirm_reset(self) -> None:
         answer = QMessageBox.question(
@@ -934,6 +960,11 @@ class MainWindow(QWidget):
     def changeEvent(self, event) -> None:  # noqa: N802
         if event.type() == QEvent.Type.ActivationChange:
             self.sidebar.set_window_active(self.isActiveWindow())
+            if self.isActiveWindow() and PAGES[self.stack.currentIndex()][0] == "general":
+                # Back from System Settings or Task Manager, where the login
+                # item may just have been switched.
+                self.controller.refresh_login_item()
+                self.refresh()
             # Calibrating in a window left behind another app would leave
             # every click in that app unfiltered.
             self._sync_pause()
@@ -975,6 +1006,8 @@ class MainWindow(QWidget):
         self.sidebar.set_current(index, emit=False)
         self.stack.setCurrentIndex(index)
         self.title_label.setText(PAGES[index][1])
+        if PAGES[index][0] == "general":
+            self.controller.refresh_login_item()
         self._sync_pause()
         self.refresh()
 

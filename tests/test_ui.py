@@ -49,6 +49,7 @@ class WindowTests(unittest.TestCase):
         self.controller = AppController()
         self.window = MainWindow(self.controller)
         self.addCleanup(self.window.deleteLater)
+        self.addCleanup(LiveWindowTests.stop_timers, self.window)
 
     def page_index(self, key: str) -> int:
         from app.ui.window import PAGES
@@ -211,6 +212,7 @@ class WindowTests(unittest.TestCase):
         reopened.setMinimumSize(300, 200)
         reopened._restore_geometry()
         self.addCleanup(reopened.deleteLater)
+        self.addCleanup(LiveWindowTests.stop_timers, reopened)
         self.assertEqual(reopened.size(), expected)
 
     def test_content_stays_readable_when_wide_and_fits_when_narrow(self) -> None:
@@ -293,6 +295,9 @@ class LiveWindowTests(unittest.TestCase):
         self.controller = AppController()
         self.window = MainWindow(self.controller)
         self.addCleanup(self.window.deleteLater)
+        # The window outlives the test until Qt deletes it; its timers must
+        # not act after the stand-in hook is gone (a real hook would start).
+        self.addCleanup(self.stop_timers, self.window)
         self.active_window = True
         self.window.isActiveWindow = lambda: self.active_window
         self.window.setMinimumSize(300, 200)
@@ -301,6 +306,14 @@ class LiveWindowTests(unittest.TestCase):
         from app.ui.window import PAGES
 
         return [name for name, _title in PAGES].index(key)
+
+    @staticmethod
+    def stop_timers(window) -> None:
+        from PySide6.QtCore import QTimer
+
+        for timer in window.findChildren(QTimer):
+            timer.stop()
+        window.hide()
 
     def set_active_window(self, active: bool) -> None:
         from PySide6.QtCore import QEvent
@@ -982,6 +995,40 @@ class WindowFixTests(WindowTests):
         ):
             page._on_login(False)
         self.assertTrue(page.login_switch.isChecked(), "a failed turn-off leaves it on")
+
+    def test_a_login_item_switched_off_in_the_system_says_where(self) -> None:
+        from app import startup
+        from app.ui.theme import IS_MAC
+
+        page = self.window.general
+        with mock.patch.object(startup, "is_supported", return_value=True), \
+                mock.patch.object(startup, "status", return_value=startup.BLOCKED):
+            self.window._show_page(self.page_index("general"))
+        self.assertFalse(page.login_switch.isChecked(), "it won't open at login")
+        self.assertIn("Turned off in", page.login_row.detail.text())
+        self.assertEqual(not page.login_items_button.isHidden(), IS_MAC, "macOS can only fix it there")
+        with mock.patch.object(startup, "open_login_items_settings") as open_settings:
+            page.login_items_button.click()
+        open_settings.assert_called_once_with()
+        with mock.patch.object(startup, "is_supported", return_value=True), \
+                mock.patch.object(startup, "status", return_value=startup.ON):
+            self.window._show_page(self.page_index("general"))
+        self.assertTrue(page.login_switch.isChecked())
+        self.assertTrue(page.login_items_button.isHidden())
+
+    def test_general_open_settings_opens_the_pane_even_when_allowed(self) -> None:
+        from app import permissions
+
+        page = self.window.general
+        if page.permission_row is None:
+            self.skipTest("macOS only")
+        with mock.patch.object(permissions, "has_accessibility", return_value=True), \
+                mock.patch.object(permissions, "request_accessibility") as request, \
+                mock.patch.object(permissions.subprocess, "Popen") as popen:
+            page.permission_button.click()
+        request.assert_not_called()
+        popen.assert_called_once_with(["open", permissions.ACCESSIBILITY_PANE])
+        self.assertEqual(page.permission_row.title.text(), permissions.pane_name())
 
     def test_background_launch_does_not_raise_the_permission_prompt(self) -> None:
         with mock.patch("app.permissions.needs_accessibility", return_value=True), mock.patch(
