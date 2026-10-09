@@ -317,10 +317,12 @@ class PeakLateness:
 
     An event the hook re-sends comes back about as late as real events reach
     it, so this sets how long the hook waits for one before giving it up as
-    lost (see GlobalClickFilter._in_flight_timeout). Every timed event counts,
-    pointer motion as well as buttons: a pause in the event stream shows in
-    whichever event comes out of it. One slow event counts for PEAK_WINDOW_S
-    and no longer, so a lone stall cannot keep the wait long.
+    lost (see GlobalClickFilter._in_flight_timeout). Every button event
+    counts, and pointer motion whenever the hook judges it: while a release
+    is held at a known place, or while re-sent events are on their way, which
+    is when the wait matters. A pause in the event stream shows in whichever
+    event comes out of it. One slow event counts for PEAK_WINDOW_S and no
+    longer, so a lone stall cannot keep the wait long.
     """
 
     def __init__(self, window_s: float = PEAK_WINDOW_S) -> None:

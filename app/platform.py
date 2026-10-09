@@ -31,12 +31,14 @@ log = logging.getLogger(__name__)
 #: automated end-to-end tests, which have no other way to produce input.
 FILTER_INJECTED_ENV = "DCF_FILTER_INJECTED"
 
-#: Marks events this app re-injects (a held release delivered late, or a
-#: press re-ordered after it), so the hook passes them straight through.
+#: Marks the button events this app re-sends (a held release delivered late,
+#: and the events kept behind one so that apps see them in the order they
+#: happened), so the hook passes them straight through.
 INJECTED_MARK = 0x44434658  # "DCFX"
 
 #: Marks pointer motion this app re-sends, one value per button whose queue it
-#: waited in, so the hook knows which button's in-flight count it settles.
+#: waited in, so the hook knows which button's re-sends it settles (see
+#: GlobalClickFilter._injected_passed).
 INJECTED_MOTION_MARKS = {INJECTED_MARK + 1 + index: button for index, button in enumerate(Button)}
 MOTION_MARK_FOR = {button: mark for mark, button in INJECTED_MOTION_MARKS.items()}
 
