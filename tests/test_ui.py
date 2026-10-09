@@ -1361,7 +1361,7 @@ class WindowFixTests(WindowTests):
                 mock.patch.object(permissions.subprocess, "Popen") as popen:
             page.permission_button.click()
         request.assert_not_called()
-        popen.assert_called_once_with(["open", permissions.ACCESSIBILITY_PANE])
+        popen.assert_called_once_with(["/usr/bin/open", permissions.ACCESSIBILITY_PANE])
         self.assertEqual(page.permission_row.title.text(), permissions.pane_name())
 
     def test_background_launch_does_not_raise_the_permission_prompt(self) -> None:

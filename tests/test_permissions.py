@@ -46,7 +46,7 @@ class OpenSettingsTests(unittest.TestCase):
                 mock.patch.object(permissions.subprocess, "Popen") as popen:
             permissions.open_accessibility_settings()
         request.assert_not_called()
-        popen.assert_called_once_with(["open", permissions.ACCESSIBILITY_PANE])
+        popen.assert_called_once_with(["/usr/bin/open", permissions.ACCESSIBILITY_PANE])
 
     def test_an_app_not_yet_allowed_is_registered_first(self) -> None:
         calls = []

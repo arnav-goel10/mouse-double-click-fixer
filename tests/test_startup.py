@@ -136,7 +136,7 @@ class MacLoginItemTests(unittest.TestCase):
         with mock.patch.object(startup, "_app_service", return_value=None), \
                 mock.patch.object(startup.subprocess, "Popen") as popen:
             startup.open_login_items_settings()
-        popen.assert_called_once_with(["open", startup.LOGIN_ITEMS_PANE])
+        popen.assert_called_once_with(["/usr/bin/open", startup.LOGIN_ITEMS_PANE])
 
 
 class TemporaryLocationTests(unittest.TestCase):
