@@ -164,6 +164,20 @@ class ControllerStateTests(unittest.TestCase):
         self.assertEqual(len(FakeFilter.instances), 1)
         self.assertTrue(self.controller.settings["fix_enabled"], "still on at the next launch")
 
+    def test_nothing_starts_a_hook_in_a_session_in_the_background(self) -> None:
+        self.controller.set_active(True)
+        first = FakeFilter.instances[0]
+        self.controller.set_session_active(False)
+        self.assertTrue(first.stopped)
+        self.assertFalse(self.controller.set_active(True))
+        self.controller.suspend()
+        self.controller.resume()
+        self.assertFalse(self.controller.active)
+        self.assertEqual(len(FakeFilter.instances), 1, "no second hook while away")
+        self.assertTrue(self.controller.settings["fix_enabled"], "the user's choice is kept")
+        self.controller.set_session_active(True)
+        self.assertTrue(self.controller.set_active(True))
+
     def test_tap_check_defaults_to_alive(self) -> None:
         self.assertTrue(self.controller.tap_alive(), "no filter: nothing to check")
         self.controller.set_active(True)

@@ -55,6 +55,10 @@ class AppController(QObject):
         # Set at quit. Nothing may start a hook after that: the window still
         # hears hide events, and AppKit notifications, as the app goes down.
         self._shut_down = False
+        # Set while the user is in another login session (fast user
+        # switching). A tap running in a session nobody is using can stall
+        # the one in front, so nothing starts one until this session is back.
+        self._session_inactive = False
         # Why the filter isn't running although the user has it on: a short
         # line for the menus, and the full message for the window.
         self.failure = ""
@@ -120,7 +124,7 @@ class AppController(QObject):
             return False
         if self.active:
             return True
-        if self._shut_down:
+        if self._shut_down or self._session_inactive:
             return False
         # Turning the filter on (from the menu bar, say) ends a pause.
         self._suspended = False
@@ -198,6 +202,21 @@ class AppController(QObject):
         is being rebuilt."""
         self._stop_filter()
         self.filter_state_changed.emit(False, "")
+
+    @property
+    def session_active(self) -> bool:
+        """Whether this login session is the one in front."""
+        return not self._session_inactive
+
+    def set_session_active(self, active: bool) -> None:
+        """The user switched into (True) or out of (False) this login
+        session. Out of it, the filter stops (sending any release it was
+        holding) and nothing starts one, whatever asks: a retry, the end of a
+        calibration pause. The user's choice is kept, so the filter comes
+        back with the session."""
+        self._session_inactive = not active
+        if not active and self._filter is not None:
+            self.stop_keeping_choice()
 
     def stop_for_permission(self) -> None:
         """Accessibility was revoked: stop the tap, keeping the user's choice."""

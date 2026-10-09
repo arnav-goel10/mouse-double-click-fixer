@@ -578,6 +578,32 @@ class KeepFilterAliveTests(LiveWindowTests):
         self.window.session_activated()
         self.assertTrue(self.controller.active)
 
+    def test_a_retry_due_after_switching_away_starts_nothing(self) -> None:
+        self.controller._store(fix_enabled=True)
+        FakeFilter.fail_with = "busy"
+        self.window.restore_filter(background=True)
+        self.assertTrue(self.window._retry_timer.isActive())
+        self.window.session_resigned()
+        self.assertFalse(self.window._retry_timer.isActive(), "no retry is left to fire while away")
+        FakeFilter.fail_with = None
+        self.window._retry_start()  # one that fired anyway
+        self.assertFalse(self.controller.active, "no tap in a session nobody is using")
+        self.window.session_activated()
+        self.assertTrue(self.controller.active)
+
+    def test_leaving_a_calibration_after_switching_away_starts_nothing(self) -> None:
+        self.controller.set_active(True)
+        self.window.show()
+        self.window._show_page(self.page_index("calibrate"))
+        self.window.calibrate._advance()
+        self.assertTrue(self.controller.suspended)
+        self.window.session_resigned()
+        self.set_active_window(False)  # the pause ends as the window loses focus
+        self.assertFalse(self.controller.active, "no tap in a session nobody is using")
+        self.assertTrue(self.controller.settings["fix_enabled"])
+        self.window.session_activated()
+        self.assertTrue(self.controller.active)
+
     def test_wake_does_not_end_a_calibration_pause(self) -> None:
         self.controller.set_active(True)
         self.window.show()

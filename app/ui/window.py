@@ -945,10 +945,6 @@ class MainWindow(QWidget):
         # Set while a retry runs: its failure shows no dialog.
         self._quiet = False
 
-        # False while the user is in another login session (macOS fast user
-        # switching), where a tap left running would stall that session.
-        self._session_active = True
-
         self._show_page(0)
         if not self._restore_geometry():
             self._fit_to_screen()
@@ -1114,7 +1110,7 @@ class MainWindow(QWidget):
         return True
 
     def _check_permission(self) -> None:
-        if not self._session_active:
+        if not self.controller.session_active:
             return  # nothing runs in another user's session; check on return
         granted = self._read_permission()
         if granted == self._permission_granted:
@@ -1242,7 +1238,7 @@ class MainWindow(QWidget):
         coming back to this login session, or when its tap stopped working.
         Taps made before sleep or a session switch can be left dead."""
         controller = self.controller
-        if not self._session_active or controller.suspended or self._enable_when_granted:
+        if not controller.session_active or controller.suspended or self._enable_when_granted:
             return
         if not controller.settings["fix_enabled"]:
             return
@@ -1260,16 +1256,17 @@ class MainWindow(QWidget):
 
     def session_resigned(self) -> None:
         """The user switched to another login session. A tap left running in
-        an inactive session can stall the active one, so stop it; stop()
-        sends any release it was holding first."""
+        an inactive session can stall the active one, so the controller stops
+        it (stop() sends any release it was holding first) and starts none
+        until the session is back. A retry still waiting is dropped too."""
         log.info("Session switched away")
-        self._session_active = False
-        if self.controller.active:
-            self.controller.stop_keeping_choice()
+        self._retry_timer.stop()
+        self._retry_waits.clear()
+        self.controller.set_session_active(False)
 
     def session_activated(self) -> None:
         log.info("Session active again")
-        self._session_active = True
+        self.controller.set_session_active(True)
         self.restart_filter()
 
     def _on_screen(self) -> bool:
