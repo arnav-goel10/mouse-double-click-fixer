@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from . import settings as settings_store
-from .contracts import Button
+from .core import Button
 from .inputs import as_button
 
 log = logging.getLogger(__name__)

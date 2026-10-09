@@ -160,7 +160,7 @@ class CalibratorTests(unittest.TestCase):
 
 class ButtonTests(unittest.TestCase):
     def test_labels(self) -> None:
-        self.assertEqual([button.label for button in Button], ["Left", "Right", "Middle"])
+        self.assertEqual([button.label for button in Button], ["Left", "Right", "Middle", "Back", "Forward"])
 
 
 class DragDropoutTests(unittest.TestCase):

@@ -16,14 +16,26 @@ import math
 import os
 import platform
 import threading
+import time
 from collections import deque
 from contextlib import contextmanager
+from dataclasses import dataclass, replace
 from time import monotonic, perf_counter
-from typing import Callable, Iterable, NamedTuple, Optional
+from types import MappingProxyType
+from typing import Any, Callable, Mapping, NamedTuple, Optional
 
-from dataclasses import replace
-
-from .core import BounceFilter, Button, ClickEvent, DeliveryDelay, PeakLateness, clamp_threshold
+from .core import (
+    DEFAULT_THRESHOLD_MS,
+    SIDE_BUTTONS,
+    TOUCH_KINDS,
+    BounceFilter,
+    Button,
+    ClickEvent,
+    DeliveryDelay,
+    PeakLateness,
+    WheelFilter,
+    clamp_threshold,
+)
 
 log = logging.getLogger(__name__)
 
@@ -87,10 +99,14 @@ def _seq_field(seq: int) -> int:
     return (seq - 1) % MARK_SEQ_SPAN + 1
 
 #: Windows tags mouse messages it makes from pen and touch input with this
-#: signature in dwExtraInfo (the low byte varies). They are absolute
-#: positions, not hand motion, so they are never held back or re-based.
+#: signature in dwExtraInfo (MI_WP_SIGNATURE; the low byte varies). They are
+#: absolute positions, not hand motion, so they are never held back or
+#: re-based, and their clicks are never filtered.
 PEN_SIGNATURE_MASK = 0xFFFFFF00
 PEN_SIGNATURE = 0xFF515700
+
+#: Windows' side buttons, by the XBUTTON number in HIWORD(mouseData).
+X_BUTTONS = {0x0001: Button.BACK, 0x0002: Button.FORWARD}
 
 #: GetTickCount, which stamps Windows input, advances in ticks of 15.6 ms. An
 #: event whose stamp is this much older than the tick count when the hook
@@ -152,6 +168,88 @@ DOUBLE_CLICK_KEY = "com.apple.mouse.doubleClickThreshold"
 DEFAULT_DOUBLE_CLICK_S = 0.5
 
 
+#: The scroll-wheel reversal window (design section 1.3). DoubleClickFix
+#: (nenning), the most used competitor, sets 50 ms the moment its wheel filter
+#: is switched on (InteractiveForm.cs, OnButtonEnabledCheckedChanged); MouseFix
+#: (matreshka15) ships 30 ms in its default preset, 35 in "office" and 20 in
+#: "strict" (main.c, PRESET_DEFAULT). 50 ms also catches the slower stray
+#: notches, and stays far below the time a person needs to stop a wheel and
+#: roll it back the other way, so a deliberate reversal loses at most this
+#: long (see core.WheelFilter).
+WHEEL_DEFAULT_MS = 50
+
+#: Why an event passes untouched instead of being filtered (see
+#: GlobalClickFilter._passes); for the log and the tests.
+PASS_APP, PASS_TOUCH, PASS_DEVICE = "excluded app", "touch", "ignored device"
+
+
+@dataclass(frozen=True)
+class FilterConfig:
+    """Everything the filter is told (design section 2.2). Built from the
+    settings by the controller; replaced whole by update(), never changed.
+
+    Whatever it is given is made exact: every Button gets a window (the
+    default for any missing), clamp_threshold applies, and button names
+    become Buttons."""
+
+    thresholds: Mapping[Button, int]
+    buttons: frozenset
+    wheel_fix: bool = False
+    wheel_window_ms: int = WHEEL_DEFAULT_MS
+    excluded_apps: frozenset = frozenset()
+    ignored_devices: frozenset = frozenset()
+
+    def __post_init__(self) -> None:
+        given = dict(self.thresholds or {})
+        thresholds = {
+            button: clamp_threshold(given.get(button, given.get(button.value, DEFAULT_THRESHOLD_MS)))
+            for button in Button
+        }
+        try:
+            wheel = max(0, int(round(float(self.wheel_window_ms))))
+        except (TypeError, ValueError, OverflowError):
+            wheel = WHEEL_DEFAULT_MS
+        setter = object.__setattr__
+        setter(self, "thresholds", MappingProxyType(thresholds))
+        setter(self, "buttons", frozenset(Button(getattr(button, "value", button)) for button in self.buttons))
+        setter(self, "wheel_fix", bool(self.wheel_fix))
+        setter(self, "wheel_window_ms", wheel)
+        setter(self, "excluded_apps", frozenset(str(key) for key in self.excluded_apps))
+        setter(self, "ignored_devices", frozenset(str(key) for key in self.ignored_devices))
+
+    @classmethod
+    def uniform(cls, threshold_ms: int, buttons, **others: Any) -> "FilterConfig":
+        """One window for every button (the tests, and the 0.x behaviour)."""
+        return cls(thresholds={button: threshold_ms for button in Button}, buttons=frozenset(buttons), **others)
+
+
+@dataclass(frozen=True)
+class DeviceInfo:
+    """A pointing device the filter has seen (design section 2.2)."""
+
+    #: Stable across reconnects and reboots: "usb:046d:c52b:<serial or
+    #: product>", "bt:...". Never the per-connection IDs the OS hands out.
+    key: str
+    #: For people: "HP 2.4G wireless and BT Mouse".
+    name: str
+    #: "mouse", "trackpad", "touchscreen", "pen" or "unknown".
+    kind: str
+    #: Whether its clicks are filtered: not for touch kinds or ignored devices.
+    filtered: bool
+    #: When it was last seen, in seconds since the epoch (time.time()).
+    last_seen: float
+
+
+class _SeenDevice:
+    """The filter's own record of a device; DeviceInfo is the snapshot."""
+
+    __slots__ = ("key", "name", "kind", "last_seen")
+
+    def __init__(self, key: str, name: str, kind: str) -> None:
+        self.key, self.name, self.kind = key, name, kind
+        self.last_seen = time.time()
+
+
 class HookError(RuntimeError):
     """The global hook could not be installed, or stopped unexpectedly."""
 
@@ -186,6 +284,22 @@ def _log_ignored(site: str) -> None:
 class GlobalClickFilter:
     """Install a system-wide filter that suppresses switch bounce.
 
+    It filters what `config` (a FilterConfig) says, and takes a new one live
+    through update(). Every button has its own window; the side buttons
+    (SIDE_BUTTONS) use the drop rule only and never hold a release. With
+    `wheel_fix`, a scroll-wheel tick that reverses within the wheel window is
+    dropped (see core.WheelFilter).
+
+    Some clicks pass untouched instead (see _passes): from trackpads,
+    touchscreens and pens, from devices the user chose to ignore, and every
+    click while an app on the exclusion list is in front. Any release still
+    held for the same button goes out first, so apps never see two presses
+    in a row.
+
+    `on_event` hears, from the hook thread, each press and release the
+    filter decided; not those that passed untouched, so wear counts stay
+    honest. `on_device` hears of each device the first time this run it
+    sends a click, and `on_wheel(axis, dropped)` of each wheel tick judged.
     `on_error` hears, from the hook thread, that the hook stopped on its own
     after it had started. On macOS, `permission_ok` says whether the app may
     still filter input (see permissions.event_tap_allowed); it is asked each
@@ -197,23 +311,48 @@ class GlobalClickFilter:
 
     def __init__(
         self,
-        threshold_ms: int,
-        buttons: Iterable[Button],
+        config: FilterConfig,
         on_event: Optional[Callable[[ClickEvent], None]] = None,
         on_error: Optional[Callable[[str], None]] = None,
         permission_ok: Optional[Callable[[], bool]] = None,
         on_permission_lost: Optional[Callable[[], None]] = None,
+        on_device: Optional[Callable[[DeviceInfo], None]] = None,
+        on_wheel: Optional[Callable[[int, bool], None]] = None,
     ) -> None:
+        if not isinstance(config, FilterConfig):
+            raise TypeError("GlobalClickFilter takes a FilterConfig (see FilterConfig.uniform)")
         self._on_event = on_event or (lambda _event: None)
         self._on_error = on_error or (lambda _message: None)
         self._permission_ok = permission_ok or (lambda: True)
         self._on_permission_lost = on_permission_lost or (lambda: None)
+        self._on_device = on_device or (lambda _device: None)
+        self._on_wheel = on_wheel or (lambda _axis, _dropped: None)
         self._lock = threading.Lock()
+        self._config = config
         self._filters = {
-            button: BounceFilter(threshold_ms, enabled=True, button=button) for button in Button
+            button: BounceFilter(
+                config.thresholds[button], enabled=True, button=button, hold_releases=button not in SIDE_BUTTONS
+            )
+            for button in Button
         }
-        self._active = set(buttons)
-        self._threshold_ms = clamp_threshold(threshold_ms)
+        self._active = set(config.buttons)
+        # The wheel: judged only while `_wheel_on`, which the hooks read on
+        # every wheel event without a lock.
+        self._wheel = WheelFilter(config.wheel_window_ms)
+        self._wheel_on = config.wheel_fix
+        # The app in front (see frontmost), and whether it is excluded: read
+        # on every click without a lock, kept current by the watcher and by
+        # update().
+        self._front_key: Optional[str] = None
+        self._excluded_front = False
+        self._front_watch = None
+        # Per button: whether its press now down passed untouched (True) or
+        # was filtered (False). Its release goes the same way, so a click is
+        # never half filtered. The hook thread's alone.
+        self._routes: dict[Button, bool] = {}
+        # Devices that sent a click this run, by key (see _device_seen).
+        self._devices: dict[str, _SeenDevice] = {}
+        self._device_lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._ready = threading.Event()
@@ -221,8 +360,12 @@ class GlobalClickFilter:
         self._thread_id: Optional[int] = None
         self._tap = None
         self._run_loop = None
-        # The Windows hook's hidden window (see SessionWindow), while it runs.
+        # The Windows hook's hidden window (see SessionWindow), and its Raw
+        # Input (see devices_win), while it runs.
         self._hook_window = None
+        self._raw_input = None
+        # The macOS tap's device lookups (devices_mac.SenderCache), while it runs.
+        self._senders = None
         self._use_os_time: Optional[bool] = None
         self._started = False
         # Why the hook last ended, for the log.
@@ -308,6 +451,10 @@ class GlobalClickFilter:
         self._set_motion_tap: Callable[[bool], None] = lambda _wanted: None
         self._motion_tap_lock = threading.Lock()
         self.filtered_count = 0
+        # Presses that passed untouched, by reason (see _passes), and wheel
+        # ticks dropped: for the diagnostics, counted on the hook thread.
+        self.passed_counts: dict[str, int] = {}
+        self.wheel_dropped = 0
 
     # -- lifecycle ---------------------------------------------------------
     @property
@@ -340,6 +487,15 @@ class GlobalClickFilter:
         self._queued_release_at.clear()
         self._outbox.clear()
         self._motion_wanted = False
+        self._routes.clear()
+        self._wheel.reset()
+        with self._device_lock:
+            self._devices.clear()
+        if platform.system() == "Darwin":
+            # NSWorkspace's activation notices arrive on the main thread,
+            # where start() is called; Windows watches from the hook thread
+            # (see _run_windows).
+            self._watch_front()
         self._thread = threading.Thread(target=self._run, name="dcf-hook", daemon=True)
         self._thread.start()
         if not self._ready.wait(timeout=5):
@@ -350,7 +506,25 @@ class GlobalClickFilter:
             self.stop()
             raise HookError(str(error)) from error
 
+    def _watch_front(self) -> None:
+        """Follow the app in front (see frontmost), from now until stop()."""
+        from . import frontmost
+
+        self._front_changed(frontmost.current_app_key())
+        try:
+            self._front_watch = frontmost.watch(self._front_changed)
+        except Exception:  # noqa: BLE001 - exclusions then follow the app in front at start only
+            _log_ignored("watching the app in front")
+            self._front_watch = None
+
+    def _unwatch_front(self) -> None:
+        watcher, self._front_watch = self._front_watch, None
+        if watcher is not None:
+            watcher.stop()
+
     def stop(self) -> None:
+        if platform.system() == "Darwin":
+            self._unwatch_front()
         # A release still held back must reach applications, or they would
         # believe the button is stuck down.
         self._let_everything_go()
@@ -407,17 +581,238 @@ class GlobalClickFilter:
 
             Quartz.CFRunLoopStop(self._run_loop)
 
-    def update(self, threshold_ms: Optional[int] = None, buttons: Optional[Iterable[Button]] = None) -> None:
-        """Change settings while the hook keeps running."""
+    @property
+    def config(self) -> FilterConfig:
+        return self._config
+
+    def update(self, config: FilterConfig) -> None:
+        """Take a new configuration while the hook keeps running. It applies
+        at once. Turning the wheel fix on or off re-creates the macOS tap
+        (see _run_macos), which the filter does by itself; held releases are
+        settled first."""
+        if not isinstance(config, FilterConfig):
+            raise TypeError("update() takes a FilterConfig")
         with self._lock:
-            if threshold_ms is not None:
-                self._threshold_ms = clamp_threshold(threshold_ms)
-                for click_filter in self._filters.values():
-                    click_filter.threshold_ms = self._threshold_ms
-            if buttons is not None:
-                self._active = set(buttons)
+            previous, self._config = self._config, config
+            for button, click_filter in self._filters.items():
+                click_filter.threshold_ms = config.thresholds[button]
+            self._active = set(config.buttons)
+            self._wheel.window_ms = config.wheel_window_ms
+            if config.wheel_fix != previous.wheel_fix:
+                self._wheel.reset()
+            self._wheel_on = config.wheel_fix
+            self._front_excluded(self._front_key)
+        self._send_outbox()
+        self._update_motion_tap()
+        if config.wheel_fix != previous.wheel_fix:
+            self._wake_hook()
+
+    def seen_devices(self) -> list[DeviceInfo]:
+        """The devices that sent a click since the filter started, newest
+        first. Thread-safe."""
+        config = self._config
+        with self._device_lock:
+            devices = [
+                DeviceInfo(
+                    seen.key,
+                    seen.name,
+                    seen.kind,
+                    seen.kind not in TOUCH_KINDS and seen.key not in config.ignored_devices,
+                    seen.last_seen,
+                )
+                for seen in self._devices.values()
+            ]
+        return sorted(devices, key=lambda device: device.last_seen, reverse=True)
+
+    # -- what passes untouched ------------------------------------------------
+    def _passes(self, touch: bool = False, kind: Optional[str] = None, key: Optional[str] = None) -> Optional[str]:
+        """Why an event passes untouched, or None to filter it: an excluded
+        app is in front, it came from a touch surface or pen (`touch`, or a
+        device of a touch `kind`), or from a device the user ignores. Reads
+        no lock: the hooks call it on every click and wheel tick."""
+        if self._excluded_front:
+            return PASS_APP
+        if touch or kind in TOUCH_KINDS:
+            return PASS_TOUCH
+        if key is not None and key in self._config.ignored_devices:
+            return PASS_DEVICE
+        return None
+
+    def _front_changed(self, key: Optional[str]) -> None:
+        """The app in front changed (frontmost.watch, on its thread). When
+        an excluded app comes to the front, every held release is settled
+        now, then everything passes."""
+        with self._lock:
+            self._front_key = key
+            self._front_excluded(key)
+        self._send_outbox()
+        self._update_motion_tap()
+
+    def _front_excluded(self, key: Optional[str]) -> None:
+        """With the lock held: whether `key`, in front, is excluded."""
+        excluded = key is not None and key in self._config.excluded_apps
+        if excluded and not self._excluded_front:
+            self._settle([button for button, click_filter in self._filters.items() if click_filter.held_id is not None])
+        self._excluded_front = excluded
+
+    def _device_seen(self, key: Optional[str], name: str, kind: str) -> None:
+        """A click (or wheel tick) came from this device: note when, and
+        tell `on_device` the first time this run. The hook thread."""
+        if not key:
+            return
+        seen = self._devices.get(key)
+        if seen is not None:
+            seen.last_seen = time.time()
+            if seen.kind != kind and kind in TOUCH_KINDS:
+                seen.kind = kind  # another of its collections is a touch surface
+            return
+        seen = _SeenDevice(key, name, kind)
+        with self._device_lock:
+            self._devices[key] = seen
+        config = self._config
+        info = DeviceInfo(key, name, kind, kind not in TOUCH_KINDS and key not in config.ignored_devices, seen.last_seen)
+        try:
+            self._on_device(info)
+        except Exception:  # noqa: BLE001 - a UI callback must never break the hook
+            _log_ignored("the device callback")
+
+    def _wake_hook(self) -> None:
+        """Have the hook thread look at its settings again now (macOS: the
+        tap's mask follows the wheel fix)."""
+        if platform.system() == "Darwin" and self._run_loop is not None:
+            try:
+                import Quartz
+
+                Quartz.CFRunLoopStop(self._run_loop)
+            except Exception:  # noqa: BLE001 - it looks again within 0.25 s anyway
+                _log_ignored("waking the hook thread")
 
     # -- shared event handling --------------------------------------------
+    def _button_event(
+        self,
+        button: Button,
+        pressed: bool,
+        timestamp: Optional[float],
+        template: object = None,
+        allow_hold: bool = True,
+        location: Optional[tuple[float, float]] = None,
+        passes: Optional[str] = None,
+        device: Optional[str] = None,
+    ) -> ClickEvent:
+        """What a platform hook calls for each press and release: filter it
+        (_handle), or let it pass untouched (_pass) when `passes` gives a
+        reason (see _passes), as _route_for decides. The caller suppresses
+        whatever is not accepted."""
+        passing, hold = self._route_for(button, pressed, passes)
+        if passing:
+            return self._pass(button, pressed, timestamp, template, allow_hold, device)
+        return self._handle(button, pressed, timestamp, template, allow_hold, location, device, hold)
+
+    def _route_for(self, button: Button, pressed: bool, passes: Optional[str]) -> tuple[bool, bool]:
+        """Whether an event passes untouched, and if not, whether the filter
+        may hold it. A release goes the way its press went, so a click is
+        never half filtered: one whose press was filtered is still judged by
+        the filter, which drops it if its press was a bounce. It is no longer
+        held once an excluded app has come to the front (nothing is held
+        there); a device that seems to have changed in mid-click is only the
+        device reports racing the click, and changes nothing. The hook
+        thread's alone."""
+        if pressed:
+            self._routes[button] = passes is not None
+            if passes is not None:
+                self.passed_counts[passes] = self.passed_counts.get(passes, 0) + 1
+            return passes is not None, True
+        route = self._routes.pop(button, None)
+        if route is None:
+            return passes is not None, True
+        return route, passes != PASS_APP
+
+    def _pass(
+        self,
+        button: Button,
+        pressed: bool,
+        timestamp: Optional[float],
+        template: object,
+        allow_hold: bool = True,
+        device: Optional[str] = None,
+    ) -> ClickEvent:
+        """An event the filter doesn't judge (see _passes). A held release of
+        its button is settled first, with any other this event's time shows
+        was real, and the event then reaches apps behind them: it is re-sent
+        right after them, or waits where they wait, exactly as an accepted
+        event does (see _handle). With nothing ahead of it, it goes through
+        untouched. `on_event` doesn't hear of it."""
+        arrived = monotonic()
+        timestamp = self._normalise_time(timestamp)
+        with self._lock:
+            self._lateness.add(arrived - timestamp)
+            self._peak_lateness.add(arrived - timestamp, arrived)
+            self._give_up(button, timestamp)
+            settled, behind = self._settle(
+                [
+                    other
+                    for other, click_filter in self._filters.items()
+                    if click_filter.held_id is not None and (other is button or click_filter.due(timestamp))
+                ]
+            )
+            deferred = self._route_accepted(button, pressed, template, timestamp, settled, behind, allow_hold)
+        self._send_outbox()
+        self._update_motion_tap()
+        return ClickEvent(button, pressed, not deferred, None, None, deferred=deferred, device=device)
+
+    def _route_accepted(
+        self,
+        button: Button,
+        pressed: bool,
+        template: object,
+        timestamp: float,
+        settled: list,
+        behind: Optional[Button],
+        allow_hold: bool,
+    ) -> bool:
+        """With the lock held: an event of `button` that is to reach apps.
+        It must reach them after the events of its button still waiting to be
+        re-sent, after the releases `settled` (which happened first), and
+        after another button's release that happened first and has not
+        reached apps yet: it waits where they wait, or is re-sent right
+        behind them. Returns True when it was queued or re-sent (the platform
+        then drops the original), False when it may go through now."""
+        queue = self._queue_for(button)
+        resend = False
+        if queue is None and allow_hold:
+            earlier, on_way = self._follow_earlier_releases(button, timestamp)
+            queue = behind if behind is not None else earlier
+            resend = bool(settled) or (on_way and not self._in_flight[button])
+        if queue is None and not resend and self._in_flight[button]:
+            # Events of this button re-sent a moment ago may still be on
+            # their way. Letting this one through now could overtake them
+            # (apps would see down, down, up, up), so it goes out after them,
+            # and so after any release of another button it follows that is
+            # on its way too.
+            queue = button
+        if queue is not None:
+            self._enqueue(queue, pressed, template, button, timestamp)
+            return True
+        if resend:
+            self._resend(button, pressed, template, timestamp)
+            return True
+        return False
+
+    def _wheel_tick(self, axis: int, direction: int, timestamp: Optional[float]) -> bool:
+        """One discrete wheel tick the wheel fix judges (see
+        core.WheelFilter). Returns True to deliver it, False to drop it; it
+        is never held or re-sent."""
+        timestamp = self._normalise_time(timestamp)
+        with self._lock:
+            deliver = self._wheel.tick(axis, direction, timestamp)
+            if not deliver:
+                self.wheel_dropped += 1
+        try:
+            self._on_wheel(axis, not deliver)
+        except Exception:  # noqa: BLE001 - a UI callback must never break the hook
+            _log_ignored("the wheel callback")
+        return deliver
+
     def _handle(
         self,
         button: Button,
@@ -426,13 +821,18 @@ class GlobalClickFilter:
         template: object = None,
         allow_hold: bool = True,
         location: Optional[tuple[float, float]] = None,
+        device: Optional[str] = None,
+        hold: bool = True,
     ) -> ClickEvent:
         """Decide one event. `template` is a copy of it, kept in case it has to
         be re-injected later; the caller suppresses whatever is not accepted.
-        `allow_hold=False` says a release could not be re-injected later.
-        `location` is where the pointer was, as (x, y), if the platform knows:
-        a release held where apps saw its press is a click made in place, and
-        pointer motion leaving that spot delivers it rather than the timer.
+        `allow_hold=False` says a release could not be re-injected later, and
+        `hold=False` that it must not be held (the click it ends is to pass
+        from now on). `location` is where the pointer was, as (x, y), if the
+        platform knows: a release held where apps saw its press is a click
+        made in place, and pointer motion leaving that spot delivers it rather
+        than the timer. `device` is the key of the device it came from, if
+        known (ClickEvent.device).
 
         First, every held release this event's timestamp shows was real is
         settled, its own button's among them (see _settle_due); this event,
@@ -449,7 +849,9 @@ class GlobalClickFilter:
             click_filter = self._filters[button]
             click_filter.enabled = button in self._active
             held_at = click_filter.held_at
-            event = click_filter.press(timestamp) if pressed else click_filter.release(timestamp, allow_hold)
+            event = click_filter.press(timestamp) if pressed else click_filter.release(timestamp, allow_hold and hold)
+            if device is not None:
+                event = replace(event, device=device)
             if event.is_bounce:
                 self.filtered_count += 1
             if event.held:
@@ -482,31 +884,10 @@ class GlobalClickFilter:
                     self._resend(button, True, template)
                 else:
                     self._enqueue(queue, True, template, button, timestamp)
-            if event.accepted:
-                # It must reach apps after the events of its button still
-                # waiting to be re-sent, after the releases it settled, which
-                # happened first, and after another button's release that
-                # happened first and has not reached apps yet: it waits where
-                # they wait, or is re-sent right behind them.
-                queue = self._queue_for(button)
-                resend = False
-                if queue is None and allow_hold:
-                    earlier, on_way = self._follow_earlier_releases(button, timestamp)
-                    queue = behind if behind is not None else earlier
-                    resend = bool(settled) or (on_way and not self._in_flight[button])
-                if queue is None and not resend and self._in_flight[button]:
-                    # Events of this button re-sent a moment ago may still be
-                    # on their way. Letting this one through now could overtake
-                    # them (apps would see down, down, up, up), so it goes out
-                    # after them, and so after any release of another button
-                    # it follows that is on its way too.
-                    queue = button
-                if queue is not None:
-                    self._enqueue(queue, pressed, template, button, timestamp)
-                    event = replace(event, accepted=False, deferred=True)
-                elif resend:
-                    self._resend(button, pressed, template, timestamp)
-                    event = replace(event, accepted=False, deferred=True)
+            if event.accepted and self._route_accepted(
+                button, pressed, template, timestamp, settled, behind, allow_hold
+            ):
+                event = replace(event, accepted=False, deferred=True)
             if pressed and not event.is_bounce:
                 # Where apps saw the button go down. A press they never see (a
                 # bounce, or the contact coming back mid-drag) must not move
@@ -1033,6 +1414,9 @@ class GlobalClickFilter:
         # records (the app's own threads are per-monitor aware through Qt).
         api.use_physical_pixels()
 
+        from . import frontmost
+        from .devices_win import RawInputDevices, Win32RawInput
+
         WH_MOUSE_LL = 14
         WM_QUIT = 0x0012
         WM_MOUSEMOVE = 0x0200
@@ -1044,6 +1428,10 @@ class GlobalClickFilter:
             0x0207: (Button.MIDDLE, True),
             0x0208: (Button.MIDDLE, False),
         }
+        # WM_XBUTTONDOWN and UP: which side button is in HIWORD(mouseData).
+        X_MESSAGES = {0x020B: True, 0x020C: False}
+        # WM_MOUSEWHEEL (vertical, axis 1) and WM_MOUSEHWHEEL (axis 2).
+        WHEELS = {0x020A: 1, 0x020E: 2}
         PMSLLHOOKSTRUCT = ctypes.POINTER(api.MSLLHOOKSTRUCT)
         LRESULT = ctypes.c_ssize_t
         HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
@@ -1131,14 +1519,28 @@ class GlobalClickFilter:
                         ):
                             return 1
                 else:
-                    entry = BUTTONS.get(int(message))
-                    if entry is not None:
+                    message = int(message)
+                    entry = BUTTONS.get(message)
+                    info = None
+                    if entry is None and message in X_MESSAGES:
                         info = ctypes.cast(data, PMSLLHOOKSTRUCT).contents
+                        side = X_BUTTONS.get((info.mouseData >> 16) & 0xFFFF)
+                        entry = (side, X_MESSAGES[message]) if side is not None else None
+                    if entry is not None:
+                        if info is None:
+                            info = ctypes.cast(data, PMSLLHOOKSTRUCT).contents
                         if hook_logic.button(
                             entry[0], entry[1], info.pt.x, info.pt.y, info.flags, info.time,
                             info.dwExtraInfo, arrival + clock_offset, get_tick_count(),
                         ):
                             return 1
+                    elif message in WHEELS and self._wheel_on:
+                        info = ctypes.cast(data, PMSLLHOOKSTRUCT).contents
+                        if hook_logic.wheel(
+                            WHEELS[message], info.mouseData, info.flags, info.dwExtraInfo,
+                            info.time, arrival + clock_offset, get_tick_count(),
+                        ):
+                            return 1  # dropped: a stray reversing notch
             return call_next(None, code, message, data)
 
         hook = user32.SetWindowsHookExW(WH_MOUSE_LL, callback, None, 0)
@@ -1147,12 +1549,48 @@ class GlobalClickFilter:
             self._startup_error = ctypes.WinError(ctypes.get_last_error())
             self._ready.set()
             return
+        # Raw Input says which device each click comes from (see
+        # devices_win); its names are read on a thread of their own, which
+        # posts WM_DEVICE here when they are in.
+        WM_DEVICE = 0x8000 + 0x45
         try:
-            window = SessionWindow(api, lambda: user32.PostThreadMessageW(thread_id, WM_REARM, REARM_SESSION, 0))
+            raw_api = Win32RawInput()
+        except Exception:  # noqa: BLE001 - devices then go unknown and are filtered
+            _log_ignored("setting up Raw Input")
+            raw_api = None
+        devices = RawInputDevices(
+            raw_api,
+            wake=lambda: user32.PostThreadMessageW(thread_id, WM_DEVICE, 0, 0),
+            seen=lambda info: self._device_seen(info.key, info.name, info.kind),
+        )
+        hook_logic.device = devices.current
+        self._raw_input = devices
+
+        def on_input(lparam: int) -> None:
+            timings = self._callback_timings
+            started = perf_counter() if timings is not None else 0.0
+            devices.on_input(lparam)
+            if timings is not None:
+                timings.append((0x00FF, False, perf_counter() - started))
+
+        try:
+            window = SessionWindow(
+                api, lambda: user32.PostThreadMessageW(thread_id, WM_REARM, REARM_SESSION, 0), on_input=on_input
+            )
         except Exception:  # noqa: BLE001 - the periodic re-arm still covers it
             _log_ignored("creating the session window")
             window = None
         self._hook_window = window.hwnd if window is not None else None
+        if window is not None and window.hwnd:
+            devices.register(window.hwnd)
+        # The app in front, followed from this thread, whose message loop
+        # delivers the foreground notices.
+        self._front_changed(frontmost.current_app_key())
+        try:
+            front_watch = frontmost.watch(self._front_changed)
+        except Exception:  # noqa: BLE001 - exclusions then follow the app in front at start only
+            _log_ignored("watching the app in front")
+            front_watch = None
         self._started = True
         self._ready.set()
         timer = user32.SetTimer(None, 0, rearm_interval_ms, None)
@@ -1162,6 +1600,9 @@ class GlobalClickFilter:
                 result = user32.GetMessageW(ctypes.byref(message), None, 0, 0)
                 if result in (0, -1) or message.message == WM_QUIT:
                     break
+                if message.message == WM_DEVICE and not message.hWnd:
+                    devices.resolved()
+                    continue
                 if message.message in (WM_REARM, WM_TIMER) and not message.hWnd:
                     fresh = user32.SetWindowsHookExW(WH_MOUSE_LL, callback, None, 0)
                     if fresh:
@@ -1180,6 +1621,9 @@ class GlobalClickFilter:
         finally:
             if timer:
                 user32.KillTimer(None, timer)
+            if front_watch is not None:
+                front_watch.stop()
+            devices.close()
             if window is not None:
                 window.close()
             self._hook_window = None
@@ -1199,6 +1643,8 @@ class GlobalClickFilter:
         except ImportError as error:  # pragma: no cover - packaging guard
             raise HookError("Install macOS support with: pip install -r requirements.txt") from error
 
+        from . import devices_mac
+
         BUTTONS = {
             Quartz.kCGEventLeftMouseDown: (Button.LEFT, True),
             Quartz.kCGEventLeftMouseUp: (Button.LEFT, False),
@@ -1207,6 +1653,28 @@ class GlobalClickFilter:
             Quartz.kCGEventOtherMouseDown: (Button.MIDDLE, True),
             Quartz.kCGEventOtherMouseUp: (Button.MIDDLE, False),
         }
+        # An "other" button is told by kCGMouseEventButtonNumber: 2 is the
+        # middle button, 3 back and 4 forward. Any other passes untouched.
+        OTHER = (Quartz.kCGEventOtherMouseDown, Quartz.kCGEventOtherMouseUp)
+        OTHER_BUTTONS = {2: Button.MIDDLE, 3: Button.BACK, 4: Button.FORWARD}
+        SCROLL = Quartz.kCGEventScrollWheel
+        # A scroll event's delta fields per axis (1 vertical, 2 horizontal):
+        # lines, then points and fixed-point lines, all cleared when one
+        # axis of a two-axis event is dropped.
+        SCROLL_FIELDS = {
+            1: (Quartz.kCGScrollWheelEventDeltaAxis1, Quartz.kCGScrollWheelEventPointDeltaAxis1,
+                Quartz.kCGScrollWheelEventFixedPtDeltaAxis1),
+            2: (Quartz.kCGScrollWheelEventDeltaAxis2, Quartz.kCGScrollWheelEventPointDeltaAxis2,
+                Quartz.kCGScrollWheelEventFixedPtDeltaAxis2),
+        }
+        SENDER = devices_mac.SENDER_ID_FIELD
+        SUBTYPE = Quartz.kCGMouseEventSubtype
+        TOUCH_SUBTYPES = devices_mac.TOUCH_SUBTYPES
+        # Which device each click came from: looked up once per sender, the
+        # devices connected now ahead of time (see devices_mac.SenderCache).
+        senders = devices_mac.SenderCache()
+        self._senders = senders
+        senders.warm()
         to_seconds = _mach_timebase()
         # Every stamp is checked on its own as it arrives (see _mach_timebase),
         # so the once-per-run check in _normalise_time must not second-guess it.
@@ -1301,24 +1769,36 @@ class GlobalClickFilter:
                 end_hook(KEPT_DISABLED)
                 return
             self.tap_resets += 1
-            Quartz.CGEventTapEnable(tap, True)
+            Quartz.CGEventTapEnable(current["tap"], True)
             # Whatever this app posted while the tap was off went past it and
             # never comes back: stop waiting for it, and send what waits
             # behind it, now that the tap sees it come back.
             self._give_up_all()
 
-        def callback(proxy: object, event_type: int, event: object, refcon: object) -> object:
-            # An exception here would make PyObjC return nothing, which drops
-            # the event. Whatever goes wrong, the event goes through untouched.
-            try:
-                # The hot path: every pointer move comes here. While nothing
-                # is pending it goes straight back after this one check.
-                if event_type in MOTION and not self._motion_wanted:
+        def make_callback(generation: int) -> Callable:
+            def callback(proxy: object, event_type: int, event: object, refcon: object) -> object:
+                # An exception here would make PyObjC return nothing, which
+                # drops the event. Whatever goes wrong, the event goes through
+                # untouched.
+                timings = self._callback_timings
+                started = perf_counter() if timings is not None else 0.0
+                try:
+                    if generation != current["generation"]:
+                        return event  # a tap being replaced: the new one decides
+                    # The hot path: every pointer move comes here. While
+                    # nothing is pending it goes straight back after this one
+                    # check.
+                    if event_type in MOTION and not self._motion_wanted:
+                        return event
+                    return decide(event_type, event)
+                except Exception:  # noqa: BLE001
+                    _log_ignored("the event tap")
                     return event
-                return decide(event_type, event)
-            except Exception:  # noqa: BLE001
-                _log_ignored("the event tap")
-                return event
+                finally:
+                    if timings is not None:
+                        timings.append((int(event_type), self._motion_wanted, perf_counter() - started))
+
+            return callback
 
         def decide(event_type: int, event: object) -> object:
             if event_type in DISABLED:
@@ -1326,41 +1806,94 @@ class GlobalClickFilter:
                 return event
             if event_type in MOTION:
                 return decide_motion(event)
+            if event_type == SCROLL:
+                return decide_scroll(event)
 
             entry = BUTTONS.get(event_type)
             if entry is None:
                 return event
+            button, pressed = entry
+            if event_type in OTHER:
+                button = OTHER_BUTTONS.get(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGMouseEventButtonNumber))
+                if button is None:
+                    return event  # a fifth or later button: not filtered
             mark = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventSourceUserData)
             if mark_kind(mark) == INJECTED_MARK:
-                self._injected_passed(entry[0], mark_seq(mark))
+                self._injected_passed(button, mark_seq(mark))
                 return event  # re-posted by this app; already decided
             source = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventSourceStateID)
             if source != Quartz.kCGEventSourceStateHIDSystemState and not filter_injected:
                 return event  # synthetic click from another app; leave it alone
 
-            button, pressed = entry
-            if button is Button.MIDDLE:
-                number = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGMouseEventButtonNumber)
-                if number != 2:
-                    return event  # a side button, not the middle one
-
             timestamp = to_seconds(Quartz.CGEventGetTimestamp(event))
+            kind, key = device_of(event)
+            passes = self._passes(Quartz.CGEventGetIntegerValueField(event, SUBTYPE) in TOUCH_SUBTYPES, kind, key)
+            passing, hold = self._route_for(button, pressed, passes)
+            state = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGMouseEventClickState)
+            location = Quartz.CGEventGetLocation(event)
+            if passing:
+                # Untouched, click count and all; the count's chain follows it.
+                result = self._pass(button, pressed, timestamp, Quartz.CGEventCreateCopy(event), device=key)
+                click_counts.passed(button, pressed, state, timestamp)
+                return event if result.accepted else None
             # Repair the click count first, so the copy kept for a re-send
             # carries the corrected count too.
-            state = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGMouseEventClickState)
             corrected = click_counts.correct(button, pressed, state, timestamp)
             if corrected != state:
                 Quartz.CGEventSetIntegerValueField(event, Quartz.kCGMouseEventClickState, corrected)
-            location = Quartz.CGEventGetLocation(event)
             result = self._handle(
                 button,
                 pressed,
                 timestamp,
                 Quartz.CGEventCreateCopy(event),
                 location=(location.x, location.y),
+                device=key,
+                hold=hold,
             )
             click_counts.record(button, result)
             return event if result.accepted else None
+
+        def device_of(event: object) -> tuple[Optional[str], Optional[str]]:
+            """(kind, key) of the device that sent `event`, as far as known."""
+            sender = Quartz.CGEventGetIntegerValueField(event, SENDER)
+            device = senders.lookup(sender) if sender else None
+            if device is None:
+                return None, None
+            self._device_seen(device.key, device.name, device.kind)
+            return device.kind, device.key
+
+        def decide_scroll(event: object) -> object:
+            # Only in the tap while the wheel fix is on (see open_tap); it may
+            # have just been turned off.
+            if not self._wheel_on:
+                return event
+            if Quartz.CGEventGetIntegerValueField(event, Quartz.kCGScrollWheelEventIsContinuous):
+                return event  # a trackpad's or Magic Mouse's scrolling: never touched
+            source = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventSourceStateID)
+            if source != Quartz.kCGEventSourceStateHIDSystemState and not filter_injected:
+                return event  # another app's scrolling
+            kind, key = device_of(event)
+            if self._passes(Quartz.CGEventGetIntegerValueField(event, SUBTYPE) in TOUCH_SUBTYPES, kind, key):
+                return event
+            timestamp = to_seconds(Quartz.CGEventGetTimestamp(event))
+            ticks, dropped = 0, []
+            for axis, (lines, points, _fixed) in SCROLL_FIELDS.items():
+                delta = Quartz.CGEventGetIntegerValueField(event, lines) or Quartz.CGEventGetIntegerValueField(
+                    event, points
+                )
+                if not delta:
+                    continue
+                ticks += 1
+                if not self._wheel_tick(axis, delta, timestamp):
+                    dropped.append(axis)
+            if not dropped:
+                return event
+            if len(dropped) == ticks:
+                return None  # a stray notch the wrong way: dropped
+            for axis in dropped:  # one axis of two: clear only it
+                for field in SCROLL_FIELDS[axis]:
+                    Quartz.CGEventSetIntegerValueField(event, field, 0)
+            return event
 
         def decide_motion(event: object) -> object:
             # Motion while a release is held or re-sent events are on their
@@ -1390,19 +1923,50 @@ class GlobalClickFilter:
         # a release is held, let the first moves after a click overtake the
         # held release: switching a tap on takes effect tens of ms later, and
         # two taps' ports are not serviced in any set order.
-        mask = 0
-        for event_type in (*BUTTONS, *MOTION):
-            mask |= Quartz.CGEventMaskBit(event_type)
+        #
+        # Scroll events join the mask only while the wheel fix is on, so with
+        # it off a trackpad's scrolling never reaches this process. A tap's
+        # mask is fixed, so turning the fix on or off replaces the tap (see
+        # replace_tap).
+        def mask_for(wheel: bool) -> int:
+            mask = 0
+            for event_type in (*BUTTONS, *MOTION, *((SCROLL,) if wheel else ())):
+                mask |= Quartz.CGEventMaskBit(event_type)
+            return mask
 
-        tap = Quartz.CGEventTapCreate(
-            Quartz.kCGHIDEventTap,
-            Quartz.kCGHeadInsertEventTap,
-            Quartz.kCGEventTapOptionDefault,
-            mask,
-            callback,
-            None,
-        )
-        if tap is None:
+        # The tap in use: its generation (a replaced tap's callback lets
+        # everything through), port, run loop source, and whether its mask
+        # has the scroll wheel.
+        current: dict = {"generation": 0, "tap": None, "source": None, "wheel": False, "callback": None}
+
+        def open_tap(wheel: bool) -> Optional[dict]:
+            generation = current["generation"] + 1
+            # Kept with the tap, so the callback lives as long as it does.
+            callback = make_callback(generation)
+            tap = Quartz.CGEventTapCreate(
+                Quartz.kCGHIDEventTap,
+                Quartz.kCGHeadInsertEventTap,
+                Quartz.kCGEventTapOptionDefault,
+                mask_for(wheel),
+                callback,
+                None,
+            )
+            if tap is None:
+                return None
+            source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
+            return {"generation": generation, "tap": tap, "source": source, "wheel": wheel, "callback": callback}
+
+        def close_tap(entry: dict, remove: bool = True) -> None:
+            # Out of the event stream: from here on clicks pass untouched.
+            # Disabling a tap is not enough: macOS keeps it registered, for
+            # the life of the process, until its port is invalidated.
+            Quartz.CGEventTapEnable(entry["tap"], False)
+            if remove:
+                Quartz.CFRunLoopRemoveSource(self._run_loop, entry["source"], Quartz.kCFRunLoopCommonModes)
+                Quartz.CFMachPortInvalidate(entry["tap"])
+
+        first = open_tap(self._wheel_on)
+        if first is None:
             from . import DISPLAY_NAME, permissions
 
             self._startup_error = HookError(
@@ -1411,16 +1975,41 @@ class GlobalClickFilter:
             )
             self._ready.set()
             return
-
-        def close_tap() -> None:
-            # Out of the event stream: from here on clicks pass untouched.
-            Quartz.CGEventTapEnable(tap, False)
-
-        self._tap = tap
-        source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
+        current.update(first)
+        self._tap = current["tap"]
         self._run_loop = Quartz.CFRunLoopGetCurrent()
-        Quartz.CFRunLoopAddSource(self._run_loop, source, Quartz.kCFRunLoopCommonModes)
-        Quartz.CGEventTapEnable(tap, True)
+        Quartz.CFRunLoopAddSource(self._run_loop, current["source"], Quartz.kCFRunLoopCommonModes)
+        Quartz.CGEventTapEnable(current["tap"], True)
+        # The wheel setting a new tap was refused for: not asked again until
+        # the setting changes.
+        refused: list = [None]
+
+        def replace_tap(wheel: bool) -> None:
+            """The wheel fix was turned on or off: a tap with the new mask
+            takes over. Held releases are settled first, while the old tap
+            still decides; then the new tap goes in ahead of the old one,
+            whose callback from then on lets everything through, and the old
+            one goes."""
+            with self._lock:
+                self._settle([button for button, click_filter in self._filters.items() if click_filter.held_id is not None])
+            self._send_outbox()
+            self._update_motion_tap()
+            fresh = open_tap(wheel)
+            if fresh is None:
+                refused[0] = wheel
+                log.warning("macOS refused a new event tap; the wheel fix stays %s", "on" if current["wheel"] else "off")
+                return
+            old = dict(current)
+            Quartz.CFRunLoopAddSource(self._run_loop, fresh["source"], Quartz.kCFRunLoopCommonModes)
+            current.update(fresh)
+            Quartz.CGEventTapEnable(fresh["tap"], True)
+            self._tap = fresh["tap"]
+            close_tap(old)
+            # What this app posted may have passed the old tap without being
+            # seen: stop waiting for it, and send what waits behind it.
+            self._give_up_all()
+            log.info("The event tap %s the scroll wheel now", "takes" if wheel else "leaves out")
+
         self._started = True
         self._ready.set()
         failed_open = None
@@ -1429,20 +2018,21 @@ class GlobalClickFilter:
                 # A bounded run keeps the stop flag responsive even when the
                 # run loop is woken for reasons of its own.
                 Quartz.CFRunLoopRunInMode(Quartz.kCFRunLoopDefaultMode, 0.25, False)
+                wheel = self._wheel_on
+                if wheel == current["wheel"]:
+                    refused[0] = None
+                elif wheel != refused[0] and not self._stop_event.is_set() and not ending:
+                    replace_tap(wheel)
             if ending and not self._stop_event.is_set():
                 # Fail open. The tap goes first: nothing answers it once the
                 # run loop has stopped, so left enabled it would stall every
                 # event, the releases about to be re-sent included. Then what
                 # is held back goes out, and every later click passes untouched.
-                close_tap()
+                close_tap(current, remove=False)
                 self._let_everything_go()
                 failed_open = ending[0]
         finally:
-            close_tap()
-            # Disabling a tap is not enough: macOS keeps it registered, for
-            # the life of the process, until its port is invalidated.
-            Quartz.CFRunLoopRemoveSource(self._run_loop, source, Quartz.kCFRunLoopCommonModes)
-            Quartz.CFMachPortInvalidate(tap)
+            close_tap(current)
             self._tap = None
         if failed_open is not None:
             self._end_reason = failed_open
@@ -1545,6 +2135,9 @@ class WindowsHook:
         # in order. The hook runs with an InputSender (see there); by
         # default, at once.
         self._send = send or (lambda batch: send_batch(api, batch, owner._resend_lost))
+        # The device that reported last (devices_win.RawInputDevices.current),
+        # set by the runner; None while unknown.
+        self.device: Callable[[], Any] = lambda: None
         # Whether motion is being watched: read on every move, without a lock.
         self.watch = [False]
         self.basis = (0, 0)
@@ -1607,6 +2200,11 @@ class WindowsHook:
         # thresholds near them, so the event is timed by its arrival on the
         # precise clock, less any lateness the tick shows (a stall here).
         stamp = windows_event_time(arrival, tick_now, tick)
+        # Pen and touch, and clicks from a touchpad, a touchscreen or an
+        # ignored device, pass untouched (see GlobalClickFilter._passes).
+        pen = (extra & PEN_SIGNATURE_MASK) == PEN_SIGNATURE
+        kind, key = self._device_of_event(owner)
+        passes = owner._passes(pen, kind, key)
         # A release is only held back if it can be re-sent to the window that
         # will receive it.
         allow_hold = pressed or self._accepts_injection(x, y)
@@ -1614,19 +2212,47 @@ class WindowsHook:
         # spot delivers it, unless the pointer's place means nothing: pen and
         # touch (absolute positions), a hidden pointer (a game's mouse-look)
         # or a remote session.
-        relocate = (extra & PEN_SIGNATURE_MASK) != PEN_SIGNATURE and (
-            pressed or self._api.relocation_allowed()
-        )
+        relocate = not pen and (pressed or self._api.relocation_allowed())
         at = self._where(x, y)
-        event = owner._handle(
+        return not owner._button_event(
             button,
             pressed,
             stamp,
             WindowsTemplate(int(tick), at[0], at[1], relocate),
             allow_hold=allow_hold,
             location=at if relocate else None,
-        )
-        return not event.accepted
+            passes=passes,
+            device=key,
+        ).accepted
+
+    def wheel(
+        self, axis: int, mouse_data: int, flags: int, extra: int, tick: int, arrival: float, tick_now: int
+    ) -> bool:
+        """A wheel notch on `axis` (1 vertical, 2 horizontal), its signed
+        delta in HIWORD(mouse_data), seen while the wheel fix is on. Returns
+        True when the hook must drop it. It is never re-sent: a stray
+        reversing notch is simply dropped."""
+        if flags & self.LLMHF_INJECTED and not self._filter_injected:
+            return False  # another program's scrolling
+        if (extra & PEN_SIGNATURE_MASK) == PEN_SIGNATURE:
+            return False
+        owner = self._owner
+        kind, key = self._device_of_event(owner)
+        if owner._passes(False, kind, key):
+            return False
+        delta = (int(mouse_data) >> 16) & 0xFFFF
+        if delta >= 0x8000:
+            delta -= 0x10000
+        return not owner._wheel_tick(axis, delta, windows_event_time(arrival, tick_now, tick))
+
+    def _device_of_event(self, owner: "GlobalClickFilter") -> tuple[Optional[str], Optional[str]]:
+        """(kind, key) of the device that reported last, as far as known."""
+        info = self.device()
+        if info is None:
+            return None, None
+        if info.key:
+            owner._device_seen(info.key, info.name, info.kind)
+        return info.kind, info.key
 
     def motion(
         self,
@@ -1713,7 +2339,7 @@ class WindowsHook:
             # spot, so the pointer needn't jump), one made where the
             # pointer's place means nothing (see button), and one whose way
             # back isn't known.
-            return [(api.button_input(flags, when, make_mark(INJECTED_MARK, seq)), button, seq)]
+            return [(api.button_input(flags, when, make_mark(INJECTED_MARK, seq), api.button_data(button)), button, seq)]
         # The pointer has moved on: take it to where the button came up,
         # release it there and take it back, in one batch so the three arrive
         # in order. The release is waited for until the way back has come
@@ -1722,7 +2348,7 @@ class WindowsHook:
         # way back queues behind it rather than being undone by it.
         return [
             (api.move_input(x, y, TELEPORT_MARK), None, 0),
-            (api.button_input(flags, when, INJECTED_MARK), None, 0),
+            (api.button_input(flags, when, INJECTED_MARK, api.button_data(button)), None, 0),
             (api.move_input(here[0], here[1], make_mark(MOTION_MARK_FOR[button], seq)), button, seq),
         ]
 
@@ -1811,7 +2437,13 @@ class WindowsApi:
         (Button.LEFT, True): 0x0002, (Button.LEFT, False): 0x0004,
         (Button.RIGHT, True): 0x0008, (Button.RIGHT, False): 0x0010,
         (Button.MIDDLE, True): 0x0020, (Button.MIDDLE, False): 0x0040,
+        # MOUSEEVENTF_XDOWN and XUP; which side button is in mouseData.
+        (Button.BACK, True): 0x0080, (Button.BACK, False): 0x0100,
+        (Button.FORWARD, True): 0x0080, (Button.FORWARD, False): 0x0100,
     }
+    #: SendInput's mouseData for a side button: XBUTTON1 or XBUTTON2, the
+    #: same value the hook saw in HIWORD(mouseData).
+    BUTTON_DATA = {button: number for number, button in X_BUTTONS.items()}
 
     def __init__(self) -> None:
         import ctypes
@@ -1976,13 +2608,16 @@ class WindowsApi:
     def button_flags(self, button: Button, pressed: bool) -> int:
         """SendInput's flags for this app's button. Those name the physical
         button, which Windows then swaps for a left-handed user, while the
-        hook sees the swapped (logical) one."""
-        if button is not Button.MIDDLE and self.buttons_swapped():
+        hook sees the swapped (logical) one. Only left and right swap."""
+        if button in (Button.LEFT, Button.RIGHT) and self.buttons_swapped():
             button = Button.RIGHT if button is Button.LEFT else Button.LEFT
         return self.BUTTON_FLAGS[(button, pressed)]
 
-    def button_input(self, flags: int, when: int, mark: int) -> object:
-        return self.INPUT(self.INPUT_MOUSE, self.MOUSEINPUT(0, 0, 0, flags, when, mark))
+    def button_data(self, button: Button) -> int:
+        return self.BUTTON_DATA.get(button, 0)
+
+    def button_input(self, flags: int, when: int, mark: int, data: int = 0) -> object:
+        return self.INPUT(self.INPUT_MOUSE, self.MOUSEINPUT(0, 0, data, flags, when, mark))
 
     def virtual_screen(self) -> tuple[int, int, int, int]:
         """The rectangle around every monitor: left, top, width, height. Read
@@ -2025,7 +2660,11 @@ class SessionWindow:
     RESUME_EVENTS = (0x7, 0x12)
     _names = itertools.count(1)
 
-    def __init__(self, api: WindowsApi, on_change: Callable[[], object]) -> None:
+    WM_INPUT = 0x00FF
+
+    def __init__(
+        self, api: WindowsApi, on_change: Callable[[], object], on_input: Optional[Callable[[int], object]] = None
+    ) -> None:
         import ctypes
         from ctypes import wintypes
 
@@ -2070,9 +2709,19 @@ class SessionWindow:
 
         session_events, resume_events = self.SESSION_EVENTS, self.RESUME_EVENTS
         session_change, power, close = self.WM_WTSSESSION_CHANGE, self.WM_POWERBROADCAST, self.WM_CLOSE
+        raw_input = self.WM_INPUT
 
         @WNDPROC
         def window_proc(hwnd, message, wparam, lparam):
+            if message == raw_input:
+                # Raw Input from every mouse, touchpad and touchscreen (see
+                # devices_win). DefWindowProc must still see it: it frees it.
+                if on_input is not None:
+                    try:
+                        on_input(lparam)
+                    except Exception:  # noqa: BLE001 - never break the hook's thread
+                        _log_ignored("reading Raw Input")
+                return user32.DefWindowProcW(hwnd, message, wparam, lparam)
             if message == close:
                 # Restart Manager, and taskkill without /F, close every
                 # top-level window of the app. The default would destroy this
@@ -2327,6 +2976,14 @@ class ClickCountRepair:
         if state < 1 or last is None:
             return state
         return min(state, last[1])
+
+    def passed(self, button: Button, pressed: bool, state: int, timestamp: float) -> None:
+        """A click that passed untouched (a touch, an ignored device, an
+        excluded app) with macOS's own count: apps got that press, so the
+        chain goes on from it."""
+        self._pending.pop(button, None)
+        if pressed and state >= 1:
+            self._delivered[button] = (timestamp, state)
 
     def record(self, button: Button, result: ClickEvent) -> None:
         # Only a press that reaches apps moves the chain on: one let through,

@@ -13,6 +13,7 @@ import unittest
 from time import monotonic
 from types import SimpleNamespace
 from typing import Optional
+from dataclasses import replace
 from unittest import mock
 
 from app.core import Button, ClickEvent
@@ -31,6 +32,7 @@ from app.platform import (
     TAP_DISABLED_MESSAGE,
     WINDOWS_STAMP_ERROR_S,
     ClickCountRepair,
+    FilterConfig,
     GlobalClickFilter,
     HookError,
     _double_click_interval,
@@ -64,7 +66,7 @@ class HandlerTests(unittest.TestCase):
         patch.start()
         self.addCleanup(patch.stop)
         self.events = []
-        self.filter = GlobalClickFilter(60, [Button.LEFT], on_event=self.events.append)
+        self.filter = GlobalClickFilter(FilterConfig.uniform(60, [Button.LEFT]), on_event=self.events.append)
         # Pretend the platform timestamps line up with our clock.
         self.filter._use_os_time = True
 
@@ -87,13 +89,13 @@ class HandlerTests(unittest.TestCase):
         self.assertEqual(self.filter.filtered_count, 0)
 
     def test_buttons_are_tracked_separately(self) -> None:
-        self.filter.update(buttons=[Button.LEFT, Button.RIGHT])
+        self.filter.update(replace(self.filter.config, buttons=frozenset([Button.LEFT, Button.RIGHT])))
         self.click(Button.LEFT, 1.0, 1.05)
         press, _ = self.click(Button.RIGHT, 1.06, 1.10)
         self.assertTrue(press.accepted, "a right click is not bounce from the left switch")
 
     def test_threshold_updates_while_running(self) -> None:
-        self.filter.update(threshold_ms=10)
+        self.filter.update(FilterConfig.uniform(10, self.filter.config.buttons))
         self.click(Button.LEFT, 1.0, 1.02)
         press, _ = self.click(Button.LEFT, 1.05, 1.06)  # 30 ms gap
         # Delivered, after the release held before it.
@@ -110,7 +112,7 @@ class HandlerTests(unittest.TestCase):
         def explode(_event):
             raise ValueError("UI is gone")
 
-        click_filter = GlobalClickFilter(60, [Button.LEFT], on_event=explode)
+        click_filter = GlobalClickFilter(FilterConfig.uniform(60, [Button.LEFT]), on_event=explode)
         with fresh_error_log(), self.assertLogs("app.platform", "WARNING") as logged:
             self.assertTrue(click_filter._handle(Button.LEFT, True, 1.0).accepted)
             self.assertTrue(click_filter._handle(Button.LEFT, False, 1.1).held)
@@ -120,7 +122,7 @@ class HandlerTests(unittest.TestCase):
 
 class ClockTests(unittest.TestCase):
     def test_unusable_event_timestamps_fall_back_to_the_local_clock(self) -> None:
-        click_filter = GlobalClickFilter(60, [Button.LEFT])
+        click_filter = GlobalClickFilter(FilterConfig.uniform(60, [Button.LEFT]))
         # Synthetic events can arrive stamped with zero; a gap measured against
         # that would be meaningless.
         first = click_filter._normalise_time(0.0)
@@ -128,13 +130,13 @@ class ClockTests(unittest.TestCase):
         self.assertFalse(click_filter._use_os_time)
 
     def test_plausible_timestamps_are_used_as_given(self) -> None:
-        click_filter = GlobalClickFilter(60, [Button.LEFT])
+        click_filter = GlobalClickFilter(FilterConfig.uniform(60, [Button.LEFT]))
         stamp = monotonic()
         self.assertEqual(click_filter._normalise_time(stamp), stamp)
         self.assertTrue(click_filter._use_os_time)
 
     def test_missing_timestamp_is_replaced(self) -> None:
-        click_filter = GlobalClickFilter(60, [Button.LEFT])
+        click_filter = GlobalClickFilter(FilterConfig.uniform(60, [Button.LEFT]))
         self.assertAlmostEqual(click_filter._normalise_time(None), monotonic(), delta=1.0)
 
 
@@ -143,11 +145,11 @@ class LifecycleTests(unittest.TestCase):
         if is_supported():
             self.skipTest("this platform does support hooks")
         with self.assertRaises(HookError):
-            GlobalClickFilter(60, [Button.LEFT]).start()
+            GlobalClickFilter(FilterConfig.uniform(60, [Button.LEFT])).start()
 
     @unittest.skipUnless(platform.system() == "Darwin", "macOS event tap")
     def test_macos_tap_starts_and_stops(self) -> None:
-        click_filter = GlobalClickFilter(60, [Button.LEFT])
+        click_filter = GlobalClickFilter(FilterConfig.uniform(60, [Button.LEFT]))
         try:
             click_filter.start()
         except HookError as error:
@@ -170,7 +172,7 @@ class LifecycleTests(unittest.TestCase):
         before = taps_of_this_process()
         for _ in range(10):
             # No buttons: nothing is held back or re-sent; the tap only watches.
-            click_filter = GlobalClickFilter(60, [])
+            click_filter = GlobalClickFilter(FilterConfig.uniform(60, []))
             try:
                 click_filter.start()
             except HookError as error:
@@ -244,7 +246,7 @@ class HeldReleaseTests(unittest.TestCase):
         patch = mock.patch("app.platform.threading.Timer", FakeTimer)
         patch.start()
         self.addCleanup(patch.stop)
-        self.filter = GlobalClickFilter(40, [Button.LEFT])
+        self.filter = GlobalClickFilter(FilterConfig.uniform(40, [Button.LEFT]))
         self.filter._use_os_time = True
         self.filter._inject = lambda button, pressed, template, _seq: self.injected.append((pressed, template))
 
@@ -312,7 +314,7 @@ class TimerTokenTests(unittest.TestCase):
         injected = []
         timers = FakeTimer.reset()
 
-        click_filter = GlobalClickFilter(40, [Button.LEFT])
+        click_filter = GlobalClickFilter(FilterConfig.uniform(40, [Button.LEFT]))
         click_filter._use_os_time = True
         click_filter._inject = lambda button, pressed, template, _seq: injected.append((pressed, template))
         with mock.patch("app.platform.threading.Timer", FakeTimer):
@@ -354,7 +356,7 @@ class EventTimeTests(unittest.TestCase):
 
     def make_filter(self):
         sent = []
-        click_filter = GlobalClickFilter(40, [Button.LEFT, Button.RIGHT])
+        click_filter = GlobalClickFilter(FilterConfig.uniform(40, [Button.LEFT, Button.RIGHT]))
         click_filter._use_os_time = True
         click_filter._inject = lambda button, pressed, template, _seq: sent.append((button, pressed, template))
         return click_filter, sent
@@ -503,7 +505,7 @@ class EventTimeTests(unittest.TestCase):
         self.assertTrue(self.handle(Button.RIGHT, False, 100.200, "rup2").held)
         self.assertTrue(self.handle(Button.LEFT, True, 100.250, "ldown").deferred)  # behind rup2
         self.assertTrue(self.handle(Button.LEFT, False, 100.350, "lup").held)
-        self.filter.update(buttons=[Button.RIGHT])
+        self.filter.update(replace(self.filter.config, buttons=frozenset([Button.RIGHT])))
         self.assertTrue(self.handle(Button.LEFT, True, 100.360, "ldown2").flush_held)
         self.assertEqual(self.sent, [(Button.RIGHT, False, "rup1")])
         come_back(self.filter, Button.RIGHT)                          # rup1 delivered
@@ -544,7 +546,7 @@ class EventTimeTests(unittest.TestCase):
             with self.subTest(active=active):
                 self.timers.clear()
                 self.filter, self.sent = self.make_filter()
-                self.filter.update(buttons=active)
+                self.filter.update(replace(self.filter.config, buttons=frozenset(active)))
                 self.handle(Button.LEFT, True, 100.000, "down1")
                 self.handle(Button.LEFT, False, 100.100, "up1")
                 self.timers[-1].fire()                                # up1 re-sent, still on its way
@@ -633,7 +635,7 @@ class EventTimeTests(unittest.TestCase):
     def test_a_press_once_its_button_is_not_filtered_replays_release_then_press(self) -> None:
         self.handle(Button.LEFT, True, 100.000, "down")
         self.assertTrue(self.handle(Button.LEFT, False, 100.100, "up").held)
-        self.filter.update(buttons=[Button.RIGHT])
+        self.filter.update(replace(self.filter.config, buttons=frozenset([Button.RIGHT])))
         press = self.handle(Button.LEFT, True, 100.120, "down2")      # inside the window
         self.assertTrue(press.flush_held)
         self.assertFalse(press.is_bounce)
@@ -800,7 +802,7 @@ class Pipeline:
         ):
             patch.start()
             test.addCleanup(patch.stop)
-        self.filter = GlobalClickFilter(threshold, list(buttons))
+        self.filter = GlobalClickFilter(FilterConfig.uniform(threshold, list(buttons)))
         self.filter._use_os_time = True
         self.sent: list = []  # (button, pressed, template), as re-sent
         self.pipe: list = []  # (when it comes back, button, its number)
@@ -1107,7 +1109,7 @@ class SendOrderTests(unittest.TestCase):
         # lup1 must still go out first. The hook must not wait for the
         # timer's send.
         sent, sending, go = [], threading.Event(), threading.Event()
-        click_filter = GlobalClickFilter(40, [Button.LEFT, Button.RIGHT])
+        click_filter = GlobalClickFilter(FilterConfig.uniform(40, [Button.LEFT, Button.RIGHT]))
         click_filter._use_os_time = True
 
         def inject(button, pressed, template, _seq):
@@ -1139,7 +1141,7 @@ class SendOrderTests(unittest.TestCase):
         # The timer's thread has sent lup and is letting go of the send lock
         # when the hook decides rup is to be re-sent: the hook finds the lock
         # still taken and leaves rup to the sender, which looks again.
-        click_filter = GlobalClickFilter(40, [Button.LEFT, Button.RIGHT])
+        click_filter = GlobalClickFilter(FilterConfig.uniform(40, [Button.LEFT, Button.RIGHT]))
         click_filter._use_os_time = True
         sent = []
         click_filter._inject = lambda button, pressed, template, _seq: sent.append(template)
@@ -1171,7 +1173,7 @@ class SendOrderTests(unittest.TestCase):
         # the timer decided to re-send a release must not pass straight
         # through before that release goes out.
         timers = FakeTimer.reset()
-        click_filter = GlobalClickFilter(40, [Button.LEFT])
+        click_filter = GlobalClickFilter(FilterConfig.uniform(40, [Button.LEFT]))
         click_filter._use_os_time = True
         click_filter._inject = lambda _button, _pressed, _template, _seq: None
         with mock.patch("app.platform.threading.Timer", FakeTimer):
@@ -1431,7 +1433,7 @@ class WindowsEventTimeTests(unittest.TestCase):
     def test_a_long_idle_is_just_a_long_gap(self) -> None:
         # 30 days without a click (time asleep counts): nothing is carried
         # from one event to the next, so the next click is simply late.
-        click_filter = GlobalClickFilter(60, [Button.LEFT])
+        click_filter = GlobalClickFilter(FilterConfig.uniform(60, [Button.LEFT]))
         click_filter._use_os_time = True
         click_filter._inject = lambda _button, _pressed, _template, _seq: False  # not waited for
         days = 30 * 24 * 3600
@@ -1459,7 +1461,7 @@ class WindowsClickTimingTests(unittest.TestCase):
         self.injected = []
 
     def make_filter(self, threshold: int) -> GlobalClickFilter:
-        click_filter = GlobalClickFilter(threshold, [Button.LEFT])
+        click_filter = GlobalClickFilter(FilterConfig.uniform(threshold, [Button.LEFT]))
         click_filter._use_os_time = True
         click_filter._inject = lambda button, pressed, template, _seq: self.injected.append((pressed, template))
         return click_filter
@@ -1521,7 +1523,7 @@ class WindowsClickTimingTests(unittest.TestCase):
 
 class AllowHoldTests(unittest.TestCase):
     def test_release_goes_straight_through_when_it_cannot_be_resent(self) -> None:
-        click_filter = GlobalClickFilter(40, [Button.LEFT])
+        click_filter = GlobalClickFilter(FilterConfig.uniform(40, [Button.LEFT]))
         click_filter._use_os_time = True
         click_filter._handle(Button.LEFT, True, 0.0, "down")
         release = click_filter._handle(Button.LEFT, False, 0.5, "up", allow_hold=False)
@@ -1696,7 +1698,7 @@ class ResendOrderTests(unittest.TestCase):
         patch.start()
         self.addCleanup(patch.stop)
         self.sent = []
-        self.filter = GlobalClickFilter(40, [Button.LEFT])
+        self.filter = GlobalClickFilter(FilterConfig.uniform(40, [Button.LEFT]))
         self.filter._use_os_time = True
         self.filter._inject = lambda button, pressed, template, _seq: self.sent.append((pressed, template))
 
@@ -1757,7 +1759,7 @@ class MotionFlushTests(unittest.TestCase):
         patch.start()
         self.addCleanup(patch.stop)
         self.injected = []
-        self.filter = GlobalClickFilter(40, [Button.LEFT])
+        self.filter = GlobalClickFilter(FilterConfig.uniform(40, [Button.LEFT]))
         self.filter._use_os_time = True
         self.filter._inject = lambda button, pressed, template, _seq: self.injected.append((pressed, template))
 
@@ -1963,7 +1965,7 @@ class MotionFlushTests(unittest.TestCase):
         self.assertEqual(self.injected, [(False, "up")])
 
     def test_a_press_still_settles_a_release_with_no_known_location(self) -> None:
-        self.filter.update(buttons=[Button.LEFT, Button.RIGHT])
+        self.filter.update(replace(self.filter.config, buttons=frozenset([Button.LEFT, Button.RIGHT])))
         self.filter._handle(Button.LEFT, True, 0.0, "down")
         self.filter._handle(Button.LEFT, False, 0.08, "up")
         self.assertTrue(self.filter._handle(Button.RIGHT, True, 0.2, "rdown").deferred)
@@ -1980,7 +1982,7 @@ class QueuedReleaseTests(unittest.TestCase):
         patch.start()
         self.addCleanup(patch.stop)
         self.sent = []
-        self.filter = GlobalClickFilter(40, [Button.LEFT])
+        self.filter = GlobalClickFilter(FilterConfig.uniform(40, [Button.LEFT]))
         self.filter._use_os_time = True
         self.filter._inject = lambda button, pressed, template, _seq: self.sent.append((pressed, template))
 
@@ -2024,13 +2026,13 @@ class TapBreakerTests(unittest.TestCase):
     """macOS disabling the tap over and over stops the filter, failing open."""
 
     def test_the_third_disable_within_the_window_gives_up(self) -> None:
-        click_filter = GlobalClickFilter(60, [Button.LEFT])
+        click_filter = GlobalClickFilter(FilterConfig.uniform(60, [Button.LEFT]))
         self.assertFalse(click_filter._tap_disabled(100.0))
         self.assertFalse(click_filter._tap_disabled(110.0))
         self.assertTrue(click_filter._tap_disabled(120.0))
 
     def test_disables_spread_out_keep_being_rearmed(self) -> None:
-        click_filter = GlobalClickFilter(60, [Button.LEFT])
+        click_filter = GlobalClickFilter(FilterConfig.uniform(60, [Button.LEFT]))
         for moment in (0.0, 20.0, 40.0, 60.0, 80.0, 100.0):
             self.assertFalse(click_filter._tap_disabled(moment))
 
@@ -2070,7 +2072,7 @@ class MacTimestampTests(unittest.TestCase):
     def test_a_posted_click_first_does_not_squeeze_later_real_ones(self) -> None:
         # A software click (ns) is the first thing the filter sees; two real
         # clicks (ticks) follow 300 ms apart and must not look like bounce.
-        click_filter = GlobalClickFilter(60, [Button.LEFT])
+        click_filter = GlobalClickFilter(FilterConfig.uniform(60, [Button.LEFT]))
         click_filter._use_os_time = True  # as _run_macos sets it
 
         def at(seconds: float, stamp: int) -> float:
@@ -2115,8 +2117,13 @@ class FakeQuartz:
     kCGEventRightMouseDown, kCGEventRightMouseUp = 3, 4
     kCGEventMouseMoved, kCGEventLeftMouseDragged, kCGEventRightMouseDragged = 5, 6, 7
     kCGEventOtherMouseDown, kCGEventOtherMouseUp, kCGEventOtherMouseDragged = 25, 26, 27
+    kCGEventScrollWheel = 22
     kCGEventTapDisabledByTimeout, kCGEventTapDisabledByUserInput = 0xFFFFFFFE, 0xFFFFFFFF
-    kCGMouseEventClickState, kCGMouseEventButtonNumber = 1, 3
+    kCGMouseEventClickState, kCGMouseEventButtonNumber, kCGMouseEventSubtype = 1, 3, 7
+    kCGScrollWheelEventDeltaAxis1, kCGScrollWheelEventDeltaAxis2 = 11, 12
+    kCGScrollWheelEventIsContinuous = 88
+    kCGScrollWheelEventFixedPtDeltaAxis1, kCGScrollWheelEventFixedPtDeltaAxis2 = 93, 94
+    kCGScrollWheelEventPointDeltaAxis1, kCGScrollWheelEventPointDeltaAxis2 = 96, 97
     kCGEventSourceUserData, kCGEventSourceStateID = 42, 45
     kCGEventSourceStateHIDSystemState = 1
     kCGHIDEventTap = kCGHeadInsertEventTap = kCGEventTapOptionDefault = kCGMouseButtonLeft = 0
@@ -2204,6 +2211,48 @@ class FakeQuartz:
         return FakeCGEvent(kind, point.x, point.y)
 
 
+class FakeSenders:
+    """devices_mac.SenderCache's stand-in: sender ID to device, no IOKit."""
+
+    def __init__(self) -> None:
+        self.devices: dict = {}
+        self.lookups: list = []
+        self.lookup_seconds: list = []
+        self.warmed = False
+
+    def lookup(self, sender):
+        self.lookups.append(sender)
+        return self.devices.get(sender)
+
+    def warm(self):
+        self.warmed = True
+
+
+class FakeFront:
+    """frontmost's stand-in: the app in front is whatever a test says."""
+
+    def __init__(self) -> None:
+        self.key = None
+        self.callbacks: list = []
+        self.stopped = 0
+
+    def current_app_key(self):
+        return self.key
+
+    def watch(self, callback):
+        self.callbacks.append(callback)
+        return SimpleNamespace(stop=self._stop)
+
+    def _stop(self) -> None:
+        self.stopped += 1
+
+    def bring(self, key) -> None:
+        """Another app comes to the front."""
+        self.key = key
+        for callback in self.callbacks:
+            callback(key)
+
+
 class UntouchableEvent:
     """An event nothing may look inside: any Quartz call on it fails."""
 
@@ -2226,9 +2275,14 @@ class MacTapTests(unittest.TestCase):
     def setUp(self) -> None:
         self.quartz = FakeQuartz()
         self.timers = FakeTimer.reset()
+        self.senders = FakeSenders()
+        self.front = FakeFront()
         for patch in (
             mock.patch.dict(sys.modules, {"Quartz": self.quartz}),
             mock.patch("app.platform.platform.system", return_value="Darwin"),
+            mock.patch("app.devices_mac.SenderCache", lambda: self.senders),
+            mock.patch("app.frontmost.current_app_key", self.front.current_app_key),
+            mock.patch("app.frontmost.watch", self.front.watch),
             mock.patch("app.platform.threading.Timer", FakeTimer),
             mock.patch("app.platform._timebase_ratio", return_value=(125, 3)),
             mock.patch("app.platform._double_click_interval", return_value=0.5),
@@ -2241,9 +2295,7 @@ class MacTapTests(unittest.TestCase):
         # Per call of on_permission_lost: its thread, and how many events
         # had been posted by then.
         self.lost = []
-        self.filter = GlobalClickFilter(
-            60,
-            [Button.LEFT],
+        self.filter = GlobalClickFilter(FilterConfig.uniform(60, [Button.LEFT]),
             on_event=self.events.append,
             on_error=self.errors.append,
             permission_ok=lambda: self.permitted,
@@ -2621,12 +2673,240 @@ class MacTapTests(unittest.TestCase):
         self.quartz.refuse_taps = True
         with mock.patch("app.permissions.pane_name", return_value="Device Control and Data Access"):
             with self.assertRaises(HookError) as raised:
-                GlobalClickFilter(60, [Button.LEFT]).start()
+                GlobalClickFilter(FilterConfig.uniform(60, [Button.LEFT])).start()
         self.assertEqual(
             str(raised.exception),
             "macOS refused the event tap. Allow Mouse Double-Click Fixer in System Settings › Privacy & Security "
             "› Device Control and Data Access, then try again.",
         )
+
+    # -- 1.0: side buttons, the wheel, devices, touch and excluded apps ------------
+    def event(self, kind, offset, at=(0, 0), number=None, subtype=0, sender=0, state=1, hardware=True, **fields):
+        """A button or scroll event with the given fields."""
+        self.clock = offset
+        values = {self.Q.kCGMouseEventClickState: state, self.Q.kCGMouseEventSubtype: subtype, 87: sender}
+        if hardware:
+            values[self.Q.kCGEventSourceStateID] = self.Q.kCGEventSourceStateHIDSystemState
+        if number is not None:
+            values[self.Q.kCGMouseEventButtonNumber] = number
+        values.update(fields)
+        return FakeCGEvent(kind, *at, timestamp=self.ticks(offset), fields=values)
+
+    def feed(self, *args, **kwargs):
+        event = self.event(*args, **kwargs)
+        return self.tap.callback(None, event.kind, event, None)
+
+    def _scroll(self, offset, vertical, horizontal, continuous, tap=None, **kwargs):
+        Q = self.Q
+        event = self.event(Q.kCGEventScrollWheel, offset, **kwargs)
+        event.fields.update({
+            Q.kCGScrollWheelEventDeltaAxis1: vertical, Q.kCGScrollWheelEventPointDeltaAxis1: vertical * 10,
+            Q.kCGScrollWheelEventFixedPtDeltaAxis1: vertical << 16,
+            Q.kCGScrollWheelEventDeltaAxis2: horizontal, Q.kCGScrollWheelEventPointDeltaAxis2: horizontal * 10,
+            Q.kCGScrollWheelEventFixedPtDeltaAxis2: horizontal << 16,
+            Q.kCGScrollWheelEventIsContinuous: continuous,
+        })
+        return (tap or self.tap).callback(None, event.kind, event, None), event
+
+    def configure(self, **changes) -> None:
+        from dataclasses import replace
+
+        self.filter.update(replace(self.filter.config, **changes))
+
+    def wait_for_taps(self, count: int) -> list:
+        deadline = monotonic() + 2
+        while len(self.quartz.taps) < count and monotonic() < deadline:
+            threading.Event().wait(0.005)
+        self.assertEqual(len(self.quartz.taps), count, "the tap was not replaced")
+        return self.quartz.taps
+
+    def test_side_buttons_by_their_number(self) -> None:
+        Q = self.Q
+        self.configure(buttons=frozenset({Button.LEFT, Button.BACK}))
+        verdicts = [
+            self.feed(Q.kCGEventOtherMouseDown, 0.000, number=3) is not None,
+            self.feed(Q.kCGEventOtherMouseUp, 0.060, number=3) is not None,
+            self.feed(Q.kCGEventOtherMouseDown, 0.066, number=3) is not None,
+            self.feed(Q.kCGEventOtherMouseUp, 0.080, number=3) is not None,
+        ]
+        self.assertEqual(verdicts, [True, True, False, False], "back: the bounce dropped, no release held")
+        self.assertEqual(self.quartz.posted, [], "nothing held or re-sent")
+        self.assertEqual([event.button for event in self.events], [Button.BACK] * 4)
+        # Forward isn't filtered here, and a fifth button never is.
+        for number in (4, 5):
+            kinds = [self.feed(kind, offset, number=number) is not None
+                     for kind, offset in ((Q.kCGEventOtherMouseDown, 1.0), (Q.kCGEventOtherMouseUp, 1.06),
+                                          (Q.kCGEventOtherMouseDown, 1.066), (Q.kCGEventOtherMouseUp, 1.08))]
+            self.assertEqual(kinds, [True] * 4, f"button {number}")
+        self.assertEqual({event.button for event in self.events[4:]}, {Button.FORWARD}, "button 5 never reached the filter")
+
+    def test_a_side_button_re_sent_behind_a_release_settles_its_own_button(self) -> None:
+        Q = self.Q
+        self.configure(buttons=frozenset({Button.LEFT, Button.BACK}))
+        self.button(Q.kCGEventLeftMouseDown, (0, 0), 0.000)
+        self.button(Q.kCGEventLeftMouseUp, (0, 0), 0.080)           # held
+        self.assertIsNone(self.feed(Q.kCGEventOtherMouseDown, 0.150, number=3), "goes out behind the release")
+        up, back = self.quartz.posted
+        self.assertEqual((up.kind, back.kind), (Q.kCGEventLeftMouseUp, Q.kCGEventOtherMouseDown))
+        self.assertEqual(back.fields[Q.kCGMouseEventButtonNumber], 3)
+        self.assertEqual(len(self.filter._in_flight[Button.BACK]), 1)
+        self.pass_back(up)
+        self.assertIs(self.pass_back(back), back)
+        self.assertEqual(len(self.filter._in_flight[Button.BACK]), 0, "its mark settled the back button's re-send")
+
+    def test_the_wheel_joins_the_tap_only_while_the_fix_is_on(self) -> None:
+        Q = self.Q
+        wheel_bit = self.quartz.CGEventMaskBit(Q.kCGEventScrollWheel)
+        self.assertFalse(self.tap.mask & wheel_bit, "off: scrolling never reaches the process")
+        self.configure(wheel_fix=True)
+        old, fresh = self.wait_for_taps(2)
+        self.assertTrue(fresh.mask & wheel_bit)
+        self.assertEqual(fresh.mask & ~wheel_bit, old.mask, "everything else as before")
+        self.assertTrue(fresh.enabled)
+        self.assertTrue(old.invalidated and not old.enabled, "the old tap is gone")
+        self.assertTrue(self.filter.tap_alive())
+        self.assertIs(self.filter._tap, fresh)
+        self.configure(wheel_fix=False)
+        self.assertFalse(self.wait_for_taps(3)[2].mask & wheel_bit)
+
+    def test_replacing_the_tap_settles_a_held_release_first(self) -> None:
+        Q = self.Q
+        self.button(Q.kCGEventLeftMouseDown, (0, 0), 0.000)
+        self.button(Q.kCGEventLeftMouseUp, (0, 0), 0.080)           # held
+        self.configure(wheel_fix=True)
+        old, fresh = self.wait_for_taps(2)
+        (release,) = self.quartz.posted
+        self.assertEqual(release.kind, Q.kCGEventLeftMouseUp)
+        self.assertEqual(self.quartz.taps_enabled_at_post[0], [True], "posted while only the old tap was there")
+        # The old tap's callback now lets everything through, and decides
+        # nothing: a bounce reaching it is not its business any more.
+        bounce = self.event(Q.kCGEventLeftMouseDown, 0.085)
+        self.assertIs(old.callback(None, bounce.kind, bounce, None), bounce)
+        self.assertEqual(len(self.events), 2)
+        self.assertEqual(self.filter._in_flight[Button.LEFT], type(self.filter._in_flight[Button.LEFT])(),
+                         "nothing waits for what may have passed the old tap")
+
+    def test_a_refused_new_tap_keeps_the_old_one(self) -> None:
+        self.quartz.refuse_taps = True
+        with self.assertLogs("app.platform", "WARNING"):
+            self.configure(wheel_fix=True)
+            deadline = monotonic() + 1
+            while monotonic() < deadline:
+                threading.Event().wait(0.01)
+        self.assertEqual(len(self.quartz.taps), 1)
+        self.assertTrue(self.tap.enabled)
+        self.assertTrue(self.filter.running)
+
+    def wheel_tap(self):
+        self.configure(wheel_fix=True)
+        return self.wait_for_taps(2)[1]
+
+    def test_a_stray_reversing_notch_is_dropped(self) -> None:
+        tap = self.wheel_tap()
+        heard = []
+        self.filter._on_wheel = lambda axis, dropped: heard.append((axis, dropped))
+        answers = [self._scroll(offset, vertical, 0, 0, tap=tap)[0] is not None
+                   for offset, vertical in ((0.000, -1), (0.020, -1), (0.030, 1), (0.040, -1), (0.200, 1))]
+        self.assertEqual(answers, [True, True, False, True, True])
+        self.assertEqual(heard, [(1, False), (1, False), (1, True), (1, False), (1, False)])
+        self.assertEqual(self.quartz.posted, [], "a notch is never held or re-sent")
+
+    def test_continuous_and_other_apps_scrolling_are_never_touched(self) -> None:
+        tap = self.wheel_tap()
+        self._scroll(0.000, -1, 0, 0, tap=tap)
+        self.assertIsNotNone(self._scroll(0.010, 1, 0, 1, tap=tap)[0], "a trackpad's scrolling")
+        self.assertIsNotNone(self._scroll(0.015, 1, 0, 0, tap=tap, hardware=False)[0], "another app's")
+        self.assertIsNotNone(self._scroll(0.016, 1, 0, 0, tap=tap, subtype=3)[0], "a touch")
+        self.assertIsNone(self._scroll(0.020, 1, 0, 0, tap=tap)[0], "the wheel's own")
+
+    def test_two_axes_in_one_event_drop_only_the_stray_one(self) -> None:
+        Q = self.Q
+        tap = self.wheel_tap()
+        self._scroll(0.000, -1, 0, 0, tap=tap)
+        answer, event = self._scroll(0.010, 1, 2, 0, tap=tap)
+        self.assertIs(answer, event)
+        self.assertEqual(
+            [event.fields[field] for field in (Q.kCGScrollWheelEventDeltaAxis1, Q.kCGScrollWheelEventPointDeltaAxis1,
+                                               Q.kCGScrollWheelEventFixedPtDeltaAxis1)],
+            [0, 0, 0],
+            "the vertical notch is cleared",
+        )
+        self.assertEqual(event.fields[Q.kCGScrollWheelEventDeltaAxis2], 2, "the horizontal one kept")
+
+    def test_a_touch_press_waits_behind_the_mouses_held_release(self) -> None:
+        Q = self.Q
+        self.button(Q.kCGEventLeftMouseDown, (0, 0), 0.000)
+        self.button(Q.kCGEventLeftMouseUp, (0, 0), 0.080)           # held
+        self.assertIsNone(self.feed(Q.kCGEventLeftMouseDown, 0.090, subtype=3, state=2), "re-sent behind it")
+        up, touch = self.quartz.posted
+        self.assertEqual((up.kind, touch.kind), (Q.kCGEventLeftMouseUp, Q.kCGEventLeftMouseDown))
+        self.assertEqual(touch.fields[Q.kCGMouseEventSubtype], 3)
+        self.assertEqual(touch.fields[Q.kCGMouseEventClickState], 2, "its count untouched")
+        self.pass_back(up)
+        self.pass_back(touch)
+        lifted = self.event(Q.kCGEventLeftMouseUp, 0.150, subtype=3, state=2)
+        self.assertIs(self.tap.callback(None, lifted.kind, lifted, None), lifted, "its release passes untouched")
+        self.assertEqual([event.pressed for event in self.events], [True, False], "on_event heard the mouse only")
+
+    def test_a_touchpad_double_tap_passes_untouched(self) -> None:
+        Q = self.Q
+        answers = [self.feed(kind, offset, subtype=3, state=state) is not None
+                   for kind, offset, state in ((Q.kCGEventLeftMouseDown, 0.000, 1), (Q.kCGEventLeftMouseUp, 0.040, 1),
+                                               (Q.kCGEventLeftMouseDown, 0.0405, 2), (Q.kCGEventLeftMouseUp, 0.080, 2))]
+        self.assertEqual(answers, [True] * 4)
+        self.assertEqual((self.quartz.posted, self.events, self.filter.filtered_count), ([], [], 0))
+        self.assertEqual(self.filter.passed_counts, {"touch": 2})
+
+    def test_the_sending_device_is_looked_up_once_and_announced(self) -> None:
+        from app.devices_mac import MacDevice
+
+        Q = self.Q
+        devices = []
+        self.filter._on_device = devices.append
+        self.senders.devices[0x1000AAA28] = MacDevice("bt:03f0:0f4c:HP Mouse", "HP Mouse", "mouse")
+        self.feed(Q.kCGEventLeftMouseDown, 0.000, sender=0x1000AAA28)
+        self.feed(Q.kCGEventLeftMouseUp, 0.080, sender=0x1000AAA28)
+        self.assertTrue(self.senders.warmed, "connected devices are looked up ahead, off the tap")
+        self.assertEqual([device.key for device in devices], ["bt:03f0:0f4c:HP Mouse"])
+        self.assertEqual([event.device for event in self.events], ["bt:03f0:0f4c:HP Mouse"] * 2)
+        self.assertEqual(self.filter.seen_devices()[0].name, "HP Mouse")
+        self.feed(Q.kCGEventLeftMouseDown, 0.500, sender=0)  # posted: no sender
+        self.assertEqual(self.senders.lookups, [0x1000AAA28, 0x1000AAA28], "sender 0 is never looked up")
+
+    def test_trackpads_and_ignored_devices_pass(self) -> None:
+        from app.devices_mac import MacDevice
+
+        Q = self.Q
+        self.senders.devices[1] = MacDevice("fifo:0000:0000:Apple Internal Keyboard / Trackpad", "Trackpad", "trackpad")
+        self.senders.devices[2] = MacDevice("usb:046d:c08b:G502", "G502", "mouse")
+        self.configure(ignored_devices=frozenset({"usb:046d:c08b:G502"}))
+        for sender, start in ((1, 0.0), (2, 1.0)):
+            answers = [self.feed(kind, start + offset, sender=sender) is not None
+                       for kind, offset in ((Q.kCGEventLeftMouseDown, 0.0), (Q.kCGEventLeftMouseUp, 0.04),
+                                            (Q.kCGEventLeftMouseDown, 0.045), (Q.kCGEventLeftMouseUp, 0.08))]
+            self.assertEqual(answers, [True] * 4, sender)
+        self.assertEqual(self.events, [])
+        self.assertEqual(self.filter.passed_counts, {"touch": 2, "ignored device": 2})
+
+    def test_nothing_is_filtered_while_an_excluded_app_is_in_front(self) -> None:
+        Q = self.Q
+        self.assertEqual(len(self.front.callbacks), 1, "the app in front is watched while the filter runs")
+        self.configure(excluded_apps=frozenset({"com.valvesoftware.steam"}))
+        self.button(Q.kCGEventLeftMouseDown, (0, 0), 0.000)
+        self.button(Q.kCGEventLeftMouseUp, (0, 0), 0.080)           # held
+        self.front.bring("com.valvesoftware.steam")
+        self.assertEqual([event.kind for event in self.quartz.posted], [Q.kCGEventLeftMouseUp], "settled at once")
+        self.pass_back(self.quartz.posted[0])
+        answers = [self.feed(kind, offset) is not None
+                   for kind, offset in ((Q.kCGEventLeftMouseDown, 0.300), (Q.kCGEventLeftMouseUp, 0.350),
+                                        (Q.kCGEventLeftMouseDown, 0.355), (Q.kCGEventLeftMouseUp, 0.390))]
+        self.assertEqual(answers, [True] * 4)
+        self.front.bring("com.apple.finder")
+        self.feed(Q.kCGEventLeftMouseDown, 1.000)
+        self.feed(Q.kCGEventLeftMouseUp, 1.050)
+        self.assertIsNone(self.feed(Q.kCGEventLeftMouseDown, 1.055), "filtered again")
+        self.filter.stop()
+        self.assertEqual(self.front.stopped, 1)
 
 
 if __name__ == "__main__":

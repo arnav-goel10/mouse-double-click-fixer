@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from app import settings
-from app.contracts import DEFAULT_THRESHOLD_MS, Button
+from app.core import DEFAULT_THRESHOLD_MS, Button
 
 
 class SettingsTests(unittest.TestCase):
@@ -240,7 +240,7 @@ class MigrationTests(unittest.TestCase):
         self.assertEqual(values["buttons"], ["left"])
         self.assertEqual(values["calibrated_buttons"], [])
         self.assertFalse(values["wheel_fix"])
-        from app.contracts import WHEEL_DEFAULT_MS
+        from app.platform import WHEEL_DEFAULT_MS
 
         self.assertEqual(values["wheel_window_ms"], WHEEL_DEFAULT_MS)
 

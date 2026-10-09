@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..contracts import Button
+from ..core import Button
 from . import symbols
 from .theme import IS_MAC, IS_WINDOWS, Look, current_look, font, with_alpha
 

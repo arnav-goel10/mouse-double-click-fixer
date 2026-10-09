@@ -104,7 +104,7 @@ class PaneTestCase(unittest.TestCase):
 
 class FilterPaneTests(PaneTestCase):
     def test_a_row_per_button_with_its_window_and_switch(self) -> None:
-        from app.contracts import Button
+        from app.core import Button
 
         page = self.window.filter_page
         self.assertEqual(set(page.button_rows), set(Button))
@@ -116,7 +116,7 @@ class FilterPaneTests(PaneTestCase):
             self.assertIn("Calibrate", page.button_rows[button].detail.text())
 
     def test_each_window_reaches_its_own_button(self) -> None:
-        from app.contracts import Button
+        from app.core import Button
 
         hook = self.hook()
         page = self.window.filter_page
@@ -136,7 +136,7 @@ class FilterPaneTests(PaneTestCase):
         set_wheel_fix.assert_not_called()
 
     def test_the_calibrate_link_opens_calibration_for_that_button(self) -> None:
-        from app.contracts import Button
+        from app.core import Button
 
         self.show("filter")
         self.window.filter_page.button_rows[Button.FORWARD].detail.linkActivated.emit("calibrate")
@@ -145,7 +145,7 @@ class FilterPaneTests(PaneTestCase):
         self.assertEqual(self.window.calibrate.button_picker.currentText(), "Forward")
 
     def test_a_calibrated_button_says_so(self) -> None:
-        from app.contracts import Button
+        from app.core import Button
 
         self.controller.set_calibrated(Button.RIGHT)
         detail = self.window.filter_page.button_rows[Button.RIGHT].detail.text()
@@ -154,7 +154,7 @@ class FilterPaneTests(PaneTestCase):
         self.assertEqual(self.window.filter_page.button_rows[Button.RIGHT].detail.accessibleDescription(), "Calibrated.")
 
     def test_each_calibrate_link_says_which_button_it_is_for(self) -> None:
-        from app.contracts import Button
+        from app.core import Button
 
         names = [row.detail.accessibleName() for row in self.window.filter_page.button_rows.values()]
         self.assertEqual(names, ["Calibrate the left button", "Calibrate the right button", "Calibrate the middle button",
@@ -198,7 +198,7 @@ class FilterPaneTests(PaneTestCase):
         return area
 
     def test_scrolling_over_a_window_box_scrolls_the_pane_and_keeps_the_window(self) -> None:
-        from app.contracts import Button
+        from app.core import Button
 
         hook = self.hook()
         self.controller.set_buttons(list(Button))  # every box enabled: the worst case
@@ -225,7 +225,7 @@ class FilterPaneTests(PaneTestCase):
         self.assertEqual(len(hook.updates), updates, "nothing reached the filter")
 
     def test_the_wheel_still_changes_a_window_box_with_focus(self) -> None:
-        from app.contracts import Button
+        from app.core import Button
 
         self.scrolling_pane("filter")
         box = self.window.filter_page.window_boxes[Button.LEFT]
@@ -238,7 +238,7 @@ class FilterPaneTests(PaneTestCase):
         self.assertEqual(self.controller.threshold_for(Button.LEFT), 45, "chosen on purpose, so saved")
 
     def test_scrolling_over_a_button_picker_keeps_the_button(self) -> None:
-        from app.contracts import Button
+        from app.core import Button
 
         self.seed_side_history()
         for key, page in (("calibrate", self.window.calibrate), ("history", self.window.history)):
@@ -256,7 +256,7 @@ class FilterPaneTests(PaneTestCase):
     def seed_side_history(self) -> None:
         """History for the back button too, so the History picker has a
         second button to turn to."""
-        from app.contracts import Button
+        from app.core import Button
         from app.core import ClickEvent
 
         self.controller.wear.note_event(ClickEvent(Button.BACK, True, True, 400.0, None), 46)
@@ -277,7 +277,7 @@ class CalibrateEachButtonTests(PaneTestCase):
         self.assertEqual(page.phase, "done")
 
     def test_the_back_button_is_measured_and_applied_to_itself(self) -> None:
-        from app.contracts import Button
+        from app.core import Button
 
         page = self.window.calibrate
         self.window.show_calibration(Button.BACK)
@@ -296,7 +296,7 @@ class CalibrateEachButtonTests(PaneTestCase):
         self.assertIs(page.button, Button.BACK, "the choice stays for next time")
 
     def test_the_picker_chooses_and_locks_while_measuring(self) -> None:
-        from app.contracts import Button
+        from app.core import Button
 
         page = self.window.calibrate
         page.button_picker.activated.emit(1)  # the user picks Right
@@ -311,7 +311,7 @@ class CalibrateEachButtonTests(PaneTestCase):
         self.assertTrue(page.button_picker.isEnabled())
 
     def test_choosing_another_button_starts_over(self) -> None:
-        from app.contracts import Button
+        from app.core import Button
 
         page = self.window.calibrate
         page._advance()
@@ -325,7 +325,7 @@ class CalibrateEachButtonTests(PaneTestCase):
         from PySide6.QtCore import QPoint, Qt
         from PySide6.QtTest import QTest
 
-        from app.contracts import Button
+        from app.core import Button
 
         self.show("test")
         pad = self.window.test_page.pad
@@ -337,7 +337,7 @@ class CalibrateEachButtonTests(PaneTestCase):
         self.assertEqual(seen, [Button.BACK, Button.FORWARD])
 
     def test_the_test_pane_judges_each_button_by_its_window(self) -> None:
-        from app.contracts import Button
+        from app.core import Button
 
         self.controller.set_threshold(Button.BACK, 20)
         page = self.window.test_page
@@ -349,7 +349,7 @@ class CalibrateEachButtonTests(PaneTestCase):
 
 class HistoryPaneTests(PaneTestCase):
     def seed(self, button=None, days=30, clicks=500, bounces=(3, 9)) -> None:
-        from app.contracts import Button
+        from app.core import Button
         from app.core import ClickEvent
 
         button = button or Button.LEFT
@@ -386,7 +386,7 @@ class HistoryPaneTests(PaneTestCase):
         self.window.grab()
 
     def test_the_picker_shows_buttons_with_history(self) -> None:
-        from app.contracts import Button
+        from app.core import Button
 
         self.seed(Button.FORWARD, days=2)
         self.window.refresh()
@@ -407,7 +407,7 @@ class HistoryPaneTests(PaneTestCase):
         self.assertEqual(page.wheel_value.text(), "1 of 1 ticks")
 
     def test_the_counts_move_while_the_pane_is_open(self) -> None:
-        from app.contracts import Button
+        from app.core import Button
         from app.core import ClickEvent
 
         self.show("history")
@@ -502,7 +502,7 @@ class AppsPaneTests(PaneTestCase):
 
 class DevicesPaneTests(PaneTestCase):
     def device(self, key, name, kind="mouse"):
-        from app.contracts import DeviceInfo
+        from app.platform import DeviceInfo
 
         import time
 
@@ -582,7 +582,7 @@ class LookTests(PaneTestCase):
             self.assertTrue(button.accessibleName() or button.text(), "a button without a name")
 
     def test_copy_diagnostics_says_what_1_0_adds_and_keeps_keys_private(self) -> None:
-        from app.contracts import Button
+        from app.core import Button
 
         self.controller.set_threshold(Button.RIGHT, 30)
         self.controller.set_wheel_fix(True)

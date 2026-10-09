@@ -15,7 +15,7 @@ from pathlib import Path
 from unittest import mock
 
 from app import settings, wear
-from app.contracts import Button
+from app.core import Button
 from app.core import ClickEvent
 from app.wear import DayStats, WearHistory, classify_trend
 

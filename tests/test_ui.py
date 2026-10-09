@@ -130,7 +130,7 @@ class WindowTests(unittest.TestCase):
         self.assertFalse(page.primary_button.isEnabled())
 
     def test_settings_changes_reach_the_controller(self) -> None:
-        from app.contracts import Button
+        from app.core import Button
 
         page = self.window.filter_page
         page.window_boxes[Button.LEFT].setValue(35)
@@ -1054,7 +1054,7 @@ class CalibrationFlowTests(LiveWindowTests):
         self.assertEqual(page.pad._flash_tone, "neutral", "not flashed as counted")
 
     def test_only_the_chosen_button_is_measured(self) -> None:
-        from app.contracts import Button
+        from app.core import Button
 
         page = self.to_double_phase()
         page._on_pad_press(1500.0, 1600.0, Button.LEFT)
@@ -1118,7 +1118,7 @@ class CalibrationFlowTests(LiveWindowTests):
         self.assertEqual(self.pad_gap(False, []), 0.0, "macOS stamps are precise; these say 0")
 
     def test_test_pane_shows_bounces_on_every_button(self) -> None:
-        from app.contracts import Button
+        from app.core import Button
         from app.core import ClickEvent
 
         page = self.window.test_page
@@ -1309,7 +1309,7 @@ class ControllerFixTests(unittest.TestCase):
     def test_settings_writes_keep_unflushed_bounces(self) -> None:
         for _ in range(40):
             self.bounce()
-        from app.contracts import Button
+        from app.core import Button
 
         self.controller.set_threshold(Button.LEFT, 70)  # an unrelated write
         self.assertEqual(self.controller.filtered_total, 40)
@@ -1567,7 +1567,7 @@ class StateFixTests(unittest.TestCase):
         self.assertEqual(self.controller.status_text(), "Paused for calibration")
 
     def test_a_failed_settings_write_still_takes_effect(self) -> None:
-        from app.contracts import Button
+        from app.core import Button
 
         with mock.patch("app.settings.save", side_effect=OSError("disk full")):
             self.controller.set_threshold(Button.RIGHT, 35)

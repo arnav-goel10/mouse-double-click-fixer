@@ -295,7 +295,7 @@ class ControllerFeatureTests(unittest.TestCase):
         return FakeFilter.instances[-1]
 
     def test_the_filter_starts_with_the_whole_configuration(self) -> None:
-        from app.contracts import Button
+        from app.core import Button
 
         self.controller.set_threshold(Button.RIGHT, 30)
         self.controller.set_buttons([Button.LEFT, Button.RIGHT, Button.BACK])
@@ -314,7 +314,7 @@ class ControllerFeatureTests(unittest.TestCase):
 
     def test_every_change_reaches_a_running_filter_and_is_saved(self) -> None:
         from app import settings
-        from app.contracts import Button
+        from app.core import Button
 
         hook = self.running()
         steps = [
@@ -342,7 +342,7 @@ class ControllerFeatureTests(unittest.TestCase):
         self.assertTrue(saved["wheel_fix"])
 
     def test_a_change_to_nothing_new_does_nothing(self) -> None:
-        from app.contracts import Button
+        from app.core import Button
 
         hook = self.running()
         self.controller.set_threshold(Button.LEFT, 46)
@@ -356,7 +356,7 @@ class ControllerFeatureTests(unittest.TestCase):
         self.assertEqual(self.controller.excluded_apps, [{"key": "a.exe", "name": "A"}])
 
     def test_each_button_has_its_own_window(self) -> None:
-        from app.contracts import Button
+        from app.core import Button
 
         self.controller.set_threshold(Button.BACK, 20)
         self.controller.set_threshold("right", 300)  # a plain name, as a signal delivers it; clamped
@@ -366,7 +366,7 @@ class ControllerFeatureTests(unittest.TestCase):
         self.assertEqual(self.controller.threshold_ms, 46, "the left button's")
 
     def test_one_button_always_stays_filtered(self) -> None:
-        from app.contracts import Button
+        from app.core import Button
 
         self.controller.set_button_filtered(Button.LEFT, False)
         self.assertEqual(self.controller.buttons, [Button.LEFT])
@@ -376,7 +376,7 @@ class ControllerFeatureTests(unittest.TestCase):
 
     def test_calibration_is_per_button(self) -> None:
         from app import settings
-        from app.contracts import Button
+        from app.core import Button
 
         self.controller.set_calibrated(Button.BACK)
         self.assertTrue(self.controller.is_calibrated(Button.BACK))
@@ -397,7 +397,7 @@ class ControllerFeatureTests(unittest.TestCase):
         self.assertFalse(self.controller.wheel_fix)
 
     def test_tooltip_names_a_window_only_when_they_agree(self) -> None:
-        from app.contracts import Button
+        from app.core import Button
 
         self.running()
         self.controller.set_buttons([Button.LEFT, Button.RIGHT])
@@ -407,7 +407,7 @@ class ControllerFeatureTests(unittest.TestCase):
 
     # -- wear --------------------------------------------------------------------
     def test_presses_of_filtered_buttons_count_towards_wear(self) -> None:
-        from app.contracts import Button
+        from app.core import Button
         from app.core import ClickEvent
 
         hook = self.running()
@@ -425,7 +425,7 @@ class ControllerFeatureTests(unittest.TestCase):
         self.assertEqual(self.controller.session_filtered, 2, "the blocked count is as before")
 
     def test_a_button_turned_on_starts_counting(self) -> None:
-        from app.contracts import Button
+        from app.core import Button
         from app.core import ClickEvent
 
         hook = self.running()
@@ -440,7 +440,7 @@ class ControllerFeatureTests(unittest.TestCase):
         self.assertEqual(self.controller.wear.wheel_totals(), (2, 1))
 
     def test_the_history_is_written_when_due_and_at_quit(self) -> None:
-        from app.contracts import Button
+        from app.core import Button
         from app.core import ClickEvent
 
         hook = self.running()
@@ -459,7 +459,7 @@ class ControllerFeatureTests(unittest.TestCase):
         self.assertEqual(saved.daily(Button.LEFT)[-1].presses, 2, "the last counts are written at quit")
 
     def test_the_history_is_read_at_launch(self) -> None:
-        from app.contracts import Button
+        from app.core import Button
         from app.controller import AppController
 
         self.controller.wear.note_event(mock.Mock(pressed=True, button=Button.LEFT, cancels_held=False,
@@ -470,7 +470,7 @@ class ControllerFeatureTests(unittest.TestCase):
     def test_presses_from_devices_passed_through_are_not_the_switchs_wear(self) -> None:
         from types import SimpleNamespace
 
-        from app.contracts import Button
+        from app.core import Button
 
         hook = self.running()
 
@@ -489,7 +489,7 @@ class ControllerFeatureTests(unittest.TestCase):
 
     # -- devices -----------------------------------------------------------------
     def device(self, key, name="HP mouse", kind="mouse", filtered=True, when=100.0):
-        from app.contracts import DeviceInfo
+        from app.platform import DeviceInfo
 
         return DeviceInfo(key=key, name=name, kind=kind, filtered=filtered, last_seen=when)
 
@@ -524,7 +524,7 @@ class ControllerFeatureTests(unittest.TestCase):
 
     # -- diagnostics -------------------------------------------------------------
     def test_diagnostics_say_what_1_0_adds_without_private_keys(self) -> None:
-        from app.contracts import Button
+        from app.core import Button
 
         hook = self.running()
         self.controller.set_threshold(Button.RIGHT, 30)
@@ -540,6 +540,12 @@ class ControllerFeatureTests(unittest.TestCase):
         self.assertEqual(state["excluded apps"], 1)
         self.assertEqual(state["ignored devices"], "G502 HERO")
         self.assertEqual(state["seen devices"], "Magic Mouse (mouse)")
+        self.assertEqual(state["passed untouched"], "none")
+        hook.passed_counts = {"touch": 3, "excluded app": 1}
+        hook.wheel_dropped = 2
+        state = self.controller.diagnostic_state()
+        self.assertEqual(state["passed untouched"], "excluded app 1, touch 3")
+        self.assertEqual(state["wheel ticks dropped"], 2)
         shown = self.controller.diagnostic_settings()
         self.assertEqual(shown["excluded_apps"], 1)
         self.assertEqual(shown["ignored_devices"], ["G502 HERO"])

@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 
 from .. import DISPLAY_NAME, __version__, diagnostics, notices, permissions, startup
 from .. import settings as settings_store
-from ..contracts import SIDE_BUTTONS, Button
+from ..core import SIDE_BUTTONS, Button
 from ..controller import AppController
 from ..core import (
     BOUNCE_CANDIDATE_MS,

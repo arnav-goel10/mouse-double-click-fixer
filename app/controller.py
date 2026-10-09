@@ -13,10 +13,9 @@ from PySide6.QtCore import QObject, Signal
 from . import DISPLAY_NAME, permissions
 from . import settings as settings_store
 from . import startup
-from .contracts import SIDE_BUTTONS, Button, DeviceInfo, FilterConfig, GlobalClickFilter
-from .core import ClickEvent, clamp_threshold
+from .core import SIDE_BUTTONS, Button, ClickEvent, clamp_threshold
 from .inputs import TOUCH_KINDS, as_button, button_name
-from .platform import HookError, is_supported
+from .platform import DeviceInfo, FilterConfig, GlobalClickFilter, HookError, is_supported
 from .wear import WearHistory
 
 log = logging.getLogger(__name__)
@@ -27,7 +26,7 @@ UPDATE_STATE_KEYS = frozenset({"auto_check", "update_attempt_version", "update_a
 
 def config_from_settings(values: dict[str, Any]) -> FilterConfig:
     """The filter's configuration from the saved settings. The one place a
-    FilterConfig is built (see app/contracts.py)."""
+    FilterConfig is built."""
     return FilterConfig(
         thresholds=settings_store.thresholds_from(values),
         buttons=frozenset(settings_store.buttons_from(values)),
@@ -415,6 +414,11 @@ class AppController(QObject):
             "tap alive": self.tap_alive(),
             "tap resets": getattr(current, "tap_resets", "-"),
             "hook re-arms": getattr(current, "hook_rearms", "-"),
+            "passed untouched": ", ".join(
+                f"{reason} {count}" for reason, count in sorted(getattr(current, "passed_counts", {}).items())
+            )
+            or "none",
+            "wheel ticks dropped": getattr(current, "wheel_dropped", "-"),
             "blocked this session": self.session_filtered,
             "login item": self.login_item_state,
             "windows": self._windows_text(every=True),

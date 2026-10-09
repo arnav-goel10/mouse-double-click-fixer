@@ -22,6 +22,7 @@ import threading
 import time
 import unittest
 from contextlib import contextmanager
+from dataclasses import replace
 from unittest import mock
 
 from app.core import Button
@@ -30,8 +31,10 @@ from app.platform import (
     MOTION_MARK_FOR,
     TELEPORT_MARK,
     WINDOWS_STAMP_ERROR_S,
+    FilterConfig,
     GlobalClickFilter,
     InputSender,
+    WindowsApi,
     WindowsHook,
     mark_kind,
     mark_seq,
@@ -44,7 +47,14 @@ WM_LBUTTONDOWN = 0x0201
 WM_LBUTTONUP = 0x0202
 WM_RBUTTONDOWN = 0x0204
 WM_RBUTTONUP = 0x0205
-MESSAGES = {WM_MOUSEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP, 0x0207, 0x0208}
+WM_MOUSEWHEEL = 0x020A
+WM_XBUTTONDOWN = 0x020B
+WM_XBUTTONUP = 0x020C
+WM_MOUSEHWHEEL = 0x020E
+MESSAGES = {
+    WM_MOUSEMOVE, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP, 0x0207, 0x0208,
+    WM_MOUSEWHEEL, WM_XBUTTONDOWN, WM_XBUTTONUP, WM_MOUSEHWHEEL,
+}
 PEN = 0xFF515701
 
 
@@ -154,14 +164,18 @@ class FakeWindows:
         return abs(location[0] - point[0]) < self.drag[0] and abs(location[1] - point[1]) < self.drag[1]
 
     def _swap(self, button: Button) -> Button:
-        if self.swapped and button is not Button.MIDDLE:
+        if self.swapped and button in (Button.LEFT, Button.RIGHT):
             return Button.RIGHT if button is Button.LEFT else Button.LEFT
         return button
 
     def button_flags(self, button: Button, pressed: bool):
         return (self._swap(button), pressed)  # the physical button
 
-    def button_input(self, flags, when, mark):
+    def button_data(self, button: Button) -> int:
+        return WindowsApi.BUTTON_DATA.get(button, 0)
+
+    def button_input(self, flags, when, mark, data=0):
+        assert data == self.button_data(flags[0]), "a side button is re-sent with its own mouseData"
         return ("button", flags, when, mark)
 
     def move_input(self, x, y, mark):
@@ -183,6 +197,10 @@ class FakeWindows:
 
     def release(self, button: Button = Button.LEFT, extra: int = 0) -> None:
         self.queue.append(("hand-button", (button, False), extra))
+
+    def scroll(self, delta: int, axis: int = 1, extra: int = 0, flags: int = 0) -> None:
+        """A wheel notch: WM_MOUSEWHEEL (axis 1) or WM_MOUSEHWHEEL (2)."""
+        self.queue.append(("hand-wheel", axis, delta, extra, flags))
 
     def wait(self, ms: float) -> None:
         self.run()
@@ -207,6 +225,15 @@ class FakeWindows:
         elif kind == "hand-button":
             _, (button, pressed), extra = item
             self._button(self._swap(button), pressed, 0, extra, int(self.now_ms))
+        elif kind == "hand-wheel":
+            _, axis, delta, extra, flags = item
+            data = (delta & 0xFFFF) << 16
+            # The hook looks at the wheel only while the wheel fix is on.
+            if self.hook._owner._wheel_on and self.hook.wheel(
+                axis, data, flags, extra, int(self.now_ms), self.now_ms / 1000, int(self.now_ms)
+            ):
+                return  # dropped
+            self.seen.append(("wheel", axis, delta, extra))
         else:
             _, (button, pressed), when, mark = item
             self._button(self._swap(button), pressed, self.INJECTED, mark, when or int(self.now_ms))
@@ -228,7 +255,10 @@ class FakeWindows:
 
     # -- what apps saw -----------------------------------------------------
     def buttons(self) -> list:
-        return [entry for entry in self.seen if entry[0] != "move"]
+        return [entry for entry in self.seen if entry[0] in ("down", "up")]
+
+    def wheel(self) -> list:
+        return [entry[1:3] for entry in self.seen if entry[0] == "wheel"]
 
     def moves_between(self, first: str, second: str) -> list:
         kinds = [entry[0] for entry in self.seen]
@@ -244,7 +274,7 @@ class WindowsHookLogicTests(unittest.TestCase):
         patch = mock.patch("app.platform.threading.Timer", FakeTimer)
         patch.start()
         self.addCleanup(patch.stop)
-        self.filter = GlobalClickFilter(60, [Button.LEFT])
+        self.filter = GlobalClickFilter(FilterConfig.uniform(60, [Button.LEFT]))
         self.win = FakeWindows(self.filter)
 
     def fire_timers(self) -> None:
@@ -448,7 +478,7 @@ class WindowsHookLogicTests(unittest.TestCase):
         self.assertEqual([up[2] for up in ups], [(200, 200), (260, 200)])
 
     def test_swapped_buttons_come_back_in_pairs(self) -> None:
-        self.filter.update(buttons=[Button.LEFT, Button.RIGHT])
+        self.filter.update(replace(self.filter.config, buttons=frozenset([Button.LEFT, Button.RIGHT])))
         self.win.swapped = True
         self.click()
         self.fire_timers()
@@ -480,16 +510,24 @@ class WindowsHookLogicTests(unittest.TestCase):
         self.fire_timers()
         self.assertEqual([entry[0] for entry in self.win.seen], ["down", "move", "up"])
 
-    def test_pen_and_touch_keep_timer_delivery(self) -> None:
+    def test_pen_and_touch_clicks_pass_untouched(self) -> None:
+        # Windows marks the clicks it makes from pen and touch input: they
+        # are never filtered. Not held (the up comes at once, still marked as
+        # Windows marked it), and a quick second tap is no bounce.
         self.win.press(extra=PEN)
         self.win.wait(80)
         self.win.release(extra=PEN)
         self.win.wait(5)
+        self.win.press(extra=PEN)
+        self.win.wait(30)
+        self.win.release(extra=PEN)
+        self.win.wait(5)
         self.win.move(50, 0, extra=PEN)
         self.win.run()
-        self.assertEqual([entry[0] for entry in self.win.seen], ["down", "move"])
-        self.fire_timers()
-        self.assertEqual([entry[0] for entry in self.win.seen], ["down", "move", "up"])
+        self.assertEqual([entry[0] for entry in self.win.seen], ["down", "up", "down", "up", "move"])
+        self.assertEqual({entry[-1] for entry in self.win.buttons()}, {PEN}, "nothing was re-sent")
+        self.assertEqual(FakeTimer.created, [], "nothing was held")
+        self.assertEqual(self.filter.filtered_count, 0)
 
     def test_a_remote_session_keeps_timer_delivery(self) -> None:
         self.win.remote = True
@@ -572,6 +610,123 @@ class WindowsHookLogicTests(unittest.TestCase):
         self.assertEqual(self.win.buttons()[1][:3], ("up", Button.LEFT, (200, 200)))
         self.assertEqual(self.win.cursor, (250, 200))
 
+
+    # -- 1.0: side buttons, the wheel, pen and touch, devices ----------------------
+    def configure(self, **changes) -> None:
+        self.filter.update(replace(self.filter.config, **changes))
+
+    def test_a_side_button_bounce_is_dropped_and_no_release_waits(self) -> None:
+        self.configure(buttons=frozenset({Button.LEFT, Button.BACK}))
+        self.win.press(Button.BACK)
+        self.win.wait(60)
+        self.win.release(Button.BACK)
+        self.win.wait(6)
+        self.win.press(Button.BACK)                                  # the bounce
+        self.win.wait(10)
+        self.win.release(Button.BACK)
+        self.win.run()
+        self.assertEqual([entry[:2] for entry in self.win.buttons()], [("down", Button.BACK), ("up", Button.BACK)])
+        self.assertEqual([entry[4] for entry in self.win.buttons()], [0, 0], "the release went straight through")
+        self.assertEqual(FakeTimer.created, [], "nothing held")
+
+    def test_a_side_button_re_sent_keeps_its_xbutton_and_never_swaps(self) -> None:
+        self.configure(buttons=frozenset({Button.LEFT, Button.FORWARD}))
+        self.win.swapped = True                                      # left-handed: only left and right swap
+        self.win.press(Button.RIGHT)                                 # the physical right is the logical left
+        self.win.wait(80)
+        self.win.release(Button.RIGHT)
+        self.win.wait(70)                                            # past the left's window
+        self.win.press(Button.FORWARD)                               # settles the left's up, goes out behind it
+        self.win.run()
+        buttons = [entry[:2] for entry in self.win.buttons()]
+        self.assertEqual(buttons, [("down", Button.LEFT), ("up", Button.LEFT), ("down", Button.FORWARD)])
+        self.assertEqual(mark_kind(self.win.buttons()[2][4]), INJECTED_MARK, "re-sent, with XBUTTON2 (FakeWindows checks)")
+
+    def test_a_reversing_wheel_notch_is_dropped_on_its_own_axis(self) -> None:
+        self.configure(wheel_fix=True, wheel_window_ms=50)
+        heard = []
+        self.filter._on_wheel = lambda axis, dropped: heard.append((axis, dropped))
+        # (delta, axis, ms until the next): the vertical wheel's stray up
+        # notch goes, the horizontal one's own reversal too; a reversal
+        # 140 ms after the last vertical notch is the hand's.
+        for delta, axis, gap in ((-120, 1, 20), (120, 1, 20), (-120, 1, 20), (120, 2, 20), (-120, 2, 100), (120, 1, 0)):
+            self.win.scroll(delta, axis)
+            self.win.wait(gap)
+        self.win.run()
+        self.assertEqual(self.win.wheel(), [(1, -120), (1, -120), (2, 120), (1, 120)])
+        self.assertEqual(heard, [(1, False), (1, True), (1, False), (2, False), (2, True), (1, False)])
+        self.assertEqual(self.win.buttons(), [])
+
+    def test_the_wheel_is_left_alone_while_the_fix_is_off(self) -> None:
+        for delta in (-120, 120, -120):
+            self.win.scroll(delta)
+            self.win.wait(5)
+        self.win.run()
+        self.assertEqual(self.win.wheel(), [(1, -120), (1, 120), (1, -120)])
+
+    def test_other_programs_pen_and_touchpad_scrolling_pass(self) -> None:
+        from app.devices_win import HandleInfo
+
+        self.configure(wheel_fix=True)
+        self.win.scroll(-120)
+        self.win.wait(5)
+        self.win.scroll(120, flags=self.win.INJECTED)                 # another program's
+        self.win.scroll(120, extra=PEN)
+        self.win.hook.device = lambda: HandleInfo("trackpad", "hid:04f3:3087:ELAN", "ELAN Touchpad")
+        self.win.scroll(120)
+        self.win.run()
+        self.assertEqual(len(self.win.wheel()), 4)
+
+    def test_touchpad_and_ignored_device_clicks_pass_untouched(self) -> None:
+        from app.devices_win import HandleInfo
+
+        devices = []
+        self.filter._on_device = devices.append
+        self.configure(ignored_devices=frozenset({"usb:046d:c08b:G502"}))
+        for info in (HandleInfo("trackpad", "hid:04f3:3087:ELAN", "ELAN Touchpad"),
+                     HandleInfo("mouse", "usb:046d:c08b:G502", "G502 HERO")):
+            self.win.hook.device = lambda info=info: info
+            self.win.seen.clear()
+            self.win.press()
+            self.win.wait(40)
+            self.win.release()
+            self.win.wait(1)                                         # a touchpad double-tap's gap
+            self.win.press()
+            self.win.wait(40)
+            self.win.release()
+            self.win.run()
+            self.assertEqual([entry[0] for entry in self.win.buttons()], ["down", "up"] * 2, info.kind)
+            self.assertEqual({entry[4] for entry in self.win.buttons()}, {0}, "nothing re-sent")
+        self.assertEqual(FakeTimer.created, [])
+        self.assertEqual([device.key for device in devices], ["hid:04f3:3087:ELAN", "usb:046d:c08b:G502"])
+        self.assertEqual(self.filter.passed_counts, {"touch": 2, "ignored device": 2})
+
+    def test_a_mouse_not_ignored_is_filtered_and_known(self) -> None:
+        from app.devices_win import HandleInfo
+
+        events = []
+        self.filter._on_event = events.append
+        self.win.hook.device = lambda: HandleInfo("mouse", "usb:046d:c08b:G502", "G502 HERO")
+        self.win.press()
+        self.win.wait(40)
+        self.win.release()
+        self.win.wait(5)
+        self.win.press()                                             # a dropout: cancels the held up
+        self.win.run()
+        self.assertEqual([entry[0] for entry in self.win.buttons()], ["down"])
+        self.assertEqual({event.device for event in events}, {"usb:046d:c08b:G502"})
+
+    def test_a_pen_tap_while_the_mouses_release_is_held_goes_out_behind_it(self) -> None:
+        self.click()                                                 # the mouse's up is held
+        self.win.press(extra=PEN)
+        self.win.run()
+        self.assertEqual([entry[0] for entry in self.win.buttons()], ["down", "up", "down"])
+        self.assertEqual([mark_kind(entry[4]) for entry in self.win.buttons()[1:]], [INJECTED_MARK] * 2,
+                         "the held up, then the pen's down re-sent behind it")
+        self.win.release(extra=PEN)
+        self.win.run()
+        self.assertEqual(self.win.buttons()[-1][0], "up")
+        self.assertEqual(self.win.buttons()[-1][4], PEN, "its release passes untouched")
 
 class InputSenderTests(unittest.TestCase):
     """The hook never sends input itself: SendInput on its thread re-enters
@@ -697,7 +852,8 @@ class RealWindows(unittest.TestCase):
                 if code >= 0 and message in MESSAGES:
                     info = ctypes.cast(data, record).contents
                     self.observed.append(
-                        (int(message), (info.pt.x, info.pt.y), int(info.dwExtraInfo), int(info.time), time.perf_counter())
+                        (int(message), (info.pt.x, info.pt.y), int(info.dwExtraInfo), int(info.time), time.perf_counter(),
+                         int(info.mouseData))
                     )
                 return user32.CallNextHookEx(None, code, message, data)
 
@@ -722,8 +878,8 @@ class RealWindows(unittest.TestCase):
         self._observer.join(timeout=2)
         self._observer = None
 
-    def start_filter(self, threshold: int = 60, buttons=(Button.LEFT,)) -> GlobalClickFilter:
-        self.filter = GlobalClickFilter(threshold, list(buttons))
+    def start_filter(self, threshold: int = 60, buttons=(Button.LEFT,), **config) -> GlobalClickFilter:
+        self.filter = GlobalClickFilter(FilterConfig.uniform(threshold, list(buttons), **config))
         self.filter.start()
         self.assertTrue(self.filter.running)
         return self.filter
@@ -765,8 +921,8 @@ class RealWindows(unittest.TestCase):
     def send(self, *inputs) -> None:
         self.assertEqual(self.api.send(list(inputs)), len(inputs))
 
-    def mouse(self, flags: int, dx: int = 0, dy: int = 0):
-        return self.api.INPUT(0, self.api.MOUSEINPUT(dx, dy, 0, flags, 0, 0))
+    def mouse(self, flags: int, dx: int = 0, dy: int = 0, data: int = 0, extra: int = 0):
+        return self.api.INPUT(0, self.api.MOUSEINPUT(dx, dy, data & 0xFFFFFFFF, flags, 0, extra))
 
     def button(self, flags: int) -> None:
         self.send(self.mouse(flags))
@@ -1077,6 +1233,151 @@ class WindowsMotionTests(RealWindows):
         self.assertLess(p99(watched), 1.0)
 
 
+MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_HWHEEL = 0x0080, 0x0100, 0x0800, 0x1000
+
+
+@unittest.skipUnless(_run_e2e(), "needs Windows and DCF_E2E=1 (it injects real input)")
+class WindowsInputFeatureTests(RealWindows):
+    """1.0: side buttons, the wheel, pen and touch, Raw Input."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.start_observer()
+
+    def side(self, down: bool, number: int, extra: int = 0) -> None:
+        self.send(self.mouse(MOUSEEVENTF_XDOWN if down else MOUSEEVENTF_XUP, data=number, extra=extra))
+
+    def notch(self, delta: int, horizontal: bool = False) -> None:
+        self.send(self.mouse(MOUSEEVENTF_HWHEEL if horizontal else MOUSEEVENTF_WHEEL, data=delta))
+
+    @staticmethod
+    def high_word(value: int) -> int:
+        word = (value >> 16) & 0xFFFF
+        return word - 0x10000 if word >= 0x8000 else word
+
+    def test_a_side_button_bounce_is_dropped_with_no_release_held(self) -> None:
+        self.start_filter(buttons=(Button.LEFT, Button.BACK))
+        self.observed.clear()
+        self.side(True, 1)
+        time.sleep(0.06)
+        self.side(False, 1)
+        time.sleep(0.008)
+        self.side(True, 1)                                            # the bounce, 8 ms on
+        time.sleep(0.03)
+        self.side(False, 1)
+        time.sleep(0.3)
+        self.side(True, 2)                                            # forward, not filtered here
+        time.sleep(0.06)
+        self.side(False, 2)
+        time.sleep(0.3)
+        sides = [(entry[0], self.high_word(entry[5]), entry[2]) for entry in self.observed if entry[0] in (WM_XBUTTONDOWN, WM_XBUTTONUP)]
+        self.assertEqual(
+            sides,
+            [(WM_XBUTTONDOWN, 1, 0), (WM_XBUTTONUP, 1, 0), (WM_XBUTTONDOWN, 2, 0), (WM_XBUTTONUP, 2, 0)],
+            "the bounce went, and each release went straight through (none re-sent)",
+        )
+        self.assertEqual(self.filter.filtered_count, 1)
+
+    def test_a_side_button_re_sent_behind_a_held_release_keeps_its_xbutton(self) -> None:
+        self.exact_relative_motion()
+        self.pointer_where_it_counts()
+        self.start_filter(buttons=(Button.LEFT, Button.FORWARD))
+        self.place(200, 200)
+        self.button(0x0002)
+        time.sleep(0.08)
+        self.button(0x0004)                                           # held in place
+        time.sleep(0.005)
+        # Leaving the spot re-sends the left up, and the move waits behind
+        # it; the forward press, which came after, waits there too and is
+        # re-sent: as XBUTTON2, as it came.
+        self.send(self.mouse(0x0001, 40, 0), self.mouse(MOUSEEVENTF_XDOWN, data=2))
+        time.sleep(0.3)
+        self.side(False, 2)
+        time.sleep(0.3)
+        order = [(entry[0], self.high_word(entry[5]) if entry[0] in (WM_XBUTTONDOWN, WM_XBUTTONUP) else 0, mark_kind(entry[2]))
+                 for entry in self.observed_buttons()]
+        self.report(f"[side] {[(hex(message), word, hex(mark)) for message, word, mark in order]}")
+        self.assertEqual([entry[:2] for entry in order],
+                         [(WM_LBUTTONDOWN, 0), (WM_LBUTTONUP, 0), (WM_XBUTTONDOWN, 2), (WM_XBUTTONUP, 2)])
+        self.assertEqual([entry[2] for entry in order[1:3]], [INJECTED_MARK] * 2, "the left up held, the press re-sent")
+
+    def test_a_reversing_wheel_notch_is_dropped(self) -> None:
+        self.start_filter(wheel_fix=True, wheel_window_ms=50)
+        self.observed.clear()
+        for delta, pause in ((-120, 0.02), (-120, 0.01), (120, 0.01), (-120, 0.2), (120, 0.05)):
+            self.notch(delta)
+            time.sleep(pause)
+        self.notch(120, horizontal=True)                              # its own axis: no reversal
+        time.sleep(0.3)
+        wheel = [(entry[0], self.high_word(entry[5])) for entry in self.observed if entry[0] in (WM_MOUSEWHEEL, WM_MOUSEHWHEEL)]
+        self.assertEqual(wheel, [(WM_MOUSEWHEEL, -120), (WM_MOUSEWHEEL, -120), (WM_MOUSEWHEEL, -120),
+                                 (WM_MOUSEWHEEL, 120), (WM_MOUSEHWHEEL, 120)])
+        self.assertEqual(self.filter.wheel_dropped, 1)
+
+    def test_the_wheel_passes_while_the_fix_is_off(self) -> None:
+        self.start_filter()
+        self.observed.clear()
+        for delta in (-120, 120, -120):
+            self.notch(delta)
+            time.sleep(0.005)
+        time.sleep(0.2)
+        self.assertEqual([self.high_word(entry[5]) for entry in self.observed if entry[0] == WM_MOUSEWHEEL], [-120, 120, -120])
+
+    def test_a_pen_marked_click_passes_untouched(self) -> None:
+        self.start_filter()
+        self.observed.clear()
+        for flags, pause in ((0x0002, 0.04), (0x0004, 0.003), (0x0002, 0.04), (0x0004, 0.3)):
+            self.send(self.mouse(flags, extra=PEN))                   # a pen's tap, then another 3 ms on
+            time.sleep(pause)
+        buttons = [(entry[0], entry[2]) for entry in self.observed_buttons()]
+        self.assertEqual(buttons, [(WM_LBUTTONDOWN, PEN), (WM_LBUTTONUP, PEN)] * 2, "not filtered, held or re-sent")
+        self.assertEqual(self.filter.passed_counts, {"touch": 2})
+
+    def test_raw_input_is_registered_on_the_hooks_window(self) -> None:
+        self.start_filter()
+        devices = self.filter._raw_input
+        self.assertIsNotNone(devices)
+        self.assertTrue(devices.registered, "RegisterRawInputDevices failed")
+        self.filter._callback_timings = timings = []
+        for _ in range(50):
+            self.move_by(1, 0)
+            self.move_by(-1, 0)
+        time.sleep(0.3)
+        raw = [seconds for message, _watched, seconds in timings if message == 0x00FF]
+        self.report(f"[raw input] {len(raw)} WM_INPUT; current device {devices.current()}")
+        self.assertGreater(len(raw), 0, "no WM_INPUT reached the hook's window")
+        self.assertIsNone(devices.current(), "SendInput names no device")
+
+    def test_the_wheel_side_buttons_and_raw_input_stay_cheap(self) -> None:
+        self.start_filter(buttons=(Button.LEFT, Button.BACK), wheel_fix=True)
+        self.filter._callback_timings = timings = []
+        for index in range(2000):
+            self.notch(120 if (index // 7) % 2 else -120)
+            if index % 100 == 99:
+                time.sleep(0.005)
+        for _ in range(50):
+            self.side(True, 1)
+            time.sleep(0.002)
+            self.side(False, 1)
+            time.sleep(0.02)
+        time.sleep(0.3)
+
+        def summary(name: str, values: list) -> str:
+            ordered = sorted(seconds * 1000 for seconds in values)
+            if not ordered:
+                return f"{name} n=0"
+            p99 = ordered[max(0, int(len(ordered) * 0.99) - 1)]
+            return f"{name} n={len(ordered)} median={statistics.median(ordered):.4f} ms p99={p99:.4f} ms max={ordered[-1]:.3f} ms"
+
+        wheel = [seconds for message, _w, seconds in timings if message == WM_MOUSEWHEEL]
+        sides = [seconds for message, _w, seconds in timings if message in (WM_XBUTTONDOWN, WM_XBUTTONUP)]
+        raw = [seconds for message, _w, seconds in timings if message == 0x00FF]
+        self.report(f"[cost] Windows: {summary('wheel', wheel)}; {summary('side', sides)}; {summary('WM_INPUT', raw)}")
+        self.assertGreaterEqual(len(wheel), 2000)
+        self.assertLess(sorted(wheel)[int(len(wheel) * 0.99) - 1] * 1000, 1.0)
+        self.assertLess(sorted(raw)[int(len(raw) * 0.99) - 1] * 1000, 1.0)
+
+
 @unittest.skipUnless(_run_e2e(), "needs Windows and DCF_E2E=1 (it installs real hooks)")
 class WindowsHookResilienceTests(RealWindows):
     """The hook is re-installed on a timer and when the session comes back."""
@@ -1131,6 +1432,23 @@ class WindowsHookResilienceTests(RealWindows):
         self.user32.mouse_event(0x0004, 0, 0, 0, 0)
         time.sleep(0.4)
         self.assertEqual([entry[0] for entry in self.observed_buttons()], [WM_LBUTTONDOWN, WM_LBUTTONUP])
+
+
+@unittest.skipUnless(platform.system() == "Windows", "Windows only")
+class WindowsApiButtonTests(unittest.TestCase):
+    """What SendInput is given for each button (nothing is sent)."""
+
+    def test_side_buttons_name_their_xbutton_and_never_swap(self) -> None:
+        api = WindowsApi()
+        for swapped in (False, True):
+            with self.subTest(swapped=swapped), mock.patch.object(api, "buttons_swapped", return_value=swapped):
+                self.assertEqual(api.button_flags(Button.LEFT, True), 0x0008 if swapped else 0x0002)
+                self.assertEqual(api.button_flags(Button.MIDDLE, False), 0x0040)
+                self.assertEqual(api.button_flags(Button.BACK, True), 0x0080)
+                self.assertEqual(api.button_flags(Button.FORWARD, False), 0x0100)
+        self.assertEqual([api.button_data(button) for button in Button], [0, 0, 0, 1, 2])
+        sent = api.button_input(0x0080, 1234, INJECTED_MARK, 2)
+        self.assertEqual((sent.mi.dwFlags, sent.mi.mouseData, sent.mi.time, sent.mi.dwExtraInfo), (0x0080, 2, 1234, INJECTED_MARK))
 
 
 @unittest.skipUnless(platform.system() == "Windows", "Windows only")

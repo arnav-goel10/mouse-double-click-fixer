@@ -53,18 +53,26 @@ PROBE_MARK = 0x0E2E
 class Seen(NamedTuple):
     """One event as applications received it."""
 
-    kind: str  # down, up, move or drag
+    kind: str  # down, up, move, drag, odown, oup (other buttons) or scroll
     x: int
     y: int
     clicks: int  # kCGMouseEventClickState
     mark: int  # kCGEventSourceUserData
+    number: int = 0  # kCGMouseEventButtonNumber
+    subtype: int = 0  # kCGMouseEventSubtype
+    delta: int = 0  # a scroll's kCGScrollWheelEventDeltaAxis1
+    continuous: int = 0  # a scroll's kCGScrollWheelEventIsContinuous
 
 
 class Step(NamedTuple):
     at_ms: float
-    kind: str  # down, up, move or drag
+    kind: str  # down, up, move, drag, odown, oup or scroll
     point: tuple
     clicks: int = 1
+    number: int = 0  # odown, oup: the button number (3 back, 4 forward)
+    subtype: int = 0  # down, up: kCGMouseEventSubtype (3 is a touch)
+    delta: int = 0  # scroll: lines, vertical
+    continuous: int = 0  # scroll: 1 for a trackpad's
 
 
 def _mach_clock() -> Callable[[], int]:
@@ -93,14 +101,18 @@ class MacTapEndToEndTests(unittest.TestCase):
         import Quartz
 
         from app.core import Button
-        from app.platform import GlobalClickFilter
+        from app.platform import FilterConfig, GlobalClickFilter
 
         cls.Quartz = Quartz
+        cls.FilterConfig = FilterConfig
         cls.kinds = {
             Quartz.kCGEventLeftMouseDown: "down",
             Quartz.kCGEventLeftMouseUp: "up",
             Quartz.kCGEventMouseMoved: "move",
             Quartz.kCGEventLeftMouseDragged: "drag",
+            Quartz.kCGEventOtherMouseDown: "odown",
+            Quartz.kCGEventOtherMouseUp: "oup",
+            Quartz.kCGEventScrollWheel: "scroll",
         }
         cls.types = {name: kind for kind, name in cls.kinds.items()}
         cls.now_ns = staticmethod(_mach_clock())
@@ -125,7 +137,8 @@ class MacTapEndToEndTests(unittest.TestCase):
         Quartz.CGWarpMouseCursorPosition(P)
         cls._require_posting_reaches_taps()
 
-        cls.filter = GlobalClickFilter(THRESHOLD_MS, [Button.LEFT], on_event=cls.log.append)
+        cls.config = FilterConfig.uniform(THRESHOLD_MS, [Button.LEFT, Button.BACK, Button.FORWARD])
+        cls.filter = GlobalClickFilter(cls.config, on_event=cls.log.append)
         cls.filter.start()
         cls.addClassCleanup(cls.filter.stop)
         time.sleep(0.3)
@@ -144,13 +157,18 @@ class MacTapEndToEndTests(unittest.TestCase):
             name = cls.kinds.get(kind)
             if name is not None:
                 location = Quartz.CGEventGetLocation(event)
+                field = Quartz.CGEventGetIntegerValueField
                 cls.seen.append(
                     Seen(
                         name,
                         round(location.x),
                         round(location.y),
-                        Quartz.CGEventGetIntegerValueField(event, Quartz.kCGMouseEventClickState),
-                        Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventSourceUserData),
+                        field(event, Quartz.kCGMouseEventClickState),
+                        field(event, Quartz.kCGEventSourceUserData),
+                        field(event, Quartz.kCGMouseEventButtonNumber) if name in ("odown", "oup") else 0,
+                        field(event, Quartz.kCGMouseEventSubtype),
+                        field(event, Quartz.kCGScrollWheelEventDeltaAxis1) if name == "scroll" else 0,
+                        field(event, Quartz.kCGScrollWheelEventIsContinuous) if name == "scroll" else 0,
                     )
                 )
             return event
@@ -223,16 +241,56 @@ class MacTapEndToEndTests(unittest.TestCase):
             due = start + int(step.at_ms * 1_000_000)
             while self.now_ns() < due:
                 time.sleep(0)  # lets the taps' threads take the GIL
-            event = Quartz.CGEventCreateMouseEvent(
-                None, self.types[step.kind], step.point, Quartz.kCGMouseButtonLeft
-            )
-            if step.kind in ("down", "up"):
-                Quartz.CGEventSetIntegerValueField(event, Quartz.kCGMouseEventClickState, step.clicks)
+            event = self.make(step)
             Quartz.CGEventSetTimestamp(event, due)
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
         self.late_ms = (self.now_ns() - due) / 1e6
         self._wait_until_quiet()
         return list(self.seen)
+
+    def make(self, step: Step):
+        Quartz = self.Quartz
+        if step.kind == "scroll":
+            event = Quartz.CGEventCreateScrollWheelEvent(None, Quartz.kCGScrollEventUnitLine, 1, step.delta)
+            Quartz.CGEventSetIntegerValueField(event, Quartz.kCGScrollWheelEventIsContinuous, step.continuous)
+            Quartz.CGEventSetLocation(event, step.point)
+            return event
+        event = Quartz.CGEventCreateMouseEvent(
+            None, self.types[step.kind], step.point, step.number or Quartz.kCGMouseButtonLeft
+        )
+        if step.kind in ("odown", "oup"):
+            Quartz.CGEventSetIntegerValueField(event, Quartz.kCGMouseEventButtonNumber, step.number)
+        if step.kind in ("down", "up", "odown", "oup"):
+            Quartz.CGEventSetIntegerValueField(event, Quartz.kCGMouseEventClickState, step.clicks)
+        if step.subtype:
+            Quartz.CGEventSetIntegerValueField(event, Quartz.kCGMouseEventSubtype, step.subtype)
+        return event
+
+    def configure(self, **changes) -> None:
+        """Hand the running filter a new configuration, as the app does."""
+        from dataclasses import replace
+
+        self.filter.update(replace(self.filter.config, **changes))
+        self.addCleanup(self.filter.update, self.config)
+
+    def wheel_in_tap(self, wanted: bool, limit_s: float = 3.0) -> None:
+        """Wait for the filter to re-create its tap with the scroll wheel in
+        its mask, or out of it."""
+        deadline = time.monotonic() + limit_s
+        while time.monotonic() < deadline:
+            tap = self.filter._tap
+            if tap is not None and self.filter._wheel_on == wanted and self._tap_has_wheel(tap) == wanted:
+                time.sleep(0.1)
+                return
+            time.sleep(0.02)
+        self.fail(f"the tap didn't {'take' if wanted else 'leave out'} the scroll wheel")
+
+    def _tap_has_wheel(self, tap) -> bool:
+        Quartz = self.Quartz
+        error, taps, count = Quartz.CGGetEventTapList(64, None, None)
+        own = [entry for entry in (taps or [])[:count] if entry.tappingProcess == os.getpid() and entry.enabled]
+        bit = Quartz.CGEventMaskBit(Quartz.kCGEventScrollWheel)
+        return any(entry.eventsOfInterest & bit and entry.options == Quartz.kCGEventTapOptionDefault for entry in own)
 
     def _wait_until_quiet(self, quiet_s: float = 0.4, limit_s: float = 5.0) -> None:
         deadline = time.monotonic() + limit_s
@@ -359,6 +417,130 @@ class MacTapEndToEndTests(unittest.TestCase):
             first_up, second_down = seen.index(buttons[1]), seen.index(buttons[2])
             between = {item.kind for item in seen[first_up + 1 : second_down]}
             self.assertEqual(between, {"move"})
+
+
+    # -- 1.0: side buttons, the wheel, touch -----------------------------------------
+    def test_a_side_button_bounce_is_dropped_and_its_release_never_waits(self) -> None:
+        seen = self.play([
+            Step(0, "odown", P, number=3), Step(70, "oup", P, number=3),
+            Step(78, "odown", P, number=3, clicks=2), Step(130, "oup", P, number=3, clicks=2),
+            Step(400, "odown", P, number=4), Step(470, "oup", P, number=4),
+        ])
+        with self.explained():
+            others = [item for item in seen if item.kind in ("odown", "oup")]
+            self.assertEqual([(item.kind, item.number) for item in others],
+                             [("odown", 3), ("oup", 3), ("odown", 4), ("oup", 4)])
+            self.assertEqual([item.mark for item in others], [0] * 4, "a release was held and re-sent")
+            self.assertEqual([event.button.value for event in self.log if event.is_bounce], ["back"])
+
+    def test_the_wheel_fix_drops_a_stray_reversing_notch(self) -> None:
+        self.configure(wheel_fix=True, wheel_window_ms=50)
+        self.wheel_in_tap(True)
+        seen = self.play([
+            Step(0, "scroll", P, delta=-1), Step(20, "scroll", P, delta=-1),
+            Step(30, "scroll", P, delta=1),                                  # the stray notch
+            Step(40, "scroll", P, delta=-1),
+            Step(50, "scroll", P, delta=3, continuous=1),                    # a trackpad's: never touched
+            Step(200, "scroll", P, delta=1),                                 # the hand rolls it back
+        ])
+        with self.explained():
+            scrolls = [(item.delta, item.continuous) for item in seen if item.kind == "scroll"]
+            self.assertEqual(scrolls, [(-1, 0), (-1, 0), (-1, 0), (3, 1), (1, 0)])
+            self.assertEqual(self.filter.wheel_dropped, 1)
+
+    def test_with_the_wheel_fix_off_the_wheel_is_not_in_the_tap(self) -> None:
+        self.configure(wheel_fix=True)
+        self.wheel_in_tap(True)
+        self.configure(wheel_fix=False)
+        self.wheel_in_tap(False)
+        seen = self.play([Step(0, "scroll", P, delta=-1), Step(10, "scroll", P, delta=1)])
+        with self.explained():
+            self.assertEqual([item.delta for item in seen if item.kind == "scroll"], [-1, 1])
+        # And clicks are still filtered by the tap that replaced the others.
+        seen = self.play([Step(0, "down", P), Step(70, "up", P), Step(78, "down", P, clicks=2), Step(130, "up", P)])
+        with self.explained():
+            self.assertEqual([item.kind for item in self.buttons(seen)], ["down", "up"])
+
+    def test_a_touch_click_passes_untouched(self) -> None:
+        # A trackpad's double-tap: 1 ms between release and press, marked as
+        # a touch (kCGMouseEventSubtype 3). Never filtered, never re-sent.
+        seen = self.play([
+            Step(0, "down", P, subtype=3), Step(40, "up", P, subtype=3),
+            Step(41, "down", P, clicks=2, subtype=3), Step(80, "up", P, clicks=2, subtype=3),
+        ])
+        with self.explained():
+            buttons = self.buttons(seen)
+            self.assertEqual([item.kind for item in buttons], ["down", "up", "down", "up"])
+            self.assertEqual([item.mark for item in buttons], [0] * 4)
+            self.assertEqual([item.subtype for item in buttons], [3] * 4)
+            self.assertEqual([item.clicks for item in buttons], [1, 1, 2, 2])
+            self.assertEqual(self.log, [], "the filter judged none of them")
+
+    def test_a_touch_press_waits_behind_the_mouses_held_release(self) -> None:
+        seen = self.play([
+            Step(0, "down", P), Step(70, "up", P),                           # the mouse's click: up held
+            Step(80, "down", P, subtype=3), Step(120, "up", P, subtype=3),  # a tap on the trackpad
+        ])
+        with self.explained():
+            buttons = self.buttons(seen)
+            self.assertEqual([item.kind for item in buttons], ["down", "up", "down", "up"], "apps saw down, down")
+            self.assertEqual([item.subtype for item in buttons], [0, 0, 3, 3])
+            self.assertEqual([event.pressed for event in self.log], [True, False], "only the mouse's was judged")
+
+    def test_the_tap_stays_cheap_with_the_wheel_in_it(self) -> None:
+        """Measures (and reports) the tap callback's cost for scroll events
+        with the wheel fix on, and for clicks and motion beside them."""
+        import statistics
+
+        self.configure(wheel_fix=True)
+        self.wheel_in_tap(True)
+        timings: list = []
+        self.filter._callback_timings = timings
+        self.addCleanup(setattr, self.filter, "_callback_timings", None)
+        steps = [Step(i * 2.0, "scroll", P, delta=-1 if (i // 7) % 2 else 1) for i in range(600)]
+        steps += [Step(1300 + i * 100.0, kind, P) for i, kind in enumerate(["down", "up"] * 10)]
+        steps += [Step(3400 + i * 2.0, "move", (P[0] + i % 5, P[1])) for i in range(300)]
+        self.play(steps)
+        Quartz = self.Quartz
+        groups = {
+            "scroll": [t for kind, _w, t in timings if kind == Quartz.kCGEventScrollWheel],
+            "button": [t for kind, _w, t in timings if kind in (Quartz.kCGEventLeftMouseDown, Quartz.kCGEventLeftMouseUp)],
+            "move": [t for kind, _w, t in timings if kind == Quartz.kCGEventMouseMoved],
+        }
+        lines = []
+        for name, values in groups.items():
+            if not values:
+                lines.append(f"{name} n=0")
+                continue
+            ordered = sorted(ms * 1000 for ms in values)
+            p99 = ordered[max(0, int(len(ordered) * 0.99) - 1)]
+            lines.append(f"{name} n={len(ordered)} median={statistics.median(ordered):.4f} ms "
+                         f"p99={p99:.4f} ms max={ordered[-1]:.3f} ms")
+        print(f"\n[cost] macOS tap callback: {'; '.join(lines)}", file=sys.stderr, flush=True)
+        self.assertGreaterEqual(len(groups["scroll"]), 500, "scroll events didn't reach the tap")
+        scroll = sorted(groups["scroll"])
+        self.assertLess(scroll[int(len(scroll) * 0.99) - 1] * 1000, 2.0)
+
+    def test_device_lookups_cost_little(self) -> None:
+        """Reports what looking a sender up costs on this machine: once per
+        device and connection, in the tap callback at worst."""
+        from app import devices_mac
+
+        started = time.perf_counter()
+        connected = devices_mac.connected_senders()
+        listing_ms = (time.perf_counter() - started) * 1000
+        costs = []
+        for sender in list(connected)[:20]:
+            started = time.perf_counter()
+            devices_mac.resolve_sender(sender)
+            costs.append((time.perf_counter() - started) * 1000)
+        names = sorted({f"{device.name} ({device.kind})" for device in connected.values()})
+        print(f"\n[cost] macOS device lookup: listing {len(connected)} senders took {listing_ms:.2f} ms; "
+              f"one sender {max(costs) if costs else float('nan'):.3f} ms at most; devices {names}",
+              file=sys.stderr, flush=True)
+        started = time.perf_counter()
+        self.assertIsNone(devices_mac.resolve_sender(0x7FFFFFFFFFFF), "no such entry")
+        print(f"[cost] an unknown sender: {(time.perf_counter() - started) * 1000:.3f} ms", file=sys.stderr, flush=True)
 
 
 

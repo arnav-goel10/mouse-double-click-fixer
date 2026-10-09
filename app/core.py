@@ -20,9 +20,11 @@ from statistics import median
 from time import monotonic
 from typing import Optional
 
-# A conservative default: longer than almost any real bounce, far shorter than
-# the gap a human leaves between the two halves of a double-click.
-DEFAULT_THRESHOLD_MS = 60
+# The window for a new or uncalibrated install: longer than almost any real
+# bounce, far shorter than the gap a human leaves between the two halves of a
+# double-click. 46 ms came out of the competitor benchmark (it was 60 before
+# 1.0); calibration replaces it with a window measured on the user's mouse.
+DEFAULT_THRESHOLD_MS = 46
 MIN_THRESHOLD_MS = 5
 MAX_THRESHOLD_MS = 200
 
@@ -45,10 +47,24 @@ class Button(str, Enum):
     LEFT = "left"
     RIGHT = "right"
     MIDDLE = "middle"
+    #: The side buttons: X1 and X2 on Windows, button numbers 3 and 4 on macOS.
+    BACK = "back"
+    FORWARD = "forward"
 
     @property
     def label(self) -> str:
-        return {"left": "Left", "right": "Right", "middle": "Middle"}[self.value]
+        return {"left": "Left", "right": "Right", "middle": "Middle", "back": "Back", "forward": "Forward"}[self.value]
+
+
+#: Filtered by the drop rule only: a press within the window of the last
+#: release is dropped with its release, and releases are never held, so these
+#: buttons add no delay. (Browsers act on a side button's release, and no one
+#: drags with one.)
+SIDE_BUTTONS = frozenset({Button.BACK, Button.FORWARD})
+
+#: Kinds of pointing device (DeviceInfo.kind) whose clicks are never filtered:
+#: they come from taps and touches, not from a switch that can bounce.
+TOUCH_KINDS = frozenset({"trackpad", "touchscreen", "pen"})
 
 
 @dataclass(frozen=True)
@@ -85,6 +101,8 @@ class ClickEvent:
     #: contact closed to be a finger letting go (the contact is still
     #: settling), "lift" otherwise. None for anything not held.
     hold_reason: Optional[str] = None
+    #: The stable key of the device it came from (DeviceInfo.key), when known.
+    device: Optional[str] = None
 
     @property
     def is_bounce(self) -> bool:
@@ -358,6 +376,57 @@ class PeakLateness:
     def _forget(self, now: float) -> None:
         while self._peaks and now - self._peaks[0][0] > self._window:
             self._peaks.popleft()
+
+
+class WheelFilter:
+    """Drop the stray notch of a worn scroll-wheel encoder.
+
+    A worn encoder now and then reports one notch the wrong way in the middle
+    of a scroll. A discrete tick that goes the opposite way to the last tick
+    delivered on its axis, and comes within the window after it, is that
+    stray notch, and is dropped. Each axis (1 vertical, 2 horizontal) is
+    judged on its own. Nothing is ever held back, so the wheel gets no delay.
+
+    The window counts from the last tick delivered, not the last one seen: a
+    dropped tick changes nothing, so the scroll it interrupted carries on, and
+    a deliberate reversal loses at most one window's worth of ticks before
+    the new direction comes through. Pure: no OS calls; the caller passes
+    discrete ticks only (never a trackpad's continuous scrolling).
+    """
+
+    def __init__(self, window_ms: float) -> None:
+        self.window_ms = window_ms
+        # Per axis: (direction, timestamp) of the last tick delivered.
+        self._last: dict[int, tuple[int, float]] = {}
+
+    @property
+    def window_ms(self) -> int:
+        return self._window_ms
+
+    @window_ms.setter
+    def window_ms(self, value: float) -> None:
+        try:
+            number = int(round(float(value)))
+        except (TypeError, ValueError, OverflowError):
+            number = 0
+        self._window_ms = max(0, number)
+
+    def reset(self) -> None:
+        self._last.clear()
+
+    def tick(self, axis: int, direction: int, timestamp: float) -> bool:
+        """One discrete tick on `axis`, its sign `direction`, at `timestamp`
+        (seconds). True to deliver it, False to drop it."""
+        if not direction:
+            return True
+        direction = 1 if direction > 0 else -1
+        timestamp = float(timestamp)
+        last = self._last.get(axis)
+        # A hair over the window in floating point is still inside it.
+        if last is not None and last[0] != direction and (timestamp - last[1]) * 1000 <= self._window_ms + 1e-6:
+            return False
+        self._last[axis] = (direction, timestamp)
+        return True
 
 
 def clamp_threshold(value: float) -> int:

@@ -118,8 +118,8 @@ def sample_state(controller) -> None:
     month of wear on a switch that is getting worse."""
     import time
 
-    from app.contracts import Button, DeviceInfo
-    from app.core import ClickEvent
+    from app.core import Button, ClickEvent
+    from app.platform import DeviceInfo
 
     controller.set_buttons([Button.LEFT, Button.RIGHT, Button.BACK])
     controller.set_threshold(Button.LEFT, 46)
