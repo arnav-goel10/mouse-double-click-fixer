@@ -2267,9 +2267,10 @@ class ClickCountRepair:
 
     def record(self, button: Button, result: ClickEvent) -> None:
         # Only a press that reaches apps moves the chain on: one let through,
-        # or only re-ordered (flush_held, behind a late release) or held back
-        # behind a re-sent event (deferred). Not a suppressed bounce, nor the
-        # contact coming back mid-drag.
+        # or one re-sent behind events that came before it (deferred), or
+        # behind the held release it delivers once its button is no longer
+        # filtered (flush_held). Not a suppressed bounce, nor the contact
+        # coming back mid-drag.
         pending = self._pending.pop(button, None)
         if result.pressed and not result.is_bounce and pending is not None:
             self._delivered[button] = pending

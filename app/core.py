@@ -69,12 +69,17 @@ class ClickEvent:
     #: A press that cancelled a held release: the contact dropped out and came
     #: back, so neither the release nor this press ever reach applications.
     cancels_held: bool = False
-    #: A press that arrived after a held release had already expired: the
-    #: caller must deliver that release first, then this press.
+    #: A press that found a held release it does not cancel, because its
+    #: button is no longer filtered or the window had passed: the caller must
+    #: deliver that release first, then this press. (The hook settles a
+    #: release by any event stamped past its window first, so a press there
+    #: comes back `deferred` instead; see GlobalClickFilter._handle.)
     flush_held: bool = False
-    #: Real, but held back by the hook so it reaches apps after an event the
-    #: app re-sent just before it, or after another button's held release
-    #: that its own timestamp settled (see GlobalClickFilter._handle).
+    #: Real, but held back by the hook to reach apps behind events that came
+    #: before it and have not reached them yet: events the app re-sent and
+    #: still waits to see come back, the held releases its timestamp settled
+    #: (its own button's among them), or another button's earlier release
+    #: still waiting or on its way (see GlobalClickFilter._handle).
     deferred: bool = False
     #: Why a release was held: "closing" when it came too soon after the
     #: contact closed to be a finger letting go (the contact is still

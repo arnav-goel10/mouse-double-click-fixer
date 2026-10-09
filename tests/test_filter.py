@@ -583,7 +583,7 @@ class EventTimeTests(unittest.TestCase):
         self.assertFalse(self.move(100.205, "m", (0, 0)))
         self.assert_motion_follows_the_right_queue()
 
-    def test_a_release_that_cannot_be_resent_is_never_held_behind_one(self) -> None:
+    def test_a_release_that_cannot_be_resent_does_not_wait_for_another_buttons_release(self) -> None:
         # Windows can't send input to a window running as administrator.
         self.handle(Button.LEFT, True, 100.000, "down")
         self.handle(Button.LEFT, False, 100.100, "up")
@@ -591,6 +591,33 @@ class EventTimeTests(unittest.TestCase):
         rup = self.handle(Button.RIGHT, False, 100.200, "rup", allow_hold=False)
         self.assertTrue(rup.accepted)
         self.assertEqual(self.sent, [(Button.LEFT, False, "up")])
+
+    def test_a_release_that_cannot_be_resent_still_follows_its_own_buttons_events(self) -> None:
+        # Its press waits to be re-sent: let through, the release would reach
+        # apps first. It is re-sent after its press, as that press is.
+        self.handle(Button.LEFT, True, 100.000, "down1")
+        self.handle(Button.LEFT, False, 100.100, "up1")
+        self.timers[-1].fire()                                        # up1 re-sent, still on its way
+        self.assertTrue(self.handle(Button.LEFT, True, 100.150, "down2").deferred)
+        self.assertTrue(self.handle(Button.LEFT, False, 100.250, "up2", allow_hold=False).deferred)
+        come_back(self.filter, Button.LEFT)
+        self.assertEqual(self.sent, [
+            (Button.LEFT, False, "up1"),
+            (Button.LEFT, True, "down2"),
+            (Button.LEFT, False, "up2"),
+        ])
+
+    def test_a_press_once_its_button_is_not_filtered_replays_release_then_press(self) -> None:
+        self.handle(Button.LEFT, True, 100.000, "down")
+        self.assertTrue(self.handle(Button.LEFT, False, 100.100, "up").held)
+        self.filter.update(buttons=[Button.RIGHT])
+        press = self.handle(Button.LEFT, True, 100.120, "down2")      # inside the window
+        self.assertTrue(press.flush_held)
+        self.assertFalse(press.is_bounce)
+        self.assertEqual(self.sent, [(Button.LEFT, False, "up"), (Button.LEFT, True, "down2")])
+        for timer in list(self.timers):
+            timer.fire()
+        self.assertEqual(self.releases(), [(Button.LEFT, False, "up")], "the timer must not send it again")
 
     def test_the_timer_settles_a_release_with_nothing_after_it(self) -> None:
         self.handle(Button.LEFT, True, 100.000, "down", late_ms=0)
