@@ -942,6 +942,9 @@ class MainWindow(QWidget):
         self._retry_timer.setSingleShot(True)
         self._retry_timer.timeout.connect(self._retry_start)
         self._retry_waits: list[int] = []
+        # Set while the app itself (not the user) starts the filter: a
+        # failure then shows no dialog.
+        self._quiet = False
 
         # False while the user is in another login session (macOS fast user
         # switching), where a tap left running would stall that session.
@@ -1175,7 +1178,7 @@ class MainWindow(QWidget):
             self._retry_waits.clear()
             self._retry_timer.stop()
         self.refresh()
-        if error and self._on_screen():
+        if error and self._on_screen() and not self._quiet:
             QMessageBox.warning(self, "The filter couldn’t start", error)
 
     def _on_hook_failed(self, message: str) -> None:
@@ -1188,17 +1191,32 @@ class MainWindow(QWidget):
 
     # -- keeping the filter alive ------------------------------------------------
     def restore_filter(self, background: bool) -> None:
-        """Turn the saved "on" back on at launch.
+        """Turn the saved "on" back on at launch. Opened by the user, it
+        goes the usual way, dialog and all; at login, see _start_quietly."""
+        if background:
+            self._start_quietly()
+        else:
+            self.request_filter(True)
 
-        A background launch (at login) shows nothing if the tap is refused:
-        the menu's status line says so, and it tries again at each of
-        RETRY_AT_S before leaving it to the user.
-        """
-        self.request_filter(True, prompt=not background)
-        if background and self._start_failed():
+    def _start_quietly(self) -> None:
+        """Start the filter for the app's own reasons (a login, a wake, a
+        session switch, a dead tap) rather than the user's. A refused tap
+        then shows no dialog, only the menu's status line and the Filter
+        pane, and it is tried again at each of RETRY_AT_S before it is left
+        to the user: at those moments the window server or the permission
+        database can answer a little late."""
+        self._attempt_quietly()
+        if self._start_failed():
             marks = (0, *RETRY_AT_S)
             self._retry_waits = [int((later - earlier) * 1000) for earlier, later in zip(marks, marks[1:])]
             self._retry_timer.start(self._retry_waits.pop(0))
+
+    def _attempt_quietly(self) -> None:
+        self._quiet = True
+        try:
+            self.request_filter(True, prompt=False)
+        finally:
+            self._quiet = False
 
     def _start_failed(self) -> bool:
         controller = self.controller
@@ -1215,7 +1233,7 @@ class MainWindow(QWidget):
             self._retry_waits.clear()
             return
         log.info("Trying the filter again")
-        self.request_filter(True, prompt=False)
+        self._attempt_quietly()
         if self._start_failed() and self._retry_waits:
             self._retry_timer.start(self._retry_waits.pop(0))
 
@@ -1229,7 +1247,7 @@ class MainWindow(QWidget):
         if not controller.settings["fix_enabled"]:
             return
         controller.stop_keeping_choice()
-        self.request_filter(True, prompt=False)
+        self._start_quietly()
 
     def _check_health(self) -> None:
         if self.controller.active and not self.controller.tap_alive():

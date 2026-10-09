@@ -542,6 +542,18 @@ class KeepFilterAliveTests(LiveWindowTests):
         self.assertTrue(old.stopped)
         self.assertTrue(self.controller.active)
 
+    def test_a_restart_that_fails_retries_without_a_dialog(self) -> None:
+        self.controller.set_active(True)
+        self.window.show()
+        FakeFilter.fail_with = "The window server isn't ready."
+        self.window.system_woke()
+        self.dialog.assert_not_called()
+        self.assertTrue(self.window._retry_timer.isActive())
+        self.assertIn("isn't ready", self.window.filter_page.status_row.detail.text())
+        FakeFilter.fail_with = None
+        self.fire_retry()
+        self.assertTrue(self.controller.active)
+
     def test_wake_leaves_an_off_filter_off(self) -> None:
         self.window.system_woke()
         self.assertFalse(self.controller.active)
