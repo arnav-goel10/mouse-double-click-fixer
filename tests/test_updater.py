@@ -185,6 +185,42 @@ class ReleaseSignatureTests(unittest.TestCase):
         )
 
 
+class InstallLocationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+
+    def test_mac_copy_in_a_writable_folder(self) -> None:
+        app = self.root / "DoubleClick Fixer.app"
+        app.mkdir()
+        with mock.patch.object(updater, "bundle_path", return_value=app):
+            self.assertEqual(updater.install_location_problem("mac"), "")
+
+    @unittest.skipIf(sys.platform == "win32" or os.geteuid() == 0, "POSIX permissions, not root")
+    def test_mac_copy_that_cant_be_replaced_says_move_it(self) -> None:
+        app = self.root / "image" / "DoubleClick Fixer.app"
+        app.mkdir(parents=True)
+        app.parent.chmod(0o555)  # like the read-only disk image
+        self.addCleanup(app.parent.chmod, 0o755)
+        with mock.patch.object(updater, "bundle_path", return_value=app):
+            self.assertEqual(updater.install_location_problem("mac"), updater.MOVE_TO_APPLICATIONS)
+
+    def test_mac_copy_in_applications_without_permission_needs_an_administrator(self) -> None:
+        with mock.patch.object(updater, "bundle_path", return_value=Path("/Applications/DoubleClick Fixer.app")), \
+                mock.patch.object(updater.os, "access", return_value=False):
+            self.assertIn("administrator", updater.install_location_problem("mac"))
+        with mock.patch.object(updater, "bundle_path", return_value=None):
+            self.assertIn("Couldn’t find", updater.install_location_problem("mac"))
+
+    def test_windows_folder_is_probed_by_writing(self) -> None:
+        exe = self.root / "DoubleClickFixer.exe"
+        with mock.patch.object(updater.sys, "executable", str(exe)):
+            self.assertEqual(updater.install_location_problem("windows-portable"), "")
+            self.assertEqual(list(self.root.iterdir()), [], "the probe is removed")
+            with mock.patch.object(Path, "write_bytes", side_effect=PermissionError):
+                self.assertIn("No permission", updater.install_location_problem("windows-installed"))
+
+
 class MacInstallTests(unittest.TestCase):
     """_install_mac up to starting the swap script, with ditto and codesign faked."""
 
@@ -334,6 +370,10 @@ class NetworkTests(unittest.TestCase):
         environment = mock.patch.dict(os.environ, {updater.TEST_KEY_ENV: TEST_KEY})
         environment.start()
         self.addCleanup(environment.stop)
+        # The test runs as a "mac" copy without being inside an app bundle.
+        location = mock.patch.object(updater, "install_location_problem", return_value="")
+        self.location_problem = location.start()
+        self.addCleanup(location.stop)
         self.requested: list[str] = []
 
     def serve(self, files: dict[str, bytes]) -> str:
@@ -491,6 +531,27 @@ class NetworkTests(unittest.TestCase):
         self.wait_for(instance, {instance.FAILED, instance.INSTALLING})
         self.assertIn("another version", instance.message)
 
+    def test_a_copy_that_cant_replace_itself_says_so_before_downloading(self) -> None:
+        base = self.matching_files()
+        instance = self.available(base)
+        self.location_problem.return_value = updater.MOVE_TO_APPLICATIONS
+        instance.install(unattended=True)
+        self.assertEqual(instance.state, instance.FAILED)
+        self.assertEqual(instance.message, "Move DoubleClick Fixer to Applications to update it.")
+        self.settle()
+        self.assertEqual(self.requested, ["latest"])
+
+    def test_a_new_download_replaces_the_previous_folder(self) -> None:
+        base = self.matching_files()
+        instance = self.available(base)
+        previous = Path(tempfile.mkdtemp(prefix=updater.WORKDIR_PREFIX))
+        instance._workdir = previous
+        with mock.patch.object(instance, "_install_mac"):
+            instance.install()
+            self.assertFalse(previous.exists())
+            self.wait_for(instance, {instance.INSTALLING, instance.FAILED})
+        self.assertNotEqual(instance._workdir, previous)
+
     def test_a_full_disk_fails_instead_of_hanging(self) -> None:
         base = self.matching_files()
         instance = self.available(base)
@@ -535,6 +596,95 @@ class NetworkTests(unittest.TestCase):
         instance.apply_if_ready()  # the window was closed
         install.assert_called_once()
         self.assertEqual(instance.state, instance.INSTALLING)
+
+    def test_checks_wait_while_an_update_is_ready(self) -> None:
+        instance, _install, base = self.ready_update()
+        before = list(self.requested)
+        with mock.patch.dict(os.environ, {updater.URL_OVERRIDE_ENV: f"{base}/latest"}):
+            instance.check(user_initiated=False)
+            instance.check(user_initiated=True)
+            self.settle()
+        self.assertEqual(instance.state, instance.READY)
+        self.assertEqual(self.requested, before, "nothing is downloaded again")
+        self.assertTrue(instance._ready_file.exists())
+
+    def test_turning_off_automatic_installs_keeps_a_ready_update_waiting_for_the_user(self) -> None:
+        instance, install, _base = self.ready_update()
+        workdir = instance._workdir
+        instance.controller.set_auto_update(False)  # switched off while it waited
+        instance.window_visible = lambda: False
+        instance.apply_if_ready()
+        install.assert_not_called()
+        self.assertEqual(instance.state, instance.AVAILABLE)
+        self.assertFalse(workdir.exists())
+
+        instance, install, _base = self.ready_update()
+        instance.set_auto_install(False)
+        self.assertEqual(instance.state, instance.AVAILABLE)
+        self.assertFalse(instance.controller.settings["auto_update"])
+        instance.install()  # the user asks for it
+        self.wait_for(instance, {instance.INSTALLING, instance.FAILED})
+        self.assertEqual(instance.state, instance.INSTALLING, instance.message)
+
+    def background_check(self, base: str, **settings):
+        instance = self.make_updater(f"{base}/latest", **settings)
+        instance.window_visible = lambda: False
+        install = mock.patch.object(instance, "_install_mac").start()
+        self.addCleanup(mock.patch.stopall)
+        with mock.patch.dict(os.environ, {updater.URL_OVERRIDE_ENV: f"{base}/latest"}):
+            instance.check(user_initiated=False)
+            # An automatic install leaves AVAILABLE at once, in the same step.
+            self.wait_for(instance, {instance.AVAILABLE, instance.INSTALLING, instance.FAILED, instance.IDLE})
+            self.settle()
+        return instance, install
+
+    def test_checking_and_installing_automatically_are_separate(self) -> None:
+        base = self.matching_files()
+        instance, install = self.background_check(base, auto_check=False, auto_update=True)
+        self.assertEqual((instance.state, self.requested), (instance.IDLE, []), "no background checks")
+
+        instance, install = self.background_check(base, auto_check=True, auto_update=False)
+        self.assertEqual(instance.state, instance.AVAILABLE, "found, and left for the user")
+        self.assertNotIn(MAC_ASSET, self.requested)
+
+        instance, install = self.background_check(base, auto_check=True, auto_update=True)
+        self.assertEqual(instance.state, instance.INSTALLING)
+        install.assert_called_once()
+        self.assertEqual(instance.controller.settings["update_attempt_version"], "9.9.9")
+        self.assertEqual(instance.controller.settings["update_attempt_count"], 1)
+
+    def test_a_version_that_failed_twice_is_not_retried_unattended(self) -> None:
+        base = self.matching_files()
+        instance, install = self.background_check(
+            base, auto_update=True, update_attempt_version="9.9.9", update_attempt_count=1
+        )
+        install.assert_called_once()
+        self.assertEqual(instance.controller.settings["update_attempt_count"], 2)
+
+        instance, install = self.background_check(
+            base, auto_update=True, update_attempt_version="9.9.9", update_attempt_count=2
+        )
+        self.assertEqual(instance.state, instance.AVAILABLE)
+        install.assert_not_called()
+        instance.install()  # the user can still ask for it
+        self.wait_for(instance, {instance.INSTALLING, instance.FAILED})
+        install.assert_called_once()
+
+        # A newer version starts afresh.
+        instance, install = self.background_check(
+            base, auto_update=True, update_attempt_version="9.9.8", update_attempt_count=5
+        )
+        install.assert_called_once()
+
+    def test_settings_switches(self) -> None:
+        instance = self.make_updater("http://127.0.0.1:9/latest")
+        self.assertTrue(instance.auto_check, "on unless turned off")
+        instance.set_auto_check(False)
+        self.assertFalse(instance.auto_check)
+        self.assertFalse(instance.controller.settings["auto_check"])
+        instance.set_auto_install(True)
+        self.assertTrue(instance.auto_install)
+
 
 class AssetStateTests(unittest.TestCase):
     def test_assets_still_uploading_are_ignored(self) -> None:
@@ -626,3 +776,18 @@ class RelaunchNoticeTests(unittest.TestCase):
             controller.set_pending_update("9.9.9")
             self.assertEqual(controller.take_update_result("0.2.8"), "failed")
 
+    def test_a_successful_update_clears_the_attempt_count(self) -> None:
+        from app.updater import Updater
+
+        controller = FakeController(update_attempt_version="9.9.9", update_attempt_count=1)
+        instance = Updater(controller)
+        self.addCleanup(instance.deleteLater)
+        instance.note_relaunch("failed")
+        self.assertEqual(controller.settings["update_attempt_count"], 1)
+        instance.note_relaunch("updated")
+        self.assertEqual(controller.settings["update_attempt_version"], "")
+        self.assertEqual(controller.settings["update_attempt_count"], 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

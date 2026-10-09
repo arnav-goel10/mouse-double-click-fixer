@@ -78,8 +78,13 @@ FIRST_CHECK_DELAY_MS = 20 * 1000
 #: connection ends in "Try Again" rather than a spinner that never stops.
 STALL_TIMEOUT_MS = 30 * 1000
 WORKDIR_PREFIX = "dcf-update-"
+#: A version that failed to install this many times is no longer installed
+#: unattended, only when the user asks. Retrying it would quit the app again at
+#: every sign-in.
+GIVE_UP_AFTER = 2
 
 UNSIGNED = "This update isn’t signed, so it wasn’t installed."
+MOVE_TO_APPLICATIONS = "Move DoubleClick Fixer to Applications to update it."
 
 
 # -- pure helpers (unit tested) ---------------------------------------------------
@@ -209,6 +214,37 @@ def bundle_path() -> Optional[Path]:
         if parent.suffix == ".app":
             return parent
     return None
+
+
+def install_location_problem(kind: str) -> str:
+    """Why this copy can't replace itself, or "" when it can.
+
+    Checked before anything is downloaded, so a copy that can never update
+    says so at once instead of downloading the update every few hours.
+    """
+    if kind == "mac":
+        bundle = bundle_path()
+        if bundle is None:
+            return "Couldn’t find the installed app."
+        # The swap renames the bundle inside its folder. A copy opened from the
+        # disk image, or translocated by Gatekeeper, is on a read-only volume,
+        # which access() reports too.
+        if os.access(bundle.parent, os.W_OK):
+            return ""
+        if bundle.parent in (Path("/Applications"), Path.home() / "Applications"):
+            return "Your account can’t change apps in Applications. Ask an administrator to update it."
+        return MOVE_TO_APPLICATIONS
+    if kind in ("windows-installed", "windows-portable"):
+        folder = Path(sys.executable).parent
+        # On Windows access() reads only the read-only attribute, not the
+        # folder's permissions, so try writing a file there.
+        probe = folder / f".{WORKDIR_PREFIX}probe"
+        try:
+            probe.write_bytes(b"")
+            probe.unlink()
+        except OSError:
+            return f"No permission to replace the app in {folder}."
+    return ""
 
 
 def bundle_version(app: Path) -> str:
@@ -372,6 +408,31 @@ class Updater(QObject):
     def supported(self) -> bool:
         return self.kind != "source" or bool(os.environ.get(URL_OVERRIDE_ENV))
 
+    @property
+    def auto_check(self) -> bool:
+        """Look for updates in the background."""
+        return bool(self.controller.settings.get("auto_check", True))
+
+    @property
+    def auto_install(self) -> bool:
+        """Install what a background check finds without asking. It has no
+        effect while `auto_check` is off, since only background checks install
+        on their own."""
+        return bool(self.controller.settings.get("auto_update", True))
+
+    def set_auto_check(self, enabled: bool) -> None:
+        self._remember(auto_check=bool(enabled))
+        self.changed.emit()
+
+    def set_auto_install(self, enabled: bool) -> None:
+        self.controller.set_auto_update(bool(enabled))
+        if not enabled and self.state == self.READY:
+            # It was going to install when the window closed; now it waits to
+            # be asked, and the window says so.
+            self._discard_download()
+        else:
+            self.changed.emit()
+
     def start(self) -> None:
         """Begin the background schedule."""
         if not self.supported:
@@ -381,9 +442,11 @@ class Updater(QObject):
         self._timer.start()
 
     def check(self, user_initiated: bool = True) -> None:
-        if not self.supported or self.state in (self.CHECKING, self.DOWNLOADING, self.INSTALLING):
+        # While READY a verified download is waiting for the window to close;
+        # checking again would only download the same update a second time.
+        if not self.supported or self.state in (self.CHECKING, self.DOWNLOADING, self.READY, self.INSTALLING):
             return
-        if not user_initiated and not self.controller.settings.get("auto_update", True):
+        if not user_initiated and not self.auto_check:
             return
         self._set(self.CHECKING, "")
         request = QNetworkRequest(QUrl(os.environ.get(URL_OVERRIDE_ENV) or LATEST_URL))
@@ -402,10 +465,12 @@ class Updater(QObject):
             return
         if self.release is None or self.state in (self.DOWNLOADING, self.INSTALLING):
             return
-        if not self.release.signature_url:
-            self._set(self.FAILED, UNSIGNED)
+        problem = UNSIGNED if not self.release.signature_url else install_location_problem(self.kind)
+        if problem:
+            self._set(self.FAILED, problem)
             return
         self._unattended = unattended
+        self._remove_workdir()
         self._workdir = Path(tempfile.mkdtemp(prefix=WORKDIR_PREFIX))
         self._claim = None
         self._set(self.DOWNLOADING, "")
@@ -440,12 +505,14 @@ class Updater(QObject):
             return
         self.release = release
         self._set(self.AVAILABLE, "")
-        if not user_initiated and self.controller.settings.get("auto_update", True):
+        if not user_initiated and self.auto_install and self._attempts(release.version) < GIVE_UP_AFTER:
             self.install(unattended=True)
 
     def note_relaunch(self, result: str) -> None:
         """Say how the update that just restarted the app went."""
         if result == "updated":
+            if self.controller.settings.get("update_attempt_version"):
+                self._remember(update_attempt_version="", update_attempt_count=0)
             self._set(self.CURRENT, f"Updated to {__version__}")
         elif result == "failed":
             self._set(self.FAILED, "The update didn’t install. Try again.")
@@ -453,8 +520,12 @@ class Updater(QObject):
     def apply_if_ready(self) -> None:
         """A good moment to restart (the window was closed): finish a
         background update that was waiting."""
-        if self.state == self.READY and self._unattended and not self.controller.suspended:
-            self._apply(self._ready_file)
+        if self.state != self.READY or not self._unattended or self.controller.suspended:
+            return
+        if not self.auto_install:
+            self._discard_download()
+            return
+        self._apply(self._ready_file)
 
     def _download(self, url: str, target: Path, done) -> None:
         request = QNetworkRequest(QUrl(url))
@@ -544,6 +615,10 @@ class Updater(QObject):
         if not expected or sha256_of(path) != expected:
             self._fail("The download didn’t match its checksum, so it wasn’t installed.")
             return
+        if self._unattended and not self.auto_install:
+            # Installing automatically was turned off while this downloaded.
+            self._discard_download()
+            return
         if self._unattended and (self.window_visible() or self.controller.suspended):
             # Don't restart the app under someone using it; finish when the
             # window closes, or when they press Restart Now.
@@ -557,6 +632,13 @@ class Updater(QObject):
             return
         self._ready_file = None
         self._set(self.INSTALLING, "")
+        # Counted before trying, so an attempt that never comes back (the app
+        # quits and the new copy doesn't start) counts too. A successful one
+        # changes the running version, after which the count no longer applies.
+        self._remember(
+            update_attempt_version=self.release.version,
+            update_attempt_count=self._attempts(self.release.version) + 1,
+        )
         try:
             if self.kind == "mac":
                 self._install_mac(path)
@@ -629,26 +711,44 @@ class Updater(QObject):
         )
 
     def _install_windows_portable(self, downloaded: Path) -> None:
-        current = Path(sys.executable)
-        # Find out now, not after quitting, whether the file can be replaced.
-        probe = current.parent / f".{WORKDIR_PREFIX}probe"
-        try:
-            probe.write_bytes(b"")
-            probe.unlink()
-        except OSError as error:
-            raise UpdateError(f"No permission to replace the app in {current.parent}.") from error
+        # install_location_problem() already found that the folder is writable.
         start_windows_script(
             downloaded.parent / "apply-update.cmd",
             windows_portable_script(os.getpid(), self._relaunch_args()),
-            app=current,
+            app=Path(sys.executable),
             source=downloaded,
         )
 
     # -- state ------------------------------------------------------------------------
-    def _fail(self, message: str) -> None:
+    def _attempts(self, version: str) -> int:
+        """How many times installing `version` has been tried."""
+        settings = self.controller.settings
+        if settings.get("update_attempt_version") != version:
+            return 0
+        try:
+            return max(0, int(settings.get("update_attempt_count", 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    def _remember(self, **values: object) -> None:
+        # The updater's own settings are written by the controller with all the
+        # others, so they survive its next save.
+        self.controller._store(**values)
+
+    def _remove_workdir(self) -> None:
         if self._workdir is not None:
             shutil.rmtree(self._workdir, ignore_errors=True)
             self._workdir = None
+
+    def _discard_download(self) -> None:
+        """Drop a waiting download: the update stays available, to install
+        when the user asks."""
+        self._remove_workdir()
+        self._ready_file = None
+        self._set(self.AVAILABLE, "")
+
+    def _fail(self, message: str) -> None:
+        self._remove_workdir()
         self._set(self.FAILED, message)
 
     def _set(self, state: str, message: str) -> None:
