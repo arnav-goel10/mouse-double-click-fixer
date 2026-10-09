@@ -16,8 +16,8 @@ import math
 import os
 import platform
 import threading
-from time import monotonic, perf_counter
 from contextlib import contextmanager
+from time import monotonic, perf_counter
 from typing import Callable, Iterable, NamedTuple, Optional
 
 from dataclasses import replace
@@ -45,7 +45,7 @@ RESTORE_MARK = max(INJECTED_MOTION_MARKS) + 1
 
 #: Marks the pointer motion that takes the pointer to where a held release
 #: happened, just before the release is re-sent there (Windows; see
-#: _run_windows). The move back after it carries the button's motion mark.
+#: WindowsHook). The move back after it carries the button's motion mark.
 TELEPORT_MARK = RESTORE_MARK + 1
 
 #: Windows tags mouse messages it makes from pen and touch input with this
@@ -670,8 +670,8 @@ class GlobalClickFilter:
         # Windows silently removes a low-level hook whose callback runs past
         # LowLevelHooksTimeout, and says nothing: the thread lives on and no
         # click is filtered again. So a slow callback re-installs the hook, so
-        # does a timer every few seconds in case a stall went unseen, and so
-        # do unlocking the session, reconnecting to it and waking from sleep,
+        # does a timer every 15 s in case a stall went unseen, and so do
+        # unlocking the session, reconnecting to it and waking from sleep,
         # when hooks are most often lost.
         WM_REARM = 0x8000 + 0x44  # WM_APP + n
         REARM_SLOW, REARM_SESSION = 1, 2

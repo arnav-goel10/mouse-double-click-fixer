@@ -54,13 +54,57 @@ Filename: "{app}\DoubleClickFixer.exe"; Description: "Open DoubleClick Fixer"; F
 Filename: "{app}\DoubleClickFixer.exe"; Parameters: "--updated {code:RelaunchArguments}"; Flags: nowait runasoriginaluser; Check: RelaunchRequested
 
 [Code]
-function IsUpgrade: Boolean;
-var
-  Key: String;
+// Inno Setup's own uninstall entry for this AppId.
+function UninstallKey: String;
 begin
-  // Inno Setup's own uninstall entry for this AppId.
-  Key := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{6B0E2F4C-3D7A-4E51-9A0B-DC1F1C5E7A21}_is1';
-  Result := RegKeyExists(HKCU, Key) or RegKeyExists(HKLM, Key);
+  Result := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{6B0E2F4C-3D7A-4E51-9A0B-DC1F1C5E7A21}_is1';
+end;
+
+function IsUpgrade: Boolean;
+begin
+  Result := RegKeyExists(HKCU, UninstallKey) or RegKeyExists(HKLM, UninstallKey);
+end;
+
+// The version installed now, or '' when there is none.
+function InstalledVersion: String;
+var
+  Version: String;
+begin
+  Result := '';
+  if RegQueryStringValue(HKCU, UninstallKey, 'DisplayVersion', Version) then
+    Result := Version
+  else if RegQueryStringValue(HKLM, UninstallKey, 'DisplayVersion', Version) then
+    Result := Version;
+end;
+
+// Whether a version like "0.2.11" is Major.Minor.Patch or later.
+function VersionAtLeast(const Version: String; Major, Minor, Patch: Integer): Boolean;
+var
+  Rest: String;
+  Parts: array[0..2] of Integer;
+  I, Dot: Integer;
+begin
+  Rest := Version;
+  for I := 0 to 2 do
+  begin
+    Dot := Pos('.', Rest);
+    if Dot = 0 then
+    begin
+      Parts[I] := StrToIntDef(Rest, 0);
+      Rest := '';
+    end
+    else
+    begin
+      Parts[I] := StrToIntDef(Copy(Rest, 1, Dot - 1), 0);
+      Rest := Copy(Rest, Dot + 1, Length(Rest));
+    end;
+  end;
+  if Parts[0] <> Major then
+    Result := Parts[0] > Major
+  else if Parts[1] <> Minor then
+    Result := Parts[1] > Minor
+  else
+    Result := Parts[2] >= Patch;
 end;
 
 // A running copy lives in the notification area and ignores window-close
@@ -86,9 +130,14 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   // The installed copy knows how to reach a running one of its own version.
-  // One too old for "--quit", or none installed here, is left to taskkill.
-  // (The new exe can't run on its own from {tmp}: it needs its folder.)
-  AskRunningCopyToQuit(ExpandConstant('{app}\DoubleClickFixer.exe'));
+  // (The new exe can't run on its own from {tmp}: it needs its folder.) A
+  // copy before 0.2.7 doesn't know "--quit": run with it, it may start a
+  // second copy that never exits, and this installer would wait on it for
+  // ever. So that one, like a copy installed elsewhere, is left to taskkill.
+  if VersionAtLeast(InstalledVersion, 0, 2, 7) then
+    AskRunningCopyToQuit(ExpandConstant('{app}\DoubleClickFixer.exe'))
+  else
+    AskRunningCopyToQuit('');
   Result := '';
 end;
 

@@ -159,6 +159,9 @@ class FakeWindows:
         return ("move", normalized_absolute(x, y, *self.screen), mark)
 
     def send(self, inputs: list) -> int:
+        # Motion is watched before anything goes out, so no real move can
+        # overtake what is being sent.
+        assert self.hook.watch[0], "sent input while motion wasn't watched"
         self.queue.extend(inputs)
         return len(inputs)
 
