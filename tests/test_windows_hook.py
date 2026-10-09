@@ -988,6 +988,18 @@ class WindowsHookResilienceTests(RealWindows):
         time.sleep(0.3)
         self.assertEqual(self.filter.hook_rearms, 3)
 
+    def test_closing_the_session_window_leaves_it_listening(self) -> None:
+        # Restart Manager, and taskkill without /F, send WM_CLOSE to every
+        # top-level window; the session window must outlive it.
+        self.start_filter()
+        window = self.filter._hook_window
+        self.user32.IsWindow.argtypes = [self.wintypes.HWND]
+        self.user32.IsWindow.restype = self.wintypes.BOOL
+        self.assertEqual(self.user32.SendMessageW(window, 0x0010, 0, 0), 0)  # WM_CLOSE
+        self.assertTrue(self.user32.IsWindow(window), "WM_CLOSE destroyed the session window")
+        self.user32.SendMessageW(window, 0x02B1, 0x8, 0)                      # and it still hears an unlock
+        self.assertGreaterEqual(self.wait_for_rearms(1), 1)
+
     def test_the_hook_is_re_armed_periodically(self) -> None:
         import app.platform
 

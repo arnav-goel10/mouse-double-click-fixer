@@ -1616,6 +1616,7 @@ class SessionWindow:
     whatever fails to register.
     """
 
+    WM_CLOSE = 0x0010
     WM_WTSSESSION_CHANGE = 0x02B1
     WM_POWERBROADCAST = 0x0218
     #: WTS_CONSOLE_CONNECT, WTS_REMOTE_CONNECT, WTS_SESSION_UNLOCK.
@@ -1666,10 +1667,16 @@ class SessionWindow:
         kernel32.GetModuleHandleW.restype = wintypes.HMODULE
 
         session_events, resume_events = self.SESSION_EVENTS, self.RESUME_EVENTS
-        session_change, power = self.WM_WTSSESSION_CHANGE, self.WM_POWERBROADCAST
+        session_change, power, close = self.WM_WTSSESSION_CHANGE, self.WM_POWERBROADCAST, self.WM_CLOSE
 
         @WNDPROC
         def window_proc(hwnd, message, wparam, lparam):
+            if message == close:
+                # Restart Manager, and taskkill without /F, close every
+                # top-level window of the app. The default would destroy this
+                # one, and session notices would stop without a word: it goes
+                # only with the hook (see close()).
+                return 0
             try:
                 if (message == session_change and wparam in session_events) or (
                     message == power and wparam in resume_events
