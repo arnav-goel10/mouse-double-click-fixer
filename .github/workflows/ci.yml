@@ -38,6 +38,11 @@ jobs:
         run: python -m unittest discover -s tests -v
         env:
           QT_QPA_PLATFORM: offscreen
+      - name: Self-test from source, which says which OpenSSL this Python runs
+        # Only a built app fails on an OpenSSL older than the floor
+        # (app/selftest.py's OPENSSL_FLOOR); from source the line says why a
+        # build on this Python would.
+        run: python run.py --self-test
       - name: Real HTTPS through the TLS backend the app ships with
         # tests/test_tls.py's RealHttpsTests, through tests/https_probe.py:
         # Schannel on Windows, Qt's OpenSSL backend on Python's OpenSSL on
