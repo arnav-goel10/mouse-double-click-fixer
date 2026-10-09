@@ -942,8 +942,7 @@ class MainWindow(QWidget):
         self._retry_timer.setSingleShot(True)
         self._retry_timer.timeout.connect(self._retry_start)
         self._retry_waits: list[int] = []
-        # Set while the app itself (not the user) starts the filter: a
-        # failure then shows no dialog.
+        # Set while a retry runs: its failure shows no dialog.
         self._quiet = False
 
         # False while the user is in another login session (macOS fast user
@@ -1192,20 +1191,21 @@ class MainWindow(QWidget):
     # -- keeping the filter alive ------------------------------------------------
     def restore_filter(self, background: bool) -> None:
         """Turn the saved "on" back on at launch. Opened by the user, it
-        goes the usual way, dialog and all; at login, see _start_quietly."""
+        goes the usual way; at login, see _start_with_retries."""
         if background:
-            self._start_quietly()
+            self._start_with_retries()
         else:
             self.request_filter(True)
 
-    def _start_quietly(self) -> None:
+    def _start_with_retries(self) -> None:
         """Start the filter for the app's own reasons (a login, a wake, a
-        session switch, a dead tap) rather than the user's. A refused tap
-        then shows no dialog, only the menu's status line and the Filter
-        pane, and it is tried again at each of RETRY_AT_S before it is left
-        to the user: at those moments the window server or the permission
-        database can answer a little late."""
-        self._attempt_quietly()
+        session switch, a dead tap) rather than the user's. At those moments
+        the window server or the permission database can answer a little
+        late, so a refused tap is tried again at each of RETRY_AT_S before
+        it is left to the user. The first failure shows as usual (a dialog
+        only if the window is on screen); the retries show only in the
+        menu's status line and the Filter pane."""
+        self.request_filter(True, prompt=False)
         if self._start_failed():
             marks = (0, *RETRY_AT_S)
             self._retry_waits = [int((later - earlier) * 1000) for earlier, later in zip(marks, marks[1:])]
@@ -1247,7 +1247,7 @@ class MainWindow(QWidget):
         if not controller.settings["fix_enabled"]:
             return
         controller.stop_keeping_choice()
-        self._start_quietly()
+        self._start_with_retries()
 
     def _check_health(self) -> None:
         if self.controller.active and not self.controller.tap_alive():
