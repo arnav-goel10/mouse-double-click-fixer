@@ -71,10 +71,22 @@ jobs:
       - name: Build the exe and the installer
         shell: pwsh
         run: |
+          # The app installs only signed updates. This build alone also trusts
+          # a key made for this run, so the update leg can sign its stand-in
+          # release (tools/ci_update_key.py); release.yml refuses the key.
+          python tools/ci_update_key.py make "$env:RUNNER_TEMP\dcf-ci-key"
+          $env:DCF_CI_UPDATE_KEY = "$env:RUNNER_TEMP\dcf-ci-key\dcf-ci-update-key.pub"
           .\installer\build_windows.ps1
           choco install innosetup --no-progress -y
           $version = (python -c "import app; print(app.__version__)")
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" "installer\windows.iss"
+      - name: The release guard finds CI's key in this build
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          python tools/ci_update_key.py check dist\DoubleClickFixer.exe dist\onedir
+          if ($LASTEXITCODE -ne 1) { throw "the check release.yml runs missed CI's key in a build that carries it" }
+          exit 0
       - name: Download the oldest installer still in use (0.2.6, before --quit)
         shell: pwsh
         env:
@@ -82,4 +94,4 @@ jobs:
         run: gh release download v0.2.6 -p DoubleClickFixer-Setup.exe -D old
       - name: Install over a running copy, quit, update, uninstall
         shell: pwsh
-        run: .\tools\windows_install_e2e.ps1 -OldSetup old\DoubleClickFixer-Setup.exe -NewSetup installer\Output\DoubleClickFixer-Setup.exe
+        run: .\tools\windows_install_e2e.ps1 -OldSetup old\DoubleClickFixer-Setup.exe -NewSetup installer\Output\DoubleClickFixer-Setup.exe -SigningKey "$env:RUNNER_TEMP\dcf-ci-key\dcf-ci-update-key.key"
