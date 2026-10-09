@@ -283,6 +283,8 @@ class DeliveryDelay:
     made inside the window but delivered late finds its release already
     gone, and a drag breaks. The allowance is the 95th percentile of the
     latest events' lateness, within MIN_ALLOWANCE_MS and MAX_ALLOWANCE_MS.
+    The worst of them sets how long the hook waits for an event it re-sent
+    to come back (see GlobalClickFilter._in_flight_timeout).
     """
 
     def __init__(self, size: int = LATENESS_SAMPLES) -> None:
@@ -301,6 +303,10 @@ class DeliveryDelay:
         ordered = sorted(self._samples)
         rank = max(0, math.ceil(LATENESS_SHARE * len(ordered)) - 1)
         return min(MAX_ALLOWANCE_MS, max(MIN_ALLOWANCE_MS, ordered[rank]))
+
+    def worst_ms(self) -> float:
+        """The most any of the latest events was late, 0 before any is seen."""
+        return max(self._samples, default=0.0)
 
 
 def clamp_threshold(value: float) -> int:

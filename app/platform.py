@@ -72,9 +72,14 @@ STATIONARY_PX = 4.0
 #: the pointer had moved on by more than this, it is put back again.
 RESTORE_MIN_PX = 0.5
 
-#: A re-sent event normally passes back through the hook within a millisecond
-#: or two. If one never does (it was blocked, or lost), stop waiting for it.
+#: A re-sent event passes back through the hook about as late as real events
+#: reach it: a millisecond or two on an idle machine, far longer on a busy
+#: one. If one never does (another app's tap swallowed it, or it was lost),
+#: the events waiting behind it go out after twice the worst lateness seen
+#: lately (see core.DeliveryDelay), but never sooner than the first bound or
+#: later than the second.
 IN_FLIGHT_TIMEOUT_S = 0.15
+IN_FLIGHT_MAX_TIMEOUT_S = 0.5
 
 #: macOS disables an event tap that it judges too slow. If it does so this
 #: many times within this many seconds, re-arming the tap would only fight
@@ -501,11 +506,22 @@ class GlobalClickFilter:
         if not self._queued[button]:
             # Should the re-sent event never come back, don't keep this one
             # waiting for the next event to notice.
-            timer = threading.Timer(IN_FLIGHT_TIMEOUT_S + 0.05, self._expire_check, (button,))
-            timer.daemon = True
-            self._timers = [t for t in self._timers if t.is_alive()] + [timer]
-            timer.start()
+            self._check_in_flight_after(button, self._in_flight_timeout())
         self._queued[button].append((pressed, template, send_as or button))
+
+    def _check_in_flight_after(self, button: Button, seconds: float) -> None:
+        """With the lock held: give up on `button`'s re-sent events, if they
+        are overdue by then, a little after `seconds`."""
+        timer = threading.Timer(max(0.0, seconds) + 0.05, self._expire_check, (button,))
+        timer.daemon = True
+        self._timers = [t for t in self._timers if t.is_alive()] + [timer]
+        timer.start()
+
+    def _in_flight_timeout(self) -> float:
+        """With the lock held: how long to wait for a re-sent event to come
+        back before giving up on it (see IN_FLIGHT_TIMEOUT_S)."""
+        follows = 2 * self._lateness.worst_ms() / 1000
+        return max(IN_FLIGHT_TIMEOUT_S, min(IN_FLIGHT_MAX_TIMEOUT_S, follows))
 
     def _commit_held(self, button: Button, expected: Optional[float] = None) -> None:
         """The threshold passed with no press: the held release was real.
@@ -662,6 +678,11 @@ class GlobalClickFilter:
     def _expire_check(self, button: Button) -> None:
         with self._lock:
             overdue = self._expire_in_flight(button)
+            if self._in_flight[button] and self._queued[button]:
+                # Not overdue yet: the wait grew with a late event since this
+                # check was set. Check again when it ends.
+                since = self._in_flight_since.get(button, 0.0)
+                self._check_in_flight_after(button, since + self._in_flight_timeout() - monotonic())
         for send_as, pressed, template in overdue:
             self._safe_inject(send_as, pressed, template)
         self._update_motion_tap()
@@ -669,7 +690,7 @@ class GlobalClickFilter:
     def _expire_in_flight(self, button: Button) -> list:
         """With the lock held: give up on re-sent events that never came back,
         returning the queue to send now."""
-        if self._in_flight[button] and monotonic() - self._in_flight_since.get(button, 0) > IN_FLIGHT_TIMEOUT_S:
+        if self._in_flight[button] and monotonic() - self._in_flight_since.get(button, 0) > self._in_flight_timeout():
             self._in_flight[button] = 0
             return self._take_queue(button)
         return []

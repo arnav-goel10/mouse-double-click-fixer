@@ -626,6 +626,47 @@ class EventTimeTests(unittest.TestCase):
             self.sent, [(Button.LEFT, False, "up"), (Button.LEFT, None, "m"), (Button.LEFT, True, "down2")]
         )
 
+    def resend_that_never_returns(self) -> None:
+        """up1 re-sent at 100.200, never to come back; down2 waits behind it."""
+        self.handle(Button.LEFT, True, 100.000, "down1", late_ms=0)
+        self.handle(Button.LEFT, False, 100.100, "up1", late_ms=0)
+        self.clock[0] = 100.200
+        self.timers[-1].fire()
+        self.assertTrue(self.handle(Button.LEFT, True, 100.210, "down2", late_ms=0).deferred)
+
+    def test_events_behind_a_lost_resend_wait_twice_the_worst_lateness(self) -> None:
+        # Within 150-500 ms. Motion is how the wait is seen ending: it gives
+        # up on whatever is overdue, then waits behind what is left.
+        for late_ms, bound_ms in ((0.2, 150), (60, 150), (100, 200), (180, 360), (400, 500), (1500, 500)):
+            with self.subTest(late_ms=late_ms):
+                self.timers.clear()
+                self.filter, self.sent = self.make_filter()
+                self.busy(late_ms=late_ms)
+                self.resend_that_never_returns()
+                self.assertAlmostEqual(self.timers[-1].interval, bound_ms / 1000 + 0.05, places=9)
+                bound = bound_ms / 1000
+                self.assertFalse(self.move(100.199 + bound, "m1", (0, 0), late_ms=0))
+                self.assertEqual(self.sent, [(Button.LEFT, False, "up1")], "still waiting for up1")
+                self.assertFalse(self.move(100.201 + bound, "m2", (0, 0), late_ms=0))
+                self.assertEqual(
+                    self.sent, [(Button.LEFT, False, "up1"), (Button.LEFT, True, "down2"), (Button.LEFT, None, "m1")]
+                )
+
+    def test_a_late_event_while_waiting_lengthens_the_wait(self) -> None:
+        self.resend_that_never_returns()                              # a prompt machine: 150 ms
+        check = self.timers[-1]
+        self.assertAlmostEqual(check.interval, 0.200, places=9)
+        # A click reaches the hook 180 ms late: up1 may be that late too.
+        self.handle(Button.RIGHT, True, 100.215, "rdown", late_ms=180)
+        self.clock[0] = 100.410
+        check.fire()
+        self.assertEqual(self.sent, [(Button.LEFT, False, "up1")], "not overdue any more")
+        recheck = self.timers[-1]
+        self.assertAlmostEqual(recheck.interval, 100.200 + 0.360 - 100.410 + 0.05, places=6)
+        self.clock[0] = 100.610
+        recheck.fire()
+        self.assertEqual(self.sent, [(Button.LEFT, False, "up1"), (Button.LEFT, True, "down2")])
+
     def test_a_real_race_between_the_timer_and_an_event_delivers_once(self) -> None:
         for _round in range(300):
             click_filter, sent = self.make_filter()

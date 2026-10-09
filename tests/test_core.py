@@ -361,6 +361,16 @@ class DeliveryDelayTests(unittest.TestCase):
             delay.add(0.090 if index % 32 == 0 else 0.010)  # 2 of 64 slow
         self.assertAlmostEqual(delay.allowance_ms(), 10.0, places=6)
 
+    def test_the_worst_is_the_most_any_recent_event_was_late(self) -> None:
+        delay = DeliveryDelay()
+        self.assertEqual(delay.worst_ms(), 0.0)
+        delay.add(0.300)
+        for _ in range(LATENESS_SAMPLES - 1):
+            delay.add(0.010)
+        self.assertAlmostEqual(delay.worst_ms(), 300.0, places=6)
+        delay.add(0.010)  # the slow one ages out
+        self.assertAlmostEqual(delay.worst_ms(), 10.0, places=6)
+
     def test_stamps_from_another_clock_are_ignored(self) -> None:
         delay = DeliveryDelay()
         for seconds in (5_000.0, -3.0, float("nan"), float("inf")):
