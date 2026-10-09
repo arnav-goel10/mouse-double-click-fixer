@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import platform
 import sys
+from functools import lru_cache
 from time import monotonic, sleep
 from typing import Optional
 
@@ -22,26 +23,103 @@ from .ui.window import MainWindow
 
 SERVER_NAME = "doubleclick-fixer-single-instance"
 #: Taken the moment a copy starts, long before its single-instance channel is
-#: listening (the Windows exe unpacks itself first, which can take seconds).
+#: listening (the portable Windows exe unpacks itself first, which can take
+#: seconds).
 LOCK_NAME = "doubleclick-fixer.lock"
 #: How long a second launch, or --quit, keeps trying to reach a copy that is
 #: still starting up.
 HAND_OVER_WAIT_S = 10.0
 
 
+@lru_cache(maxsize=1)
+def _windows_session_and_user() -> tuple[int, str]:
+    """This process's Terminal Services session and its user's SID (the
+    user's name if the SID can't be read). An elevated copy has the same
+    user SID as a normal one, so the two still find each other."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    session = wintypes.DWORD()
+    kernel32.ProcessIdToSessionId.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    if not kernel32.ProcessIdToSessionId(kernel32.GetCurrentProcessId(), ctypes.byref(session)):
+        session.value = 0
+    user = ""
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
+    advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)
+    ]
+    advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+    token = wintypes.HANDLE()
+    if advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(token)):  # TOKEN_QUERY
+        try:
+            buffer = ctypes.create_string_buffer(256)
+            size = wintypes.DWORD()
+            # TokenUser = 1: a TOKEN_USER, whose first field points at the SID.
+            if advapi32.GetTokenInformation(token, 1, buffer, ctypes.sizeof(buffer), ctypes.byref(size)):
+                sid = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0]
+                text = wintypes.LPWSTR()
+                if advapi32.ConvertSidToStringSidW(sid, ctypes.byref(text)):
+                    user = text.value or ""
+                    kernel32.LocalFree(ctypes.cast(text, ctypes.c_void_p))
+        finally:
+            kernel32.CloseHandle(token)
+    if not user:
+        user = os.environ.get("USERNAME", "")
+    return session.value, user
+
+
+def _channel_name() -> str:
+    """The single-instance channel's name, which also names the lock.
+
+    On Windows a named pipe is machine-wide: one name for everyone would let
+    a second signed-in user's copy find the first user's, fail to reach it
+    and fail to listen. So the name carries the session and the user. macOS
+    keeps both in the user's own temporary folder already."""
+    if platform.system() != "Windows":
+        return SERVER_NAME
+    try:
+        session, user = _windows_session_and_user()
+    except Exception:  # noqa: BLE001 - a name per user is still better than none
+        session, user = 0, os.environ.get("USERNAME", "")
+    user = "".join(character if character.isalnum() or character == "-" else "_" for character in user)
+    return f"{SERVER_NAME}-{session}-{user}"
+
+
+def _channel_names() -> list[str]:
+    """Where a running copy may be listening: this session's channel, and on
+    Windows the machine-wide name copies before 1.0 used (another user's copy
+    there refuses the connection, so only this user's own old copy answers)."""
+    name = _channel_name()
+    return [name] if name == SERVER_NAME else [name, SERVER_NAME]
+
+
 def _instance_lock():
     from PySide6.QtCore import QDir, QLockFile
 
-    lock = QLockFile(os.path.join(QDir.tempPath(), f"{LOCK_NAME}-{SERVER_NAME}"))
+    lock = QLockFile(os.path.join(QDir.tempPath(), f"{LOCK_NAME}-{_channel_name()}"))
     # A copy that crashed leaves its lock behind; Qt sees its process is gone
     # and takes the lock over.
     return lock
 
 
+def _same_session(kernel32, pid: int, session: int) -> bool:
+    from ctypes import byref, wintypes
+
+    theirs = wintypes.DWORD()
+    # Unknown counts as another session: never wait on a copy that isn't ours.
+    return bool(kernel32.ProcessIdToSessionId(pid, byref(theirs))) and theirs.value == session
+
+
 def _other_copies_running() -> bool:
-    """Whether another process of this executable exists: one still unpacking
-    itself (the Windows exe does that for a few seconds before any of this
-    code runs, so it holds no lock yet), or an older copy that takes none."""
+    """Whether another process of this executable exists in this session: the
+    portable exe still unpacking itself (it does that for a few seconds before
+    any of this code runs, so it holds no lock yet), or an older copy that
+    takes none. Another signed-in user's copy doesn't count."""
     if not getattr(sys, "frozen", False):
         return False
     mine = {os.getpid(), os.getppid()}  # a one-file exe is a launcher plus the app
@@ -61,15 +139,27 @@ def _other_copies_running() -> bool:
                 ]
 
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+            kernel32.ProcessIdToSessionId.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry)]
+            kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry)]
+            session = wintypes.DWORD()
+            if not kernel32.ProcessIdToSessionId(os.getpid(), ctypes.byref(session)):
+                return False
             snapshot = kernel32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
-            if snapshot == ctypes.c_void_p(-1).value:
+            if not snapshot or snapshot == ctypes.c_void_p(-1).value:
                 return False
             try:
                 entry = ProcessEntry()
                 entry.dwSize = ctypes.sizeof(entry)
                 more = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
                 while more:
-                    if entry.szExeFile.lower() == name and entry.th32ProcessID not in mine:
+                    if (
+                        entry.szExeFile.lower() == name
+                        and entry.th32ProcessID not in mine
+                        and _same_session(kernel32, entry.th32ProcessID, session.value)
+                    ):
                         return True
                     more = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
             finally:
@@ -130,16 +220,18 @@ def _hand_over_to_running_instance(request: bytes = b"show") -> bool:
             ctypes.windll.user32.AllowSetForegroundWindow(ctypes.c_uint32(0xFFFFFFFF).value)  # ASFW_ANY
         except Exception:  # noqa: BLE001 - cosmetic
             pass
-    socket = QLocalSocket()
-    socket.connectToServer(SERVER_NAME)
-    # Generous: a copy still starting up answers late, and giving up early
-    # would start a second copy with a second mouse hook.
-    if socket.waitForConnected(1000):
-        socket.write(request)
-        socket.flush()
-        socket.waitForBytesWritten(300)
-        socket.disconnectFromServer()
-        return True
+    for name in _channel_names():
+        socket = QLocalSocket()
+        socket.connectToServer(name)
+        # Generous: a copy still starting up answers late, and giving up
+        # early would start a second copy with a second mouse hook. (A name
+        # nobody listens on fails at once.)
+        if socket.waitForConnected(1000):
+            socket.write(request)
+            socket.flush()
+            socket.waitForBytesWritten(300)
+            socket.disconnectFromServer()
+            return True
     return False
 
 
@@ -185,8 +277,19 @@ class Application:
         self.window.closed_to_tray.connect(self.updater.apply_if_ready)
 
         self.server = QLocalServer()
-        QLocalServer.removeServer(SERVER_NAME)
-        self.server.listen(SERVER_NAME)
+        channel = _channel_name()
+        if platform.system() == "Windows":
+            # Only this user, elevated or not, may connect: a copy run as
+            # administrator still hears a normal launch, or the installer's
+            # --quit, from the same user.
+            self.server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
+        QLocalServer.removeServer(channel)
+        if not self.server.listen(channel):
+            diagnostics.log.warning(
+                "The single-instance channel isn't listening (%s): opening the app again won't "
+                "find this copy",
+                self.server.errorString(),
+            )
         self.server.newConnection.connect(self._on_second_instance)
 
         hints = self.qt.styleHints()
