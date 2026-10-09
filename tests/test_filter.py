@@ -400,11 +400,9 @@ class ResendOrderTests(unittest.TestCase):
 
 
 class MotionFlushTests(unittest.TestCase):
-    """A click made in place ends when the pointer moves off it."""
+    """A click made in place ends when the pointer moves off it, and only then."""
 
     def setUp(self) -> None:
-        from unittest import mock
-
         self.timers = FakeTimer.reset()
         patch = mock.patch("app.platform.threading.Timer", FakeTimer)
         patch.start()
@@ -414,41 +412,115 @@ class MotionFlushTests(unittest.TestCase):
         self.filter._use_os_time = True
         self.filter._inject = lambda button, pressed, template: self.injected.append((pressed, template))
 
+    def handle(self, pressed, moment, name, at):
+        return self.filter._handle(Button.LEFT, pressed, moment, name, location=at)
+
+    def fire_all(self) -> None:
+        for timer in list(self.timers):
+            timer.fire()
+
     def test_motion_delivers_a_stationary_release_before_itself(self) -> None:
-        self.filter._handle(Button.LEFT, True, 0.0, "down")
-        self.assertTrue(self.filter._handle(Button.LEFT, False, 0.08, "up", stationary=True).held)
-        self.assertFalse(self.filter._motion("m1"), "the motion waits behind the release")
+        self.handle(True, 0.0, "down", (100, 100))
+        self.assertTrue(self.handle(False, 0.08, "up", (101, 100)).held)
+        self.assertFalse(self.filter._motion("m1", (106, 100)), "the motion waits behind the release")
         self.assertEqual(self.injected, [(False, "up")])
         self.filter._injected_passed(Button.LEFT)                     # the up comes back
         self.assertEqual(self.injected, [(False, "up"), (None, "m1")])
         self.filter._injected_passed(Button.LEFT)                     # the motion comes back
-        self.assertTrue(self.filter._motion("m2"), "nothing left in flight")
-        for timer in list(self.timers):
-            timer.fire()
+        self.assertTrue(self.filter._motion("m2", (110, 100)), "nothing left in flight")
+        self.fire_all()
         self.assertEqual(self.injected, [(False, "up"), (None, "m1")], "the timer must not resend the up")
 
-    def test_motion_during_a_moving_hold_passes_and_keeps_the_drag(self) -> None:
-        self.filter._handle(Button.LEFT, True, 0.0, "down")
-        self.assertTrue(self.filter._handle(Button.LEFT, False, 0.08, "up", stationary=False).held)
-        self.assertTrue(self.filter._motion("m"))
+    def test_motion_within_the_click_passes_and_keeps_the_hold(self) -> None:
+        # One count of tremor during a dropout at the start of a drag.
+        self.handle(True, 0.0, "down", (100, 100))
+        self.assertTrue(self.handle(False, 0.06, "drop", (100, 100)).held)
+        self.assertTrue(self.filter._motion("tremor", (101, 100)), "small motion passes unqueued")
         self.assertEqual(self.injected, [])
-        self.assertTrue(self.filter._handle(Button.LEFT, True, 0.09, "back").cancels_held)
+        self.assertTrue(self.handle(True, 0.07, "back", (101, 100)).cancels_held, "the drag is kept")
+        self.handle(False, 1.0, "lift", (300, 100))
+        self.fire_all()
+        self.assertEqual(self.injected, [(False, "lift")])
+
+    def test_the_click_spot_is_where_the_button_came_up(self) -> None:
+        # Released 3 pt from the press: in place. Motion 5 pt from the press
+        # but only 2 pt from the release is still on the click.
+        self.handle(True, 0.0, "down", (0, 0))
+        self.handle(False, 0.08, "up", (3, 0))
+        self.assertTrue(self.filter._motion("m", (5, 0)))
+        self.assertEqual(self.injected, [])
+        self.assertFalse(self.filter._motion("m2", (7, 0)))
+        self.assertEqual(self.injected, [(False, "up")])
+
+    def test_motion_during_a_moving_hold_passes_and_keeps_the_drag(self) -> None:
+        self.handle(True, 0.0, "down", (0, 0))
+        self.assertTrue(self.handle(False, 0.08, "up", (50, 0)).held)
+        self.assertTrue(self.filter._motion("m", (60, 0)))
+        self.assertEqual(self.injected, [])
+        self.assertTrue(self.handle(True, 0.09, "back", (61, 0)).cancels_held)
 
     def test_a_cancelled_stationary_dropout_lets_motion_through(self) -> None:
-        self.filter._handle(Button.LEFT, True, 0.0, "down")
-        self.filter._handle(Button.LEFT, False, 0.06, "up", stationary=True)
-        self.assertTrue(self.filter._handle(Button.LEFT, True, 0.075, "back").cancels_held)
-        self.assertTrue(self.filter._motion("m"))
+        self.handle(True, 0.0, "down", (0, 0))
+        self.handle(False, 0.06, "up", (0, 0))
+        self.assertTrue(self.handle(True, 0.075, "back", (0, 0)).cancels_held)
+        self.assertTrue(self.filter._motion("m", (20, 0)))
         self.assertEqual(self.injected, [])
+
+    def test_motion_never_settles_a_release_as_the_contact_closes(self) -> None:
+        # Press, a 3 ms flicker open, motion, then the contact closes again.
+        self.handle(True, 0.000, "down", (0, 0))
+        flicker = self.handle(False, 0.003, "flicker", (0, 0))
+        self.assertEqual(flicker.hold_reason, "closing")
+        self.assertTrue(self.filter._motion("m", (10, 0)))
+        self.assertEqual(self.injected, [])
+        self.assertTrue(self.handle(True, 0.008, "back", (10, 0)).cancels_held, "the drag starts")
+
+    def test_two_dropouts_within_the_click_keep_the_drag(self) -> None:
+        self.handle(True, 0.000, "down", (0, 0))
+        self.assertTrue(self.handle(False, 0.300, "drop1", (0, 0)).held)
+        self.assertTrue(self.handle(True, 0.310, "back1", (1, 0)).cancels_held)
+        self.assertTrue(self.handle(False, 0.400, "drop2", (2, 0)).held)
+        self.assertTrue(self.filter._motion("m", (3, 0)), "motion in the second gap passes")
+        self.assertTrue(self.handle(True, 0.410, "back2", (3, 0)).cancels_held)
+        self.assertEqual(self.injected, [], "nothing reaches apps before the real lift")
+        self.handle(False, 1.500, "lift", (200, 0))
+        self.fire_all()
+        self.assertEqual(self.injected, [(False, "lift")])
+
+    def test_a_comeback_press_does_not_move_the_click_spot(self) -> None:
+        # A slow drag: the first dropout lands 60 pt from the press. Its
+        # comeback never reached apps, so a second dropout 2.5 pt further on
+        # is still part of the drag, not a click made in place.
+        self.handle(True, 0.000, "down", (100, 100))
+        self.assertTrue(self.handle(False, 0.600, "drop1", (160, 100)).held)
+        self.assertTrue(self.handle(True, 0.617, "back1", (160.5, 100)).cancels_held)
+        self.assertTrue(self.handle(False, 0.700, "drop2", (163, 100)).held)
+        self.assertFalse(self.filter._held_stationary.get(Button.LEFT))
+        self.assertTrue(self.filter._motion("m", (170, 100)))
+        self.assertTrue(self.handle(True, 0.703, "back2", (171, 100)).cancels_held)
+        self.handle(False, 1.500, "lift", (250, 100))
+        self.fire_all()
+        self.assertEqual(self.injected, [(False, "lift")])
+
+    def test_a_bounce_press_does_not_move_the_click_spot(self) -> None:
+        self.handle(True, 0.000, "down", (0, 0))
+        self.handle(False, 0.100, "up", (0, 0))
+        self.fire_all()                                               # the click is over
+        self.filter._injected_passed(Button.LEFT)
+        self.assertTrue(self.handle(True, 0.110, "bounce", (40, 0)).is_bounce)
+        self.handle(False, 0.112, "bounce-up", (40, 0))
+        self.handle(True, 0.500, "down2", (80, 0))
+        self.handle(False, 0.600, "up2", (81, 0))
+        self.assertTrue(self.filter._held_stationary.get(Button.LEFT), "measured from down2, not the bounce")
 
     def test_motion_tap_is_wanted_only_while_it_matters(self) -> None:
         calls = []
         self.filter._set_motion_tap = calls.append
-        self.filter._handle(Button.LEFT, True, 0.0, "down")
+        self.handle(True, 0.0, "down", (0, 0))
         self.assertEqual(calls[-1], False)
-        self.filter._handle(Button.LEFT, False, 0.08, "up", stationary=True)
+        self.handle(False, 0.08, "up", (0, 0))
         self.assertEqual(calls[-1], True, "a release is held in place")
-        self.filter._motion("m1")
+        self.filter._motion("m1", (9, 0))
         self.assertEqual(calls[-1], True, "the up and the motion are still on their way")
         self.filter._injected_passed(Button.LEFT)
         self.filter._injected_passed(Button.LEFT)
@@ -457,9 +529,25 @@ class MotionFlushTests(unittest.TestCase):
     def test_moving_hold_does_not_want_the_motion_tap(self) -> None:
         calls = []
         self.filter._set_motion_tap = calls.append
-        self.filter._handle(Button.LEFT, True, 0.0, "down")
-        self.filter._handle(Button.LEFT, False, 0.08, "up", stationary=False)
+        self.handle(True, 0.0, "down", (0, 0))
+        self.handle(False, 0.08, "up", (30, 0))
         self.assertEqual(calls[-1], False)
+
+    def test_closing_hold_does_not_want_the_motion_tap(self) -> None:
+        calls = []
+        self.filter._set_motion_tap = calls.append
+        self.handle(True, 0.0, "down", (0, 0))
+        self.handle(False, 0.004, "flicker", (0, 0))
+        self.assertEqual(calls[-1], False)
+
+    def test_a_release_with_no_known_location_is_left_to_the_timer(self) -> None:
+        # Windows passes no location yet.
+        self.filter._handle(Button.LEFT, True, 0.0, "down")
+        self.filter._handle(Button.LEFT, False, 0.08, "up")
+        self.assertTrue(self.filter._motion("m", (50, 0)))
+        self.assertEqual(self.injected, [])
+        self.fire_all()
+        self.assertEqual(self.injected, [(False, "up")])
 
 
 class MacTimestampTests(unittest.TestCase):

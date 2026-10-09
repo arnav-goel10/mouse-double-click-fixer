@@ -9,6 +9,7 @@ bounce through.
 
 from __future__ import annotations
 
+import math
 import os
 import platform
 import threading
@@ -32,8 +33,9 @@ INJECTED_MARK = 0x44434658  # "DCFX"
 INJECTED_MOTION_MARKS = {INJECTED_MARK + 1 + index: button for index, button in enumerate(Button)}
 MOTION_MARK_FOR = {button: mark for mark, button in INJECTED_MOTION_MARKS.items()}
 
-#: A release this close to where its press landed counts as a click made in
-#: place (not the end of a drag), so the first pointer motion settles it.
+#: A release this close to where apps saw its press counts as a click made in
+#: place (not the end of a drag). Motion that takes the pointer this far from
+#: where the button came up settles it; less is a hand resting on the mouse.
 STATIONARY_PX = 4.0
 
 #: A re-sent event normally passes back through the hook within a millisecond
@@ -82,9 +84,13 @@ class GlobalClickFilter:
         self._started = False
         # Per button: the event kept for a release that is being held back.
         self._held_templates: dict = {}
-        # Per button: whether the release being held landed where its press
-        # did. Pointer motion settles such a release at once (see _motion).
+        # Per button: whether the release being held landed where apps saw its
+        # press, and where it landed. Pointer motion that leaves that spot
+        # settles such a release at once (see _motion).
         self._held_stationary: dict[Button, bool] = {}
+        self._held_points: dict[Button, Optional[tuple[float, float]]] = {}
+        # Per button: where the last press that reached apps landed.
+        self._press_points: dict[Button, Optional[tuple[float, float]]] = {}
         self.tap_resets = 0  # times macOS disabled the tap and it was re-armed
         self.hook_rearms = 0  # times the Windows hook was re-installed
         self._timers: list[threading.Timer] = []
@@ -122,6 +128,8 @@ class GlobalClickFilter:
         self._started = False
         self._held_templates.clear()
         self._held_stationary.clear()
+        self._held_points.clear()
+        self._press_points.clear()
         for button in Button:
             self._in_flight[button] = 0
             self._queued[button].clear()
@@ -192,13 +200,14 @@ class GlobalClickFilter:
         timestamp: Optional[float],
         template: object = None,
         allow_hold: bool = True,
-        stationary: bool = True,
+        location: Optional[tuple[float, float]] = None,
     ) -> ClickEvent:
         """Decide one event. `template` is a copy of it, kept in case it has to
         be re-injected later; the caller suppresses whatever is not accepted.
         `allow_hold=False` says a release could not be re-injected later.
-        `stationary` says a release landed where its press did: if it is held,
-        the first pointer motion delivers it rather than the timer."""
+        `location` is where the pointer was, as (x, y), if the platform knows:
+        a release held where apps saw its press is a click made in place, and
+        pointer motion leaving that spot delivers it rather than the timer."""
         timestamp = self._normalise_time(timestamp)
         replay = []
         overdue = []
@@ -211,7 +220,13 @@ class GlobalClickFilter:
                 self.filtered_count += 1
             if event.held:
                 self._held_templates[button] = template
-                self._held_stationary[button] = stationary
+                self._held_points[button] = location
+                # A release that came while the contact was still closing is
+                # never a click ending, however still the pointer: it waits for
+                # its press to come back, and motion must not settle it.
+                self._held_stationary[button] = event.hold_reason == "lift" and _near(
+                    self._press_points.get(button), location
+                )
                 timer = threading.Timer(
                     click_filter.threshold_ms / 1000.0, self._commit_held, (button, click_filter.held_id)
                 )
@@ -220,11 +235,11 @@ class GlobalClickFilter:
                 timer.start()
             elif event.cancels_held:
                 self._held_templates.pop(button, None)
-                self._held_stationary.pop(button, None)
+                self._forget_held(button)
             elif event.flush_held:
                 # The held release was real after all: deliver it, then this.
                 replay = [(False, self._held_templates.pop(button, None)), (True, template)]
-                self._held_stationary.pop(button, None)
+                self._forget_held(button)
                 self._track(button, len(replay))
             if event.accepted and (self._in_flight[button] or self._queued[button]):
                 # A release this app re-sent a moment ago may still be on its
@@ -232,6 +247,11 @@ class GlobalClickFilter:
                 # would see down, down, up, up), so it goes out right after.
                 self._enqueue(button, pressed, template)
                 event = replace(event, accepted=False, deferred=True)
+            if pressed and not event.is_bounce:
+                # Where apps saw the button go down. A press they never see (a
+                # bounce, or the contact coming back mid-drag) must not move
+                # it, or a drag would look like a click made in place.
+                self._press_points[button] = location
         for replay_pressed, replay_template in overdue + replay:
             self._safe_inject(button, replay_pressed, replay_template)
         self._update_motion_tap()
@@ -259,20 +279,29 @@ class GlobalClickFilter:
             committed = self._filters[button].commit_held(expected)
             if committed:
                 template = self._held_templates.pop(button, None)
-                self._held_stationary.pop(button, None)
+                self._forget_held(button)
                 self._track(button, 1)
         if committed:
             self._safe_inject(button, False, template)
         self._update_motion_tap()
 
-    def _motion(self, template: object) -> bool:
-        """The pointer moved (`template` is a copy of the motion event).
+    def _forget_held(self, button: Button) -> None:
+        """With the lock held: the held release is settled one way or another."""
+        self._held_stationary.pop(button, None)
+        self._held_points.pop(button, None)
 
-        A release held where its press landed is settled now: a click made
-        in place ends when the pointer moves off, and apps must see its
-        release where it happened, before the motion. Motion arriving while
-        re-sent events are still on their way waits behind them, so apps
-        never see the pointer leave before the click is over.
+    def _motion(self, template: object, location: Optional[tuple[float, float]] = None) -> bool:
+        """The pointer moved (`template` is a copy of the motion event, and
+        `location` where it took the pointer, if known).
+
+        A release held where its press landed is settled once the pointer
+        leaves the spot where the button came up: a click made in place ends
+        when the pointer moves off, and apps must see its release where it
+        happened, before the motion. Smaller motion goes through and the hold
+        stays: it is a hand resting on the mouse, or a drag only starting,
+        and the contact may yet come back. Motion arriving while re-sent
+        events are still on their way waits behind them, so apps never see
+        the pointer leave before the click is over.
 
         Returns True to let the event through unchanged, False when the
         platform must drop it because it was queued to be re-sent.
@@ -286,10 +315,12 @@ class GlobalClickFilter:
                 click_filter = self._filters[button]
                 if click_filter.held_id is None or not self._held_stationary.get(button):
                     continue
+                if location is not None and _near(self._held_points.get(button), location):
+                    continue
                 if click_filter.commit_held():
                     flushed.append((button, self._held_templates.pop(button, None)))
                     self._track(button, 1)
-                self._held_stationary.pop(button, None)
+                self._forget_held(button)
             for button in Button:
                 if self._in_flight[button] or self._queued[button]:
                     self._enqueue(button, None, template)
@@ -606,10 +637,6 @@ class GlobalClickFilter:
 
         self._inject = inject
         click_counts = ClickCountRepair()
-        # Per button: where its last press landed, to tell a click made in
-        # place from the end of a drag.
-        press_points: dict = {}
-
         def callback(proxy: object, event_type: int, event: object, refcon: object) -> object:
             # An exception here would make PyObjC return nothing, which drops
             # the click. Whatever goes wrong, the event goes through untouched.
@@ -650,18 +677,12 @@ class GlobalClickFilter:
             if corrected != state:
                 Quartz.CGEventSetIntegerValueField(event, Quartz.kCGMouseEventClickState, corrected)
             location = Quartz.CGEventGetLocation(event)
-            stationary = True
-            if pressed:
-                press_points[button] = (location.x, location.y)
-            elif button in press_points:
-                px, py = press_points[button]
-                stationary = ((location.x - px) ** 2 + (location.y - py) ** 2) ** 0.5 < STATIONARY_PX
             result = self._handle(
                 button,
                 pressed,
                 to_seconds(Quartz.CGEventGetTimestamp(event)),
                 Quartz.CGEventCreateCopy(event),
-                stationary=stationary,
+                location=(location.x, location.y),
             )
             click_counts.record(button, result)
             return event if result.accepted else None
@@ -706,7 +727,8 @@ class GlobalClickFilter:
             if mark in INJECTED_MOTION_MARKS:
                 self._injected_passed(INJECTED_MOTION_MARKS[mark])
                 return event  # re-sent by this app; already decided
-            return event if self._motion(Quartz.CGEventCreateCopy(event)) else None
+            location = Quartz.CGEventGetLocation(event)
+            return event if self._motion(Quartz.CGEventCreateCopy(event), (location.x, location.y)) else None
 
         motion_mask = 0
         for event_type in (Quartz.kCGEventMouseMoved, *DRAGGED):
@@ -944,6 +966,13 @@ class ClickCountRepair:
         # event (deferred): apps still get those.
         if result.is_bounce:
             self._suppressed[button] = self._suppressed.get(button, 0) + 1
+
+
+def _near(point: Optional[tuple[float, float]], location: Optional[tuple[float, float]]) -> bool:
+    """Whether two pointer positions are within STATIONARY_PX of each other."""
+    if point is None or location is None:
+        return False
+    return math.hypot(location[0] - point[0], location[1] - point[1]) < STATIONARY_PX
 
 
 def _mach_timebase() -> Callable[[int], float]:
