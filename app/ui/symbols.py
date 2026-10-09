@@ -30,6 +30,7 @@ SYMBOLS = {
     "power": ("power", "", "#8e8e93"),
     "chart": ("chart.bar", "", "#8e8e93"),
     "sync": ("arrow.triangle.2.circlepath", "", "#8e8e93"),
+    "copy": ("doc.on.clipboard", "", "#8e8e93"),
 }
 
 

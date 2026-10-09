@@ -68,5 +68,96 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.buttons_from(values), [Button.LEFT, Button.MIDDLE])
 
 
+class DurabilityTests(unittest.TestCase):
+    """A save must never turn a passing read failure into reset settings."""
+
+    def setUp(self) -> None:
+        self.directory = Path(tempfile.mkdtemp())
+        for target, value in (("config_dir", mock.Mock(return_value=self.directory)),
+                              ("LEGACY_PATH", self.directory / "absent.json")):
+            patcher = mock.patch.object(settings, target, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.good = {"threshold_ms": 120, "fix_enabled": True, "buttons": ["left", "right"],
+                     "calibrated": True, "start_at_login": True}
+        settings.save(self.good, current={})
+
+    def test_save_merges_onto_what_the_app_holds_without_reading(self) -> None:
+        held = settings.load()
+        with mock.patch.object(Path, "read_bytes", side_effect=PermissionError(32, "locked")):
+            settings.save({"filtered_total": 905}, current=held)
+        values = settings.load()
+        self.assertEqual(values["threshold_ms"], 120)
+        self.assertTrue(values["fix_enabled"])
+        self.assertEqual(values["buttons"], ["left", "right"])
+        self.assertEqual(values["filtered_total"], 905)
+
+    def test_an_unreadable_file_is_not_taken_for_an_empty_one(self) -> None:
+        with mock.patch.object(Path, "read_bytes", side_effect=PermissionError(32, "locked")):
+            with self.assertRaises(OSError):
+                settings.save({"filtered_total": 905})
+        self.assertEqual(settings.load()["threshold_ms"], 120, "nothing was overwritten")
+
+    def test_controller_keeps_its_settings_through_a_failed_read(self) -> None:
+        from app.controller import AppController
+
+        controller = AppController()
+        with mock.patch.object(Path, "read_bytes", side_effect=PermissionError(32, "locked")):
+            controller._store(filtered_total=905)
+        self.assertEqual(controller.settings["threshold_ms"], 120)
+        self.assertTrue(controller.settings["calibrated"])
+        self.assertEqual(settings.load()["threshold_ms"], 120)
+
+    def test_the_new_file_is_flushed_to_disk_before_it_replaces_the_old(self) -> None:
+        order = []
+        real_fsync, real_replace = settings.os.fsync, Path.replace
+
+        def fsync(descriptor):
+            order.append("fsync")
+            real_fsync(descriptor)
+
+        def replace(path, target):
+            order.append("replace")
+            return real_replace(path, target)
+
+        with mock.patch.object(settings.os, "fsync", side_effect=fsync), \
+                mock.patch.object(Path, "replace", replace):
+            settings.save({"threshold_ms": 45}, current=settings.load())
+        self.assertEqual(order, ["fsync", "replace"])
+
+    def test_a_damaged_file_falls_back_to_the_previous_one(self) -> None:
+        settings.save({"threshold_ms": 90}, current=settings.load())  # keeps the 120 file as the spare
+        (self.directory / "settings.json").write_bytes(b"\x00" * 64)  # what a power cut can leave
+        values = settings.load()
+        self.assertEqual(values["threshold_ms"], 120)
+        self.assertTrue(values["calibrated"])
+
+    def test_a_damaged_file_never_becomes_the_spare(self) -> None:
+        settings.save({"threshold_ms": 90}, current=settings.load())
+        (self.directory / "settings.json").write_text("{cut sho")
+        held = settings.load()
+        settings.save({"filtered_total": 3}, current=held)
+        self.assertEqual(json.loads((self.directory / "settings.json.bak").read_text())["threshold_ms"], 120)
+
+    def test_deleting_the_file_still_starts_from_defaults(self) -> None:
+        settings.save({"threshold_ms": 90}, current=settings.load())
+        (self.directory / "settings.json").unlink()
+        self.assertEqual(settings.load()["threshold_ms"], DEFAULT_THRESHOLD_MS)
+        settings.save({"filtered_total": 1}, current=settings.load())
+        self.assertFalse((self.directory / "settings.json.bak").exists(), "the old copy is gone too")
+
+    def test_a_briefly_locked_file_is_read_on_a_later_try(self) -> None:
+        real = Path.read_bytes
+        failures = [PermissionError(32, "locked")]
+
+        def read_bytes(path):
+            if failures and path.name == "settings.json":
+                raise failures.pop()
+            return real(path)
+
+        with mock.patch.object(Path, "read_bytes", read_bytes), mock.patch.object(settings, "sleep"):
+            self.assertEqual(settings.load()["threshold_ms"], 120)
+
+
 if __name__ == "__main__":
     unittest.main()

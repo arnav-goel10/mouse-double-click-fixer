@@ -13,7 +13,7 @@ from PySide6.QtGui import QAction, QFont, QKeySequence
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QMenuBar, QMessageBox, QSystemTrayIcon
 
-from . import __version__
+from . import __version__, diagnostics
 from .controller import AppController
 from .updater import Updater
 from .ui import dock, icons
@@ -174,6 +174,7 @@ class Application:
                 on_toggle=self.window.request_filter,
                 updater=self.updater,
                 on_check_updates=self.check_for_updates,
+                on_install_update=self.install_update,
                 parent=self.window,
             )
             self.tray.show()
@@ -182,7 +183,6 @@ class Application:
         # A background update waits while the window is open; closing it is
         # the moment to finish.
         self.window.closed_to_tray.connect(self.updater.apply_if_ready)
-        self._told_about_tray = False
 
         self.server = QLocalServer()
         QLocalServer.removeServer(SERVER_NAME)
@@ -192,13 +192,23 @@ class Application:
         hints = self.qt.styleHints()
         if hasattr(hints, "colorSchemeChanged"):
             hints.colorSchemeChanged.connect(lambda _scheme: self._on_theme_changed())
-        # Quitting from anywhere (Dock, app menu, logout) stops the hook cleanly.
+        # Quitting from anywhere (Dock, app menu, logout) stops the hook cleanly,
+        # then the log writes out what is left.
         self.qt.aboutToQuit.connect(self.controller.shutdown)
+        self.qt.aboutToQuit.connect(diagnostics.shutdown)
         self.menu_bar = self._build_menu_bar()
         # Opening the app again (Launchpad, Spotlight, Finder, Dock) while it
         # runs from the menu bar shows the window. Installed once the event
         # loop runs, after AppKit has registered its own handler.
         QTimer.singleShot(0, lambda: dock.on_reopen(self.show_window))
+        # Sleep and session switches can leave the event taps dead or in the
+        # way; the window rebuilds or stops the filter on them.
+        dock.observe_system(
+            on_wake=self.window.system_woke,
+            on_session_active=self.window.session_activated,
+            on_session_inactive=self.window.session_resigned,
+            on_permission_change=self.window.check_permission_soon,
+        )
 
     def _build_menu_bar(self) -> Optional[QMenuBar]:
         """macOS app menu: About, Settings… (⌘,) and Quit, where users expect them."""
@@ -221,12 +231,26 @@ class Application:
         quit_action.setMenuRole(QAction.MenuRole.QuitRole)
         quit_action.triggered.connect(self.quit)
         menu.addActions([about, updates, settings, quit_action])
+        # The standard Window menu: Minimize (⌘M) and Zoom, as in every Mac app.
         window_menu = bar.addMenu("Window")
+        minimize = QAction("Minimize", window_menu)
+        minimize.setShortcut(QKeySequence("Ctrl+M"))  # Qt's Ctrl is ⌘ on macOS
+        minimize.triggered.connect(self.window.showMinimized)
+        zoom = QAction("Zoom", window_menu)
+        zoom.triggered.connect(self._zoom)
         close = QAction("Close", window_menu)
         close.setShortcut(QKeySequence.StandardKey.Close)
         close.triggered.connect(self.window.close)
+        window_menu.addActions([minimize, zoom])
+        window_menu.addSeparator()
         window_menu.addAction(close)
         return bar
+
+    def _zoom(self) -> None:
+        if self.window.isMaximized():
+            self.window.showNormal()
+        else:
+            self.window.showMaximized()
 
     def _on_theme_changed(self) -> None:
         self.window.apply_look()
@@ -237,6 +261,13 @@ class Application:
         self.show_window()
         self.window.show_page("general")
         self.updater.check(user_initiated=True)
+
+    def install_update(self) -> None:
+        """The menu's "Update to X": install with General on screen, where
+        the progress, and any failure, shows."""
+        self.show_window()
+        self.window.show_page("general")
+        self.updater.install()
 
     def _about(self) -> None:
         QMessageBox.about(
@@ -264,11 +295,12 @@ class Application:
     def _note_hidden(self) -> None:
         # The window is closed; the app carries on from the menu bar alone.
         dock.set_visible(False)
-        # A one-time hint on Windows, where tray icons hide in the overflow.
-        # macOS apps don't announce this; the menu bar icon speaks for itself.
-        if self.tray is None or self._told_about_tray or platform.system() == "Darwin":
+        # A one-time hint on Windows, where tray icons hide in the overflow:
+        # once ever, not once per sign-in. macOS apps don't announce this;
+        # the menu bar icon speaks for itself.
+        if self.tray is None or self.controller.tray_hint_shown or platform.system() == "Darwin":
             return
-        self._told_about_tray = True
+        self.controller.note_tray_hint_shown()
         self.tray.showMessage(
             "DoubleClick Fixer is still running",
             "It keeps filtering from the notification area."
@@ -311,8 +343,9 @@ class Application:
 
         if self.controller.settings["fix_enabled"] and self.controller.supported():
             # Restore the filter after the UI is up, so any failure has a
-            # window to be reported in.
-            QTimer.singleShot(0, lambda: self.window.request_filter(True, prompt=not minimized))
+            # window to be reported in, or, in the background, the menu's
+            # status line and a few more tries.
+            QTimer.singleShot(0, lambda: self.window.restore_filter(background=minimized))
         elif not self.controller.supported():
             QTimer.singleShot(0, self._warn_unsupported)
 
@@ -332,10 +365,14 @@ class Application:
         )
 
     def quit(self) -> None:
+        diagnostics.log.info("Quitting")
         if self.window.isVisible():
             self.window.save_geometry()
         self.controller.shutdown()
-        if self.tray is not None:
+        if self.tray is not None and platform.system() != "Darwin":
+            # Windows leaves a dead icon in the notification area otherwise.
+            # macOS removes the item with the app, and hiding it first would
+            # be remembered under its autosave name.
             self.tray.hide()
         self.qt.quit()
 
@@ -367,6 +404,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         lock.unlock()
         return 0
 
+    # Only the copy that runs logs: a second launch that hands over, or
+    # --quit, would otherwise write to the same file at the same time.
+    diagnostics.setup(__version__)
     application = Application(arguments)
     application.instance_lock = lock  # held for as long as the app runs
     return application.start(minimized)

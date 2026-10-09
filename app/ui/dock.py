@@ -1,4 +1,5 @@
-"""The macOS Dock icon, shown only while the window is open.
+"""The macOS Dock icon, shown only while the window is open, and the other
+app-wide events AppKit delivers: reopen, wake, and session switches.
 
 DoubleClick Fixer is a menu bar app: the bundle is marked as an agent
 (LSUIElement), so it launches with no Dock icon and lives in the menu bar.
@@ -17,6 +18,8 @@ from .theme import IS_MAC
 
 # Keeps the Apple Event handler alive; AppKit holds it only weakly.
 _REOPEN_HANDLER: list = []
+# Likewise for the notification observer.
+_SYSTEM_OBSERVER: list = []
 
 
 def _available() -> bool:
@@ -82,4 +85,55 @@ def set_visible(visible: bool) -> None:
             else:  # macOS 13 and earlier
                 app.activateIgnoringOtherApps_(True)
     except Exception:  # noqa: BLE001 - cosmetic; the window still works
+        pass
+
+
+def observe_system(
+    on_wake: Callable[[], None],
+    on_session_active: Callable[[], None],
+    on_session_inactive: Callable[[], None],
+    on_permission_change: Callable[[], None],
+) -> None:
+    """Call back when the Mac wakes, when the user switches into or out of
+    this login session (fast user switching), and when the Accessibility
+    list changes.
+
+    Event taps can be left dead by sleep, and a tap running in a session
+    the user switched away from can stall the one in front, so the filter is
+    rebuilt or stopped on these. The Accessibility notification only comes
+    when a switch in the list is flipped, not when the app is removed from
+    it, so it speeds up the permission poll rather than replacing it.
+    """
+    if not _available() or _SYSTEM_OBSERVER:
+        return
+    try:
+        import AppKit
+        from Foundation import NSDistributedNotificationCenter, NSObject
+
+        class DoubleClickFixerSystemObserver(NSObject):
+            def woke_(self, _notification):
+                on_wake()
+
+            def sessionActive_(self, _notification):  # noqa: N802 - selector
+                on_session_active()
+
+            def sessionInactive_(self, _notification):  # noqa: N802 - selector
+                on_session_inactive()
+
+            def permissionChanged_(self, _notification):  # noqa: N802 - selector
+                on_permission_change()
+
+        observer = DoubleClickFixerSystemObserver.alloc().init()
+        workspace = AppKit.NSWorkspace.sharedWorkspace().notificationCenter()
+        for selector, name in (
+            (b"woke:", AppKit.NSWorkspaceDidWakeNotification),
+            (b"sessionActive:", AppKit.NSWorkspaceSessionDidBecomeActiveNotification),
+            (b"sessionInactive:", AppKit.NSWorkspaceSessionDidResignActiveNotification),
+        ):
+            workspace.addObserver_selector_name_object_(observer, selector, name, None)
+        NSDistributedNotificationCenter.defaultCenter().addObserver_selector_name_object_(
+            observer, b"permissionChanged:", "com.apple.accessibility.api", None
+        )
+        _SYSTEM_OBSERVER.append(observer)
+    except Exception:  # noqa: BLE001 - the timers in the window still cover it
         pass

@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 import threading
 from typing import Optional
 
 from PySide6.QtCore import QObject, Signal
 
+from . import permissions
 from . import settings as settings_store
 from . import startup
 from .core import Button, ClickEvent, clamp_threshold
 from .platform import GlobalClickFilter, HookError, is_supported
+
+log = logging.getLogger(__name__)
 
 
 class AppController(QObject):
@@ -29,30 +33,37 @@ class AppController(QObject):
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
         self.settings = settings_store.load()
-        # The login item can be changed outside the app (the Windows
-        # installer, System Settings), so the system is the source of truth.
+        self.login_item_state = startup.ON if self.settings["start_at_login"] else startup.OFF
         if startup.is_supported():
-            try:
-                actual = startup.is_enabled()
-            except OSError:
-                actual = self.settings["start_at_login"]
-            if actual != self.settings["start_at_login"]:
-                self._store(start_at_login=actual)
-            if actual and getattr(sys, "frozen", False):
+            self.refresh_login_item()
+            if (
+                self.login_item_state == startup.ON
+                and getattr(sys, "frozen", False)
+                and not startup.running_from_temporary_location()
+            ):
                 # Rewrite the entry so it points at this copy of the app and
                 # carries the current format (an older one may lack the app's
-                # name and icon in Login Items).
+                # name and icon in Login Items). Never from a disk image or a
+                # translocated copy: that path is gone after an eject or a
+                # reboot, and the installed copy would stop opening at login.
                 try:
                     startup.set_enabled(True)
                 except (OSError, RuntimeError):
                     pass
         self._filter: Optional[GlobalClickFilter] = None
         self._suspended = False
+        # Set at quit. Nothing may start a hook after that: the window still
+        # hears hide events, and AppKit notifications, as the app goes down.
+        self._shut_down = False
+        # Why the filter isn't running although the user has it on: a short
+        # line for the menus, and the full message for the window.
+        self.failure = ""
+        self.failure_detail = ""
         # Turned on, but macOS hasn't granted Accessibility yet (set by the window).
         self.waiting_for_permission = False
         # Bounces counted on the hook thread since the last flush. Kept apart
-        # from `settings`, which every settings write replaces with what is on
-        # disk, so an unrelated write can never lose them.
+        # from `settings`, which every settings write replaces, so an
+        # unrelated write can never lose them.
         self._count_lock = threading.Lock()
         self._pending_filtered = 0
         self.session_filtered = 0
@@ -83,46 +94,82 @@ class AppController(QObject):
         return is_supported()
 
     # -- filter lifecycle --------------------------------------------------
-    def set_active(self, active: bool) -> bool:
-        """Turn the system-wide filter on or off. Returns the resulting state."""
-        if active == self.active and (active or self._filter is None):
-            # Nothing to do. A filter whose hook thread has died reads as
-            # inactive but still needs releasing, so that case falls through.
-            # Turning off still records the choice: the filter may only have
-            # been waiting for permission, and must not ask again next launch.
-            if not active and self.settings["fix_enabled"]:
-                self._store(fix_enabled=False)
-            return self.active
-        if active:
-            # Turning the filter on (from the menu bar, say) ends a pause.
-            self._suspended = False
-            self._stop_filter()  # release a filter whose hook thread died
-            try:
-                self._filter = GlobalClickFilter(
-                    self.threshold_ms,
-                    self.buttons,
-                    on_event=self._on_global_event,
-                    on_error=self.hook_failed.emit,
-                )
-                self._filter.start()
-            except HookError as error:
-                self._filter = None
-                self._store(fix_enabled=False)
-                self.filter_state_changed.emit(False, str(error))
-                return False
-            self._store(fix_enabled=True)
-            self.filter_state_changed.emit(True, "")
-            return True
+    @property
+    def wanted(self) -> bool:
+        """Whether the user has the filter on: running, waiting for
+        permission, or paused while calibration measures. The menus show and
+        toggle this, so choosing the item while waiting or paused turns the
+        filter off instead of asking again."""
+        return (
+            self.active
+            or self.waiting_for_permission
+            or (self._suspended and bool(self.settings["fix_enabled"]))
+        )
 
+    def set_active(self, active: bool) -> bool:
+        """Turn the system-wide filter on or off. Returns the resulting state.
+
+        This is the user's own choice, from the window or a menu, and only it
+        changes the saved one. Off is saved, so the filter stays off at the
+        next login. A failure to turn on saves nothing: a tap macOS refuses
+        for a moment at login must not cost the user their "on" for every
+        login after it.
+        """
+        if not active:
+            self._turn_off()
+            return False
+        if self.active:
+            return True
+        if self._shut_down:
+            return False
+        # Turning the filter on (from the menu bar, say) ends a pause.
+        self._suspended = False
+        self._stop_filter()  # release a filter whose hook thread died
+        try:
+            self._filter = GlobalClickFilter(
+                self.threshold_ms,
+                self.buttons,
+                on_event=self._on_global_event,
+                on_error=self.hook_failed.emit,
+            )
+            self._filter.start()
+        except HookError as error:
+            self._filter = None
+            log.warning("The filter couldn't start: %s", error)
+            self.failure, self.failure_detail = "Couldn't start the filter", str(error)
+            self.filter_state_changed.emit(False, str(error))
+            return False
+        self.failure = self.failure_detail = ""
+        log.info("Filter on: %d ms, buttons %s", self.threshold_ms, ", ".join(self.settings["buttons"]))
+        self._store(fix_enabled=True)
+        self.filter_state_changed.emit(True, "")
+        return True
+
+    def _turn_off(self) -> None:
+        # A filter whose hook thread has died reads as inactive but still
+        # needs releasing. Turning off also ends a wait for permission, a
+        # pause, or a failed start, all of which the menus show as "on".
+        changed = self._filter is not None or self._suspended or bool(self.failure)
         self._stop_filter()
-        self._store(fix_enabled=False)
-        self.filter_state_changed.emit(False, "")
-        return False
+        self._suspended = False
+        self.failure = self.failure_detail = ""
+        if self.settings["fix_enabled"]:
+            changed = True
+            self._store(fix_enabled=False)
+        if changed:
+            log.info("Filter turned off")
+            self.filter_state_changed.emit(False, "")
 
     def _stop_filter(self) -> None:
         if self._filter is not None:
-            self._filter.stop()
-            self._filter = None
+            current, self._filter = self._filter, None
+            current.stop()
+            # Counted on the hook thread, so only read here, never logged there.
+            log.info(
+                "Filter stopped (tap resets %s, hook re-arms %s)",
+                getattr(current, "tap_resets", 0),
+                getattr(current, "hook_rearms", 0),
+            )
 
     def suspend(self) -> None:
         """Pause filtering so the click pad measures the raw mouse.
@@ -141,14 +188,42 @@ class AppController(QObject):
         if self.active:
             self._stop_filter()
         self._suspended = True
+        self.failure = self.failure_detail = ""
+        self.filter_state_changed.emit(False, "")
+
+    def stop_keeping_choice(self) -> None:
+        """Stop the tap but keep the user's choice, so the filter comes back by
+        itself once whatever stopped it is over, even after a restart: access
+        was revoked, the user switched to another login session, or the tap
+        is being rebuilt."""
+        self._stop_filter()
         self.filter_state_changed.emit(False, "")
 
     def stop_for_permission(self) -> None:
-        """Accessibility was revoked: stop the tap, but keep the user's choice,
-        so the filter comes back by itself once access is granted again, even
-        after a restart."""
-        self._stop_filter()
-        self.filter_state_changed.emit(False, "")
+        """Accessibility was revoked: stop the tap, keeping the user's choice."""
+        log.warning("Access was withdrawn; filter stopped until it is back")
+        self.stop_keeping_choice()
+
+    def stop_after_failure(self, message: str) -> None:
+        """The hook stopped on its own. Release it and say so, but keep the
+        user's choice: the next login, or the user, starts it again."""
+        log.error("The filter stopped: %s", message)
+        self.failure, self.failure_detail = "The filter stopped", message
+        self.stop_keeping_choice()
+
+    def tap_alive(self) -> bool:
+        """False when the filter runs but its tap no longer receives events.
+        A filter that can't tell (Windows, for one) counts as alive."""
+        current = self._filter
+        if current is None or not current.running:
+            return True
+        check = getattr(current, "tap_alive", None)
+        if check is None:
+            return True
+        try:
+            return bool(check())
+        except Exception:  # noqa: BLE001 - unsure: leave a working filter alone
+            return True
 
     def set_waiting_for_permission(self, waiting: bool) -> None:
         if waiting != self.waiting_for_permission:
@@ -159,11 +234,23 @@ class AppController(QObject):
         """One line for the menu bar and tray menus."""
         if self.active:
             return f"On · {self.filtered_total:,} blocked"
-        if self._suspended:
+        if self._suspended and self.settings["fix_enabled"]:
             return "Paused for calibration"
         if self.waiting_for_permission:
-            return "Waiting for Accessibility access"
+            return f"Waiting for {permissions.pane_name()} permission"
+        if self.failure:
+            # Kept until the filter starts or the user turns it off, so a
+            # failure with the window closed is still explained.
+            return self.failure
         return "Off"
+
+    def tooltip_text(self) -> str:
+        """The status line as a tooltip for the menu bar or tray icon, so a
+        paused or waiting filter never reads as plain "off"."""
+        if self.active:
+            return f"DoubleClick Fixer: on, {self.threshold_ms} ms"
+        status = self.status_text()
+        return f"DoubleClick Fixer: {status[0].lower()}{status[1:]}"
 
     def resume(self) -> None:
         if self._suspended:
@@ -176,8 +263,26 @@ class AppController(QObject):
         return self._suspended
 
     def shutdown(self) -> None:
+        self._shut_down = True
         self._stop_filter()
         self.flush_stats()
+
+    def diagnostic_state(self) -> dict:
+        """The filter's state for a bug report. Counts only, never clicks."""
+        current = self._filter
+        return {
+            "filter running": self.active,
+            "user has it on": self.wanted,
+            "saved choice": "on" if self.settings["fix_enabled"] else "off",
+            "paused for calibration": self._suspended,
+            "waiting for permission": self.waiting_for_permission,
+            "failure": f"{self.failure}: {self.failure_detail}" if self.failure else "none",
+            "tap alive": self.tap_alive(),
+            "tap resets": getattr(current, "tap_resets", "-"),
+            "hook re-arms": getattr(current, "hook_rearms", "-"),
+            "blocked this session": self.session_filtered,
+            "login item": self.login_item_state,
+        }
 
     # -- settings ----------------------------------------------------------
     def set_threshold(self, value: int) -> None:
@@ -205,16 +310,46 @@ class AppController(QObject):
 
     def set_start_at_login(self, enabled: bool) -> str:
         """Returns an error message, or an empty string on success."""
+        if enabled and startup.running_from_temporary_location():
+            return (
+                "DoubleClick Fixer is running from the disk image or a temporary copy, "
+                "which won’t be there at your next login. Move it to Applications, open "
+                "it from there, and turn this on again."
+            )
         try:
             startup.set_enabled(enabled)
         except (OSError, RuntimeError) as error:
             return str(error)
         self._store(start_at_login=bool(enabled))
+        self.refresh_login_item()
         return ""
+
+    def refresh_login_item(self) -> str:
+        """Read the login item from the system, which is the source of truth:
+        the Windows installer, System Settings and Task Manager all change it
+        behind the app's back. Returns startup.ON, OFF or BLOCKED."""
+        if not startup.is_supported():
+            return self.login_item_state
+        try:
+            state = startup.status()
+        except OSError:
+            return self.login_item_state
+        self.login_item_state = state
+        actual = state == startup.ON
+        if actual != self.settings["start_at_login"]:
+            self._store(start_at_login=actual)
+        return state
 
     def set_window_geometry(self, encoded: str) -> None:
         if encoded != self.settings.get("window_geometry"):
             self._store(window_geometry=encoded)
+
+    @property
+    def tray_hint_shown(self) -> bool:
+        return bool(self.settings.get("tray_hint_shown"))
+
+    def note_tray_hint_shown(self) -> None:
+        self._store(tray_hint_shown=True)
 
     def set_auto_update(self, enabled: bool) -> None:
         self._store(auto_update=bool(enabled))
@@ -245,7 +380,10 @@ class AppController(QObject):
 
     def _store(self, **values: object) -> None:
         try:
-            self.settings = settings_store.save(values)
+            # Merged onto what the app holds, never onto a fresh read of the
+            # file: a read that fails for a moment would otherwise reset
+            # every other setting to its default.
+            self.settings = settings_store.save(values, current=self.settings)
         except OSError:
             # The disk is full or the file is locked (a sync tool, antivirus).
             # Keep running on the new values; the next write tries again.

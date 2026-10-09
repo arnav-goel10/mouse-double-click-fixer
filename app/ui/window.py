@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from PySide6.QtCore import QByteArray, QEvent, QRect, QTimer, Qt, Signal
-from PySide6.QtGui import QPainter
+from PySide6.QtGui import QGuiApplication, QPainter
 from PySide6.QtWidgets import (
+    QApplication,
     QFrame,
     QHBoxLayout,
     QMessageBox,
@@ -21,9 +23,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import __version__, permissions
+from .. import __version__, diagnostics, permissions, startup
 from ..controller import AppController
 from ..core import (
+    BOUNCE_CANDIDATE_MS,
     MAX_THRESHOLD_MS,
     MIN_THRESHOLD_MS,
     REQUIRED_DOUBLE_CLICKS,
@@ -49,14 +52,28 @@ from .widgets import (
     set_look,
 )
 
-#: A pause longer than this starts a new pair while calibrating double-clicks.
+log = logging.getLogger(__name__)
+
+#: The shortest release-to-press pause that still ends a double-click while
+#: calibrating. A slower system double-click setting widens it.
 PAIR_WINDOW_MS = 600.0
+
+#: A background launch whose filter fails to start tries again this many
+#: seconds later: at login the window server or the permission database can
+#: answer a moment late.
+RETRY_AT_S = (1, 3, 8, 20)
+#: How often a running filter is checked for a tap that stopped working.
+HEALTH_CHECK_MS = 5000
 
 #: Content never stretches wider than this; extra window width becomes margin,
 #: so a label always stays within reach of its control.
 COLUMN_MAX = 640 if IS_MAC else 1000
 #: The narrowest the content column may get before the window stops shrinking.
 COLUMN_MIN = 440
+#: Room left around a first-launch window for its frame and title bar.
+FRAME_ALLOWANCE = (16, 48)
+
+DIAGNOSTICS_DETAIL = "Version, settings and the recent log, for a bug report. Never your clicks."
 
 PAGES = [
     ("filter", "Bounce Filter"),
@@ -181,8 +198,8 @@ class FilterPage(Page):
         self.permission_button.clicked.connect(lambda: self.window().request_filter(True))
         self.permission_row = self.permission.add(
             Row(
-                "Accessibility access required",
-                "Allow DoubleClick Fixer in Privacy & Security.",
+                "Permission required",
+                f"Allow DoubleClick Fixer in Privacy & Security › {permissions.pane_name()}.",
                 self.permission_button,
                 SymbolView("warning", 22, "symbol"),
             )
@@ -223,7 +240,7 @@ class FilterPage(Page):
         self.button_switches: dict[Button, Switch] = {}
         for button in Button:
             switch = Switch(accessible_name=f"Filter the {button.label.lower()} button")
-            switch.toggled.connect(self._on_buttons)
+            switch.clicked.connect(self._on_buttons)
             self.button_switches[button] = switch
             buttons.add(Row(f"{button.label} button", "", switch, card_icon("mouse")))
 
@@ -241,13 +258,19 @@ class FilterPage(Page):
 
     def refresh(self, granted: bool, waiting_for_permission: bool = False) -> None:
         self._loading = True
-        active = self.controller.active
-        threshold = self.controller.threshold_ms
-        self.switch.setChecked(active or waiting_for_permission, animate=self.isVisible())
-        if self.controller.suspended:
+        controller = self.controller
+        threshold = controller.threshold_ms
+        # The user's choice, as the menus show it: on while it waits for
+        # permission or calibration has it paused.
+        self.switch.setChecked(controller.wanted, animate=self.isVisible())
+        if controller.suspended and controller.settings["fix_enabled"]:
             self.status_row.set_detail("Paused during calibration.")
         elif waiting_for_permission:
-            self.status_row.set_detail("Waiting for Accessibility access.")
+            self.status_row.set_detail(f"Waiting for {permissions.pane_name()} permission.")
+        elif controller.failure and not controller.active:
+            # Kept here too: the failure may have happened while the window
+            # was closed, with only the menu's status line to show it.
+            self.status_row.set_detail(f"{controller.failure}. {controller.failure_detail}".strip())
         else:
             self.status_row.set_detail("Ignores the extra click a worn switch adds.")
         self.slider.setValue(threshold)
@@ -346,12 +369,7 @@ class TestPage(Page):
     def note_global_event(self, event: ClickEvent) -> None:
         """A bounce the system-wide filter blocked. With the filter on, this
         pad never receives it, so show it here: proof the filter works."""
-        if (
-            self.isVisible()
-            and event.is_bounce
-            and event.button is Button.LEFT
-            and event.gap_ms is not None
-        ):
+        if self.isVisible() and event.is_bounce and event.gap_ms is not None:
             self.timeline.add(event.gap_ms, True)
             self.pad.flash(True)
 
@@ -364,7 +382,9 @@ class TestPage(Page):
         self.shortest_value.setText("—")
         self.count_value.setText("0")
 
-    def _on_pad_press(self, gap_ms: Optional[float], _interval_ms: Optional[float]) -> None:
+    def _on_pad_press(
+        self, gap_ms: Optional[float], _interval_ms: Optional[float], button: Button = Button.LEFT
+    ) -> None:
         self.clicks += 1
         self.count_value.setText(str(self.clicks))
         if gap_ms is None:
@@ -372,7 +392,9 @@ class TestPage(Page):
             return
         bounce = gap_ms <= self.controller.threshold_ms
         self.timeline.add(gap_ms, bounce)
-        self.last_value.setText(f"{gap_ms:.0f} ms")
+        # Each button is timed against its own release; say which one.
+        which = "" if button is Button.LEFT else f" ({button.label.lower()})"
+        self.last_value.setText(f"{gap_ms:.0f} ms{which}")
         if self.shortest_gap is None or gap_ms < self.shortest_gap:
             self.shortest_gap = gap_ms
             self.shortest_value.setText(f"{gap_ms:.0f} ms")
@@ -383,6 +405,9 @@ class CalibratePage(Page):
     """Two measured phases, then a recommendation."""
 
     threshold_chosen = Signal(int)
+    #: The phase moved: "intro", "single", "double" or "done". Filtering
+    #: pauses only while a measuring phase is on screen.
+    phase_changed = Signal(str)
 
     def __init__(self, controller: AppController, parent: Optional[QWidget] = None) -> None:
         super().__init__("Calibrate", parent)
@@ -390,6 +415,9 @@ class CalibratePage(Page):
         self.calibrator = Calibrator()
         self.phase = "intro"
         self.suggestion = None
+        # The button whose first press of a double-click is waiting for its
+        # second, or None.
+        self._pair_button: Optional[Button] = None
 
         # The step and its progress bar are one row, so they share one box
         # (macOS) or one card (Windows).
@@ -444,18 +472,29 @@ class CalibratePage(Page):
         self.restart()
 
     # -- flow ------------------------------------------------------------------
+    @property
+    def measuring(self) -> bool:
+        return self.phase in ("single", "double")
+
+    def _set_phase(self, phase: str) -> None:
+        if phase != self.phase:
+            self.phase = phase
+            self.phase_changed.emit(phase)
+
     def restart(self) -> None:
         self.calibrator = Calibrator()
-        self.phase = "intro"
         self.suggestion = None
+        self._pair_button = None
         self.pad.reset()
+        self._set_phase("intro")
         self._render()
 
     def _advance(self) -> None:
         if self.phase == "intro":
-            self.phase = "single"
+            self._set_phase("single")
         elif self.phase == "single":
-            self.phase = "double"
+            self._pair_button = None
+            self._set_phase("double")
         elif self.phase == "double":
             self._finish()
             return
@@ -469,34 +508,67 @@ class CalibratePage(Page):
 
     def _finish(self) -> None:
         self.suggestion = self.calibrator.suggest()
-        self.phase = "done"
+        self._set_phase("done")
         self._render()
 
-    def _on_pad_press(self, gap_ms: Optional[float], _interval_ms: Optional[float]) -> None:
+    @staticmethod
+    def pair_window_ms() -> float:
+        """How long a double-click may pause between its release and second
+        press: at least PAIR_WINDOW_MS, and as long as the system's own
+        double-click setting, so a pair the system accepts counts here too."""
+        interval = QGuiApplication.styleHints().mouseDoubleClickInterval()
+        return max(PAIR_WINDOW_MS, float(interval))
+
+    def _on_pad_press(
+        self, gap_ms: Optional[float], _interval_ms: Optional[float], button: Button = Button.LEFT
+    ) -> None:
         note = ""
+        if self.phase == "intro":
+            # Clicking the pad is as good as Begin, and counts as the first
+            # single click. Its gap means nothing: it is the first.
+            self._advance()
+            gap_ms = None
         if self.phase == "single":
             counted = self.calibrator.add_single_click(gap_ms)
             self.pad.flash(not counted)
             if not counted:
                 note = f"Bounce detected ({gap_ms:.0f} ms)."
             if self.calibrator.has_enough_singles:
-                self.phase = "double"
+                self._pair_button = None
+                self._set_phase("double")
                 self.pad.reset()
                 note = ""
         elif self.phase == "double":
-            if gap_ms is not None and gap_ms <= PAIR_WINDOW_MS:
-                recorded = self.calibrator.add_double_click(gap_ms)
-                self.pad.flash(not recorded)
-                if not recorded:
-                    note = f"Bounce detected ({gap_ms:.0f} ms)."
-            else:
-                self.pad.flash(False)
+            note = self._double_click_press(gap_ms, button)
             if self.calibrator.has_enough_doubles:
                 self._finish()
                 return
         else:
             return
         self._render(note)
+
+    def _double_click_press(self, gap_ms: Optional[float], button: Button) -> str:
+        """Pair presses into double-clicks: a first press opens a pair, and
+        the same button's next press within the pair window closes it and
+        counts. Anything else opens a new pair, so the third press of a
+        triple-click never counts as another double. Returns a note."""
+        if gap_ms is not None and gap_ms <= BOUNCE_CANDIDATE_MS:
+            # Chatter, wherever it lands, is evidence; the pair stays open.
+            self.calibrator.add_double_click(gap_ms)
+            self.pad.flash(True)
+            return f"Bounce detected ({gap_ms:.0f} ms)."
+        if self._pair_button is button and gap_ms is not None and gap_ms <= self.pair_window_ms():
+            self.calibrator.add_double_click(gap_ms)
+            self._pair_button = None
+            self.pad.flash(False)
+            return ""
+        too_slow = self._pair_button is button
+        self._pair_button = button
+        # Only the start of a pair: no "counted" flash.
+        self.pad.flash(False, neutral=True)
+        if too_slow:
+            return "Too slow for a double-click, so it wasn’t counted. Double-click a little faster."
+        return ""
 
     # -- rendering ---------------------------------------------------------------
     def _render(self, note: str = "") -> None:
@@ -512,7 +584,10 @@ class CalibratePage(Page):
 
         if self.phase == "intro":
             self.step_row.title.setText("Calibrate your mouse")
-            self.step_row.set_detail("Click once at a time, then double-click. Filtering pauses until you finish.")
+            self.step_row.set_detail(
+                "Click once at a time, then double-click. Filtering pauses while you do, "
+                "so the pad sees your mouse as it is."
+            )
             self.count_label.setText("")
             self.pad.set_text(label("Ready"), "")
             self.primary_button.setText(label("Begin"))
@@ -578,13 +653,23 @@ class GeneralPage(Page):
         self.updater = updater
         self._loading = False
 
-        startup = self.section()
+        startup_section = self.section()
         self.login_switch = Switch(accessible_name="Open at login")
-        where = "menu bar" if IS_MAC else "notification area"
-        self.login_row = startup.add(
-            Row("Open at login", f"Starts in the {where}.", self.login_switch, card_icon("power"))
+        # Shown when the user switched the app off in System Settings › Login
+        # Items: only there can it be switched back on.
+        self.login_items_button = _button("Open Login Items…")
+        self.login_items_button.clicked.connect(lambda: startup.open_login_items_settings())
+        self.login_items_button.setVisible(False)
+        login_controls = QWidget()
+        login_layout = QHBoxLayout(login_controls)
+        login_layout.setContentsMargins(0, 0, 0, 0)
+        login_layout.setSpacing(10)
+        login_layout.addWidget(self.login_items_button)
+        login_layout.addWidget(self.login_switch)
+        self.login_row = startup_section.add(
+            Row("Open at login", self._login_detail(startup.ON), login_controls, card_icon("power"))
         )
-        self.login_switch.toggled.connect(self._on_login)
+        self.login_switch.clicked.connect(self._on_login)
 
         self.permission_row: Optional[Row] = None
         if permissions.needs_accessibility():
@@ -592,13 +677,15 @@ class GeneralPage(Page):
             section = self.section()
             self.permission_icon = SymbolView("ok", 20, "symbol")
             button = _button("Open Settings…")
-            button.clicked.connect(permissions.open_accessibility_settings)
-            self.permission_row = section.add(Row("Accessibility", "", button, self.permission_icon))
+            button.clicked.connect(lambda: permissions.open_accessibility_settings())
+            self.permission_button = button
+            # The name System Settings itself uses, which macOS 27 changed.
+            self.permission_row = section.add(Row(permissions.pane_name(), "", button, self.permission_icon))
 
         self.update_header = self.header("Software update")
         self.update_section = self.section()
         self.auto_update_switch = Switch(accessible_name="Install updates automatically")
-        self.auto_update_switch.toggled.connect(self._on_auto_update)
+        self.auto_update_switch.clicked.connect(self._on_auto_update)
         self.update_section.add(Row("Install updates automatically", "", self.auto_update_switch, card_icon("sync")))
         self.update_button = _button("Check Now")
         self.update_button.clicked.connect(self._on_update_button)
@@ -617,16 +704,34 @@ class GeneralPage(Page):
         reset.clicked.connect(self._confirm_reset)
         self.stats_row = stats.add(Row("Blocked bounces", "", reset, card_icon("chart")))
 
+        self.header("Troubleshooting")
+        troubleshooting = self.section()
+        self.diagnostics_button = _button("Copy Diagnostics")
+        self.diagnostics_button.clicked.connect(self._copy_diagnostics)
+        self.diagnostics_row = troubleshooting.add(
+            Row("Diagnostics", DIAGNOSTICS_DETAIL, self.diagnostics_button, card_icon("copy"))
+        )
+        self._diagnostics_timer = QTimer(self)
+        self._diagnostics_timer.setSingleShot(True)
+        self._diagnostics_timer.setInterval(4000)
+        self._diagnostics_timer.timeout.connect(lambda: self.diagnostics_row.set_detail(DIAGNOSTICS_DETAIL))
+
         self.body.addStretch(1)
         version = TextLabel(f"DoubleClick Fixer {__version__}", "caption", "tertiary")
         version.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         version.setContentsMargins(0, 24, 0, 0)
         self.body.addWidget(version)
 
+    @staticmethod
+    def _login_detail(state: str) -> str:
+        if state == startup.BLOCKED:
+            if IS_MAC:
+                return "Turned off in System Settings."
+            return "Turned off in Task Manager › Startup apps. Turn it on here to allow it again."
+        return f"Starts in the {'menu bar' if IS_MAC else 'notification area'}."
+
     def refresh(self, granted: bool) -> None:
-        self._loading = True
-        self.login_switch.setChecked(bool(self.controller.settings["start_at_login"]), animate=False)
-        self._loading = False
+        self.refresh_login()
         if self.permission_row is not None:
             self.permission_icon.name = "ok" if granted else "warning"
             self.permission_icon.update()
@@ -675,6 +780,12 @@ class GeneralPage(Page):
         if not self._loading:
             self.controller.set_auto_update(checked)
 
+    def refresh_login(self) -> None:
+        self.login_switch.setChecked(bool(self.controller.settings["start_at_login"]), animate=False)
+        state = self.controller.login_item_state
+        self.login_row.set_detail(self._login_detail(state))
+        self.login_items_button.setVisible(IS_MAC and state == startup.BLOCKED)
+
     def _on_login(self, checked: bool) -> None:
         if self._loading:
             return
@@ -682,6 +793,23 @@ class GeneralPage(Page):
         if error:
             self.login_switch.setChecked(not checked)
             QMessageBox.warning(self, "Couldn’t change the login item", error)
+            return
+        # Still off if macOS keeps it switched off in Login Items; say so.
+        self.refresh_login()
+
+    def _copy_diagnostics(self) -> None:
+        """Put a bug report's worth of detail on the clipboard: versions,
+        state, settings and the end of the log."""
+        window = self.window()
+        state = self.controller.diagnostic_state()
+        if permissions.needs_accessibility():
+            state[f"{permissions.pane_name()} permission"] = getattr(window, "_permission_granted", "?")
+        if self.updater is not None and self.updater.supported:
+            state["update"] = f"{self.updater.state} {self.updater.message}".strip()
+        text = diagnostics.report(__version__, state, self.controller.settings)
+        QApplication.clipboard().setText(text)
+        self.diagnostics_row.set_detail("Copied. Paste it into your bug report.")
+        self._diagnostics_timer.start()
 
     def _confirm_reset(self) -> None:
         answer = QMessageBox.question(
@@ -713,7 +841,9 @@ class MainWindow(QWidget):
         self._material = False
         side = look().sidebar_width
         page_margins = 40 if IS_MAC else 72
-        self.setMinimumSize(side + page_margins + COLUMN_MIN + 16, 480 if IS_MAC else 540)
+        # Every pane scrolls, so the minimum height only has to fit the
+        # sidebar; Windows at 200% scaling leaves about 490 px.
+        self.setMinimumSize(side + page_margins + COLUMN_MIN + 16, 480)
         self.resize(side + page_margins + COLUMN_MAX // (1 if IS_MAC else 2) + 60, 640 if IS_MAC else 700)
 
         root = QHBoxLayout(self)
@@ -752,6 +882,10 @@ class MainWindow(QWidget):
         for page in self.pages:
             area = QScrollArea()
             area.setWidgetResizable(True)
+            # Not a Tab stop of its own: it shows no focus, so Tab would seem
+            # to do nothing. The wheel still scrolls it, and so does moving
+            # focus to a control inside it.
+            area.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             area.setFrameShape(QFrame.Shape.NoFrame)
             area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             # The pane colour is painted once by the window; the scroll area,
@@ -769,8 +903,11 @@ class MainWindow(QWidget):
         root.addWidget(content, 1)
 
         self.sidebar.current_changed.connect(self._show_page)
-        self.filter_page.switch.toggled.connect(self._on_switch)
+        # clicked, not toggled: refresh() sets the switch, and must not echo
+        # back into a request.
+        self.filter_page.switch.clicked.connect(self._on_switch)
         self.calibrate.threshold_chosen.connect(self._apply_calibration)
+        self.calibrate.phase_changed.connect(lambda _phase: self._sync_pause())
         controller.filter_state_changed.connect(self._on_filter_state)
         controller.settings_changed.connect(self.refresh)
         controller.global_event.connect(self.filter_page.note_global_event)
@@ -783,8 +920,9 @@ class MainWindow(QWidget):
         self._save_timer.timeout.connect(controller.flush_stats)
         self._save_timer.start()
 
-        # macOS sends no notification when Accessibility is granted or revoked,
-        # so poll it. The check is a cheap local query.
+        # macOS sends no reliable notification when Accessibility is granted
+        # or revoked, so poll it every second (see _check_permission). While
+        # filtering, that poll is also the guard against a revoked grant.
         self._permission_granted = permissions.has_accessibility()
         self._enable_when_granted = False
         self._permission_timer = QTimer(self)
@@ -793,15 +931,51 @@ class MainWindow(QWidget):
         if permissions.needs_accessibility():
             self._permission_timer.start()
 
+        # A tap macOS disabled and couldn't re-arm lets every click through;
+        # look now and then, and rebuild it.
+        self._health_timer = QTimer(self)
+        self._health_timer.setInterval(HEALTH_CHECK_MS)
+        self._health_timer.timeout.connect(self._check_health)
+
+        # Retries for a filter that failed to start in the background.
+        self._retry_timer = QTimer(self)
+        self._retry_timer.setSingleShot(True)
+        self._retry_timer.timeout.connect(self._retry_start)
+        self._retry_waits: list[int] = []
+        # Set while a retry runs: its failure shows no dialog.
+        self._quiet = False
+
+        # False while the user is in another login session (macOS fast user
+        # switching), where a tap left running would stall that session.
+        self._session_active = True
+
         self._show_page(0)
-        self._restore_geometry()
+        if not self._restore_geometry():
+            self._fit_to_screen()
 
     # -- size and position -------------------------------------------------------
-    def _restore_geometry(self) -> None:
-        """Reopen where the window was left, as Mac and Windows apps do."""
+    def _restore_geometry(self) -> bool:
+        """Reopen where the window was left, as Mac and Windows apps do.
+        Qt keeps a restored window on a screen that is still there."""
         saved = self.controller.settings.get("window_geometry") or ""
         if saved:
-            self.restoreGeometry(QByteArray.fromBase64(saved.encode("ascii")))
+            return bool(self.restoreGeometry(QByteArray.fromBase64(saved.encode("ascii"))))
+        return False
+
+    def _fit_to_screen(self) -> None:
+        """First launch: the default size, but never more than the screen's
+        work area. A 1080p laptop at 150% has about 670 px above the
+        taskbar, less than the default, and Qt only centres a window that
+        fits; one that doesn't hides its bottom edge under the taskbar."""
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+        # The size set here leaves out the title bar and frame.
+        width = min(self.width(), available.width() - FRAME_ALLOWANCE[0])
+        height = min(self.height(), available.height() - FRAME_ALLOWANCE[1])
+        self.setMinimumSize(min(self.minimumWidth(), width), min(self.minimumHeight(), height))
+        self.resize(width, height)
 
     def save_geometry(self) -> None:
         encoded = bytes(self.saveGeometry().toBase64()).decode("ascii")
@@ -814,11 +988,12 @@ class MainWindow(QWidget):
             self._material = native.apply(self, self.sidebar.width(), look().dark)
         self.sidebar.paint_background = not (self.translucent and self._material)
         self._tint_title_bar()
-        # Reopening on the Calibrate pane pauses filtering again; closing the
-        # window resumed it (see closeEvent).
-        if PAGES[self.stack.currentIndex()][0] == "calibrate":
-            self.controller.suspend()
+        self._sync_pause()
         self.update()
+
+    def hideEvent(self, event) -> None:  # noqa: N802
+        super().hideEvent(event)
+        self._sync_pause()
 
     def paintEvent(self, _event) -> None:  # noqa: N802
         lk = look()
@@ -838,9 +1013,18 @@ class MainWindow(QWidget):
 
     def changeEvent(self, event) -> None:  # noqa: N802
         if event.type() == QEvent.Type.ActivationChange:
-            self.sidebar.window_active = self.isActiveWindow()
-            self.sidebar.update()
-        elif (
+            self.sidebar.set_window_active(self.isActiveWindow())
+            if self.isActiveWindow() and PAGES[self.stack.currentIndex()][0] == "general":
+                # Back from System Settings or Task Manager, where the login
+                # item may just have been switched.
+                self.controller.refresh_login_item()
+                self.refresh()
+            # Calibrating in a window left behind another app would leave
+            # every click in that app unfiltered.
+            self._sync_pause()
+        elif event.type() == QEvent.Type.WindowStateChange:
+            self._sync_pause()
+        if (
             event.type() == QEvent.Type.WindowStateChange
             and not IS_MAC
             and self.isMinimized()
@@ -876,11 +1060,9 @@ class MainWindow(QWidget):
         self.sidebar.set_current(index, emit=False)
         self.stack.setCurrentIndex(index)
         self.title_label.setText(PAGES[index][1])
-        if PAGES[index][0] == "calibrate":
-            # Calibration has to see the raw clicks, so filtering pauses.
-            self.controller.suspend()
-        else:
-            self.controller.resume()
+        if PAGES[index][0] == "general":
+            self.controller.refresh_login_item()
+        self._sync_pause()
         self.refresh()
 
     def show_page(self, key: str) -> None:
@@ -891,6 +1073,26 @@ class MainWindow(QWidget):
     def show_calibration(self) -> None:
         self.show_page("calibrate")
 
+    # -- calibration pause -------------------------------------------------------
+    def _should_pause(self) -> bool:
+        """Calibration has to see the raw clicks, so filtering pauses, but
+        only while it is measuring in front of the user: not on the intro or
+        the result, and not while the window is hidden, minimized or behind
+        another app, where those clicks would go unfiltered."""
+        return (
+            PAGES[self.stack.currentIndex()][0] == "calibrate"
+            and self.calibrate.measuring
+            and self.isVisible()
+            and not self.isMinimized()
+            and self.isActiveWindow()
+        )
+
+    def _sync_pause(self) -> None:
+        if self._should_pause():
+            self.controller.suspend()
+        else:
+            self.controller.resume()
+
     # -- state -------------------------------------------------------------------
     def refresh(self) -> None:
         granted = self._permission_granted
@@ -900,15 +1102,30 @@ class MainWindow(QWidget):
         self.test_page.refresh()
         self.general.refresh(granted)
 
+    def _read_permission(self) -> bool:
+        if not permissions.has_accessibility():
+            return False
+        if self.controller.active or self._enable_when_granted:
+            # AXIsProcessTrusted can stay true after the app is removed from
+            # the list, and a filtering tap left on a dead grant can stall
+            # input everywhere. A throwaway tap tells the truth. Only asked
+            # while it matters: filtering, or about to start.
+            return permissions.event_tap_allowed()
+        return True
+
     def _check_permission(self) -> None:
-        granted = permissions.has_accessibility()
+        if not self._session_active:
+            return  # nothing runs in another user's session; check on return
+        granted = self._read_permission()
         if granted == self._permission_granted:
             return
+        log.info("Permission %s", "granted" if granted else "withdrawn")
         self._permission_granted = granted
         if granted and self._enable_when_granted:
-            # The user already asked for the filter; finish the job.
+            # The user already asked for the filter; finish the job (after
+            # calibration, if it is measuring).
             self._enable_when_granted = False
-            self.controller.set_active(True)
+            self._on_switch(True, prompt=False)
         elif not granted and self.controller.active:
             # Without permission the tap cannot block anything, so an "on"
             # switch would be lying. The saved choice stays on, so the filter
@@ -916,6 +1133,11 @@ class MainWindow(QWidget):
             self.controller.stop_for_permission()
             self._enable_when_granted = True
         self.refresh()
+
+    def check_permission_soon(self) -> None:
+        """The Accessibility list just changed. macOS posts that a moment
+        before the new answer can be read, so look shortly after."""
+        QTimer.singleShot(300, self._check_permission)
 
     def request_filter(self, checked: bool, prompt: bool = True) -> None:
         """Turn the filter on or off from anywhere: the switch, the menu, launch.
@@ -937,7 +1159,7 @@ class MainWindow(QWidget):
             if prompt:
                 permissions.open_accessibility_settings()
             return
-        if checked and self.isVisible() and PAGES[self.stack.currentIndex()][0] == "calibrate":
+        if checked and self._should_pause():
             # Turned on from the menu while calibrating: the pad must keep
             # seeing raw clicks, so filtering starts when calibration ends.
             self.controller.enable_after_calibration()
@@ -947,14 +1169,114 @@ class MainWindow(QWidget):
         self.refresh()
 
     def _on_filter_state(self, _active: bool, error: str) -> None:
+        if self.controller.active:
+            self._health_timer.start()
+        else:
+            self._health_timer.stop()
+        if self.controller.active or not self.controller.settings["fix_enabled"]:
+            self._retry_waits.clear()
+            self._retry_timer.stop()
         self.refresh()
-        if error:
+        if error and self._on_screen() and not self._quiet:
             QMessageBox.warning(self, "The filter couldn’t start", error)
 
     def _on_hook_failed(self, message: str) -> None:
-        self.controller.set_active(False)
+        # Not set_active(False): that is the user's "off", and would keep the
+        # filter off at every later login.
+        self.controller.stop_after_failure(message)
         self.refresh()
-        QMessageBox.warning(self, "The filter stopped", message)
+        if self._on_screen():
+            QMessageBox.warning(self, "The filter stopped", message)
+
+    # -- keeping the filter alive ------------------------------------------------
+    def restore_filter(self, background: bool) -> None:
+        """Turn the saved "on" back on at launch. Opened by the user, it
+        goes the usual way; at login, see _start_with_retries."""
+        if background:
+            self._start_with_retries()
+        else:
+            self.request_filter(True)
+
+    def _start_with_retries(self) -> None:
+        """Start the filter for the app's own reasons (a login, a wake, a
+        session switch, a dead tap) rather than the user's. At those moments
+        the window server or the permission database can answer a little
+        late, so a refused tap is tried again at each of RETRY_AT_S before
+        it is left to the user. The first failure shows as usual (a dialog
+        only if the window is on screen); the retries show only in the
+        menu's status line and the Filter pane."""
+        self.request_filter(True, prompt=False)
+        if self._start_failed():
+            marks = (0, *RETRY_AT_S)
+            self._retry_waits = [int((later - earlier) * 1000) for earlier, later in zip(marks, marks[1:])]
+            self._retry_timer.start(self._retry_waits.pop(0))
+
+    def _attempt_quietly(self) -> None:
+        self._quiet = True
+        try:
+            self.request_filter(True, prompt=False)
+        finally:
+            self._quiet = False
+
+    def _start_failed(self) -> bool:
+        controller = self.controller
+        return (
+            bool(controller.failure)
+            and controller.settings["fix_enabled"]
+            and not controller.active
+            and not controller.suspended
+            and not controller.waiting_for_permission
+        )
+
+    def _retry_start(self) -> None:
+        if not self._start_failed():
+            self._retry_waits.clear()
+            return
+        log.info("Trying the filter again")
+        self._attempt_quietly()
+        if self._start_failed() and self._retry_waits:
+            self._retry_timer.start(self._retry_waits.pop(0))
+
+    def restart_filter(self) -> None:
+        """Start the filter afresh if the user has it on: after sleep, on
+        coming back to this login session, or when its tap stopped working.
+        Taps made before sleep or a session switch can be left dead."""
+        controller = self.controller
+        if not self._session_active or controller.suspended or self._enable_when_granted:
+            return
+        if not controller.settings["fix_enabled"]:
+            return
+        controller.stop_keeping_choice()
+        self._start_with_retries()
+
+    def _check_health(self) -> None:
+        if self.controller.active and not self.controller.tap_alive():
+            log.warning("The event tap stopped receiving events; rebuilding it")
+            self.restart_filter()
+
+    def system_woke(self) -> None:
+        log.info("Woke from sleep")
+        self.restart_filter()
+
+    def session_resigned(self) -> None:
+        """The user switched to another login session. A tap left running in
+        an inactive session can stall the active one, so stop it; stop()
+        sends any release it was holding first."""
+        log.info("Session switched away")
+        self._session_active = False
+        if self.controller.active:
+            self.controller.stop_keeping_choice()
+
+    def session_activated(self) -> None:
+        log.info("Session active again")
+        self._session_active = True
+        self.restart_filter()
+
+    def _on_screen(self) -> bool:
+        """Whether a failure can be shown in a dialog. With the window closed
+        or minimized the menu's status line carries it instead: a dialog
+        nobody asked for would open over whatever the user is doing."""
+        return self.isVisible() and not self.isMinimized()
 
     def _apply_calibration(self, threshold_ms: int) -> None:
         self.controller.set_threshold(threshold_ms)
@@ -963,9 +1285,12 @@ class MainWindow(QWidget):
 
     def closeEvent(self, event) -> None:  # noqa: N802
         event.ignore()
-        # Calibration pauses filtering only while its pane is on screen.
-        self.controller.resume()
+        # A calibration left half done, or finished but not applied, starts
+        # over next time, so reopening the window never pauses filtering.
+        if self.calibrate.phase != "intro":
+            self.calibrate.restart()
         self.save_geometry()
         self.controller.flush_stats()
         self.hide()
+        self._sync_pause()
         self.closed_to_tray.emit()
