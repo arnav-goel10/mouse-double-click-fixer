@@ -1,9 +1,9 @@
 version: 2
+# Only the workflows' actions. Python packages are pinned with every file's
+# hash in requirements-build.txt, which uv regenerates from
+# requirements-build.in (the command is at the top of that file); Dependabot
+# can't regenerate it, so update those pins by hand.
 updates:
-  - package-ecosystem: pip
-    directory: "/"
-    schedule:
-      interval: monthly
   - package-ecosystem: github-actions
     directory: "/"
     schedule:

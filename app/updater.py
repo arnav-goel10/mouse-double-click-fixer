@@ -42,7 +42,7 @@ from typing import Optional
 from PySide6.QtCore import QObject, QTimer, QUrl, Signal
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 
-from . import __version__
+from . import __version__, build_flags
 from .update_signature import PublicKey, ReleaseClaim, SignatureError, parse_claim, parse_public_key, verify
 
 log = logging.getLogger(__name__)
@@ -73,12 +73,6 @@ RELEASE_KEYS = (
 #: copy running from source reads it: a packaged app never takes a key from its
 #: environment, which whatever starts the app controls.
 TEST_KEY_ENV = "DCF_UPDATE_TEST_KEY"
-#: CI's end-to-end build of the Windows app carries one more key, made for that
-#: run and thrown away after it, as a file beside the app's own (see
-#: tools/ci_update_key.py). release.yml refuses to build with it, so no release
-#: has the file; and anyone able to put it there could replace the app itself.
-CI_KEY_FILE = "dcf-ci-update-key.pub"
-
 #: The Windows update scripts find the running app and the download through
 #: these. cmd reads a batch file in the OEM code page, which can't spell every
 #: path, but expands variables from its Unicode environment intact.
@@ -197,17 +191,17 @@ def release_from_json(data: dict, kind: str) -> Optional[Release]:
 
 
 def _ci_key() -> Optional[PublicKey]:
-    """CI's throwaway key, in a packaged Windows app built by CI's end-to-end job."""
-    bundled = getattr(sys, "_MEIPASS", None)
-    if sys.platform != "win32" or not getattr(sys, "frozen", False) or not bundled:
-        return None
-    path = Path(bundled) / CI_KEY_FILE
-    if not path.is_file():
+    """CI's throwaway key, made for one run of CI's end-to-end job and thrown
+    away after it, in the packaged Windows app that job built to trust it.
+    Decided when the app was built (app/build_flags.py): nothing is read at
+    run time, and every other build has no such key."""
+    text = build_flags.CI_UPDATE_KEY
+    if not text or sys.platform != "win32" or not getattr(sys, "frozen", False):
         return None
     try:
-        key = parse_public_key(path.read_text(encoding="ascii"))
-    except (OSError, ValueError) as error:  # SignatureError is a ValueError
-        log.warning("Ignored an unreadable %s: %s", CI_KEY_FILE, error)
+        key = parse_public_key(text)
+    except ValueError as error:  # SignatureError is a ValueError
+        log.warning("Ignored CI's update key, which can't be read: %s", error)
         return None
     log.warning("This build trusts CI's throwaway update key %s", key.key_id_text)
     return key
