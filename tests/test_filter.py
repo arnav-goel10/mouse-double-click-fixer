@@ -11,6 +11,7 @@ from unittest import mock
 from app.core import Button, ClickEvent
 from app.platform import (
     INJECTED_MARK,
+    MOTION_MARK_FOR,
     RESTORE_MARK,
     TAP_DISABLED_MESSAGE,
     ClickCountRepair,
@@ -909,12 +910,46 @@ class MacTapTests(unittest.TestCase):
         self.timers[-1].fire()
         self.assertEqual([event.kind for event in self.quartz.posted], [self.Q.kCGEventLeftMouseUp])
 
+    def test_the_motion_tap_judges_motion_by_where_it_went(self) -> None:
+        self.button(self.Q.kCGEventLeftMouseDown, (100, 100), 0.0)
+        self.assertIsNone(self.button(self.Q.kCGEventLeftMouseUp, (100, 100), 0.1))
+        self.assertTrue(self.motion_tap.enabled, "a release is held in place")
+        self.quartz.pointer = (100.0, 100.0)
+        self.assertIsNotNone(self.motion((101, 100)), "a nudge passes")
+        self.assertEqual(self.quartz.posted, [])
+        self.assertIsNone(self.motion((106, 100)), "leaving the click waits behind its release")
+        self.assertEqual([self.mark(event) for event in self.quartz.posted], [INJECTED_MARK])
+        self.pass_back(self.quartz.posted[0])
+        moved = self.quartz.posted[-1]
+        self.assertEqual((moved.location.x, self.mark(moved)), (106, MOTION_MARK_FOR[Button.LEFT]))
+
     def test_restore_motion_never_settles_a_held_release(self) -> None:
         self.button(self.Q.kCGEventLeftMouseDown, (100, 100), 0.0)
         self.button(self.Q.kCGEventLeftMouseUp, (100, 100), 0.1)
         self.assertIsNotNone(self.motion((300, 100), mark=RESTORE_MARK))
         self.assertEqual(self.quartz.posted, [])
         self.assertTrue(self.filter._filters[Button.LEFT].holding_release)
+
+    def test_a_posted_click_first_does_not_squeeze_later_real_ones(self) -> None:
+        self.button(self.Q.kCGEventLeftMouseDown, (0, 0), 0.00, ns=True)
+        self.button(self.Q.kCGEventLeftMouseUp, (0, 0), 0.05, ns=True)
+        self.button(self.Q.kCGEventLeftMouseDown, (0, 0), 0.50)
+        self.button(self.Q.kCGEventLeftMouseUp, (0, 0), 0.58)
+        self.button(self.Q.kCGEventLeftMouseDown, (0, 0), 0.88)
+        press = self.events[-1]
+        self.assertFalse(press.is_bounce)
+        self.assertAlmostEqual(press.gap_ms or 0, 300, delta=0.01)
+
+    def test_the_click_count_ignores_a_suppressed_bounce(self) -> None:
+        # Release chatter at 105 ms keeps macOS's chain going; the next
+        # click, 560 ms after the first, arrives numbered 3.
+        self.button(self.Q.kCGEventLeftMouseDown, (0, 0), 0.000, state=1)
+        self.button(self.Q.kCGEventLeftMouseUp, (0, 0), 0.080, state=1)
+        self.button(self.Q.kCGEventLeftMouseDown, (0, 0), 0.105, state=2)
+        self.button(self.Q.kCGEventLeftMouseUp, (0, 0), 0.108, state=2)
+        self.button(self.Q.kCGEventLeftMouseDown, (0, 0), 0.560, state=3)
+        press = [event for event in self.quartz.posted if event.kind == self.Q.kCGEventLeftMouseDown][-1]
+        self.assertEqual(press.fields[self.Q.kCGMouseEventClickState], 1)
 
     def test_stopping_invalidates_both_taps(self) -> None:
         self.filter.stop()
