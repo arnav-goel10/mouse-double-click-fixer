@@ -7,6 +7,11 @@ hand.
 The builds run on macOS 13 or later on Apple silicon, and on 64-bit Windows 10
 version 1809 or later or Windows 11. Both minimums come from Qt 6.11.
 
+Build with python.org's Python 3.14 (3.14.6 or later), as releases are: the
+app ships Python's OpenSSL, and its self-test fails a build whose OpenSSL is
+older than 3.5. Homebrew's and uv's Pythons don't make a working macOS build;
+[Packaging locally](../docs/RELEASING.md#packaging-locally) says why.
+
 ## macOS
 
 ```bash

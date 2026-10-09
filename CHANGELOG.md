@@ -154,6 +154,13 @@ on Apple silicon, or 64-bit Windows 10 version 1809 or later, or Windows 11.
   move to a new signing certificate has to be named in a signed release.
 - Releases are now built by CI as drafts. Before one is published, it is
   checked against CI's build and signed on the maintainer's Mac.
+- The app now runs on Python 3.14 and ships its OpenSSL 3.5, a long-term
+  support release maintained until April 2030. 0.5.3 and earlier were built
+  on Python 3.13, whose OpenSSL 3.0 stopped getting security fixes on
+  7 September 2026. On macOS this OpenSSL carries update checks and
+  downloads; on Windows, where those go through Schannel, the app uses it
+  for checksums. A build whose OpenSSL is out of support now fails its own
+  self-test.
 - Checking for updates and installing them have separate switches, so
   turning off automatic installs no longer stops the checks. If you turned
   updates off before 1.0, both stay off.

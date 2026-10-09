@@ -109,6 +109,9 @@ bash tools/macos_injection_check.sh "$signed"
 
 # The notices it ships must be exactly what its own files call for.
 python3 tools/make_notices.py --bundle "$signed" --check --output "$signed/Contents/Resources/THIRD_PARTY_NOTICES.md"
+# What it ships, for the log: each component and its version (OpenSSL's
+# among them, which the self-test held to its floor).
+grep '^| ' "$signed/Contents/Resources/THIRD_PARTY_NOTICES.md"
 
 # The disk image opens to a designed window: the app, an arrow and the
 # Applications folder, so installing is one drag. dmgbuild writes Finder's

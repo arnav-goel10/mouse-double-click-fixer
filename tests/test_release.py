@@ -388,6 +388,27 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(ARTIFACTS["DoubleClickFixer-windows"][-1], WINDOWS_NOTICES)
         self.assertEqual(ARTIFACTS["DoubleClickFixer-macos"][-1], MAC_NOTICES)
 
+    def test_builds_run_on_python_3_14_and_tests_on_each_python_from_3_11(self) -> None:
+        # python.org's CPython ships OpenSSL 3.5 (LTS) from 3.14.6 on; 3.13's
+        # is 3.0, out of support since 2026-09-07. The built app's self-test
+        # fails below app/selftest.py's OPENSSL_FLOOR, so every job that builds
+        # it takes the newest 3.14 (check-latest), not an older one a runner
+        # has cached, and the jobs that run its code end to end use 3.14 too.
+        builds = set()
+        for path in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+            text = path.read_text(encoding="utf-8")
+            for name in re.findall(r"^  ([\w-]+):\n", text[text.index("\njobs:\n"):], re.MULTILINE):
+                body = job(text, name)
+                if re.search(r"^(?!\s*#).*installer[\\/]build_(macos\.sh|windows\.ps1)", body, re.MULTILINE):
+                    builds.add((path.name, name))
+                    self.assertIn('          python-version: "3.14"\n          check-latest: true\n', body,
+                                  f"{path.name} {name} builds the app")
+                for version in re.findall(r'^\s+python-version: "([^"]+)"', body, re.MULTILINE):
+                    self.assertEqual(version, "3.14", f"{path.name} {name}")
+        self.assertEqual(builds, {("build-macos.yml", "build"), ("ci.yml", "windows-install"),
+                                  ("release.yml", "windows"), ("release.yml", "macos")})
+        self.assertIn('python-version: ["3.11", "3.12", "3.13", "3.14"]', job(self.workflow("ci.yml"), "test"))
+
     def test_dependabot_leaves_the_hash_locked_pins_alone(self) -> None:
         # It can't regenerate requirements-build.txt (uv pip compile, with
         # hashes; see requirements-build.in), so it isn't asked to.

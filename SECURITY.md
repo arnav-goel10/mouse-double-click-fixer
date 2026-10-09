@@ -68,6 +68,10 @@ trusts. If the app has no TLS library it may use, the update check fails and
 says so. Updates don't rely on the connection, though: whatever it delivers
 is installed only if the signature and checksums above verify.
 
+The OpenSSL the app ships is Python's: OpenSSL 3.5, a long-term support
+release. A build's self-test fails if any OpenSSL inside the app is older
+(`OPENSSL_FLOOR` in `app/selftest.py`).
+
 To check a download by hand, with minisign installed:
 
 ```bash

@@ -24,6 +24,8 @@ python -m unittest discover -s tests
 ```
 
 UI tests run offscreen (`QT_QPA_PLATFORM=offscreen`, set by the tests).
+Builds of the app are another matter: they need python.org's Python 3.14,
+for the OpenSSL it ships ([Packaging locally](docs/RELEASING.md#packaging-locally)).
 
 ## Keep tests off the real machine
 

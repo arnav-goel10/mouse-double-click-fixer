@@ -227,6 +227,26 @@ The macOS job runs on a macOS 26 runner: only its Xcode can compile the layered
 app icon (`installer/assets/AppIcon.icon`). An older Xcode still builds the app,
 with the flat icon only.
 
+### The build Python and its OpenSSL
+
+Release builds run on python.org's CPython 3.14: the workflows ask
+`actions/setup-python` for `"3.14"` with `check-latest`, so they get the
+newest 3.14 rather than an older one a runner has cached. The app ships
+Python's own OpenSSL. Python's `ssl` and `hashlib` run it on both platforms,
+and on macOS Qt's TLS runs it too, for every update check and download.
+CPython 3.14.6 and later ship OpenSSL 3.5, a long-term support release
+supported until 2030-04-08; python.org's 3.13 still ships OpenSSL 3.0, which
+reached end of life on 2026-09-07.
+
+The self-test's `openssl` check fails a build if the OpenSSL that Python or
+Qt runs, or any OpenSSL library file inside the app, is older than
+`OPENSSL_FLOOR` in `app/selftest.py` (3.5). OpenSSL makes a long-term support
+release every other April, the next in April 2027. Once python.org's CPython
+ships it, move the builds to that Python and raise the floor to it; in any
+case, before April 2030. `tests/test_release.py` fails if a job that builds
+the app asks for another Python. The unit tests still run on Python 3.11 to
+3.14; run from source, the check only reports.
+
 ### SIP and the injection check
 
 `tools/macos_injection_check.sh` runs the app's self-test with canary
@@ -340,7 +360,7 @@ where the requirement is exactly what
 CI runs on every push to `main` and every pull request, and the release
 workflow runs it in full before it puts up a draft:
 
-- **Unit tests** on Windows and macOS 14, Python 3.11 to 3.13. On macOS, where
+- **Unit tests** on Windows and macOS 14, Python 3.11 to 3.14. On macOS, where
   the runner allows it, two of them also start the real event tap and stop it
   again; neither posts any input.
 - **macOS event tap end-to-end**, on macOS 14 and macOS 26, posts real clicks
@@ -365,3 +385,19 @@ bash installer/build_macos.sh       # app, DMG and updater zip in dist/
 
 Build outside a synced folder if you can; iCloud Drive adds file attributes
 that code signing rejects, which is why the script signs in a temporary folder.
+
+A build that matches a release needs python.org's CPython 3.14 (see
+[The build Python and its OpenSSL](#the-build-python-and-its-openssl)). On a
+Mac, install it from python.org and build in a virtualenv made from it:
+
+```bash
+/Library/Frameworks/Python.framework/Versions/3.14/bin/python3 -m venv .venv-build
+. .venv-build/bin/activate && bash installer/build_macos.sh
+```
+
+Other Pythons fail the macOS build. Homebrew's loads OpenSSL from Homebrew's
+own folder, outside Python, which the build refuses
+(`tools/binary_sources.py`). uv's CPython links OpenSSL into Python itself,
+so the app has no OpenSSL library for Qt's TLS to load and the self-test's
+`tls` check fails. python.org's 3.13, and 3.14 before 3.14.6, ship OpenSSL
+3.0, which the `openssl` check refuses.

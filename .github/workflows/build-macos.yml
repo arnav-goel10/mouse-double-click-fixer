@@ -15,7 +15,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.13"
+          # Builds run on python.org's CPython 3.14, which ships OpenSSL 3.5
+          # (LTS) from 3.14.6 on, as the app's self-test requires (OPENSSL_FLOOR
+          # in app/selftest.py); 3.13 ships OpenSSL 3.0, out of support since
+          # 2026-09-07. check-latest: the newest 3.14, never an older one the
+          # runner has cached.
+          python-version: "3.14"
+          check-latest: true
       - name: Build app and DMG
         # Installs the pinned packages and build tools first, each checked
         # against its hash.
