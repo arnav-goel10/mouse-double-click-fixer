@@ -940,6 +940,11 @@ class MacTapTests(unittest.TestCase):
         self.assertFalse(press.is_bounce)
         self.assertAlmostEqual(press.gap_ms or 0, 300, delta=0.01)
 
+    def test_the_double_click_interval_is_read_before_the_tap_goes_live(self) -> None:
+        from app import platform as platform_module
+
+        self.assertEqual(platform_module._double_click_interval.call_count, 1)
+
     def test_the_click_count_ignores_a_suppressed_bounce(self) -> None:
         # Release chatter at 105 ms keeps macOS's chain going; the next
         # click, 560 ms after the first, arrives numbered 3.

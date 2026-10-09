@@ -741,6 +741,9 @@ class GlobalClickFilter:
 
         self._inject = inject
         click_counts = ClickCountRepair()
+        # The first read of the double-click interval loads AppKit; do it now,
+        # not inside the tap callback, where a slow call gets the tap disabled.
+        click_counts.interval()
         # Set when macOS keeps disabling the taps: the run loop then ends.
         given_up: list[bool] = []
 
