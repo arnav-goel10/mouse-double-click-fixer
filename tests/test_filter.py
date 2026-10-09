@@ -1177,6 +1177,19 @@ class CrossButtonOrderTests(unittest.TestCase):
         self.assertFalse(rdown.is_bounce)
         self.assertEqual(rig.sent, [(Button.LEFT, False, "lup"), (Button.RIGHT, True, "rdown")], "right behind it")
 
+    def test_a_release_after_another_buttons_release_on_its_way_follows_it(self) -> None:
+        # The right button is not filtered: its release is never held, and
+        # would reach apps at once, before the left release that came first.
+        rig = Pipeline(self)                                          # only the left button filtered
+        rig.round_trip = None
+        rig.handle(Button.RIGHT, True, 99.900, "rdown")
+        rig.handle(Button.LEFT, True, 100.000, "ldown")
+        rig.handle(Button.LEFT, False, 100.100, "lup")
+        rig.run_until(100.150)                                        # lup re-sent
+        rup = rig.handle(Button.RIGHT, False, 100.160, "rup")
+        self.assertTrue(rup.deferred)
+        self.assertEqual(rig.sent, [(Button.LEFT, False, "lup"), (Button.RIGHT, False, "rup")], "right behind it")
+
     def test_a_press_from_before_another_buttons_release_goes_straight_through(self) -> None:
         rig = Pipeline(self, buttons=(Button.LEFT, Button.RIGHT))
         rig.round_trip = None
