@@ -3,6 +3,7 @@
 import platform
 import unittest
 from time import monotonic
+from unittest import mock
 
 from app.core import Button
 from app.platform import GlobalClickFilter, HookError, is_supported
@@ -12,6 +13,10 @@ class HandlerTests(unittest.TestCase):
     """Drive the code path both native hooks call, without installing one."""
 
     def setUp(self) -> None:
+        FakeTimer.reset()
+        patch = mock.patch("app.platform.threading.Timer", FakeTimer)
+        patch.start()
+        self.addCleanup(patch.stop)
         self.events = []
         self.filter = GlobalClickFilter(60, [Button.LEFT], on_event=self.events.append)
         # Pretend the platform timestamps line up with our clock.
@@ -45,7 +50,9 @@ class HandlerTests(unittest.TestCase):
         self.filter.update(threshold_ms=10)
         self.click(Button.LEFT, 1.0, 1.02)
         press, _ = self.click(Button.LEFT, 1.05, 1.06)  # 30 ms gap
-        self.assertTrue(press.accepted)
+        # Delivered, after the release held before it.
+        self.assertFalse(press.is_bounce)
+        self.assertTrue(press.flush_held)
 
     def test_every_event_is_reported_to_the_ui(self) -> None:
         self.click(Button.LEFT, 1.0, 1.05)
@@ -361,7 +368,9 @@ class ResendOrderTests(unittest.TestCase):
         self.comes_back()                                             # up1 delivered
         self.assertEqual(self.sent, [(False, "up1"), (True, "down2")])
         self.comes_back()                                             # down2 delivered
-        self.assertTrue(self.filter._handle(Button.LEFT, False, 1.170, "up2").accepted)
+        self.assertTrue(self.filter._handle(Button.LEFT, False, 1.170, "up2").held)
+        self.timers[-1].fire()
+        self.assertEqual(self.sent, [(False, "up1"), (True, "down2"), (False, "up2")])
 
     def test_events_flow_normally_once_nothing_is_in_flight(self) -> None:
         self.filter._handle(Button.LEFT, True, 1.0, "down1")
