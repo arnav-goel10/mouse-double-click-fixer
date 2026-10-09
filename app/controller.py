@@ -415,7 +415,7 @@ class AppController(QObject):
             "tap resets": getattr(current, "tap_resets", "-"),
             "hook re-arms": getattr(current, "hook_rearms", "-"),
             "passed untouched": ", ".join(
-                f"{reason} {count}" for reason, count in sorted(getattr(current, "passed_counts", {}).items())
+                f"{reason} {count}" for reason, count in sorted(dict(getattr(current, "passed_counts", {})).items())
             )
             or "none",
             "wheel ticks dropped": getattr(current, "wheel_dropped", "-"),

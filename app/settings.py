@@ -11,9 +11,8 @@ from pathlib import Path
 from time import sleep
 from typing import Any
 
-from .core import DEFAULT_THRESHOLD_MS, Button
+from .core import DEFAULT_THRESHOLD_MS, MAX_THRESHOLD_MS, MIN_THRESHOLD_MS, Button
 from .platform import WHEEL_DEFAULT_MS
-from .core import MAX_THRESHOLD_MS, MIN_THRESHOLD_MS
 
 #: 3 (1.0): a window per button, side buttons, the wheel fix, app exclusions
 #: and ignored devices. 2: one window for every button.
