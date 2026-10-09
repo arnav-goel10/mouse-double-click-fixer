@@ -38,7 +38,17 @@ jobs:
         run: python -m unittest discover -s tests -v
         env:
           QT_QPA_PLATFORM: offscreen
-          # tests/test_tls.py's real HTTPS request; GitHub limits unauthenticated calls per address.
+      - name: Real HTTPS through the TLS backend the app ships with
+        # tests/test_tls.py's RealHttpsTests, through tests/https_probe.py:
+        # Schannel on Windows, Qt's OpenSSL backend on Python's OpenSSL on
+        # macOS. GitHub must answer; expired, self-signed and wrong-host
+        # certificates (badssl.com) must be refused.
+        run: python -m unittest tests.test_tls.RealHttpsTests -v
+        env:
+          QT_QPA_PLATFORM: offscreen
+          DCF_REAL_HTTPS: "1"
+          # Sent to api.github.com alone: GitHub limits unauthenticated calls
+          # per address, and CI's Macs share theirs.
           GITHUB_TOKEN: ${{ github.token }}
       - run: python -m compileall -q app run.py
 
@@ -152,7 +162,8 @@ jobs:
             ForEach-Object { "{0,8:N1} MB  {1}" -f ($_.Length / 1MB), $_.FullName.Substring($PWD.Path.Length + 1) }
           $mesa = Join-Path (python -c "import os, PySide6; print(os.path.dirname(PySide6.__file__))") "opengl32sw.dll"
           if (Test-Path $mesa) { "left out: PySide6's opengl32sw.dll, {0:N1} MB" -f ((Get-Item $mesa).Length / 1MB) }
-          # The OpenSSL files Qt's OpenSSL backend loads by name, wherever PATH has them.
+          # OpenSSL files on this runner's PATH, which Qt's OpenSSL backend would load by
+          # name; the build leaves them out, and fails if one comes from anywhere unexpected.
           foreach ($name in "libcrypto-3-x64.dll", "libssl-3-x64.dll") {
             $env:PATH -split ";" | Where-Object { $_ -and (Test-Path -LiteralPath (Join-Path $_ $name)) } |
               ForEach-Object { "on PATH: $(Join-Path $_ $name)" }

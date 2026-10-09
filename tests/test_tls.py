@@ -1,5 +1,6 @@
-"""The TLS backend the app makes Qt use (app/tls.py), and, on CI only, a real
-HTTPS request through it."""
+"""The TLS backend the app makes Qt use (app/tls.py), and, on CI only, real
+HTTPS requests through it: one that must succeed, and three whose bad
+certificates must be refused."""
 
 try:
     import _isolation  # noqa: F401  (first: keeps tests off the real machine)
@@ -8,7 +9,6 @@ except ImportError:  # run as tests.<module> from the repository root
 
 import os
 import sys
-import time
 import unittest
 from unittest import mock
 
@@ -115,39 +115,67 @@ class ChoiceTests(unittest.TestCase):
             self.assertEqual(name, "schannel")
 
 
-@unittest.skipUnless(os.environ.get("CI") == "true", "reaches api.github.com; runs on CI only")
+#: The probe's URLs: one that must answer, and three whose certificates must
+#: be refused (badssl.com keeps them broken on purpose).
+GOOD = "https://api.github.com/zen"
+REFUSED = {
+    "https://expired.badssl.com/": {"CertificateExpired"},
+    "https://self-signed.badssl.com/": {"SelfSignedCertificate", "CertificateUntrusted"},
+    "https://wrong.host.badssl.com/": {"HostNameMismatch"},
+}
+PROBE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "https_probe.py")
+
+
+@unittest.skipUnless(os.environ.get("DCF_REAL_HTTPS") == "1", "reaches the internet; ci.yml runs it in a step of its own")
 class RealHttpsTests(unittest.TestCase):
-    def test_github_answers_over_the_apps_tls(self) -> None:
-        from PySide6.QtCore import QUrl
-        from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest, QSslSocket
-        from PySide6.QtWidgets import QApplication
+    """Real requests through the backend the app ships with (tests/https_probe.py,
+    in a fresh process): Schannel on Windows, Qt's OpenSSL backend on macOS,
+    on the very OpenSSL Python uses. One must succeed, and certificates that
+    are expired, self-signed or for another host must each be refused."""
 
-        from app import __version__
+    @classmethod
+    def setUpClass(cls) -> None:
+        import json
+        import subprocess
 
-        application = QApplication.instance() or QApplication([])
-        backend = tls.use_preferred_backend()
-        manager = QNetworkAccessManager()
-        request = QNetworkRequest(QUrl("https://api.github.com/zen"))
-        request.setRawHeader(b"User-Agent", f"DoubleClickFixer/{__version__} (CI)".encode())
-        request.setTransferTimeout(30_000)
-        token = os.environ.get("GITHUB_TOKEN", "")
-        if token:  # GitHub limits unauthenticated calls per address, and CI's Macs share theirs
-            request.setRawHeader(b"Authorization", f"Bearer {token}".encode())
-        reply = manager.get(request)
-        deadline = time.time() + 60
-        while not reply.isFinished() and time.time() < deadline:
-            application.processEvents()
-            time.sleep(0.01)
-        self.assertTrue(reply.isFinished(), "no answer within 60 s")
-        status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
-        body = bytes(reply.readAll()).decode("utf-8", "replace").strip()
-        print(f"\nGET https://api.github.com/zen through Qt's {QSslSocket.activeBackend()} backend "
-              f"({QSslSocket.sslLibraryVersionString()}): HTTP {status}, {body!r}", file=sys.stderr)
-        self.assertEqual(reply.error(), QNetworkReply.NetworkError.NoError, reply.errorString())
-        self.assertEqual(status, 200)
-        self.assertTrue(body)
-        self.assertEqual(QSslSocket.activeBackend(), backend)
-        reply.deleteLater()
+        result = subprocess.run([sys.executable, PROBE, GOOD, *REFUSED], capture_output=True, text=True,
+                                timeout=300, check=False)
+        print(f"\n{result.stdout}{result.stderr}", file=sys.stderr)
+        if result.returncode != 0:
+            raise AssertionError(f"the probe failed (exit {result.returncode})")
+        lines = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]
+        cls.setup = lines[0]
+        cls.replies = {line["url"]: line for line in lines if "url" in line}
+        cls.images = next((line["openssl_images"] for line in lines if "openssl_images" in line), [])
+
+    def test_the_backend_is_the_one_the_app_ships_with(self) -> None:
+        expected = {"win32": "schannel", "darwin": "openssl"}.get(sys.platform, "openssl")
+        self.assertEqual((self.setup["backend"], self.setup["active"]), (expected, expected), self.setup)
+        self.assertGreater(self.setup["roots"], 0)
+        if sys.platform == "darwin":
+            self.assertTrue(self.setup["library"].startswith("OpenSSL 3."), self.setup)
+            loaded = [path for path in self.images if not path.startswith(("/usr/lib/", "/System/"))]
+            self.assertTrue(loaded, self.images)
+            folders = {os.path.realpath(os.path.dirname(path)) for path in loaded}
+            self.assertEqual(folders, {os.path.realpath(self.setup["openssl_folder"])}, self.images)
+            if self.setup["openssl_source"] == "Python's":
+                # The same file, so the same version: what a built app runs.
+                self.assertEqual(self.setup["library"], self.setup["python_openssl"])
+
+    def test_github_answers(self) -> None:
+        reply = self.replies[GOOD]
+        self.assertEqual((reply["error"], reply["status"]), ("NoError", 200), reply)
+        self.assertTrue(reply["body"], reply)
+        self.assertEqual(reply["ssl_errors"], [])
+
+    def test_a_bad_certificate_is_refused(self) -> None:
+        for url, expected in REFUSED.items():
+            with self.subTest(url=url):
+                reply = self.replies[url]
+                self.assertTrue(reply["finished"], reply)
+                self.assertEqual(reply["error"], "SslHandshakeFailedError", reply)
+                self.assertIsNone(reply["status"], reply)
+                self.assertTrue(expected & set(reply["ssl_errors"]), reply)
 
 
 if __name__ == "__main__":
