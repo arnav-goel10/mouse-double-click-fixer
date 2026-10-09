@@ -13,12 +13,12 @@ on Apple silicon, or 64-bit Windows 10 version 1809 or later, or Windows 11.
   its press used to go straight through, so a contact that bounced twice as
   it closed could turn the start of a drag into a click. Very short taps now
   wait like any other click.
-- **A small movement no longer ends a drag.** Since 0.5.1 on macOS, a held
-  release was settled by any pointer motion, even a hand resting on the
-  mouse, and a dropout's comeback could make a drag look like a click made in
-  place. Now motion inside the filter window settles only a release made
-  where its press landed, and only once the pointer has moved a few pixels
-  from where the button came up.
+- **A small movement no longer ends a drag.** Since 0.5.1 on macOS, a
+  release held in place was settled by any pointer motion, even a hand
+  resting on the mouse, and a dropout's comeback could make a drag look like
+  a click made in place. Now motion inside the filter window settles such a
+  release only once the pointer has moved a few pixels from where the button
+  came up.
 - **A drag survives a busy computer.** A held release is now settled by
   the time of the events that follow it, not by a timer started when it
   arrived. Events reach the filter in the order they happened, so once one
@@ -121,12 +121,17 @@ on Apple silicon, or 64-bit Windows 10 version 1809 or later, or Windows 11.
 - Updates now finish in folders whose names use characters outside the
   system's code page (a user name like Łukasz on an English system).
   Before, the app didn't come back after updating there.
-- The updater starts cmd.exe, and the programs its update script runs, from
-  System32 by full path. Named alone, Windows would look for them in the
-  app's own folder or the current folder first, so a file with one of their
-  names beside the portable exe (in Downloads, say) could have run instead.
+- The updater starts cmd.exe, and the Windows programs its update script
+  runs, from System32 by full path. Named alone, Windows would look for them
+  in the app's own folder or the current folder first, so a file with one of
+  their names beside the portable exe (in Downloads, say) could have run
+  instead.
 - Windows builds no longer carry Mesa's software OpenGL (opengl32sw.dll,
   about 20 MB), which the app never used.
+- Update checks and downloads go through Windows' own TLS (Schannel). The
+  build no longer ships Qt's OpenSSL plugin and the copy of OpenSSL it picked
+  up from another program on the build machine, nor a copy of the Universal
+  C Runtime, which Windows 10 and later have built in and keep updated.
 
 ### Updates and security
 
@@ -142,6 +147,8 @@ on Apple silicon, or 64-bit Windows 10 version 1809 or later, or Windows 11.
 - On macOS an update must also be the version it claims and keep the
   installed app's signing requirement, which the permission depends on. A
   move to a new signing certificate has to be named in a signed release.
+- Releases are now built by CI as drafts. Before one is published, it is
+  checked against CI's build and signed on the maintainer's Mac.
 - Checking for updates and installing them have separate switches, so
   turning off automatic installs no longer stops the checks. If you turned
   updates off before 1.0, both stay off.
@@ -155,7 +162,8 @@ on Apple silicon, or 64-bit Windows 10 version 1809 or later, or Windows 11.
   code inside them and the other software the app is built on, including
   the LGPL and GPL texts, worked out from the files that build ships.
   **General › Acknowledgements…** opens it, and on Windows it is also in the
-  install folder.
+  install folder. Each release also carries both platforms' copies, as
+  THIRD_PARTY_NOTICES-macos.md and THIRD_PARTY_NOTICES-windows.md.
 
 ### App
 

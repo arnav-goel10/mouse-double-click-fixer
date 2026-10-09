@@ -121,11 +121,11 @@ the app.
 
 ## Updates
 
-Updates install by themselves while **General › Install updates
-automatically** is on. If the window is open when one is ready, it waits and
-installs when you close the window; **Restart Now** (Windows: **Restart
-now**) installs it straight away. After the app reopens, **General** says
-whether the update worked.
+Updates install by themselves while **General › Check for updates
+automatically** and **Install updates automatically** are both on. If the
+window is open when one is ready, it waits and installs when you close the
+window; **Restart Now** (Windows: **Restart now**) installs it straight away.
+After the app reopens, **General** says whether the update worked.
 
 What the messages in **General › Software update** mean:
 
@@ -133,9 +133,7 @@ What the messages in **General › Software update** mean:
   repository's releases, for example because none is published yet.
 - **This update isn't signed, so it can't be installed.** (or its signature
   isn't valid, or is for another version.) The release doesn't carry a valid
-  signature from the project's keys, so the app won't download it. If a
-  release was published a moment ago, its signature may still be on its way:
-  **Try Again** (Windows: **Try again**) later.
+  signature from the project's keys, so the app won't download it.
 - **Move DoubleClick Fixer to Applications to update it.** The app is running
   from the disk image or from where macOS put a downloaded copy it hasn't
   moved. Drag it to Applications and open it from there.

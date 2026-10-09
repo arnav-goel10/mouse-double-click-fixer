@@ -18,5 +18,7 @@
 - Use the standard library for tests unless a dependency is essential. UI tests
   run with `QT_QPA_PLATFORM=offscreen`. Every test module imports
   `tests/_isolation.py` first, so no test touches the user's settings, login
-  item or running copy; tests never post input or open apps.
+  item or running copy; tests never post input or open apps, except the
+  end-to-end tests that CI runs with `DCF_E2E=1`
+  (`tests/test_windows_hook.py`, `tests/test_macos_tap_e2e.py`).
 - Validate with `python -m unittest discover -s tests`.

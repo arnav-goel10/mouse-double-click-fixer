@@ -58,12 +58,15 @@ settings or quit the copy you have running. So:
 
 Some tests touch the system on purpose, and only in CI:
 
-- `DCF_E2E=1` turns on the Windows hook tests in `tests/test_windows_hook.py`.
-  They install the real low-level hook and inject real clicks and moves, so
-  never set it on your own PC. CI runs them on a Windows machine.
-- The macOS event tap end-to-end test moves the pointer and posts real
-  clicks. It runs on CI's Macs; `DCF_E2E_ALLOW_LOCAL=1` would let it run
-  elsewhere, so never set that on your own Mac.
+- `DCF_E2E=1` turns on the end-to-end tests, which send real input. On
+  Windows, `tests/test_windows_hook.py` installs the real low-level hook and
+  injects real clicks and moves. On macOS, `tests/test_macos_tap_e2e.py`
+  starts the real event tap, moves the pointer and posts real clicks. Never
+  set it on your own computer. CI runs them on its Windows machines and on
+  macOS 14 and 26.
+- The macOS test also runs only where `GITHUB_ACTIONS=true` (CI sets it) or
+  `DCF_E2E_ALLOW_LOCAL=1`; never set either on your own Mac. Asked for with
+  `DCF_E2E=1` where it can't run, it fails instead of skipping.
 - `tools/windows_install_e2e.ps1` installs, upgrades, updates and uninstalls
   the app for real. CI runs it; never run it on a PC whose copy of
   DoubleClick Fixer you care about.

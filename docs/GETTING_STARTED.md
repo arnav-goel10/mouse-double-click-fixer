@@ -56,4 +56,5 @@ says so and how to turn it back on.
 Every release waits for the filter window before apps see it, a little
 longer on a still mouse, and a click made in place goes out as soon as you
 move the pointer off it. So a shorter window also means a quicker click.
-Presses are not held back.
+Presses go straight through; one waits only behind a release still on its
+way to apps, usually for a millisecond or two.

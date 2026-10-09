@@ -26,11 +26,13 @@ updates automatically** stops the background checks.
 ## How updates are verified
 
 Releases from 1.0 on are signed with [minisign](https://jedisct1.github.io/minisign/)
-(Ed25519). The secret keys stay on the maintainer's Mac and never go to GitHub
-or CI: CI builds a release as a draft, and it is signed there and only then
-published. The app has the public halves of two keys built in, a primary and
-a backup, so a lost or retired primary can be replaced without stranding
-installed copies.
+(Ed25519). CI builds each release and puts it up as a draft. On the
+maintainer's Mac, a script then checks that every file on the draft is byte
+for byte the one CI built, checks the macOS app's code signature and that it
+loads no code named in its environment, signs the checksums and publishes the
+release. The secret keys never leave that Mac. The app has the public halves
+of two keys built in, a primary and a backup, so a lost or retired primary
+can be replaced without stranding installed copies.
 
 Before it offers an update, the app downloads the release's `SHA256SUMS.txt`
 and `SHA256SUMS.txt.minisig` and checks that:
@@ -55,6 +57,17 @@ that brings them to 1.0 against the release's checksums alone (on macOS, plus
 the code-signature check), and those come from the same release as the files.
 From 1.0 on, every update is signature-checked.
 
+Update checks and downloads go to GitHub over HTTPS. On Windows they use
+Windows' own TLS (Schannel), and the Windows build ships no OpenSSL for Qt.
+On macOS they use the OpenSSL that ships inside the app, the copy its Python
+uses too, and the build's self-test fails if any other copy is loaded; if
+Qt's OpenSSL backend can't start, the app uses macOS's own Secure Transport
+instead. Either
+way, GitHub's certificate is checked against the certificates the system
+trusts. If the app has no TLS library it may use, the update check fails and
+says so. Updates don't rely on the connection, though: whatever it delivers
+is installed only if the signature and checksums above verify.
+
 To check a download by hand, with minisign installed:
 
 ```bash
@@ -75,8 +88,11 @@ entitlement, `disable-library-validation`, is needed because its self-signed
 certificate has no Team ID, which library validation would otherwise require
 of the bundled Python and Qt. With that entitlement, a library inside the app
 could still load code named in an environment variable (OpenSSL's
-configuration, Qt's plugin paths and others), so the app clears those
-variables before any of its code runs.
+configuration, Qt's plugin paths and others). So before any of its code
+runs, the app removes those variables and sets `OPENSSL_CONF` to
+`/dev/null`, an empty configuration, rather than let OpenSSL read the file
+it was built to look for, which can sit in a folder other software can
+write to.
 
 The programs the app starts run as the app too: `pgrep`, `codesign`, `ditto`,
 `open`, and `bash` for the update swap. It starts each by its full path, sets
@@ -90,10 +106,10 @@ The Windows builds are not signed with a code-signing certificate yet, so
 SmartScreen warns about an unknown publisher, and Smart App Control, where it
 is on, blocks them.
 Updates don't depend on that: the updater checks the minisign signature above.
-It starts `cmd.exe`, and the programs its update script runs, from System32 by
-full path: Windows looks for a program named alone in the starting program's
-folder and the current folder first, and the portable exe may sit in
-Downloads.
+It starts `cmd.exe`, and the Windows programs its update scripts run
+(`tasklist`, `find` and `ping`), from System32 by full path: Windows looks
+for a program named alone in the starting program's folder and the current
+folder first, and the portable exe may sit in Downloads.
 The installer installs for the current user and needs no administrator rights.
 Windows doesn't let the app send input to windows running as administrator, so
 over those it never holds a release back.

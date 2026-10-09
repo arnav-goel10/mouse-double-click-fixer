@@ -53,7 +53,7 @@ replaces files it asks a running copy to quit through the installed one, and
 ends it if that doesn't work within 20 seconds. That step runs in
 PowerShell's Constrained Language Mode, as it would on a PC with application
 control, and waits with `Wait-Process`. An installed copy from before 0.2.7,
-or an installed folder build (0.5.4 and later) that has lost its `_internal`
+or an installed folder build (1.0 and later) that has lost its `_internal`
 folder, can't be asked, and is ended with `taskkill`.
 
 ## Uninstalling
