@@ -63,7 +63,7 @@ jobs:
   windows-install:
     name: Windows install, quit and update end-to-end
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -89,11 +89,16 @@ jobs:
           python tools/ci_update_key.py check dist\DoubleClickFixer.exe dist\onedir
           if ($LASTEXITCODE -ne 1) { throw "the check release.yml runs missed CI's key in a build that carries it" }
           exit 0
-      - name: Download the oldest installer still in use (0.2.6, before --quit)
+      - name: Download the old installers to upgrade from
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release download v0.2.6 -p DoubleClickFixer-Setup.exe -D old
-      - name: Install over a running copy, quit, update, uninstall
+        run: |
+          # 0.2.6: the oldest still in use, before --quit (taskkill closes it).
+          # 0.5.3: the last one-file release, the upgrade every current user
+          # takes; its own --quit closes the running copy.
+          gh release download v0.2.6 -p DoubleClickFixer-Setup.exe -D old\0.2.6
+          gh release download v0.5.3 -p DoubleClickFixer-Setup.exe -D old\0.5.3
+      - name: Install over running copies, quit, update, uninstall
         shell: pwsh
-        run: .\tools\windows_install_e2e.ps1 -OldSetup old\DoubleClickFixer-Setup.exe -NewSetup installer\Output\DoubleClickFixer-Setup.exe -SigningKey "$env:RUNNER_TEMP\dcf-ci-key\dcf-ci-update-key.key"
+        run: .\tools\windows_install_e2e.ps1 -OldSetup old\0.2.6\DoubleClickFixer-Setup.exe,old\0.5.3\DoubleClickFixer-Setup.exe -NewSetup installer\Output\DoubleClickFixer-Setup.exe -SigningKey "$env:RUNNER_TEMP\dcf-ci-key\dcf-ci-update-key.key"
