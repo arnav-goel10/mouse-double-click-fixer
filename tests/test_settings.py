@@ -63,6 +63,37 @@ class SettingsTests(unittest.TestCase):
         self.assertFalse(values["fix_enabled"], "the fix stays off until the user asks again")
         self.assertFalse(values["calibrated"])
 
+    def write(self, values: dict) -> None:
+        (self.directory / "settings.json").write_text(json.dumps(values))
+
+    def test_an_old_opt_out_of_updates_stops_the_checks_too(self) -> None:
+        # Before 1.0, turning "auto_update" off also stopped the checks.
+        self.write({"auto_update": False, "threshold_ms": 45})
+        values = settings.load()
+        self.assertFalse(values["auto_check"])
+        self.assertFalse(values["auto_update"])
+        settings.save({"auto_update": True}, current=values)
+        self.assertFalse(settings.load()["auto_check"], "kept once saved, whatever happens to installs")
+
+    def test_update_checks_stay_on_for_everyone_else(self) -> None:
+        self.assertTrue(settings.load()["auto_check"], "a new install")
+        self.write({"auto_update": True})
+        self.assertTrue(settings.load()["auto_check"])
+
+    def test_a_saved_check_choice_is_its_own(self) -> None:
+        self.write({"auto_update": False, "auto_check": True})
+        self.assertTrue(settings.load()["auto_check"])
+        self.write({"auto_update": True, "auto_check": 0})
+        self.assertIs(settings.load()["auto_check"], False)
+
+    def test_update_attempts_are_typed(self) -> None:
+        self.write({"update_attempt_version": 5, "update_attempt_count": "2"})
+        values = settings.load()
+        self.assertEqual(values["update_attempt_version"], "")
+        self.assertEqual(values["update_attempt_count"], 2)
+        for bad in (-3, "many", None, float("inf")):
+            self.assertEqual(settings.coerce({"update_attempt_count": bad})["update_attempt_count"], 0, bad)
+
     def test_buttons_from_returns_enum_members(self) -> None:
         values = settings.save({"buttons": ["left", "middle"]})
         self.assertEqual(settings.buttons_from(values), [Button.LEFT, Button.MIDDLE])

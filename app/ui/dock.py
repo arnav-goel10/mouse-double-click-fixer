@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import Callable
 
+from PySide6.QtCore import QTimer
 from PySide6.QtGui import QGuiApplication
 
 from .theme import IS_MAC
@@ -30,6 +31,18 @@ def _four_char(code: str) -> int:
     return int.from_bytes(code.encode("ascii"), "big")
 
 
+def _deferred(callback: Callable[[], None]) -> Callable[[], None]:
+    """`callback`, run from Qt's event loop just after AppKit calls in,
+    rather than inside AppKit's own dispatch. An exception in it then
+    reaches sys.excepthook and the log instead of crossing into
+    Objective-C, and the work never runs halfway through a notification."""
+
+    def run() -> None:
+        QTimer.singleShot(0, callback)
+
+    return run
+
+
 def on_reopen(callback: Callable[[], None]) -> None:
     """Call `callback` when the user opens the app again while it runs.
 
@@ -44,6 +57,7 @@ def on_reopen(callback: Callable[[], None]) -> None:
     """
     if not _available() or _REOPEN_HANDLER:
         return
+    callback = _deferred(callback)
     try:
         from Foundation import NSAppleEventManager, NSObject
 
@@ -106,6 +120,9 @@ def observe_system(
     """
     if not _available() or _SYSTEM_OBSERVER:
         return
+    on_wake, on_session_active, on_session_inactive, on_permission_change = (
+        _deferred(callback) for callback in (on_wake, on_session_active, on_session_inactive, on_permission_change)
+    )
     try:
         import AppKit
         from Foundation import NSDistributedNotificationCenter, NSObject

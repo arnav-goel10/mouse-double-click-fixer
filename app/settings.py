@@ -24,10 +24,16 @@ DEFAULTS: dict[str, Any] = {
     "calibrated": False,
     "filtered_total": 0,
     "window_geometry": "",
+    # Install updates without asking. Checking for them is "auto_check",
+    # which has no default here: see coerce().
     "auto_update": True,
     "last_update_check": 0.0,
     # The version an update was installing when the app quit for it.
     "pending_update": "",
+    # The update last installed without asking, and how many times it was
+    # tried; one that keeps failing is left for the user.
+    "update_attempt_version": "",
+    "update_attempt_count": 0,
     # Windows: the "still running in the notification area" hint was shown.
     "tray_hint_shown": False,
 }
@@ -65,15 +71,23 @@ def coerce(values: dict[str, Any]) -> dict[str, Any]:
     merged["buttons"] = [name for name in buttons if name in valid] or [Button.LEFT.value]
     for flag in ("fix_enabled", "start_at_login", "start_minimized", "calibrated", "auto_update", "tray_hint_shown"):
         merged[flag] = bool(merged.get(flag))
-    try:
-        merged["filtered_total"] = max(0, int(merged.get("filtered_total", 0)))
-    except (TypeError, ValueError):
-        merged["filtered_total"] = 0
+    if "auto_check" in values:
+        merged["auto_check"] = bool(values["auto_check"])
+    else:
+        # Before 1.0 one switch covered checking for updates and installing
+        # them, and turning it off stopped the checks too. Settings saved
+        # then take that answer for both, so an opt-out stays an opt-out.
+        merged["auto_check"] = merged["auto_update"]
+    for count in ("filtered_total", "update_attempt_count"):
+        try:
+            merged[count] = max(0, int(merged.get(count, 0)))
+        except (TypeError, ValueError, OverflowError):
+            merged[count] = 0
     try:
         merged["last_update_check"] = float(merged.get("last_update_check") or 0.0)
     except (TypeError, ValueError):
         merged["last_update_check"] = 0.0
-    for text in ("window_geometry", "pending_update"):
+    for text in ("window_geometry", "pending_update", "update_attempt_version"):
         if not isinstance(merged.get(text), str):
             merged[text] = ""
     merged["version"] = SCHEMA_VERSION

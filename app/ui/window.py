@@ -54,9 +54,10 @@ from .widgets import (
 
 log = logging.getLogger(__name__)
 
-#: The shortest release-to-press pause that still ends a double-click while
-#: calibrating. A slower system double-click setting widens it.
-PAIR_WINDOW_MS = 600.0
+#: The longest release-to-press pause that still ends a double-click while
+#: calibrating, whatever the system's own setting (macOS allows 5 s, which
+#: would count two separate slow clicks as a double-click).
+PAIR_WINDOW_MAX_MS = 1000.0
 
 #: A background launch whose filter fails to start tries again this many
 #: seconds later: at login the window server or the permission database can
@@ -264,7 +265,7 @@ class FilterPage(Page):
         # permission or calibration has it paused.
         self.switch.setChecked(controller.wanted, animate=self.isVisible())
         if controller.suspended and controller.settings["fix_enabled"]:
-            self.status_row.set_detail("Paused during calibration.")
+            self.status_row.set_detail("Paused for calibration.")
         elif waiting_for_permission:
             self.status_row.set_detail(f"Waiting for {permissions.pane_name()} permission.")
         elif controller.failure and not controller.active:
@@ -514,10 +515,10 @@ class CalibratePage(Page):
     @staticmethod
     def pair_window_ms() -> float:
         """How long a double-click may pause between its release and second
-        press: at least PAIR_WINDOW_MS, and as long as the system's own
-        double-click setting, so a pair the system accepts counts here too."""
+        press: the system's own double-click setting, so a pair counts here
+        when the system would take it for one, up to PAIR_WINDOW_MAX_MS."""
         interval = QGuiApplication.styleHints().mouseDoubleClickInterval()
-        return max(PAIR_WINDOW_MS, float(interval))
+        return min(float(interval), PAIR_WINDOW_MAX_MS)
 
     def _on_pad_press(
         self, gap_ms: Optional[float], _interval_ms: Optional[float], button: Button = Button.LEFT
@@ -651,7 +652,6 @@ class GeneralPage(Page):
         super().__init__("General", parent)
         self.controller = controller
         self.updater = updater
-        self._loading = False
 
         startup_section = self.section()
         self.login_switch = Switch(accessible_name="Open at login")
@@ -684,9 +684,12 @@ class GeneralPage(Page):
 
         self.update_header = self.header("Software update")
         self.update_section = self.section()
-        self.auto_update_switch = Switch(accessible_name="Install updates automatically")
-        self.auto_update_switch.clicked.connect(self._on_auto_update)
-        self.update_section.add(Row("Install updates automatically", "", self.auto_update_switch, card_icon("sync")))
+        self.auto_check_switch = Switch(accessible_name="Check for updates automatically")
+        self.auto_check_switch.clicked.connect(self._on_auto_check)
+        self.update_section.add(Row("Check for updates automatically", "", self.auto_check_switch, card_icon("sync")))
+        self.auto_install_switch = Switch(accessible_name="Install updates automatically")
+        self.auto_install_switch.clicked.connect(self._on_auto_install)
+        self.update_section.add(Row("Install updates automatically", "", self.auto_install_switch, card_icon("sync")))
         self.update_button = _button("Check Now")
         self.update_button.clicked.connect(self._on_update_button)
         self.update_row = self.update_section.add(
@@ -726,7 +729,7 @@ class GeneralPage(Page):
     def _login_detail(state: str) -> str:
         if state == startup.BLOCKED:
             if IS_MAC:
-                return "Turned off in System Settings."
+                return "Turned off in System Settings. Turn it on again in Login Items."
             return "Turned off in Task Manager › Startup apps. Turn it on here to allow it again."
         return f"Starts in the {'menu bar' if IS_MAC else 'notification area'}."
 
@@ -738,15 +741,16 @@ class GeneralPage(Page):
             self.permission_row.set_detail("Allowed" if granted else "Not allowed")
         total = self.controller.filtered_total
         self.stats_row.set_detail(f"{total:,} total")
-        self._loading = True
-        self.auto_update_switch.setChecked(bool(self.controller.settings.get("auto_update", True)), animate=False)
-        self._loading = False
         self.refresh_update()
 
     def refresh_update(self) -> None:
         updater = self.updater
         if updater is None or not updater.supported:
             return
+        self.auto_check_switch.setChecked(updater.auto_check, animate=False)
+        self.auto_install_switch.setChecked(updater.auto_install, animate=False)
+        # Only a background check installs anything by itself.
+        self.auto_install_switch.setEnabled(updater.auto_check)
         release = updater.release
         states = {
             updater.CHECKING: ("Checking for updates…", "Check Now", False),
@@ -776,19 +780,27 @@ class GeneralPage(Page):
         else:
             self.updater.check(user_initiated=True)
 
-    def _on_auto_update(self, checked: bool) -> None:
-        if not self._loading:
-            self.controller.set_auto_update(checked)
+    def _on_auto_check(self, checked: bool) -> None:
+        if self.updater is not None:
+            self.updater.set_auto_check(checked)
+
+    def _on_auto_install(self, checked: bool) -> None:
+        # Through the updater, which also drops a download waiting to
+        # install when this is turned off.
+        if self.updater is not None:
+            self.updater.set_auto_install(checked)
 
     def refresh_login(self) -> None:
         self.login_switch.setChecked(bool(self.controller.settings["start_at_login"]), animate=False)
         state = self.controller.login_item_state
         self.login_row.set_detail(self._login_detail(state))
-        self.login_items_button.setVisible(IS_MAC and state == startup.BLOCKED)
+        # On macOS only Login Items can switch it back on; the switch here
+        # would slide on and snap off again.
+        blocked_by_system = IS_MAC and state == startup.BLOCKED
+        self.login_items_button.setVisible(blocked_by_system)
+        self.login_switch.setEnabled(not blocked_by_system)
 
     def _on_login(self, checked: bool) -> None:
-        if self._loading:
-            return
         error = self.controller.set_start_at_login(checked)
         if error:
             self.login_switch.setChecked(not checked)
@@ -914,6 +926,8 @@ class MainWindow(QWidget):
         controller.global_event.connect(self.test_page.note_global_event)
         self.filter_page.calibrate_requested.connect(self.show_calibration)
         controller.hook_failed.connect(self._on_hook_failed)
+        # Reported from the hook's thread; handled here, on the UI thread.
+        controller.permission_lost.connect(self._on_permission_lost, Qt.ConnectionType.QueuedConnection)
 
         self._save_timer = QTimer(self)
         self._save_timer.setInterval(20000)
@@ -944,10 +958,6 @@ class MainWindow(QWidget):
         self._retry_waits: list[int] = []
         # Set while a retry runs: its failure shows no dialog.
         self._quiet = False
-
-        # False while the user is in another login session (macOS fast user
-        # switching), where a tap left running would stall that session.
-        self._session_active = True
 
         self._show_page(0)
         if not self._restore_geometry():
@@ -1114,7 +1124,7 @@ class MainWindow(QWidget):
         return True
 
     def _check_permission(self) -> None:
-        if not self._session_active:
+        if not self.controller.session_active:
             return  # nothing runs in another user's session; check on return
         granted = self._read_permission()
         if granted == self._permission_granted:
@@ -1127,12 +1137,33 @@ class MainWindow(QWidget):
             self._enable_when_granted = False
             self._on_switch(True, prompt=False)
         elif not granted and self.controller.active:
-            # Without permission the tap cannot block anything, so an "on"
-            # switch would be lying. The saved choice stays on, so the filter
-            # returns by itself once access is back, even after a restart.
-            self.controller.stop_for_permission()
-            self._enable_when_granted = True
+            self._wait_for_permission()
         self.refresh()
+
+    def _wait_for_permission(self) -> None:
+        """Access is gone while the user has the filter on. Without it the
+        tap cannot block anything, so an "on" switch would be lying: stop
+        it, and wait. The saved choice stays on, so the filter returns by
+        itself once access is back, even after a restart."""
+        self._permission_granted = False
+        self._enable_when_granted = True
+        self.controller.stop_for_permission()
+
+    def _on_permission_lost(self) -> None:
+        """The filter found its access withdrawn when macOS disabled its
+        tap, let every click through and stopped. Wait for access to come
+        back, as when the permission poll is first to notice."""
+        if not self.controller.settings["fix_enabled"]:
+            return
+        log.warning("The filter lost its permission")
+        self._wait_for_permission()
+        self.refresh()
+
+    def _access_withdrawn(self) -> bool:
+        """macOS: whether a filtering tap would be refused right now. Asked
+        when a start fails, since AXIsProcessTrusted can still say yes for an
+        app removed from the list."""
+        return permissions.needs_accessibility() and not permissions.event_tap_allowed()
 
     def check_permission_soon(self) -> None:
         """The Accessibility list just changed. macOS posts that a moment
@@ -1169,6 +1200,16 @@ class MainWindow(QWidget):
         self.refresh()
 
     def _on_filter_state(self, _active: bool, error: str) -> None:
+        if error and self._access_withdrawn():
+            # The tap was refused because access is gone, though macOS may
+            # still report the app as allowed (at launch, say). That is a
+            # wait for permission, which the permission row explains and the
+            # poll ends, not a failure with a dialog and retries.
+            log.warning("The filter couldn't start without access; waiting for it")
+            self._permission_granted = False
+            self._enable_when_granted = True
+            self.controller.clear_failure()
+            error = ""
         if self.controller.active:
             self._health_timer.start()
         else:
@@ -1242,7 +1283,7 @@ class MainWindow(QWidget):
         coming back to this login session, or when its tap stopped working.
         Taps made before sleep or a session switch can be left dead."""
         controller = self.controller
-        if not self._session_active or controller.suspended or self._enable_when_granted:
+        if not controller.session_active or controller.suspended or self._enable_when_granted:
             return
         if not controller.settings["fix_enabled"]:
             return
@@ -1260,16 +1301,17 @@ class MainWindow(QWidget):
 
     def session_resigned(self) -> None:
         """The user switched to another login session. A tap left running in
-        an inactive session can stall the active one, so stop it; stop()
-        sends any release it was holding first."""
+        an inactive session can stall the active one, so the controller stops
+        it (stop() sends any release it was holding first) and starts none
+        until the session is back. A retry still waiting is dropped too."""
         log.info("Session switched away")
-        self._session_active = False
-        if self.controller.active:
-            self.controller.stop_keeping_choice()
+        self._retry_timer.stop()
+        self._retry_waits.clear()
+        self.controller.set_session_active(False)
 
     def session_activated(self) -> None:
         log.info("Session active again")
-        self._session_active = True
+        self.controller.set_session_active(True)
         self.restart_filter()
 
     def _on_screen(self) -> bool:

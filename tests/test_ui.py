@@ -1,5 +1,6 @@
 """Offscreen tests for the window, including a full calibration run."""
 
+import contextlib
 import os
 import tempfile
 import unittest
@@ -86,13 +87,6 @@ class WindowTests(unittest.TestCase):
         page.reset()
         self.assertEqual(page.clicks, 0)
         self.assertEqual(page.count_value.text(), "0")
-
-    def test_opening_calibrate_alone_does_not_pause_the_filter(self) -> None:
-        # Only measuring pauses it (see CalibrationPauseTests); the intro
-        # is just reading.
-        with mock.patch.object(self.controller, "suspend") as suspend:
-            self.window._show_page(self.page_index("calibrate"))
-            suspend.assert_not_called()
 
     def test_calibration_runs_end_to_end_and_applies(self) -> None:
         from app.core import REQUIRED_DOUBLE_CLICKS, REQUIRED_SINGLE_CLICKS
@@ -242,8 +236,10 @@ class FakeFilter:
 
     fail_with = None
 
-    def __init__(self, *_args, **_kwargs) -> None:
+    def __init__(self, threshold_ms, buttons, on_event=None, on_error=None,
+                 permission_ok=None, on_permission_lost=None) -> None:
         self.started = self.stopped = False
+        self.on_permission_lost = on_permission_lost
 
     @property
     def running(self) -> bool:
@@ -400,6 +396,8 @@ class CalibrationPauseTests(LiveWindowTests):
         self.assertFalse(self.controller.active, "the pad keeps measuring raw clicks")
         self.assertTrue(self.controller.wanted)
         self.assertTrue(self.window.filter_page.switch.isChecked())
+        # The same words as the menus' status line.
+        self.assertEqual(self.window.filter_page.status_row.detail.text(), f"{self.controller.status_text()}.")
         page._finish()
         self.assertTrue(self.controller.active)
 
@@ -447,6 +445,72 @@ class KeepFilterAliveTests(LiveWindowTests):
             self.window._check_permission()
             self.assertTrue(self.controller.active, "back on once access returns")
 
+    def mac_access(self, ax: bool, tap: bool):
+        """macOS permission answers: AXIsProcessTrusted, then the tap probe."""
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch("app.permissions.needs_accessibility", return_value=True))
+        stack.enter_context(mock.patch("app.permissions.has_accessibility", return_value=ax))
+        stack.enter_context(mock.patch("app.permissions.event_tap_allowed", return_value=tap))
+        return stack
+
+    def test_a_tap_refused_at_launch_for_lack_of_access_waits_for_it(self) -> None:
+        from app import permissions
+
+        # macOS still reports the app as allowed, but the grant is dead, so
+        # the tap is refused.
+        self.controller._store(fix_enabled=True)
+        self.window.show()
+        FakeFilter.fail_with = "macOS refused the event tap."
+        with self.mac_access(ax=True, tap=False):
+            self.window._permission_granted = True
+            self.window.restore_filter(background=False)
+            self.assertTrue(self.controller.waiting_for_permission)
+            self.assertEqual(self.controller.failure, "", "a wait, not a failure")
+            self.assertEqual(self.controller.status_text(), f"Waiting for {permissions.pane_name()} permission")
+            self.assertFalse(self.window.filter_page.permission.isHidden(), "the permission row explains it")
+            self.assertFalse(self.window._retry_timer.isActive(), "the permission poll takes it from here")
+            self.window._check_permission()
+            self.assertFalse(self.controller.active)
+        self.dialog.assert_not_called()
+        FakeFilter.fail_with = None
+        with self.mac_access(ax=True, tap=True):
+            self.window._check_permission()
+            self.assertTrue(self.controller.active, "starts once access is back")
+            self.assertFalse(self.controller.waiting_for_permission)
+
+    def test_a_tap_refused_with_access_in_place_is_a_failure(self) -> None:
+        self.controller._store(fix_enabled=True)
+        self.window.show()
+        FakeFilter.fail_with = "The window server isn't ready."
+        with self.mac_access(ax=True, tap=True):
+            self.window._permission_granted = True
+            self.window.restore_filter(background=False)
+        self.assertFalse(self.controller.waiting_for_permission)
+        self.assertEqual(self.controller.failure_detail, "The window server isn't ready.")
+        self.dialog.assert_called_once()
+
+    def test_a_filter_that_lost_its_access_is_stopped_and_waits(self) -> None:
+        import threading
+
+        self.controller.set_active(True)
+        filter_ = self.controller._filter
+        with self.mac_access(ax=True, tap=False):
+            self.window._permission_granted = True
+            hook = threading.Thread(target=filter_.on_permission_lost)
+            hook.start()
+            hook.join()
+            self.assertFalse(filter_.stopped, "handled on the UI thread, not the hook's")
+            self.application.processEvents()
+            self.assertTrue(filter_.stopped)
+            self.assertFalse(self.controller.active)
+            self.assertTrue(self.controller.waiting_for_permission)
+            self.assertTrue(self.controller.settings["fix_enabled"], "the user's choice is kept")
+            self.window._check_permission()  # still refused: nothing starts
+            self.assertFalse(self.controller.active)
+        with self.mac_access(ax=True, tap=True):
+            self.window._check_permission()
+            self.assertTrue(self.controller.active, "back on once access returns")
+
     def test_the_probe_only_runs_while_it_matters(self) -> None:
         with mock.patch("app.permissions.needs_accessibility", return_value=True), \
                 mock.patch("app.permissions.has_accessibility", return_value=True), \
@@ -467,7 +531,7 @@ class KeepFilterAliveTests(LiveWindowTests):
         FakeFilter.fail_with = "macOS refused the event tap."
         self.window.request_filter(True)
         self.dialog.assert_not_called()
-        self.assertEqual(self.controller.status_text(), "Couldn't start the filter")
+        self.assertEqual(self.controller.status_text(), "Couldn’t start the filter")
         self.window.show()
         self.assertIn("refused", self.window.filter_page.status_row.detail.text())
         self.window.request_filter(True)
@@ -507,6 +571,17 @@ class KeepFilterAliveTests(LiveWindowTests):
         self.window.restore_filter(background=True)
         self.window.request_filter(False)
         self.assertFalse(self.window._retry_timer.isActive())
+
+    def test_a_saved_on_that_keeps_failing_can_be_switched_off(self) -> None:
+        self.controller._store(fix_enabled=True)
+        FakeFilter.fail_with = "busy"
+        self.window.restore_filter(background=True)
+        self.assertTrue(self.window.filter_page.switch.isChecked(), "shows the user's on")
+        self.window.filter_page.switch.click()
+        self.assertFalse(self.controller.settings["fix_enabled"])
+        self.assertFalse(self.window._retry_timer.isActive())
+        self.assertFalse(self.window.filter_page.switch.isChecked())
+        self.assertEqual(self.controller.status_text(), "Off")
 
     def test_an_opened_window_does_not_retry_by_itself(self) -> None:
         self.controller._store(fix_enabled=True)
@@ -561,7 +636,7 @@ class KeepFilterAliveTests(LiveWindowTests):
         FakeFilter.fail_with = "The window server isn't ready."
         self.window.system_woke()
         self.dialog.assert_not_called()
-        self.assertEqual(self.controller.status_text(), "Couldn't start the filter")
+        self.assertEqual(self.controller.status_text(), "Couldn’t start the filter")
         self.assertTrue(self.window._retry_timer.isActive())
 
     def test_wake_leaves_an_off_filter_off(self) -> None:
@@ -575,6 +650,32 @@ class KeepFilterAliveTests(LiveWindowTests):
         self.assertTrue(self.controller.settings["fix_enabled"])
         self.window.system_woke()  # nothing starts while away
         self.assertFalse(self.controller.active)
+        self.window.session_activated()
+        self.assertTrue(self.controller.active)
+
+    def test_a_retry_due_after_switching_away_starts_nothing(self) -> None:
+        self.controller._store(fix_enabled=True)
+        FakeFilter.fail_with = "busy"
+        self.window.restore_filter(background=True)
+        self.assertTrue(self.window._retry_timer.isActive())
+        self.window.session_resigned()
+        self.assertFalse(self.window._retry_timer.isActive(), "no retry is left to fire while away")
+        FakeFilter.fail_with = None
+        self.window._retry_start()  # one that fired anyway
+        self.assertFalse(self.controller.active, "no tap in a session nobody is using")
+        self.window.session_activated()
+        self.assertTrue(self.controller.active)
+
+    def test_leaving_a_calibration_after_switching_away_starts_nothing(self) -> None:
+        self.controller.set_active(True)
+        self.window.show()
+        self.window._show_page(self.page_index("calibrate"))
+        self.window.calibrate._advance()
+        self.assertTrue(self.controller.suspended)
+        self.window.session_resigned()
+        self.set_active_window(False)  # the pause ends as the window loses focus
+        self.assertFalse(self.controller.active, "no tap in a session nobody is using")
+        self.assertTrue(self.controller.settings["fix_enabled"])
         self.window.session_activated()
         self.assertTrue(self.controller.active)
 
@@ -638,12 +739,14 @@ class AccessibilityTests(LiveWindowTests):
         from PySide6.QtCore import Qt
         from PySide6.QtTest import QTest
 
-        switch = self.window.general.auto_update_switch
+        from app.core import Button
+
+        switch = self.window.filter_page.button_switches[Button.RIGHT]
         self.window.show()
         before = switch.isChecked()
         QTest.keyClick(switch, Qt.Key.Key_Space)
         self.assertNotEqual(switch.isChecked(), before)
-        self.assertEqual(self.controller.settings["auto_update"], switch.isChecked())
+        self.assertEqual(Button.RIGHT in self.controller.buttons, switch.isChecked())
 
     def test_sidebar_is_a_list_of_its_panes(self) -> None:
         from PySide6.QtGui import QAccessible
@@ -739,6 +842,67 @@ class AccessibilityTests(LiveWindowTests):
             self.assertFalse(self.window.filter_page.switch.grab().isNull())
 
 
+class UpdateSettingsTests(LiveWindowTests):
+    """General's update switches, through the real updater (no network:
+    nothing here checks or downloads)."""
+
+    def general(self):
+        from app.ui.window import GeneralPage
+        from app.updater import Updater
+
+        updater = Updater(self.controller)
+        updater.kind = "mac"  # an installed copy, so the section shows
+        page = GeneralPage(self.controller, updater)
+        self.addCleanup(page.deleteLater)
+        page.refresh(True)
+        return page, updater
+
+    def test_checking_and_installing_are_separate_switches(self) -> None:
+        from app import settings
+
+        page, updater = self.general()
+        self.assertTrue(page.auto_check_switch.isChecked())
+        self.assertTrue(page.auto_install_switch.isChecked())
+        self.assertTrue(page.auto_install_switch.isEnabled())
+        page.auto_check_switch.click()
+        self.assertFalse(updater.auto_check)
+        self.assertFalse(settings.load()["auto_check"], "saved")
+        self.assertTrue(self.controller.settings["auto_update"], "installing is its own choice")
+        self.assertFalse(page.auto_install_switch.isEnabled(), "nothing installs without a check")
+        page.auto_check_switch.click()
+        self.assertTrue(page.auto_install_switch.isEnabled())
+        page.auto_install_switch.click()
+        self.assertFalse(updater.auto_install)
+        self.assertFalse(settings.load()["auto_update"])
+        self.assertTrue(updater.auto_check)
+
+    def test_turning_installs_off_goes_through_the_updater(self) -> None:
+        page, updater = self.general()
+        with mock.patch.object(updater, "set_auto_install", wraps=updater.set_auto_install) as set_install:
+            page.auto_install_switch.click()
+        set_install.assert_called_once_with(False)
+
+    def test_the_switches_follow_the_updater(self) -> None:
+        page, updater = self.general()
+        updater.set_auto_check(False)  # from anywhere but this pane
+        self.assertFalse(page.auto_check_switch.isChecked())
+        self.assertFalse(page.auto_install_switch.isEnabled())
+
+    def test_an_old_opt_out_shows_both_off(self) -> None:
+        import json
+
+        from app import settings
+
+        settings.config_dir().mkdir(parents=True, exist_ok=True)
+        settings.settings_path().write_text(json.dumps({"auto_update": False}))
+        from app.controller import AppController
+
+        self.controller = AppController()
+        page, _updater = self.general()
+        self.assertFalse(page.auto_check_switch.isChecked(), "no background checks either")
+        self.assertFalse(page.auto_install_switch.isChecked())
+
+
 class CalibrationFlowTests(LiveWindowTests):
     """Calibration UX: starting from the pad, pairing double-clicks, buttons."""
 
@@ -802,6 +966,18 @@ class CalibrationFlowTests(LiveWindowTests):
         self.assertEqual(page.phase, "done")
         self.assertIsNotNone(page.suggestion)
 
+    def test_a_long_system_setting_still_needs_a_quick_pair(self) -> None:
+        hints = mock.Mock()
+        hints.mouseDoubleClickInterval.return_value = 5000  # the slowest macOS allows
+        with mock.patch("app.ui.window.QGuiApplication.styleHints", return_value=hints):
+            page = self.to_double_phase()
+            page._on_pad_press(1500.0, 1600.0)
+            page._on_pad_press(1500.0, 1600.0)  # two separate slow clicks
+            self.assertEqual(page.calibrator.double_clicks, 0)
+            self.assertIn("Too slow", page.step_row.detail.text())
+            page._on_pad_press(900.0, 990.0)  # within a second of the last
+        self.assertEqual(page.calibrator.double_clicks, 1)
+
     def test_too_slow_a_pair_says_so(self) -> None:
         hints = mock.Mock()
         hints.mouseDoubleClickInterval.return_value = 500
@@ -846,6 +1022,36 @@ class CalibrationFlowTests(LiveWindowTests):
         self.assertEqual(self.window.test_page.clicks, 4)
         self.assertTrue(self.window.test_page.last_value.text().endswith("(right)"))
 
+    def pad_gap(self, windows: bool, arrivals: list) -> float:
+        """A press, release and press with tick-quantized event stamps
+        (1000, 1016, 1016 ms) arriving at `arrivals` on the precise clock."""
+        from PySide6.QtCore import Qt
+
+        from app.ui import widgets
+
+        pad = widgets.ClickPad()
+        self.addCleanup(pad.deleteLater)
+        gaps = []
+        pad.pressed_with_gap.connect(lambda gap, _interval, _button: gaps.append(gap))
+
+        def event(stamp):
+            return mock.Mock(button=mock.Mock(return_value=Qt.MouseButton.LeftButton),
+                             timestamp=mock.Mock(return_value=stamp))
+
+        with mock.patch.object(widgets, "IS_WINDOWS", windows), \
+                mock.patch.object(widgets, "perf_counter", side_effect=arrivals):
+            pad.mousePressEvent(event(1000))
+            pad.mouseReleaseEvent(event(1016))
+            pad.mousePressEvent(event(1016))
+        return gaps[-1]
+
+    def test_the_pad_times_windows_clicks_on_the_precise_clock(self) -> None:
+        # Windows stamps both from the same 15.6 ms tick: a 9 ms bounce reads 0.
+        self.assertAlmostEqual(self.pad_gap(True, [10.000, 10.050, 10.059]), 9.0, places=3)
+
+    def test_the_pad_keeps_the_events_own_stamps_elsewhere(self) -> None:
+        self.assertEqual(self.pad_gap(False, []), 0.0, "macOS stamps are precise; these say 0")
+
     def test_test_pane_shows_bounces_on_every_button(self) -> None:
         from app.core import Button, ClickEvent
 
@@ -855,6 +1061,60 @@ class CalibrationFlowTests(LiveWindowTests):
         for button in Button:
             page.note_global_event(ClickEvent(button, True, False, 9.0, None))  # blocked
         self.assertEqual(len(page.timeline._gaps), 3)
+
+
+class AppKitCallbackTests(unittest.TestCase):
+    """Work AppKit asks for runs from Qt's event loop, not inside AppKit."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.application = QApplication.instance() or QApplication([])
+
+    def test_system_notifications_are_handled_from_the_event_loop(self) -> None:
+        import sys
+
+        from app.ui import dock
+
+        class NSObject:  # stands in for PyObjC's; nothing registers with AppKit
+            @classmethod
+            def alloc(cls):
+                return cls()
+
+            def init(self):
+                return self
+
+        calls = []
+        with mock.patch.dict(sys.modules, {"AppKit": mock.MagicMock(), "Foundation": mock.MagicMock(NSObject=NSObject)}), \
+                mock.patch.object(dock, "_available", return_value=True), \
+                mock.patch.object(dock, "_SYSTEM_OBSERVER", []):
+            dock.observe_system(
+                on_wake=lambda: calls.append("wake"),
+                on_session_active=lambda: calls.append("active"),
+                on_session_inactive=lambda: calls.append("inactive"),
+                on_permission_change=lambda: calls.append("permission"),
+            )
+            observer = dock._SYSTEM_OBSERVER[0]
+        observer.woke_(None)
+        observer.sessionInactive_(None)
+        observer.sessionActive_(None)
+        observer.permissionChanged_(None)
+        self.assertEqual(calls, [], "nothing runs inside AppKit's dispatch")
+        self.application.processEvents()
+        self.assertEqual(calls, ["wake", "inactive", "active", "permission"])
+
+    def test_an_exception_in_one_reaches_the_log_not_appkit(self) -> None:
+        import sys
+
+        from app.ui import dock
+
+        def broken() -> None:
+            raise RuntimeError("not a HookError")
+
+        with mock.patch.object(sys, "excepthook") as excepthook:
+            dock._deferred(broken)()  # what AppKit calls: returns cleanly
+            self.application.processEvents()
+        excepthook.assert_called_once()
+        self.assertIs(excepthook.call_args[0][0], RuntimeError)
 
 
 class MenuBarItemTests(unittest.TestCase):
@@ -1004,14 +1264,6 @@ class ControllerFixTests(unittest.TestCase):
 
 
 class WindowFixTests(WindowTests):
-    def test_closing_on_calibrate_resumes_filtering(self) -> None:
-        from PySide6.QtCore import QEvent
-
-        with mock.patch.object(self.controller, "resume") as resume:
-            self.window._show_page(self.page_index("calibrate"))
-            self.window.closeEvent(QEvent(QEvent.Type.Close))
-            resume.assert_called()
-
     def test_failed_login_change_restores_the_previous_state(self) -> None:
         page = self.window.general
         page.login_switch.setChecked(False, animate=False)
@@ -1038,6 +1290,7 @@ class WindowFixTests(WindowTests):
         self.assertFalse(page.login_switch.isChecked(), "it won't open at login")
         self.assertIn("Turned off in", page.login_row.detail.text())
         self.assertEqual(not page.login_items_button.isHidden(), IS_MAC, "macOS can only fix it there")
+        self.assertEqual(page.login_switch.isEnabled(), not IS_MAC, "so the switch here can't")
         with mock.patch.object(startup, "open_login_items_settings") as open_settings:
             page.login_items_button.click()
         open_settings.assert_called_once_with()
@@ -1046,6 +1299,7 @@ class WindowFixTests(WindowTests):
             self.window._show_page(self.page_index("general"))
         self.assertTrue(page.login_switch.isChecked())
         self.assertTrue(page.login_items_button.isHidden())
+        self.assertTrue(page.login_switch.isEnabled())
 
     def test_general_open_settings_opens_the_pane_even_when_allowed(self) -> None:
         from app import permissions

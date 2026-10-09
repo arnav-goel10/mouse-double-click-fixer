@@ -17,6 +17,9 @@ from .platform import GlobalClickFilter, HookError, is_supported
 
 log = logging.getLogger(__name__)
 
+#: The settings the updater keeps, through store_update_state().
+UPDATE_STATE_KEYS = frozenset({"auto_check", "update_attempt_version", "update_attempt_count"})
+
 
 class AppController(QObject):
     """Owns the filter and the saved settings; everything else observes it."""
@@ -29,6 +32,9 @@ class AppController(QObject):
     settings_changed = Signal()
     #: The hook stopped on its own.
     hook_failed = Signal(str)
+    #: macOS: the filter found its permission withdrawn, let every click
+    #: through and stopped. Emitted from the hook's thread.
+    permission_lost = Signal()
 
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
@@ -51,10 +57,18 @@ class AppController(QObject):
                 except (OSError, RuntimeError):
                     pass
         self._filter: Optional[GlobalClickFilter] = None
+        # A filter whose stop() gave up with its hook thread still alive.
+        # Never dropped: no second hook may start beside it, and the next
+        # stop tries it again.
+        self._unstopped: Optional[GlobalClickFilter] = None
         self._suspended = False
         # Set at quit. Nothing may start a hook after that: the window still
         # hears hide events, and AppKit notifications, as the app goes down.
         self._shut_down = False
+        # Set while the user is in another login session (fast user
+        # switching). A tap running in a session nobody is using can stall
+        # the one in front, so nothing starts one until this session is back.
+        self._session_inactive = False
         # Why the filter isn't running although the user has it on: a short
         # line for the menus, and the full message for the window.
         self.failure = ""
@@ -97,13 +111,14 @@ class AppController(QObject):
     @property
     def wanted(self) -> bool:
         """Whether the user has the filter on: running, waiting for
-        permission, or paused while calibration measures. The menus show and
-        toggle this, so choosing the item while waiting or paused turns the
-        filter off instead of asking again."""
+        permission, paused while calibration measures, or saved as on but
+        failing to start. The menus show and toggle this, so choosing the
+        item in any of those states turns the filter off instead of asking
+        for on again."""
         return (
             self.active
             or self.waiting_for_permission
-            or (self._suspended and bool(self.settings["fix_enabled"]))
+            or (bool(self.settings["fix_enabled"]) and (self._suspended or bool(self.failure)))
         )
 
     def set_active(self, active: bool) -> bool:
@@ -120,23 +135,33 @@ class AppController(QObject):
             return False
         if self.active:
             return True
-        if self._shut_down:
+        if self._shut_down or self._session_inactive:
             return False
         # Turning the filter on (from the menu bar, say) ends a pause.
         self._suspended = False
         self._stop_filter()  # release a filter whose hook thread died
+        if self._unstopped is not None:
+            message = "The filter from before is still stopping. Try again in a moment."
+            log.warning("The filter can't start: %s", message)
+            self.failure, self.failure_detail = "Couldn’t start the filter", message
+            self.filter_state_changed.emit(False, message)
+            return False
         try:
             self._filter = GlobalClickFilter(
                 self.threshold_ms,
                 self.buttons,
                 on_event=self._on_global_event,
                 on_error=self.hook_failed.emit,
+                # macOS re-arms a tap it disabled only while access is still
+                # there; without it the filter lets clicks through and stops.
+                permission_ok=permissions.event_tap_allowed if permissions.needs_accessibility() else None,
+                on_permission_lost=self.permission_lost.emit,
             )
             self._filter.start()
         except HookError as error:
             self._filter = None
             log.warning("The filter couldn't start: %s", error)
-            self.failure, self.failure_detail = "Couldn't start the filter", str(error)
+            self.failure, self.failure_detail = "Couldn’t start the filter", str(error)
             self.filter_state_changed.emit(False, str(error))
             return False
         self.failure = self.failure_detail = ""
@@ -161,15 +186,25 @@ class AppController(QObject):
             self.filter_state_changed.emit(False, "")
 
     def _stop_filter(self) -> None:
-        if self._filter is not None:
-            current, self._filter = self._filter, None
-            current.stop()
-            # Counted on the hook thread, so only read here, never logged there.
-            log.info(
-                "Filter stopped (tap resets %s, hook re-arms %s)",
-                getattr(current, "tap_resets", 0),
-                getattr(current, "hook_rearms", 0),
-            )
+        current, self._filter = self._filter, None
+        if current is None:
+            # One that didn't stop last time gets another try.
+            current, self._unstopped = self._unstopped, None
+        if current is None:
+            return
+        current.stop()
+        if current.running:
+            # Its hook thread didn't end in time. Dropping the handle to a
+            # live hook would let a second one start on top of it.
+            log.error("The filter's hook thread didn't stop; no new filter starts until it does")
+            self._unstopped = current
+            return
+        # Counted on the hook thread, so only read here, never logged there.
+        log.info(
+            "Filter stopped (tap resets %s, hook re-arms %s)",
+            getattr(current, "tap_resets", 0),
+            getattr(current, "hook_rearms", 0),
+        )
 
     def suspend(self) -> None:
         """Pause filtering so the click pad measures the raw mouse.
@@ -199,6 +234,21 @@ class AppController(QObject):
         self._stop_filter()
         self.filter_state_changed.emit(False, "")
 
+    @property
+    def session_active(self) -> bool:
+        """Whether this login session is the one in front."""
+        return not self._session_inactive
+
+    def set_session_active(self, active: bool) -> None:
+        """The user switched into (True) or out of (False) this login
+        session. Out of it, the filter stops (sending any release it was
+        holding) and nothing starts one, whatever asks: a retry, the end of a
+        calibration pause. The user's choice is kept, so the filter comes
+        back with the session."""
+        self._session_inactive = not active
+        if not active and self._filter is not None:
+            self.stop_keeping_choice()
+
     def stop_for_permission(self) -> None:
         """Accessibility was revoked: stop the tap, keeping the user's choice."""
         log.warning("Access was withdrawn; filter stopped until it is back")
@@ -210,6 +260,11 @@ class AppController(QObject):
         log.error("The filter stopped: %s", message)
         self.failure, self.failure_detail = "The filter stopped", message
         self.stop_keeping_choice()
+
+    def clear_failure(self) -> None:
+        """Forget the last failure: the window found a better explanation
+        for it (access is gone) and shows that instead."""
+        self.failure = self.failure_detail = ""
 
     def tap_alive(self) -> bool:
         """False when the filter runs but its tap no longer receives events.
@@ -272,6 +327,7 @@ class AppController(QObject):
         current = self._filter
         return {
             "filter running": self.active,
+            "old hook still stopping": self._unstopped is not None,
             "user has it on": self.wanted,
             "saved choice": "on" if self.settings["fix_enabled"] else "off",
             "paused for calibration": self._suspended,
@@ -352,7 +408,16 @@ class AppController(QObject):
         self._store(tray_hint_shown=True)
 
     def set_auto_update(self, enabled: bool) -> None:
+        """Install updates without asking (the updater's auto_install)."""
         self._store(auto_update=bool(enabled))
+
+    def store_update_state(self, **values: object) -> None:
+        """Save the updater's own settings (UPDATE_STATE_KEYS) with all the
+        others, so the next save of anything else keeps them."""
+        unknown = sorted(set(values) - UPDATE_STATE_KEYS)
+        if unknown:
+            raise ValueError(f"Not an update setting: {', '.join(unknown)}")
+        self._store(**values)
 
     def set_last_update_check(self) -> None:
         import time

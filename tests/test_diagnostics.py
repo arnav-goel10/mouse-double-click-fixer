@@ -102,6 +102,39 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertTrue(faulthandler.is_enabled())
         self.assertTrue((self.directory / diagnostics.CRASH_NAME).exists())
 
+    def crash_text(self) -> str:
+        return (self.directory / diagnostics.CRASH_NAME).read_text(encoding="utf-8")
+
+    def test_each_launch_dates_crash_log(self) -> None:
+        diagnostics.shutdown()
+        diagnostics.setup("9.9.10")
+        lines = self.crash_text().splitlines()
+        self.assertEqual(len(lines), 2, "one line per launch")
+        self.assertTrue(lines[0].startswith(f"{diagnostics.CRASH_HEADER} 9.9.9 started 20"))
+        self.assertTrue(lines[1].startswith(f"{diagnostics.CRASH_HEADER} 9.9.10 started 20"))
+
+    def test_crash_log_is_cut_back_at_launch(self) -> None:
+        diagnostics.shutdown()
+        path = self.directory / diagnostics.CRASH_NAME
+        dumps = "".join(f"Windows fatal exception: code 0x8001010d, dump {number}\n" for number in range(20000))
+        path.write_text(dumps, encoding="utf-8")
+        self.assertGreater(path.stat().st_size, diagnostics.CRASH_MAX_BYTES)
+        diagnostics.setup("9.9.9")
+        self.assertLessEqual(path.stat().st_size, diagnostics.CRASH_MAX_BYTES + 200)
+        lines = self.crash_text().splitlines()
+        self.assertTrue(lines[0].startswith("Windows fatal exception"), "starts on a whole line")
+        self.assertEqual(lines[-2], "Windows fatal exception: code 0x8001010d, dump 19999", "the newest is kept")
+        self.assertTrue(lines[-1].startswith(diagnostics.CRASH_HEADER))
+
+    def test_report_shows_crash_log_only_with_something_in_it(self) -> None:
+        self.flush()
+        self.assertNotIn("crash.log", diagnostics.report("9.9.9", {}, {}), "launch lines alone")
+        with open(self.directory / diagnostics.CRASH_NAME, "a", encoding="utf-8") as handle:
+            handle.write("Fatal Python error: Segmentation fault\n")
+        text = diagnostics.report("9.9.9", {}, {})
+        self.assertIn("crash.log, last lines:", text)
+        self.assertIn("Segmentation fault", text)
+
     def test_shutdown_puts_the_hooks_back(self) -> None:
         diagnostics.shutdown()
         self.assertEqual((sys.excepthook, threading.excepthook, sys.unraisablehook), self.hooks)

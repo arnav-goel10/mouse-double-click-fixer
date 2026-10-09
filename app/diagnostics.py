@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import faulthandler
 import json
+import os
 import logging
 import logging.handlers
 import platform
@@ -19,6 +20,7 @@ import queue
 import sys
 import threading
 from collections import deque
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -27,6 +29,10 @@ CRASH_NAME = "crash.log"
 #: Two files of this size are kept, plus the one being written.
 MAX_BYTES = 256 * 1024
 BACKUPS = 2
+#: crash.log is cut back to about this much, its newest end, at each launch.
+CRASH_MAX_BYTES = 256 * 1024
+#: Starts the line crash.log gets at each launch.
+CRASH_HEADER = "--- DoubleClick Fixer"
 #: How much of the log "Copy Diagnostics" includes.
 REPORT_LINES = 200
 FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -107,7 +113,7 @@ def setup(version: str) -> None:
     _state.listener, _state.queue_handler, _state.recent = listener, queue_handler, recent
 
     _install_hooks()
-    _enable_crash_log()
+    _enable_crash_log(version)
     log.info("DoubleClick Fixer %s on %s", version, os_description())
 
 
@@ -167,9 +173,36 @@ def _install_hooks() -> None:
     sys.unraisablehook = on_unraisable
 
 
-def _enable_crash_log() -> None:
+def _trim(path: Path, limit: int) -> None:
+    """Cut `path` back to its last `limit` bytes, starting at a whole line."""
     try:
-        handle = open(crash_path(), "a", encoding="utf-8")
+        size = path.stat().st_size
+        if size <= limit:
+            return
+        with open(path, "rb") as handle:
+            handle.seek(size - limit)
+            tail = handle.read()
+        start = tail.find(b"\n") + 1
+        temporary = path.with_name(path.name + ".tmp")
+        temporary.write_bytes(tail[start:])
+        os.replace(temporary, path)
+    except OSError:
+        pass  # left as it is; it only grows by what crashes write
+
+
+def _enable_crash_log(version: str) -> None:
+    """Send hard crashes to crash.log. Each launch adds a dated line, so a
+    dump can be placed in time, and the file is kept to CRASH_MAX_BYTES: on
+    Windows faulthandler also writes exceptions the system handled itself,
+    which would otherwise pile up for good."""
+    path = crash_path()
+    _trim(path, CRASH_MAX_BYTES)
+    try:
+        handle = open(path, "a", encoding="utf-8")
+        started = datetime.now().astimezone().isoformat(timespec="seconds")
+        handle.write(f"{CRASH_HEADER} {version} started {started} ---\n")
+        # faulthandler writes to the file descriptor, around this buffer.
+        handle.flush()
     except OSError:
         return
     faulthandler.enable(file=handle, all_threads=True)
@@ -236,6 +269,7 @@ def report(version: str, state: dict[str, Any], settings: dict[str, Any]) -> str
         *(_private(line) for line in recent_lines()),
     ]
     crash = _tail(crash_path(), 60)
-    if crash:
+    # Launch lines alone mean nothing went wrong.
+    if any(line.strip() and not line.startswith(CRASH_HEADER) for line in crash):
         lines += ["", "crash.log, last lines:", *(_private(line) for line in crash)]
     return "\n".join(lines) + "\n"
