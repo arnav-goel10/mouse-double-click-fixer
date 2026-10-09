@@ -471,7 +471,10 @@ class Sidebar(QListWidget):
         self.setViewportMargins(0, top_inset + (8 if IS_MAC else 12), 0, 0)
         self.setItemDelegate(_SidebarDelegate(self))
         for _name, title in items:
-            QListWidgetItem(title, self)
+            item = QListWidgetItem(title, self)
+            # Selectable entries, nothing more: no check box or drag for a
+            # screen reader to offer.
+            item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
         self.setCurrentRow(0)
         self.currentRowChanged.connect(self._on_row)
 

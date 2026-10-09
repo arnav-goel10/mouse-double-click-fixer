@@ -649,6 +649,7 @@ class AccessibilityTests(LiveWindowTests):
             item = interface.child(index)
             self.assertEqual(item.role(), QAccessible.Role.ListItem)
             self.assertTrue(item.state().selectable)
+            self.assertFalse(item.state().checkable, "no check box to announce")
         self.assertTrue(interface.child(0).state().selected)
         self.window.sidebar.set_current(self.page_index("calibrate"))
         selected = [interface.child(index).state().selected for index in range(interface.childCount())]
