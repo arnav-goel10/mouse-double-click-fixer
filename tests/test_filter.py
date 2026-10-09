@@ -1,11 +1,13 @@
 """Tests for the platform-facing filter that do not need a real mouse."""
 
+import math
 import platform
 import sys
 import threading
 import unittest
 from time import monotonic
 from types import SimpleNamespace
+from typing import Optional
 from unittest import mock
 
 from app.core import Button, ClickEvent
@@ -22,6 +24,7 @@ from app.platform import (
     HookError,
     _double_click_interval,
     is_supported,
+    windows_event_time,
 )
 
 
@@ -285,33 +288,125 @@ class TimerTokenTests(unittest.TestCase):
             self.assertEqual(injected, [(False, "lift")])
 
 
-class TickClockTests(unittest.TestCase):
-    def test_wrap_does_not_make_a_negative_gap(self) -> None:
-        from app.platform import TickClock
+def quantized_tick(ms: float) -> int:
+    """GetTickCount at `ms` milliseconds since boot: it advances only with the
+    64 Hz system timer, so it reads whole milliseconds, 15 or 16 apart."""
+    return int(math.floor(math.floor(ms / 15.625) * 15.625))
 
-        clock = TickClock()
-        before = clock.seconds(0xFFFFFFF0)        # 16 ms before the wrap
-        after = clock.seconds(0x00000010)         # 16 ms after it
-        self.assertAlmostEqual((after - before) * 1000, 32, places=6)
 
-    def test_slightly_older_event_is_not_a_wrap(self) -> None:
-        from app.platform import TickClock
+class WindowsEventTimeTests(unittest.TestCase):
+    """Windows stamps input with GetTickCount (15.6 ms steps). The hook times
+    each event by its arrival on the precise clock instead, and the stamp
+    only says how late the hook ran."""
 
-        clock = TickClock()
-        first = clock.seconds(1_000_000)
-        second = clock.seconds(999_990)
-        self.assertAlmostEqual((second - first) * 1000, -10, places=6)
+    def test_a_prompt_event_is_timed_by_its_arrival(self) -> None:
+        # Up to one tick between the stamp and the hook's reading is the tick
+        # being coarse, not the hook being late.
+        for late in (0, 1, 15, 16):
+            self.assertEqual(windows_event_time(5.0, 1_000 + late, 1_000), 5.0)
 
-    def test_first_event_lands_on_the_monotonic_clock(self) -> None:
-        from app.platform import TickClock
+    def test_a_late_hook_takes_its_lateness_off(self) -> None:
+        self.assertAlmostEqual(windows_event_time(5.0, 1_045, 1_000), 5.0 - 0.029, places=9)
 
-        clock = TickClock(lambda: 5_000_020)
-        self.assertAlmostEqual(clock.seconds(5_000_000), monotonic() - 0.02, delta=0.05)
+    def test_the_tick_count_wrapping_changes_nothing(self) -> None:
+        # Stamped 10 ms before GetTickCount wrapped to 0, seen 30 ms after.
+        self.assertAlmostEqual(windows_event_time(5.0, 0x1E, 0xFFFFFFF6), 5.0 - 0.024, places=9)
+        self.assertEqual(windows_event_time(5.0, 0x05, 0xFFFFFFFB), 5.0)
 
-    def test_missing_stamp_falls_back(self) -> None:
-        from app.platform import TickClock
+    def test_a_stamp_after_the_hooks_reading_is_not_late(self) -> None:
+        self.assertEqual(windows_event_time(5.0, 1_000, 1_004), 5.0)
 
-        self.assertIsNone(TickClock().seconds(0))
+    def test_an_absurd_lateness_is_capped(self) -> None:
+        self.assertAlmostEqual(windows_event_time(5.0, 0x7FFFFFFF, 0), 3.0, places=9)
+
+    def test_a_long_idle_is_just_a_long_gap(self) -> None:
+        # 30 days without a click (time asleep counts): nothing is carried
+        # from one event to the next, so the next click is simply late.
+        click_filter = GlobalClickFilter(60, [Button.LEFT])
+        click_filter._use_os_time = True
+        click_filter._inject = lambda _button, _pressed, _template: False  # not waited for
+        days = 30 * 24 * 3600
+        tick = (days * 1000) & 0xFFFFFFFF
+        with mock.patch("app.platform.threading.Timer", FakeTimer):
+            click_filter._handle(Button.LEFT, True, windows_event_time(1.0, 1_000, 1_000), "down")
+            click_filter._handle(Button.LEFT, False, windows_event_time(1.1, 1_100, 1_100), "up")
+            FakeTimer.created[-1].fire()
+            press = click_filter._handle(Button.LEFT, True, windows_event_time(1.0 + days, tick, tick), "down2")
+        self.assertTrue(press.accepted)
+        self.assertAlmostEqual(press.gap_ms, (days - 0.1) * 1000, places=0)
+
+
+class WindowsClickTimingTests(unittest.TestCase):
+    """The click timing the hook feeds the filter, end to end through
+    GlobalClickFilter, with GetTickCount's coarse stamps."""
+
+    BOOT_MS = 15_624.0  # 1 ms before a tick: a 3 ms flicker crosses into the next
+
+    def setUp(self) -> None:
+        self.timers = FakeTimer.reset()
+        patch = mock.patch("app.platform.threading.Timer", FakeTimer)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.injected = []
+
+    def make_filter(self, threshold: int) -> GlobalClickFilter:
+        click_filter = GlobalClickFilter(threshold, [Button.LEFT])
+        click_filter._use_os_time = True
+        click_filter._inject = lambda button, pressed, template: self.injected.append((pressed, template))
+        return click_filter
+
+    def stamp(self, happened_ms: float, seen_ms: Optional[float] = None) -> float:
+        """What the hook passes the filter for an event that happened at
+        `happened_ms` and reached the hook at `seen_ms`."""
+        seen = happened_ms + 0.2 if seen_ms is None else seen_ms
+        return windows_event_time(
+            (self.BOOT_MS + seen) / 1000, quantized_tick(self.BOOT_MS + seen), quantized_tick(self.BOOT_MS + happened_ms)
+        )
+
+    def tick_stamp(self, happened_ms: float) -> float:
+        """What the hook passed before 1.0: the tick itself."""
+        return quantized_tick(self.BOOT_MS + happened_ms) / 1000
+
+    def make_bounce_with_motion(self, stamp) -> None:
+        # Press, a 3 ms flicker open as the contact closes, the hand already
+        # moving, the contact closed again, the real lift much later.
+        click_filter = self.make_filter(60)
+        click_filter._handle(Button.LEFT, True, stamp(0), "down", location=(100, 100))
+        click_filter._handle(Button.LEFT, False, stamp(3), "flicker", location=(100, 100))
+        click_filter._motion("move", (140, 100))
+        click_filter._handle(Button.LEFT, True, stamp(4), "back", location=(140, 100))
+        click_filter._handle(Button.LEFT, False, stamp(800), "lift", location=(300, 100))
+        for timer in list(self.timers):
+            timer.fire()
+
+    def test_a_make_bounce_keeps_the_drag(self) -> None:
+        self.make_bounce_with_motion(self.stamp)
+        self.assertNotIn((False, "flicker"), self.injected, "the drag became a 3 ms click")
+        self.assertEqual([entry for entry in self.injected if entry[0] is False], [(False, "lift")])
+
+    def test_tick_stamps_would_have_lost_it(self) -> None:
+        # Why the clock changed: the flicker reads 15 ms, a finger letting go.
+        self.make_bounce_with_motion(self.tick_stamp)
+        self.assertIn((False, "flicker"), self.injected)
+
+    def test_a_late_press_callback_still_blocks_a_bounce(self) -> None:
+        for threshold, seen_ms in ((60, 130), (40, 155)):
+            with self.subTest(threshold=threshold, late_ms=seen_ms - 110):
+                self.timers.clear()
+                click_filter = self.make_filter(threshold)
+                click_filter._handle(Button.LEFT, True, self.stamp(0), "down")
+                click_filter._handle(Button.LEFT, False, self.stamp(100), "up")
+                self.timers[-1].fire()  # timers run while the hook's thread is stalled
+                bounce = click_filter._handle(Button.LEFT, True, self.stamp(110, seen_ms), "bounce")
+                self.assertTrue(bounce.is_bounce, f"gap read as {bounce.gap_ms:.1f} ms")
+
+    def test_a_late_release_callback_keeps_a_double_click(self) -> None:
+        click_filter = self.make_filter(60)
+        click_filter._handle(Button.LEFT, True, self.stamp(0), "down")
+        click_filter._handle(Button.LEFT, False, self.stamp(100, seen_ms=170), "up")
+        second = click_filter._handle(Button.LEFT, True, self.stamp(220), "down2")
+        self.assertTrue(second.flush_held, "the double-click was taken for a dropout")
+        self.assertEqual(self.injected, [(False, "up"), (True, "down2")])
 
 
 class AllowHoldTests(unittest.TestCase):
@@ -714,7 +809,8 @@ class MotionFlushTests(unittest.TestCase):
         self.assertEqual(calls[-1], False)
 
     def test_a_release_with_no_known_location_is_left_to_the_timer(self) -> None:
-        # Windows passes no location yet.
+        # Windows passes none where the pointer's place means nothing (a
+        # hidden pointer, pen and touch, a remote session).
         self.filter._handle(Button.LEFT, True, 0.0, "down")
         self.filter._handle(Button.LEFT, False, 0.08, "up")
         self.assertTrue(self.filter._motion("m", (50, 0)))
