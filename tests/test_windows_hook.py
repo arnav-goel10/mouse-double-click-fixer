@@ -25,8 +25,10 @@ from app.platform import (
     MOTION_MARK_FOR,
     TELEPORT_MARK,
     GlobalClickFilter,
+    InputSender,
     WindowsHook,
     normalized_absolute,
+    send_batch,
 )
 
 WM_MOUSEMOVE = 0x0200
@@ -396,6 +398,58 @@ class WindowsHookLogicTests(unittest.TestCase):
         self.win.run()
         self.assertEqual(self.win.cursor, (600, 600))
         self.assertEqual(len(self.win.buttons()), 1, "still held: the move wasn't the hand's")
+
+
+class InputSenderTests(unittest.TestCase):
+    """The hook never sends input itself: SendInput on its thread re-enters
+    its callback, and a send from there never returns."""
+
+    class Api:
+        def __init__(self, accept: int = 99) -> None:
+            self.accept = accept
+            self.sent: list = []
+            self.threads: list = []
+
+        @contextmanager
+        def physical_pixels(self):
+            yield
+
+        def send(self, inputs: list) -> int:
+            self.threads.append(threading.current_thread().name)
+            taken = inputs[: self.accept]
+            self.sent.extend(taken)
+            return len(taken)
+
+    def test_batches_go_out_in_order_on_the_senders_thread(self) -> None:
+        api = self.Api()
+        sender = InputSender(api, lost=lambda _button: None)
+        for index in range(50):
+            sender.submit([(index, Button.LEFT)])
+        sender.close()
+        self.assertEqual(api.sent, list(range(50)))
+        self.assertEqual(set(api.threads), {"dcf-send"})
+
+    def test_inputs_that_dont_go_in_are_settled_not_waited_for(self) -> None:
+        lost = []
+        sent = send_batch(self.Api(accept=1), [("there", None), ("up", Button.LEFT), ("back", Button.LEFT)], lost.append)
+        self.assertEqual(sent, 1)
+        self.assertEqual(lost, [Button.LEFT, Button.LEFT])
+
+    def test_a_failing_send_settles_the_whole_batch(self) -> None:
+        api = self.Api()
+        api.send = mock.Mock(side_effect=OSError("blocked"))
+        lost = []
+        with mock.patch("app.platform._logged_sites", set()), self.assertLogs("app.platform", "WARNING"):
+            self.assertEqual(send_batch(api, [("up", Button.RIGHT)], lost.append), 0)
+        self.assertEqual(lost, [Button.RIGHT])
+
+    def test_after_closing_batches_are_sent_directly(self) -> None:
+        api = self.Api()
+        sender = InputSender(api, lost=lambda _button: None)
+        sender.close()
+        sender.submit([("late", Button.LEFT)])
+        self.assertEqual(api.sent, ["late"])
+        self.assertEqual(api.threads, [threading.current_thread().name])
 
 
 # -- the real hook ------------------------------------------------------------------

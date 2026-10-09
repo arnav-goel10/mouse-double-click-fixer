@@ -649,11 +649,13 @@ class GlobalClickFilter:
         call_next = user32.CallNextHookEx
 
         targets = InjectableWindows(user32, kernel32)
+        sender = InputSender(api, self._injected_passed)
         hook_logic = WindowsHook(
             self,
             api,
             accepts_injection=lambda x, y: targets.accepts_injection(wintypes.POINT(x, y)),
             filter_injected=_filter_injected(),
+            send=sender.submit,
         )
         watch = hook_logic.watch
         self._inject = hook_logic.inject
@@ -719,6 +721,7 @@ class GlobalClickFilter:
 
         hook = user32.SetWindowsHookExW(WH_MOUSE_LL, callback, None, 0)
         if not hook:
+            sender.close()
             self._startup_error = ctypes.WinError(ctypes.get_last_error())
             self._ready.set()
             return
@@ -762,6 +765,10 @@ class GlobalClickFilter:
             with self._motion_tap_lock:
                 self._set_motion_tap = lambda _wanted: None
                 watch[0] = False
+            # What stop() handed over (held releases, queued events) goes out
+            # now, with no hook of ours left for SendInput to wait on. A timer
+            # that fires later sends directly.
+            sender.close()
 
     # -- macOS -------------------------------------------------------------
     def _run_macos(self) -> None:
@@ -1142,11 +1149,15 @@ class WindowsHook:
         api: "WindowsApi",
         accepts_injection: Callable[[int, int], bool],
         filter_injected: bool = False,
+        send: Optional[Callable[[list], object]] = None,
     ) -> None:
         self._owner = owner
         self._api = api
         self._accepts_injection = accepts_injection
         self._filter_injected = filter_injected
+        # Sends a batch of (input, button it counts for or None), in order.
+        # The hook runs with an InputSender (see there); by default, at once.
+        self._send = send or (lambda batch: send_batch(api, batch, owner._injected_passed))
         # Whether motion is being watched: read on every move, without a lock.
         self.watch = [False]
         self.basis = (0, 0)
@@ -1257,42 +1268,104 @@ class WindowsHook:
     # -- sending ----------------------------------------------------------------
     def inject(self, button: Button, pressed: Optional[bool], template: object) -> bool:
         """The filter's re-send (GlobalClickFilter._inject). `template` is a
-        WindowsTemplate, or for motion the (x, y) it was headed for."""
+        WindowsTemplate, or for motion the (x, y) it was headed for. What to
+        send is decided here, at once; the sending itself is handed on."""
         api = self._api
         with api.physical_pixels():
-            if pressed is None:
-                x, y = template
-                self._watch_now()
-                return api.send([api.move_input(x, y, MOTION_MARK_FOR[button])]) == 1
-            tick, x, y, relocate = template
-            flags = api.button_flags(button, pressed)
-            here = self._watch_now()
-            moved = here is not None and here != (x, y)
-            # Message times must not run backwards: once later motion has
-            # reached apps, a release goes out stamped now.
-            when = 0 if moved and not pressed else int(tick) & 0xFFFFFFFF
-            if pressed or not moved or not relocate or not api.relocation_allowed():
-                # A press goes where the pointer is: it is re-sent right after
-                # the events that came before it, motion included. So does a
-                # release where the pointer still is, one made where the
-                # pointer's place means nothing (see button), and one whose
-                # way back isn't known.
-                return api.send([api.button_input(flags, when)]) == 1
-            # The pointer has moved on: take it to where the button came up,
-            # release it there and take it back, in one batch so the three
-            # arrive in order. The way back counts as re-sent motion, so a
-            # real move that comes between the release and it queues behind
-            # it rather than being undone by it.
-            with self._owner._lock:
-                self._owner._track(button, 1)
-            sent = api.send([
-                api.move_input(x, y, TELEPORT_MARK),
-                api.button_input(flags, when),
-                api.move_input(here[0], here[1], MOTION_MARK_FOR[button]),
-            ])
-            if sent != 3:
-                self._owner._injected_passed(button)  # the way back never went out
-            return sent >= 2
+            batch = self._batch(api, button, pressed, template)
+        self._send(batch)
+        return True  # anything that doesn't go in is settled by send_batch
+
+    def _batch(self, api: "WindowsApi", button: Button, pressed: Optional[bool], template: object) -> list:
+        if pressed is None:
+            x, y = template
+            self._watch_now()
+            return [(api.move_input(x, y, MOTION_MARK_FOR[button]), button)]
+        tick, x, y, relocate = template
+        flags = api.button_flags(button, pressed)
+        here = self._watch_now()
+        moved = here is not None and here != (x, y)
+        # Message times must not run backwards: once later motion has
+        # reached apps, a release goes out stamped now.
+        when = 0 if moved and not pressed else int(tick) & 0xFFFFFFFF
+        if pressed or not moved or not relocate or not api.relocation_allowed():
+            # A press goes where the pointer is: it is re-sent right after the
+            # events that came before it, motion included. So does a release
+            # where the pointer still is, one made where the pointer's place
+            # means nothing (see button), and one whose way back isn't known.
+            return [(api.button_input(flags, when), button)]
+        # The pointer has moved on: take it to where the button came up,
+        # release it there and take it back, in one batch so the three arrive
+        # in order. The way back counts as re-sent motion, so a real move that
+        # comes between the release and it queues behind it rather than being
+        # undone by it.
+        with self._owner._lock:
+            self._owner._track(button, 1)
+        return [
+            (api.move_input(x, y, TELEPORT_MARK), None),
+            (api.button_input(flags, when), button),
+            (api.move_input(here[0], here[1], MOTION_MARK_FOR[button]), button),
+        ]
+
+
+def send_batch(api, batch: list, lost: Callable[[Button], object]) -> int:
+    """SendInput one batch of (input, button it counts for or None). An input
+    that didn't go in never comes back through the hook, so it is settled
+    with `lost` rather than waited for. Returns how many went in."""
+    try:
+        with api.physical_pixels():
+            sent = api.send([item for item, _button in batch])
+    except Exception:  # noqa: BLE001 - never break the event stream
+        _log_ignored("sending input")
+        sent = 0
+    for _item, button in batch[sent:]:
+        if button is not None:
+            lost(button)
+    return sent
+
+
+class InputSender:
+    """Sends the Windows hook's input, in order, from a thread of its own.
+
+    While a low-level hook is installed, SendInput waits until every hook has
+    seen the input. On the hook's own thread, inside its callback, that means
+    the callback runs again within SendInput, and a send from there waits for
+    ever: all input on the machine stops. So the hook decides what to send
+    and hands it here, and timers and stop() do the same, so one queue keeps
+    every batch in the order it was decided.
+    """
+
+    def __init__(self, api: "WindowsApi", lost: Callable[[Button], object]) -> None:
+        import queue
+
+        self._api = api
+        self._lost = lost
+        self._queue: "queue.SimpleQueue" = queue.SimpleQueue()
+        self._closed = False
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._run, name="dcf-send", daemon=True)
+        self._thread.start()
+
+    def submit(self, batch: list) -> None:
+        with self._lock:
+            if not self._closed:
+                self._queue.put(batch)
+                return
+        send_batch(self._api, batch, self._lost)  # the hook is gone: nothing to wait on
+
+    def close(self, timeout: float = 2.0) -> None:
+        """Send what is queued, then stop; later batches are sent directly."""
+        with self._lock:
+            self._closed = True
+            self._queue.put(None)
+        self._thread.join(timeout)
+
+    def _run(self) -> None:
+        while True:
+            batch = self._queue.get()
+            if batch is None:
+                return
+            send_batch(self._api, batch, self._lost)
 
 
 class WindowsApi:
