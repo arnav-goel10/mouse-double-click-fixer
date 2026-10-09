@@ -63,25 +63,37 @@ if sys.platform == "darwin":
 # app, before any other code runs (see the hook for which and why).
 RUNTIME_HOOKS = ["installer/runtime_hooks/scrub_env.py"] if sys.platform == "darwin" else []
 
-# Every build carries the licences of what it bundles (Qt's LGPL among them),
-# written for the exact versions in this environment: Contents/Resources on
-# macOS, beside the program files on Windows (app/notices.py finds it).
-import subprocess
-
-NOTICES = Path("build", "notices", "THIRD_PARTY_NOTICES.md")
-subprocess.run([sys.executable, "tools/make_notices.py", "--output", str(NOTICES)], check=True)
-DATAS = [(str(NOTICES), ".")]
-
 analysis = Analysis(
     ["run.py"],
     pathex=["."],
     binaries=[],
-    datas=DATAS + datas,
+    datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=RUNTIME_HOOKS,
     excludes=EXCLUDES,
 )
+
+import importlib.util
+
+_spec = importlib.util.spec_from_file_location("make_notices", "tools/make_notices.py")
+make_notices = importlib.util.module_from_spec(_spec)
+sys.modules["make_notices"] = make_notices
+_spec.loader.exec_module(make_notices)
+
+# Leave out the Qt image-format and icon-engine plugins the app never uses
+# (it draws its icons in code and only round-trips PNG, which Qt GUI has
+# built in), and Qt SVG, which only they need. Their code (libjpeg, libtiff,
+# libwebp and more) is then neither shipped nor attributed.
+analysis.binaries = [entry for entry in analysis.binaries if not make_notices.unused_qt_file(entry[0])]
+analysis.datas = [entry for entry in analysis.datas if not make_notices.unused_qt_file(entry[0])]
+
+# Every build carries the licences of what it bundles (Qt's LGPL among them),
+# worked out from the very files it ships: Contents/Resources on macOS,
+# beside the program files on Windows (app/notices.py finds it).
+NOTICES = Path("build", "notices", "THIRD_PARTY_NOTICES.md")
+make_notices.write(NOTICES, make_notices.Build.from_toc(analysis.binaries, analysis.pure, analysis.datas))
+analysis.datas.append(("THIRD_PARTY_NOTICES.md", str(NOTICES.resolve()), "DATA"))
 
 pyz = PYZ(analysis.pure)
 
