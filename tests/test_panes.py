@@ -151,6 +151,15 @@ class FilterPaneTests(PaneTestCase):
         detail = self.window.filter_page.button_rows[Button.RIGHT].detail.text()
         self.assertTrue(detail.startswith("Calibrated."), detail)
         self.assertTrue(self.window.filter_page.button_rows[Button.LEFT].detail.text().startswith("Not calibrated."))
+        self.assertEqual(self.window.filter_page.button_rows[Button.RIGHT].detail.accessibleDescription(), "Calibrated.")
+
+    def test_each_calibrate_link_says_which_button_it_is_for(self) -> None:
+        from app.contracts import Button
+
+        names = [row.detail.accessibleName() for row in self.window.filter_page.button_rows.values()]
+        self.assertEqual(names, ["Calibrate the left button", "Calibrate the right button", "Calibrate the middle button",
+                                 "Calibrate the back button", "Calibrate the forward button"])
+        self.assertEqual(self.window.filter_page.button_rows[Button.LEFT].detail.accessibleDescription(), "Not calibrated.")
 
     def test_the_wheel_fix_row(self) -> None:
         hook = self.hook()

@@ -170,6 +170,8 @@ class FilterPage(Page):
             switch.clicked.connect(self._on_buttons)
             row = Row(f"{name} button", " ", controls(box, switch), card_icon("mouse"))
             make_link_label(row.detail)
+            # Five links all read "Calibrate"; a screen reader says whose.
+            row.detail.setAccessibleName(f"Calibrate the {name.lower()} button")
             row.detail.linkActivated.connect(lambda _href, which=button: self.calibrate_requested.emit(which))
             buttons.add(row)
             self.button_switches[button] = switch
@@ -229,6 +231,7 @@ class FilterPage(Page):
             box.setEnabled(on)
             state = "Calibrated." if controller.is_calibrated(button) else "Not calibrated."
             self.button_rows[button].set_detail(f"{state} {link(label('Calibrate'), 'calibrate')}")
+            self.button_rows[button].detail.setAccessibleDescription(state)
         self.wheel_switch.setChecked(controller.wheel_fix, animate=False)
         self.wheel_box.setValue(controller.wheel_window_ms)
         self.wheel_box.setEnabled(controller.wheel_fix)
