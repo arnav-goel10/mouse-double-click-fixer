@@ -169,6 +169,7 @@ foreach ($old in $OldSetup) {
         Expect-Quit $quit @("taskkill only", "taskkill exit code 0 ") @("asking the installed copy")
     }
     Write-Host "the upgrade from a running $oldVersion replaced it cleanly; exe and Installed apps both say $version"
+    Write-Host "still in $(Split-Path $app); listed as '$listed'; Start menu: $NewShortcut, no $OldShortcut"
 }
 
 $app = App-Path
