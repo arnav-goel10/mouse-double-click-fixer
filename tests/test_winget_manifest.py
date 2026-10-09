@@ -11,6 +11,8 @@ import io
 import json
 import re
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -54,9 +56,9 @@ class Release:
     release has them, signed with a throwaway key."""
 
     def __init__(self, root: Path, name: str = "test") -> None:
-        secret, public = keygen(name, root / "keys", root / "public")
+        secret, self.public = keygen(name, root / "keys", root / "public")
         self.key_id, self.seed = read_secret_key(secret)
-        self.key = parse_public_key(public.read_text(encoding="ascii"))
+        self.key = parse_public_key(self.public.read_text(encoding="ascii"))
         self.folder = root / f"release-{name}"
         self.folder.mkdir()
 
@@ -116,6 +118,9 @@ class ManifestTests(unittest.TestCase):
         # Each file names the schema it follows, for editors and reviewers.
         text = (folder / f"{PACKAGE_IDENTIFIER}.installer.yaml").read_text(encoding="utf-8")
         self.assertIn(f"# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.{MANIFEST_VERSION}.schema.json\n", text)
+        # Line endings are LF wherever the tool runs, Windows included.
+        for path in folder.iterdir():
+            self.assertNotIn(b"\r", path.read_bytes(), path.name)
 
     def test_the_installer_is_described_as_installer_windows_iss_builds_it(self) -> None:
         iss = (ROOT / "installer" / "windows.iss").read_text(encoding="utf-8")
@@ -193,6 +198,38 @@ class ManifestTests(unittest.TestCase):
         )
         self.assertEqual(self.read(folder)[f"{PACKAGE_IDENTIFIER}.installer.yaml"]["Installers"][0]["InstallerSha256"],
                          SETUP_HASH.upper())
+
+    @unittest.skipUnless(sys.platform == "darwin" and Path("/usr/bin/python3").exists(), "macOS's own python3")
+    def test_macos_own_python_writes_the_same_manifests(self) -> None:
+        # docs/RELEASING.md runs the release tools, this one included, with
+        # whichever python3 the Mac has, and macOS's own /usr/bin/python3 is
+        # 3.9, older than every Python the test suite runs on.
+        if subprocess.run(["xcode-select", "-p"], capture_output=True).returncode != 0:
+            self.skipTest("no developer tools, so /usr/bin/python3 would only offer to install them")
+        checksums = self.release.write(self.listed)
+        expected = self.make(checksums_folder=checksums)
+        script = (
+            "import sys\n"
+            "from pathlib import Path\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "from app.update_signature import parse_public_key\n"
+            "from tools.winget_manifest import make_manifests\n"
+            "key = parse_public_key(Path(sys.argv[2]).read_text(encoding='ascii'))\n"
+            "print(sys.version.split()[0])\n"
+            "make_manifests(sys.argv[3], Path(sys.argv[4]), sys.argv[5], Path(sys.argv[6]), [key],"
+            " changelog=Path(sys.argv[7]))\n"
+        )
+        out = self.root / "out-system-python"
+        done = subprocess.run(
+            ["/usr/bin/python3", "-I", "-c", script, str(ROOT), str(self.release.public), VERSION, str(out), REPOSITORY,
+             str(checksums), str(self.changelog)],
+            capture_output=True, text=True, timeout=120,
+        )
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        folder = out / expected.relative_to(self.out)
+        self.assertEqual(sorted(path.name for path in folder.iterdir()), sorted(path.name for path in expected.iterdir()))
+        for path in expected.iterdir():
+            self.assertEqual((folder / path.name).read_bytes(), path.read_bytes(), f"{path.name} on Python {done.stdout.strip()}")
 
     def test_a_second_run_replaces_the_versions_folder(self) -> None:
         folder = self.make()

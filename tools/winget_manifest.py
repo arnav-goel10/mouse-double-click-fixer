@@ -511,7 +511,10 @@ def write_manifests(version: str, checksums: dict[str, str], out: Path, reposito
         shutil.rmtree(folder)
     folder.mkdir(parents=True)
     for name, text in texts.items():
-        (folder / name).write_text(text, encoding="utf-8", newline="\n")
+        # As bytes: LF line endings on Windows too, and on Python 3.9 (macOS's
+        # own /usr/bin/python3, which runs the release tools), whose
+        # write_text has no newline argument.
+        (folder / name).write_bytes(text.encode("utf-8"))
     return folder
 
 
