@@ -493,6 +493,7 @@ class SignPathWorkflowTests(unittest.TestCase):
             "Hand the executables to SignPath",
             "Sign the executables",
             "Put the signed executables in place",
+            "Run the portable executable's self-test",
             "Build the Windows installer",
             "Hand the installer to SignPath",
             "Sign the installer",
@@ -525,6 +526,21 @@ class SignPathWorkflowTests(unittest.TestCase):
         # Inno Setup pads the installer's product name and version with spaces.
         self.assertIn("if ($info.ProductName.Trim() -ne $name -or $info.ProductVersion.Trim() -ne $version) {", check)
         self.assertNotIn(SIGN_IF, check, "the metadata check runs on every build")
+
+    def test_the_portable_exe_that_ships_runs_its_self_test(self) -> None:
+        # The release file itself, signed or not, as installer/build_macos.sh
+        # runs the signed Mac app's; the installed exe's runs in the install
+        # test, from the installer (tools/windows_install_e2e.ps1).
+        selftest = step(self.windows, "Run the portable executable's self-test")
+        self.assertNotIn(SIGN_IF, selftest, "it runs on every build")
+        self.assertIn("$exe = (Resolve-Path dist\\DoubleClickFixer.exe).Path", selftest)
+        self.assertIn('Start-Process $exe -ArgumentList "--self-test" -PassThru -NoNewWindow', selftest)
+        self.assertIn("if (-not $process.WaitForExit(300000)) {", selftest)
+        self.assertIn("if ($process.ExitCode -ne 0) { throw", selftest)
+        self.assertIn('Select-String -Path $log -Pattern "^self-test passed: " -Quiet', selftest)
+        self.assertIn("self-test passed: ", (ROOT / "app" / "selftest.py").read_text(encoding="utf-8"))
+        e2e = (ROOT / "tools" / "windows_install_e2e.ps1").read_text(encoding="utf-8")
+        self.assertIn('Start-Process $app -ArgumentList "--self-test"', e2e)
 
     def test_the_files_sent_for_signing_never_become_release_files(self) -> None:
         names = re.findall(r"name: (unsigned-[\w-]+)\n", self.windows)

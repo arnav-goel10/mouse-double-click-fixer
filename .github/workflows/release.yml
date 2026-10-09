@@ -176,6 +176,27 @@ jobs:
           Copy-Item signing\signed-executables\portable\DoubleClickFixer.exe dist\DoubleClickFixer.exe -Force
           Copy-Item signing\signed-executables\installed\DoubleClickFixer.exe dist\onedir\DoubleClickFixer\DoubleClickFixer.exe -Force
           python tools/ci_update_key.py check dist\DoubleClickFixer.exe dist\onedir
+      - name: Run the portable executable's self-test
+        # The portable exe that becomes the release file, signed or not: a
+        # build that can't start, or that its signing breaks, could never
+        # update itself again (app/selftest.py). The installed exe's self-test
+        # runs in the install test, from the installer. The time limit is for
+        # a build that ignores --self-test and starts the app instead.
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP "portable-self-test.txt"
+          $exe = (Resolve-Path dist\DoubleClickFixer.exe).Path
+          $process = Start-Process $exe -ArgumentList "--self-test" -PassThru -NoNewWindow `
+              -RedirectStandardOutput $log -RedirectStandardError "$log.err"
+          $null = $process.Handle  # keeps the exit code readable once it exits
+          if (-not $process.WaitForExit(300000)) {
+            taskkill /F /T /PID $process.Id
+            throw "the portable exe's self-test didn't finish within 5 minutes"
+          }
+          $process.WaitForExit()
+          Get-Content $log, "$log.err" | Write-Host
+          if ($process.ExitCode -ne 0) { throw "the portable exe's self-test failed (exit $($process.ExitCode))" }
+          if (-not (Select-String -Path $log -Pattern "^self-test passed: " -Quiet)) { throw "the portable exe reported no self-test result" }
       - name: Build the Windows installer
         shell: pwsh
         run: |
