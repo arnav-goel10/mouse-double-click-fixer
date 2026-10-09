@@ -55,6 +55,7 @@ class SelfTestTests(unittest.TestCase):
         # Only a built app is signed and has its environment cleaned.
         self.assertEqual(result["environment"], "skipped: " + ("not a built app" if IS_MAC else "macOS only"))
         self.assertEqual(result["code signature"], "skipped: " + ("not a built app" if IS_MAC else "macOS only"))
+        self.assertEqual(result["child processes"], "skipped: " + ("not a built app" if IS_MAC else "macOS only"))
 
     def test_a_failed_check_fails_the_run_and_the_rest_still_run(self) -> None:
         ran = []
@@ -110,8 +111,10 @@ class SelfTestTests(unittest.TestCase):
 class BuiltAppCheckTests(unittest.TestCase):
     """The checks that only mean something inside a built app, pretending."""
 
-    def check_environment(self, environment):
+    def check_environment(self, environment, path=selftest.SYSTEM_PATH):
         bundle = "/Applications/Example.app/Contents"
+        if path is not None:
+            environment = {"PATH": path, **environment}
         with mock.patch.object(sys, "frozen", True, create=True), mock.patch.object(
             sys, "_MEIPASS", f"{bundle}/Frameworks", create=True
         ), mock.patch.dict(os.environ, environment, clear=True):
@@ -127,6 +130,7 @@ class BuiltAppCheckTests(unittest.TestCase):
             "QML2_IMPORT_PATH": f"{bundle}/Resources/PySide6/Qt/qml:{bundle}/Frameworks/PySide6/Qt/qml",
         })
         self.assertIn("clean", detail)
+        self.assertIn("PATH=/usr/bin:/bin:/usr/sbin:/sbin", detail)
 
     def test_anything_left_over_fails(self) -> None:
         for name, value in [
@@ -136,9 +140,45 @@ class BuiltAppCheckTests(unittest.TestCase):
             ("DYLD_INSERT_LIBRARIES", "/tmp/evil.dylib"),
             ("PYTHONPATH", "/tmp/evil"),
             ("QT_PLUGIN_PATH", "/tmp/evil"),  # outside the bundle
+            ("BASH_ENV", "/tmp/evil.sh"),
+            ("ENV", "/tmp/evil.sh"),
+            ("BASH_FUNC_sleep%%", "() { /tmp/evil; }"),
+            ("__BASH_FUNC<sleep>()", "() { /tmp/evil; }"),
+            ("SHELLOPTS", "xtrace"),
         ]:
             with self.subTest(name=name), self.assertRaisesRegex(RuntimeError, name):
                 self.check_environment({"OPENSSL_CONF": os.devnull, name: value})
+
+    def test_path_must_be_pinned_to_the_system_folders(self) -> None:
+        for path in (None, "/tmp/evil:/usr/bin:/bin:/usr/sbin:/sbin", "/usr/bin:/bin"):
+            with self.subTest(path=path), self.assertRaisesRegex(RuntimeError, "PATH"):
+                self.check_environment({"OPENSSL_CONF": os.devnull}, path=path)
+
+    def test_child_processes_run_from_the_system(self) -> None:
+        import app.main
+
+        with mock.patch.object(sys, "frozen", True, create=True), mock.patch.dict(
+            os.environ, {"PATH": selftest.SYSTEM_PATH}
+        ), mock.patch.object(app.main, "_other_copies_running", return_value=False) as pgrep:
+            self.assertEqual(
+                selftest.check_child_processes(), "pgrep ran (no other copy), bash -p runs /bin/sleep"
+            )
+        pgrep.assert_called_once_with()
+
+    def test_a_program_earlier_on_path_fails_the_child_process_check(self) -> None:
+        import tempfile
+
+        import app.main
+
+        with tempfile.TemporaryDirectory() as folder:
+            fake = Path(folder) / "sleep"
+            fake.write_text("#!/bin/sh\nexit 0\n")
+            fake.chmod(0o755)
+            with mock.patch.object(sys, "frozen", True, create=True), mock.patch.dict(
+                os.environ, {"PATH": f"{folder}:{selftest.SYSTEM_PATH}"}
+            ), mock.patch.object(app.main, "_other_copies_running", return_value=False):
+                with self.assertRaisesRegex(RuntimeError, "bash -p found sleep at '.*/sleep'"):
+                    selftest.check_child_processes()
 
     def test_openssl_conf_must_point_at_an_empty_file(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "OPENSSL_CONF"):
@@ -189,7 +229,7 @@ class ScrubHookTests(unittest.TestCase):
     def test_variables_that_load_outside_code_are_removed(self) -> None:
         left = self.run_hook({
             "HOME": "/Users/someone",
-            "PATH": "/usr/bin:/bin",
+            "PATH": "/tmp/evil:/usr/local/bin:/usr/bin:/bin",
             "TMPDIR": "/var/folders/x/T/",
             "OPENSSL_CONF": "/tmp/evil.cnf",
             "OPENSSL_MODULES": "/tmp/evil",
@@ -206,10 +246,17 @@ class ScrubHookTests(unittest.TestCase):
             "DYLD_LIBRARY_PATH": "/tmp/evil",
             "_PYI_APPLICATION_HOME_DIR": "/Applications/Example.app/Contents/Frameworks",
             "PYINSTALLER_RESET_ENVIRONMENT": "1",
+            "BASH_ENV": "/tmp/evil.sh",
+            "ENV": "/tmp/evil.sh",
+            "BASH_FUNC_sleep%%": "() { /tmp/evil; }",
+            "__BASH_FUNC<sleep>()": "() { /tmp/evil; }",
+            "SHELLOPTS": "xtrace",
+            "BASHOPTS": "extdebug",
         })
         self.assertEqual(left, {
             "HOME": "/Users/someone",
-            "PATH": "/usr/bin:/bin",
+            # Pinned: programs the app starts by name come from the system.
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
             "TMPDIR": "/var/folders/x/T/",
             # What PyInstaller's bootloader itself uses stays.
             "_PYI_APPLICATION_HOME_DIR": "/Applications/Example.app/Contents/Frameworks",
@@ -223,7 +270,17 @@ class ScrubHookTests(unittest.TestCase):
             {"QT_QPA_PLATFORM": "offscreen", "QT_QPA_PLATFORM_PLUGIN_PATH": "/tmp/evil"},
             argv=("DoubleClickFixer", "--self-test"),
         )
-        self.assertEqual(left, {"QT_QPA_PLATFORM": "offscreen", "OPENSSL_CONF": os.devnull})
+        self.assertEqual(left, {
+            "QT_QPA_PLATFORM": "offscreen", "OPENSSL_CONF": os.devnull, "PATH": selftest.SYSTEM_PATH,
+        })
+
+    def test_the_hook_and_the_self_test_agree(self) -> None:
+        hook = SCRUB_HOOK.read_text(encoding="utf-8")
+        self.assertIn(f'os.environ["PATH"] = "{selftest.SYSTEM_PATH}"', hook)
+        for prefix in selftest.SCRUBBED_PREFIXES:
+            self.assertIn(f'"{prefix}"', hook)
+        for name in selftest.SCRUBBED_NAMES:
+            self.assertIn(f'"{name}"', hook)
 
     def test_the_hook_is_wired_into_the_macos_build_only(self) -> None:
         spec = (ROOT / "doubleclick-fixer.spec").read_text(encoding="utf-8")

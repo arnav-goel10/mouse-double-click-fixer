@@ -39,9 +39,13 @@ CS_RUNTIME = 0x10000
 #: Variables installer/runtime_hooks/scrub_env.py removes from a built macOS
 #: app, and the ones that may be set again afterwards (by the self-test
 #: itself, or by PyInstaller's own Qt hook, which points Qt at the bundle).
-SCRUBBED_PREFIXES = ("OPENSSL_", "SSL_CERT_", "QT_", "QML", "PYTHON", "DYLD_")
+SCRUBBED_PREFIXES = ("OPENSSL_", "SSL_CERT_", "QT_", "QML", "PYTHON", "DYLD_", "BASH_FUNC_", "__BASH_FUNC")
+SCRUBBED_NAMES = ("BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS")
 SET_BY_SELF_TEST = ("QT_QPA_PLATFORM",)
 BUNDLE_PATHS = ("QT_PLUGIN_PATH", "QML2_IMPORT_PATH")
+#: The hook pins PATH to the system's own folders, so whatever the app starts
+#: by name comes from there.
+SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
 
 
 class Skipped(Exception):
@@ -52,7 +56,8 @@ class Skipped(Exception):
 
 def check_environment() -> str:
     """The runtime hook ran: nothing is left that would make OpenSSL, Qt or
-    dyld load code from outside the app."""
+    dyld load code from outside the app, or make a program the app starts
+    run something else."""
     if sys.platform != "darwin":
         raise Skipped("macOS only")
     if not getattr(sys, "frozen", False):
@@ -60,7 +65,8 @@ def check_environment() -> str:
     bundle = os.path.dirname(os.path.realpath(getattr(sys, "_MEIPASS", sys.executable)))  # Contents
     left = []
     for name, value in os.environ.items():
-        if not name.startswith(SCRUBBED_PREFIXES) or name in SET_BY_SELF_TEST or name == "OPENSSL_CONF":
+        scrubbed = name.startswith(SCRUBBED_PREFIXES) or name in SCRUBBED_NAMES
+        if not scrubbed or name in SET_BY_SELF_TEST or name == "OPENSSL_CONF":
             continue
         if name in BUNDLE_PATHS and all(
             os.path.realpath(path).startswith(bundle + os.sep) for path in value.split(os.pathsep) if path
@@ -69,9 +75,35 @@ def check_environment() -> str:
         left.append(name)
     if os.environ.get("OPENSSL_CONF") != os.devnull:
         left.append("OPENSSL_CONF (not pinned to an empty file)")
+    if os.environ.get("PATH") != SYSTEM_PATH:
+        left.append(f"PATH (not pinned to {SYSTEM_PATH})")
     if left:
         raise RuntimeError("still set: " + ", ".join(sorted(left)))
-    return f"clean, OPENSSL_CONF={os.devnull}"
+    return f"clean, OPENSSL_CONF={os.devnull}, PATH={SYSTEM_PATH}"
+
+
+def check_child_processes() -> str:
+    """The programs the app starts run from the system, whatever the app was
+    started with: pgrep, as --quit and every launch run it, and bash -p, as
+    the update swap runs it, finding sleep by name. A program placed earlier
+    on PATH, a BASH_ENV file or an exported function would run as the app."""
+    if sys.platform != "darwin":
+        raise Skipped("macOS only")
+    if not getattr(sys, "frozen", False):
+        raise Skipped("not a built app")
+    import subprocess
+
+    from . import main
+
+    others = main._other_copies_running()  # /usr/bin/pgrep in a built app
+    shell = subprocess.run(
+        ["/bin/bash", "-p", "-c", "command -v sleep && sleep 0"],
+        capture_output=True, text=True, timeout=10, check=False,
+    )
+    found = shell.stdout.strip()
+    if shell.returncode != 0 or found != "/bin/sleep":
+        raise RuntimeError(f"bash -p found sleep at {found or 'nothing'!r}: {shell.stderr.strip()}")
+    return f"pgrep ran ({'another copy is running' if others else 'no other copy'}), bash -p runs {found}"
 
 
 def check_code_signature() -> str:
@@ -256,6 +288,7 @@ CHECKS: List[Tuple[str, Callable[[], str]]] = [
     ("event tap", check_event_tap),
     ("Qt platform plugin", check_qt_platform),
     ("app modules", check_app_modules),
+    ("child processes", check_child_processes),
     ("third-party notices", check_notices),
 ]
 
