@@ -194,9 +194,9 @@ def release_from_json(data: dict, kind: str) -> Optional[Release]:
 
 
 def _ci_key() -> Optional[PublicKey]:
-    """CI's throwaway key, in a packaged app built by CI's end-to-end job."""
+    """CI's throwaway key, in a packaged Windows app built by CI's end-to-end job."""
     bundled = getattr(sys, "_MEIPASS", None)
-    if not getattr(sys, "frozen", False) or not bundled:
+    if sys.platform != "win32" or not getattr(sys, "frozen", False) or not bundled:
         return None
     path = Path(bundled) / CI_KEY_FILE
     if not path.is_file():

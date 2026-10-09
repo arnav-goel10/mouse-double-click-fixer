@@ -35,7 +35,7 @@ class CiUpdateKeyTests(unittest.TestCase):
         with self.assertRaises(updater.UpdateError):
             updater.verified_claim(checksums.read_bytes(), signature.read_bytes(), "9.9.9")  # release keys only
 
-    def bundle(self, frozen: bool, with_key: bool):
+    def bundle(self, frozen: bool, with_key: bool, platform: str = "win32"):
         bundled = self.folder / "_internal"
         bundled.mkdir(exist_ok=True)
         if with_key:
@@ -43,6 +43,7 @@ class CiUpdateKeyTests(unittest.TestCase):
             (bundled / updater.CI_KEY_FILE).write_bytes((self.folder / "key" / updater.CI_KEY_FILE).read_bytes())
         patches = [mock.patch.object(sys, "_MEIPASS", str(bundled), create=True)]
         patches.append(mock.patch.object(sys, "frozen", frozen, create=True))
+        patches.append(mock.patch.object(sys, "platform", platform))
         for patch in patches:
             patch.start()
             self.addCleanup(patch.stop)
@@ -55,6 +56,12 @@ class CiUpdateKeyTests(unittest.TestCase):
 
     def test_a_release_build_trusts_the_release_keys_only(self) -> None:
         self.bundle(frozen=True, with_key=False)
+        self.assertEqual(len(updater.trusted_keys()), len(updater.RELEASE_KEYS))
+
+    def test_a_macos_build_never_reads_the_file(self) -> None:
+        # Only the Windows end-to-end job uses the key; a Mac app's bundle
+        # is user-writable, so nothing there may add a trusted key.
+        self.bundle(frozen=True, with_key=True, platform="darwin")
         self.assertEqual(len(updater.trusted_keys()), len(updater.RELEASE_KEYS))
 
     def test_running_from_source_never_reads_the_file(self) -> None:
