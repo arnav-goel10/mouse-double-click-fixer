@@ -8,7 +8,9 @@ what order, where, and with what click count.
 It moves the pointer and clicks wherever it is, so it runs only where nobody
 is using the Mac: with DCF_E2E=1 on a CI runner (GITHUB_ACTIONS=true), whose
 processes may create event taps and post events. DCF_E2E_ALLOW_LOCAL=1 lets
-it run elsewhere, on a machine set aside for it.
+it run elsewhere, on a machine set aside for it. Without DCF_E2E=1 it is
+skipped; with it, anything that would skip it fails instead, so a job that
+asked for it can't pass having run nothing.
 
 Events are posted on a schedule, each stamped with its planned time. A
 background process on these runners oversleeps short waits by tens of
@@ -32,11 +34,14 @@ import unittest
 from typing import Callable, NamedTuple
 from unittest import mock
 
-RUN = (
-    os.environ.get("DCF_E2E") == "1"
-    and platform.system() == "Darwin"
-    and (os.environ.get("GITHUB_ACTIONS") == "true" or os.environ.get("DCF_E2E_ALLOW_LOCAL") == "1")
+#: Asked for: a skip is then a failure.
+E2E = os.environ.get("DCF_E2E") == "1"
+#: Where it may post input: a Mac set aside for it.
+ALLOWED_HERE = platform.system() == "Darwin" and (
+    os.environ.get("GITHUB_ACTIONS") == "true" or os.environ.get("DCF_E2E_ALLOW_LOCAL") == "1"
 )
+RUN = E2E and ALLOWED_HERE
+SKIP_REASON = "posts real input: runs with DCF_E2E=1 on a CI Mac only"
 
 THRESHOLD_MS = 46
 #: Where the scenarios click. Inside the smallest runner display (1024 x 768).
@@ -75,10 +80,16 @@ def _mach_clock() -> Callable[[], int]:
     return lambda: system.mach_absolute_time() * info.numer // info.denom
 
 
-@unittest.skipUnless(RUN, "posts real input: runs with DCF_E2E=1 on a CI Mac only")
 class MacTapEndToEndTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        if not RUN:
+            if E2E:
+                raise AssertionError(
+                    "DCF_E2E=1 asks for the event tap end-to-end test, but it can't run here: it needs macOS and "
+                    "GITHUB_ACTIONS=true (or DCF_E2E_ALLOW_LOCAL=1 on a Mac set aside for it)"
+                )
+            raise unittest.SkipTest(SKIP_REASON)
         import Quartz
 
         from app.core import Button
@@ -118,6 +129,11 @@ class MacTapEndToEndTests(unittest.TestCase):
         cls.filter.start()
         cls.addClassCleanup(cls.filter.stop)
         time.sleep(0.3)
+
+    def skipTest(self, reason: str) -> None:
+        if E2E:
+            self.fail(f"DCF_E2E=1 asked for this scenario, which would have been skipped: {reason}")
+        super().skipTest(reason)
 
     # -- the observer: what applications receive ----------------------------------
     @classmethod
@@ -343,6 +359,39 @@ class MacTapEndToEndTests(unittest.TestCase):
             first_up, second_down = seen.index(buttons[1]), seen.index(buttons[2])
             between = {item.kind for item in seen[first_up + 1 : second_down]}
             self.assertEqual(between, {"move"})
+
+
+
+class RequestedRunTests(unittest.TestCase):
+    """DCF_E2E=1 never ends in an all-skipped pass. These never post input:
+    they only take the paths where the scenarios don't run."""
+
+    def outcome_of_set_up(self, e2e: bool) -> Exception:
+        with mock.patch.object(sys.modules[__name__], "E2E", e2e), \
+                mock.patch.object(sys.modules[__name__], "RUN", False):
+            try:
+                MacTapEndToEndTests.setUpClass()
+            except (unittest.SkipTest, AssertionError) as outcome:
+                return outcome
+        raise AssertionError("setUpClass went ahead where it may not post input")
+
+    def test_asked_for_where_it_cant_run_fails(self) -> None:
+        outcome = self.outcome_of_set_up(e2e=True)
+        self.assertIsInstance(outcome, AssertionError)
+        self.assertNotIsInstance(outcome, unittest.SkipTest)
+        self.assertIn("DCF_E2E=1", str(outcome))
+
+    def test_not_asked_for_it_skips(self) -> None:
+        self.assertIsInstance(self.outcome_of_set_up(e2e=False), unittest.SkipTest)
+
+    def test_a_scenario_skipped_while_asked_for_fails(self) -> None:
+        scenario = MacTapEndToEndTests("test_a_bounce_is_removed")
+        with mock.patch.object(sys.modules[__name__], "E2E", True):
+            with self.assertRaises(AssertionError):
+                scenario.skipTest("no display")
+        with mock.patch.object(sys.modules[__name__], "E2E", False):
+            with self.assertRaises(unittest.SkipTest):
+                scenario.skipTest("no display")
 
 
 if __name__ == "__main__":
