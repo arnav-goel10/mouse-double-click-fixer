@@ -5,9 +5,15 @@ on:
     branches: [main, modern-ui]
   pull_request:
   workflow_dispatch:
+  # release.yml runs these checks too, and publishes nothing unless they pass.
+  workflow_call:
 
 permissions:
   contents: read
+
+env:
+  # Inno Setup builds the Windows installer; release.yml pins the same version.
+  INNO_SETUP_VERSION: "6.7.1"
 
 jobs:
   test:
@@ -17,30 +23,60 @@ jobs:
         os: [windows-latest, macos-14]
         python-version: ["3.11", "3.12", "3.13"]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      - run: python -m pip install --upgrade pip
-      - run: python -m pip install -r requirements.txt
+          cache-dependency-path: requirements-build.txt
+      - name: Install the pinned packages, each checked against its hash
+        run: |
+          python -m pip install --require-hashes --only-binary :all: -r requirements-build.txt
       - name: Run tests
         run: python -m unittest discover -s tests -v
         env:
           QT_QPA_PLATFORM: offscreen
       - run: python -m compileall -q app run.py
 
+  macos-tap:
+    name: macOS event tap end-to-end
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest and newest macOS GitHub runs: the order WindowServer
+        # delivers events in is what this checks.
+        os: [macos-14, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Install the pinned packages, each checked against its hash
+        run: |
+          python -m pip install --require-hashes --only-binary :all: -r requirements-build.txt
+      - name: Post clicks through the real event tap
+        # GitHub's Macs let a job create event taps and post events, so the
+        # real filter runs in the real event stream (tests/test_macos_tap_e2e.py).
+        run: python -m unittest tests.test_macos_tap_e2e -v
+        env:
+          DCF_E2E: "1"
+
   windows-hook:
     name: Windows hook end-to-end
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
-      - run: python -m pip install -r requirements.txt
+      - name: Install the pinned packages, each checked against its hash
+        run: |
+          python -m pip install --require-hashes --only-binary :all: -r requirements-build.txt
       - name: Inject clicks through the real low-level hook
         run: python -m unittest tests.test_windows_hook -v
         env:
@@ -55,7 +91,7 @@ jobs:
           Set-ItemProperty -Path $key -Name AppsUseLightTheme -Value 0 -Type DWord
           Set-ItemProperty -Path $key -Name SystemUsesLightTheme -Value 0 -Type DWord
           python tools/screenshots.py screenshots --live --docs
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-screenshots
           path: screenshots/
@@ -65,11 +101,21 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
-      - run: python -m pip install -r requirements.txt pyinstaller
+      - name: Install the pinned packages and build tools, each checked against its hash
+        run: |
+          python -m pip install --require-hashes --only-binary :all: -r requirements-build.txt
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --version=$env:INNO_SETUP_VERSION --allow-downgrade --no-progress -y
+          if ($LASTEXITCODE -ne 0) { throw "choco couldn't install Inno Setup $env:INNO_SETUP_VERSION" }
+          $found = (Get-Item "C:\Program Files (x86)\Inno Setup 6\ISCC.exe").VersionInfo.ProductVersion
+          Write-Host "ISCC.exe $found"
+          if (-not $found.StartsWith($env:INNO_SETUP_VERSION)) { throw "ISCC.exe is $found, not $env:INNO_SETUP_VERSION" }
       - name: Build the exe and the installer
         shell: pwsh
         run: |
@@ -79,9 +125,9 @@ jobs:
           python tools/ci_update_key.py make "$env:RUNNER_TEMP\dcf-ci-key"
           $env:DCF_CI_UPDATE_KEY = "$env:RUNNER_TEMP\dcf-ci-key\dcf-ci-update-key.pub"
           .\installer\build_windows.ps1
-          choco install innosetup --no-progress -y
           $version = (python -c "import app; print(app.__version__)")
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" "installer\windows.iss"
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed to build the installer" }
       - name: The release guard finds CI's key in this build
         shell: pwsh
         run: |
