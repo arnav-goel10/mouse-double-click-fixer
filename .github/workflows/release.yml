@@ -62,9 +62,10 @@ jobs:
         run: |
           choco install innosetup --version=$env:INNO_SETUP_VERSION --allow-downgrade --no-progress -y
           if ($LASTEXITCODE -ne 0) { throw "choco couldn't install Inno Setup $env:INNO_SETUP_VERSION" }
-          $found = (Get-Item "C:\Program Files (x86)\Inno Setup 6\ISCC.exe").VersionInfo.ProductVersion
-          Write-Host "ISCC.exe $found"
-          if (-not $found.StartsWith($env:INNO_SETUP_VERSION)) { throw "ISCC.exe is $found, not $env:INNO_SETUP_VERSION" }
+          # ISCC.exe carries no version of its own (it reads 0.0.0.0); ask Chocolatey.
+          $found = (choco list innosetup --exact --limit-output) -join " "
+          Write-Host "Chocolatey has $found"
+          if ($found -ne "innosetup|$env:INNO_SETUP_VERSION") { throw "Inno Setup is $found, not $env:INNO_SETUP_VERSION" }
       - name: Build the portable executable and the installed folder
         shell: pwsh
         run: .\installer\build_windows.ps1
@@ -174,6 +175,10 @@ jobs:
           identity="$(security find-identity -p codesigning "$keychain" | awk '/DoubleClick Fixer Signing/ {print $2; exit}')"
           echo "DCF_SIGN_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
           echo "DCF_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+      - name: Show whether this Mac enforces code signatures
+        # The build's injection check needs it: with System Integrity
+        # Protection off, dyld loads DYLD_INSERT_LIBRARIES into any app.
+        run: csrutil status || true
       - name: Build macOS app, DMG and update archive
         run: bash installer/build_macos.sh
       - name: Confirm the app reports the release's version
