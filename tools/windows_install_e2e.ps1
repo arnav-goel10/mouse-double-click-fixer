@@ -140,6 +140,21 @@ foreach ($old in $OldSetup) {
 $app = App-Path
 $folder = Split-Path $app
 
+Step "The installed app's self-test passes, its TLS going through Schannel"
+# It loads Qt and every module of the app and starts the TLS backend, without
+# touching the network or any running copy (app/selftest.py).
+$selfTest = Join-Path $env:TEMP "dcf-self-test.txt"
+$process = Start-Process $app -ArgumentList "--self-test" -Wait -PassThru -NoNewWindow `
+    -RedirectStandardOutput $selfTest -RedirectStandardError "$selfTest.err"
+Get-Content $selfTest, "$selfTest.err" | Write-Host
+if ($process.ExitCode -ne 0) { Fail "the installed app's self-test failed (exit $($process.ExitCode))" }
+if (-not (Select-String -Path $selfTest -Pattern "^tls: ok \(schannel, " -Quiet)) { Fail "the self-test reported no TLS through Schannel" }
+# Left out of every Windows build (tools/make_notices.py, unused_qt_file).
+$leftOut = '^(qopensslbackend|lib(crypto|ssl)-\d+-(x64|arm64|arm)|ucrtbase|api-ms-win-.+)\.dll$'
+$shipped = @(Get-ChildItem $folder -Recurse -File | Where-Object Name -match $leftOut)
+if ($shipped) { Fail "the installed app ships what the build leaves out: $(($shipped | ForEach-Object Name) -join ', ')" }
+Write-Host "self-test passed; no OpenSSL for Qt and no Universal C Runtime copy in the install folder"
+
 Step "A folder install that lost its runtime is closed with taskkill, not run"
 # A failed update can leave the exe without _internal: [InstallDelete] runs
 # first, and rollback doesn't put it back. Such an exe can't start; run with

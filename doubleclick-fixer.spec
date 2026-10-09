@@ -84,9 +84,16 @@ _spec.loader.exec_module(make_notices)
 # Leave out the Qt image-format and icon-engine plugins the app never uses
 # (it draws its icons in code and only round-trips PNG, which Qt GUI has
 # built in), and Qt SVG, which only they need. Their code (libjpeg, libtiff,
-# libwebp and more) is then neither shipped nor attributed.
+# libwebp and more) is then neither shipped nor attributed. On Windows also
+# Qt's OpenSSL backend with the OpenSSL files PyInstaller found for it on
+# this machine's PATH (TLS goes through Windows' Schannel, app/tls.py), and
+# the Universal C Runtime, which Windows 10 and later have built in.
+left_out = [entry for entry in analysis.binaries + analysis.datas if make_notices.unused_qt_file(entry[0])]
 analysis.binaries = [entry for entry in analysis.binaries if not make_notices.unused_qt_file(entry[0])]
 analysis.datas = [entry for entry in analysis.datas if not make_notices.unused_qt_file(entry[0])]
+for destination, source, *_rest in sorted(left_out):
+    size = os.path.getsize(source) if source and os.path.isfile(source) else 0
+    print(f"left out: {destination} ({size / 1e6:.1f} MB, from {source})")
 
 # Every build carries the licences of what it bundles (Qt's LGPL among them),
 # worked out from the very files it ships: Contents/Resources on macOS,

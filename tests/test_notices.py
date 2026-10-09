@@ -213,47 +213,100 @@ class BuildScanTests(unittest.TestCase):
         gui = fake_binary(self.folder, "Qt6Gui.dll", b"llvmpipe", b"Mesa")  # Qt naming it is not Mesa itself
         make_notices.inside_qt(self.build([gui], platform="win32"))
 
-    def windows_openssl(self, qt_version: bytes = b"OpenSSL 3.5.5 27 Jan 2026") -> list:
-        """A Windows build's two copies: Python's, which its modules link to,
-        and the one Qt's OpenSSL backend loads by name."""
+    def python_openssl(self, version: bytes = b"OpenSSL 3.0.15 3 Sep 2024") -> list:
+        """A Windows build's OpenSSL: Python's, which its modules link to."""
         return [
-            fake_binary(self.folder, "libcrypto-3.dll", b"OpenSSL 3.0.15 3 Sep 2024", b"x"),
+            fake_binary(self.folder, "libcrypto-3.dll", version, b"x"),
             fake_binary(self.folder, "libssl-3.dll", b"no version text in libssl"),
             fake_binary(self.folder, "_hashlib.pyd", b"LIBCRYPTO-3.dll"),
             fake_binary(self.folder, "_ssl.pyd", b"libssl-3.dll", b"libcrypto-3.dll"),
-            fake_binary(self.folder, "libcrypto-3-x64.dll", qt_version, b"x"),
-            fake_binary(self.folder, "libssl-3-x64.dll"),
-            fake_binary(self.folder, "qopensslbackend.dll", b"libssl-3-x64", b"libcrypto-3-x64", b"libssl-3", b""),
         ]
 
-    def test_each_openssl_copy_is_listed_with_the_version_its_file_carries(self) -> None:
-        build = self.build(self.windows_openssl(), platform="win32")
+    def test_pythons_openssl_is_listed_with_the_version_its_file_carries(self) -> None:
+        build = self.build(self.python_openssl(), platform="win32")
         self.assertEqual(
             [(item.name, item.version) for item in make_notices.python_libraries(build) if "OpenSSL" in item.name],
             [("OpenSSL (libcrypto, libssl)", "3.0.15")],
         )
-        self.assertEqual(
-            [(item.name, item.version, item.licence) for item in make_notices.qt_libraries(build)],
-            [("OpenSSL for Qt Network (libcrypto-3-x64.dll, libssl-3-x64.dll)", "3.5.5", "Apache-2.0")],
-        )
         text = make_notices.render(build)
         self.assertIn("| OpenSSL (libcrypto, libssl) | 3.0.15 | Apache-2.0 |", text)
-        self.assertIn("| OpenSSL for Qt Network (libcrypto-3-x64.dll, libssl-3-x64.dll) | 3.5.5 | Apache-2.0 |", text)
-        self.assertIn("openssl-3.5.5/openssl-3.5.5.tar.gz", text)
-        self.assertIn("### OpenSSL for Qt Network", text)
+        self.assertIn("openssl-3.0.15/openssl-3.0.15.tar.gz", text)
+        self.assertNotIn("OpenSSL for Qt Network (", text)
+        self.assertIn("through Windows' own TLS (Schannel), so this build ships no OpenSSL for Qt", text)
 
-    def test_an_openssl_copy_without_a_readable_version_fails_the_build(self) -> None:
-        build = self.build(self.windows_openssl(b"nothing to go by"), platform="win32")
-        with self.assertRaisesRegex(SystemExit, "Couldn't read which OpenSSL libcrypto-3-x64.dll is"):
-            make_notices.qt_libraries(build)
-        build = self.build(self.windows_openssl(b"OpenSSL 1.1.1w  11 Sep 2023"), platform="win32")
+    def test_a_windows_build_with_qts_openssl_fails(self) -> None:
+        # Qt's OpenSSL backend loads these by name from wherever Windows finds
+        # them; Windows builds connect through Schannel instead.
+        for name, contents in (
+            ("libcrypto-3-x64.dll", b"OpenSSL 3.5.5 27 Jan 2026"),
+            ("libssl-3-x64.dll", b""),
+            ("libcrypto-3-arm64.dll", b"OpenSSL 3.5.5 27 Jan 2026"),
+            ("qopensslbackend.dll", b"qt.tlsbackend.ossl"),
+            ("renamedbackend.dll", b"qt.tlsbackend.ossl"),  # found by what it says, whatever its name
+        ):
+            build = self.build(self.python_openssl() + [fake_binary(self.folder, name, contents)], platform="win32")
+            with self.subTest(name=name), self.assertRaisesRegex(SystemExit, rf"Windows build ships {name}: .*Schannel"):
+                make_notices.render(build)
+
+    def test_the_macos_build_keeps_qts_openssl_backend_on_pythons_openssl(self) -> None:
+        files = [
+            fake_binary(self.folder, "libcrypto.3.dylib", b"OpenSSL 3.6.5 29 Sep 2026", b"x"),
+            fake_binary(self.folder, "libssl.3.dylib"),
+            fake_binary(self.folder, "_hashlib.cpython-314-darwin.so", b"@rpath/libcrypto.3.dylib"),
+            fake_binary(self.folder, "_ssl.cpython-314-darwin.so", b"@rpath/libssl.3.dylib", b"@rpath/libcrypto.3.dylib"),
+            fake_binary(self.folder, "libqopensslbackend.dylib", b"qt.tlsbackend.ossl", b"libssl.*"),
+        ]
+        text = make_notices.render(self.build(files))
+        self.assertIn("| OpenSSL (libcrypto, libssl) | 3.6.5 | Apache-2.0 |", text)
+        self.assertIn("through Qt Network's OpenSSL backend, which uses the copy of OpenSSL that comes with Python",
+                      text)
+
+    def test_an_openssl_copy_of_an_unsupported_version_fails_the_build(self) -> None:
+        build = self.build(self.python_openssl(b"OpenSSL 1.1.1w  11 Sep 2023"), platform="win32")
         with self.assertRaisesRegex(SystemExit, "OpenSSL 1.1.1w"):
-            make_notices.qt_libraries(build)
+            make_notices.python_libraries(build)
 
-    def test_an_openssl_copy_neither_python_nor_qt_loads_fails_the_build(self) -> None:
-        files = [path for path in self.windows_openssl() if path.name != "qopensslbackend.dll"]
-        with self.assertRaisesRegex(SystemExit, "ships libcrypto-3-x64.dll, which neither"):
-            make_notices.python_libraries(self.build(files, platform="win32"))
+    def test_an_openssl_copy_python_doesnt_load_fails_the_build(self) -> None:
+        files = self.python_openssl() + [fake_binary(self.folder, "libcrypto.3.dylib", b"OpenSSL 3.5.5 27 Jan 2026")]
+        with self.assertRaisesRegex(SystemExit, "ships libcrypto.3.dylib, which Python's ssl modules don't load"):
+            make_notices.python_libraries(self.build(files))
+
+    def version_resource(self, version: str) -> bytes:
+        """A Windows file's VS_FIXEDFILEINFO, as its version resource has it."""
+        import struct
+
+        parts = [int(part) for part in version.split(".")]
+        return struct.pack("<IIII", 0xFEEF04BD, 0x10000, parts[0] << 16 | parts[1], parts[2] << 16 | parts[3])
+
+    def test_a_windows_files_version_is_read_from_its_version_resource(self) -> None:
+        self.assertEqual(make_notices.file_version(b"MZ..." + self.version_resource("14.44.35211.0") + b"..."),
+                         "14.44.35211.0")
+        self.assertEqual(make_notices.file_version(b"MZ no resource"), "")
+
+    def test_the_microsoft_runtime_a_windows_build_carries_is_named(self) -> None:
+        files = self.python_openssl() + [
+            fake_binary(self.folder, "VCRUNTIME140.dll", self.version_resource("14.44.35211.0")),
+            fake_binary(self.folder, "VCRUNTIME140_1.dll", self.version_resource("14.44.35211.0")),
+            fake_binary(self.folder, "MSVCP140.dll", self.version_resource("14.42.34433.0")),
+        ]
+        build = self.build(files, platform="win32")
+        [(runtime, shipped)] = make_notices.microsoft_runtimes(build)
+        self.assertEqual((runtime.name, runtime.version), ("Microsoft Visual C++ runtime",
+                                                           "14.42.34433.0, 14.44.35211.0"))
+        self.assertEqual(shipped, ["MSVCP140.dll", "VCRUNTIME140.dll", "VCRUNTIME140_1.dll"])
+        text = make_notices.render(build)
+        self.assertIn("| Microsoft Visual C++ runtime | 14.42.34433.0, 14.44.35211.0 | Microsoft Visual Studio "
+                      "licence terms (Distributable Code) |", text)
+        self.assertIn("`MSVCP140.dll`, `VCRUNTIME140.dll`, `VCRUNTIME140_1.dll`", text)
+        self.assertIn("Windows 10 and later include the Universal C Runtime", text)
+        # Were the Universal C Runtime ever shipped again, it would be named too.
+        with_ucrt = self.build(files + [fake_binary(self.folder, "ucrtbase.dll", self.version_resource("10.0.26100.1")),
+                                        fake_binary(self.folder, "api-ms-win-crt-runtime-l1-1-0.dll")],
+                               platform="win32")
+        text = make_notices.render(with_ucrt)
+        self.assertIn("| Microsoft Universal C Runtime | 10.0.26100.1 |", text)
+        self.assertNotIn("Windows 10 and later include the Universal C Runtime", text)
+        self.assertEqual(make_notices.microsoft_runtimes(self.build(files)), [])  # not on macOS
 
     def test_python_notices_follow_the_modules_that_ship(self) -> None:
         select = fake_binary(self.folder, "select.cpython-314-darwin.so", b"kqueue")
@@ -305,8 +358,24 @@ class BuildScanTests(unittest.TestCase):
         for destination in (
             "PySide6/Qt/plugins/imageformats/libqico.dylib", "PySide6/Qt/plugins/platforms/libqcocoa.dylib",
             "PySide6/Qt/lib/QtGui.framework/Versions/A/QtGui", "QtGui", "PySide6/Qt6Gui.dll",
+            "PySide6/Qt/plugins/tls/libqopensslbackend.dylib", "libssl.3.dylib",
         ):
             self.assertFalse(make_notices.unused_qt_file(destination), destination)
+
+    def test_windows_leaves_out_qts_openssl_and_the_universal_c_runtime(self) -> None:
+        for destination in (
+            "PySide6/plugins/tls/qopensslbackend.dll", "libcrypto-3-x64.dll", "libssl-3-x64.dll",
+            "LIBSSL-3-X64.DLL", "libcrypto-3-arm64.dll", "ucrtbase.dll", "api-ms-win-crt-runtime-l1-1-0.dll",
+            "api-ms-win-core-file-l1-2-0.dll",
+        ):
+            self.assertTrue(make_notices.unused_qt_file(destination, "win32"), destination)
+            self.assertFalse(make_notices.unused_qt_file(destination, "darwin"), destination)
+        for destination in (
+            "libcrypto-3.dll", "libssl-3.dll",  # Python's, for its ssl and hashlib modules
+            "PySide6/plugins/tls/qschannelbackend.dll", "PySide6/plugins/tls/qcertonlybackend.dll",
+            "VCRUNTIME140.dll", "VCRUNTIME140_1.dll", "PySide6/MSVCP140.dll", "python313.dll",
+        ):
+            self.assertFalse(make_notices.unused_qt_file(destination, "win32"), destination)
 
     def test_every_licence_text_it_can_use_is_vendored(self) -> None:
         from_environment = {"PSF-2.0", "MIT-PyObjC"}
@@ -350,12 +419,24 @@ class EnvironmentFilesTests(unittest.TestCase):
         text = make_notices.render(build)
         for copy in copies:
             self.assertRegex(copy.version, r"^3\.\d+\.\d+", copy)
-            if copy.for_qt:
-                files = ", ".join(name for name in (copy.crypto, copy.ssl) if name)
-                self.assertIn(f"| OpenSSL for Qt Network ({files}) | {copy.version} |", text)
-            else:
-                self.assertEqual(copy.version, ssl.OPENSSL_VERSION.split()[1], "Python's copy is the one ssl runs")
-                self.assertIn(f"| OpenSSL (libcrypto, libssl) | {copy.version} |", text)
+            self.assertEqual(copy.version, ssl.OPENSSL_VERSION.split()[1], "Python's copy is the one ssl runs")
+            self.assertIn(f"| OpenSSL (libcrypto, libssl) | {copy.version} |", text)
+
+    def test_the_openssl_backend_marker_is_in_pyside6s_plugin(self) -> None:
+        import PySide6
+
+        package = Path(PySide6.__file__).parent
+        plugins = [path for name in ("qopensslbackend.dll", "libqopensslbackend.dylib")
+                   for path in package.rglob(name)]
+        if not plugins:
+            self.skipTest("PySide6 has no OpenSSL backend here")
+        for path in plugins:
+            self.assertIn(make_notices.QT_OPENSSL_BACKEND_MARKER, path.read_bytes(), path)
+            destination = str(path.relative_to(package.parent))
+            self.assertEqual(make_notices.unused_qt_file(destination, "win32"), path.suffix == ".dll")
+            self.assertFalse(make_notices.unused_qt_file(destination, "darwin"))
+        if sys.platform == "win32":
+            self.assertFalse(any(path.name == "qopensslbackend.dll" for path in make_notices._qt_files_in_environment()))
 
 
 class ResolverTests(unittest.TestCase):

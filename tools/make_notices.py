@@ -32,6 +32,7 @@ import importlib.util
 import os
 import platform
 import re
+import struct
 import subprocess
 import sys
 import sysconfig
@@ -61,6 +62,25 @@ UNUSED_QT_LIBRARIES = frozenset({"Svg", "Pdf"})
 #: software OpenGL (llvmpipe), which Qt falls back on on Windows when asked for
 #: OpenGL without a working driver. The app draws only widgets, which never ask.
 UNUSED_FILES = frozenset({"opengl32sw.dll"})
+#: Windows builds make their TLS connections through Windows itself, with
+#: Schannel (app/tls.py). Qt's OpenSSL backend would load OpenSSL from files
+#: it names (libssl-3-x64.dll, libcrypto-3-x64.dll) wherever Windows finds
+#: them, PATH included, and PyInstaller collects such files from the PATH of
+#: the machine that builds: whichever other program put its copy there
+#: first. Neither the plugin nor those files ship on Windows, and a Windows
+#: build that ships either fails (windows_openssl_for_qt). Python's own
+#: libssl-3.dll and libcrypto-3.dll, which its ssl and hashlib modules link
+#: to, stay.
+QT_OPENSSL_ON_WINDOWS = re.compile(r"qopensslbackend\.dll|lib(?:crypto|ssl)-\d+-(?:x64|arm64|arm)\.dll", re.IGNORECASE)
+#: Qt's OpenSSL backend names itself so in its log messages.
+QT_OPENSSL_BACKEND_MARKER = b"qt.tlsbackend.ossl"
+#: The Universal C Runtime, which PyInstaller collects on Windows: Windows 10
+#: and later (all that Qt 6 runs on) have it built in, and keep it updated, so
+#: a build leaves out its own copy rather than ship an older one beside it.
+UCRT_FILE = re.compile(r"ucrtbase\.dll|api-ms-win-[a-z0-9-]+\.dll", re.IGNORECASE)
+#: The Microsoft Visual C++ runtime, which Windows doesn't have built in;
+#: Python and Qt need it, and a build ships it.
+MSVC_RUNTIME_FILE = re.compile(r"(?:vcruntime|msvcp|concrt|vccorlib)140(?:_\w+)?\.dll", re.IGNORECASE)
 
 
 @dataclass
@@ -339,16 +359,16 @@ def _qt_files_in_environment() -> List[Path]:
     for plugins in (package / "Qt" / "plugins", package / "plugins"):
         for folder in QT_PLUGIN_FOLDERS:
             for path in sorted((plugins / folder).glob("*")):
-                if path.suffix in (".dylib", ".dll") and qt_plugin_name(path.name) not in UNUSED_QT_PLUGINS:
+                if path.suffix in (".dylib", ".dll") and not unused_qt_file(str(path.relative_to(package.parent))):
                     found.append(path)
     return found
 
 
 def _openssl_files_in_environment() -> List[Path]:
     """OpenSSL's libraries where a build collects them from: beside Python's
-    _ssl module (Windows keeps them there), inside PySide6, and on Windows the
-    files Qt's OpenSSL backend loads by name, from the first folder on PATH
-    that has them (PyInstaller's Qt Network hook collects them from there)."""
+    _ssl module (Windows keeps them there) and inside PySide6. (PyInstaller's
+    Qt Network hook also collects the ones Qt's OpenSSL backend loads by name
+    from PATH on Windows; Windows builds leave those out.)"""
     folders = []
     for module in ("_ssl", "PySide6"):
         try:
@@ -359,26 +379,16 @@ def _openssl_files_in_environment() -> List[Path]:
             folders += [(Path(folder), "**/") for folder in spec.submodule_search_locations]
         elif spec is not None and spec.origin and os.path.isfile(spec.origin):
             folders.append((Path(spec.origin).parent, ""))
-    found = [
+    return [
         path for folder, depth in folders for pattern in ("libcrypto*", "libssl*")
-        for path in sorted(folder.glob(depth + pattern)) if _OPENSSL_FILE.match(path.name) and path.is_file()
+        for path in sorted(folder.glob(depth + pattern))
+        if _OPENSSL_FILE.match(path.name) and path.is_file() and not unused_qt_file(path.name)
     ]
-    backend = [path for path in _qt_files_in_environment() if qt_plugin_name(path.name) == "qopensslbackend"]
-    if sys.platform == "win32" and backend:
-        for name in sorted({stem.decode("ascii") + ".dll" for stem in _QT_OPENSSL_NAME.findall(backend[0].read_bytes())}):
-            folder = next((folder for folder in os.environ.get("PATH", "").split(os.pathsep)
-                           if folder and os.path.isfile(os.path.join(folder, name))), None)
-            if folder is not None:
-                found.append(Path(folder) / name)
-    return found
 
 
 #: OpenSSL's libraries, as they are named on each platform: libcrypto-3.dll,
 #: libcrypto-3-x64.dll, libcrypto.3.dylib, libssl.so.3 and so on.
 _OPENSSL_FILE = re.compile(r"lib(crypto|ssl)([-.]|\.so\.)\d", re.IGNORECASE)
-#: The OpenSSL files Qt's OpenSSL backend loads at run time, as it names them
-#: ("libcrypto-3-x64" on 64-bit Windows).
-_QT_OPENSSL_NAME = re.compile(rb"(?<![\w-])(lib(?:crypto|ssl)-[\w-]+)\x00")
 
 
 def qt_plugin_name(file_name: str) -> str:
@@ -386,14 +396,17 @@ def qt_plugin_name(file_name: str) -> str:
     return file_name.split(".")[0].removeprefix("lib")
 
 
-def unused_qt_file(destination: str) -> bool:
+def unused_qt_file(destination: str, platform: str = sys.platform) -> bool:
     """Whether a file a build would collect is one the app never uses: a
     plugin in UNUSED_QT_PLUGINS, the Qt library (and its PySide6 binding)
-    that only those plugins need, or one of UNUSED_FILES. The spec leaves
-    these out."""
+    that only those plugins need, or one of UNUSED_FILES; on Windows also
+    Qt's OpenSSL backend and the OpenSSL it would load, and the Universal C
+    Runtime. The spec leaves these out."""
     parts = Path(destination).parts
     name = parts[-1] if parts else ""
     if name.lower() in UNUSED_FILES:
+        return True
+    if platform == "win32" and (QT_OPENSSL_ON_WINDOWS.fullmatch(name) or UCRT_FILE.fullmatch(name)):
         return True
     if len(parts) >= 2 and parts[-2] in ("imageformats", "iconengines"):
         return qt_plugin_name(name) in UNUSED_QT_PLUGINS
@@ -607,6 +620,20 @@ def _freetype_version(build: Build) -> str:
     return version if re.fullmatch(r"\d+\.\d+\.\d+", version) else ""
 
 
+def windows_openssl_for_qt(build: Build) -> None:
+    """Fail a Windows build that ships Qt's OpenSSL backend or the OpenSSL
+    files it loads: Windows builds connect through Schannel (see
+    QT_OPENSSL_ON_WINDOWS)."""
+    if build.platform != "win32":
+        return
+    files = sorted({name for name in build.files if QT_OPENSSL_ON_WINDOWS.fullmatch(name)}
+                   | set(build.search(QT_OPENSSL_BACKEND_MARKER)))
+    if files:
+        raise SystemExit(f"This Windows build ships {', '.join(files)}: Qt's OpenSSL backend or the OpenSSL it "
+                         "loads. Windows builds make their TLS connections through Schannel and leave these out "
+                         "(app/tls.py, unused_qt_file in tools/make_notices.py)")
+
+
 def inside_qt(build: Build) -> List[Inside]:
     for marker, name in UNATTRIBUTED.items():
         files = build.search(marker)
@@ -676,41 +703,33 @@ _OPENSSL_VERSION = re.compile(rb"OpenSSL (\d+\.\d+\.\d+[a-z]?) +\d{1,2} [A-Z][a-
 
 @dataclass(frozen=True)
 class OpenSSLCopy:
-    """One copy of OpenSSL a build ships: its libcrypto (and libssl, if it
-    ships one beside it), the version the libcrypto file says it is, and
-    whether it is the one Qt Network's OpenSSL backend loads rather than the
-    one Python's ssl and hashlib modules link to."""
+    """The copy of OpenSSL a build ships for Python's ssl and hashlib modules
+    (which Qt's OpenSSL backend uses too, on macOS): its libcrypto, its
+    libssl if it ships one beside it, and the version the libcrypto file says
+    it is."""
 
     crypto: str
     ssl: str
     version: str
-    for_qt: bool
 
 
 def openssl_copies(build: Build) -> List[OpenSSLCopy]:
-    """Each copy of OpenSSL's libraries among the build's files, and whose it
-    is: Python's ssl and hashlib modules link to theirs by file name, and Qt's
-    OpenSSL backend names the files it loads. A Windows build ships both, and
-    they may be different versions. A copy neither names fails the build."""
+    """Each copy of OpenSSL's libraries among the build's files. Python's ssl
+    and hashlib modules link to theirs by file name; a copy they don't name
+    fails the build, since nothing here can say whose it is."""
     python = b"\x00".join(build.extension(module) or b"" for module in ("_ssl", "_hashlib")).lower()
-    qt = b"\x00".join(build.qt(library) or b"" for library in ("qopensslbackend", "Network"))
-    qt_names = {stem.decode("ascii").lower() for stem in _QT_OPENSSL_NAME.findall(qt)}
     copies = []
     for name in sorted(build.files, key=str.lower):
         match = _OPENSSL_FILE.match(name)
         if not match or match.group(1).lower() != "crypto":
             continue
+        if name.lower().encode() not in python:
+            raise SystemExit(f"This build ships {name}, which Python's ssl modules don't load; tools/make_notices.py "
+                             "can't say whose copy it is")
         partner = next((other for other in build.files if other.lower() == "libssl" + name[len("libcrypto"):].lower()),
                        "")
         found = _OPENSSL_VERSION.search(build.data(name) or b"")
-        version = found.group(1).decode("ascii") if found else ""
-        if name.lower().encode() in python:
-            copies.append(OpenSSLCopy(name, partner, version, for_qt=False))
-        elif name.lower().removesuffix(".dll") in qt_names:
-            copies.append(OpenSSLCopy(name, partner, version, for_qt=True))
-        else:
-            raise SystemExit(f"This build ships {name}, which neither Python's ssl modules nor Qt's OpenSSL backend "
-                             "load; tools/make_notices.py can't say whose copy it is")
+        copies.append(OpenSSLCopy(name, partner, found.group(1).decode("ascii") if found else ""))
     return copies
 
 
@@ -727,20 +746,6 @@ def _openssl(name: str, version: str) -> Component:
     )
 
 
-def qt_libraries(build: Build) -> List[Component]:
-    """Libraries Qt loads that the build ships beside it: the OpenSSL copy Qt
-    Network's OpenSSL backend loads (on Windows, where PyInstaller collects
-    it)."""
-    found = []
-    for copy in openssl_copies(build):
-        if copy.for_qt:
-            if not copy.version:
-                raise SystemExit(f"Couldn't read which OpenSSL {copy.crypto} is")
-            files = ", ".join(name for name in (copy.crypto, copy.ssl) if name)
-            found.append(_openssl(f"OpenSSL for Qt Network ({files})", copy.version))
-    return found
-
-
 def python_libraries(build: Build) -> List[Component]:
     """Libraries Python's own modules use, where the build carries its own copy."""
     found = []
@@ -752,7 +757,7 @@ def python_libraries(build: Build) -> List[Component]:
         running = ""
     # Python's copy as its file says (where the build lists its files), or
     # as the Python making the build reports it.
-    own = [copy for copy in openssl_copies(build) if not copy.for_qt]
+    own = openssl_copies(build)
     for copy in own:
         found.append(_openssl("OpenSSL (libcrypto, libssl)", copy.version or running))
     if not own and running and build.bundles("_hashlib", "libcrypto"):
@@ -829,6 +834,44 @@ def python_libraries(build: Build) -> List[Component]:
     return found
 
 
+def file_version(data: bytes) -> str:
+    """A Windows file's version, as its version resource (VS_FIXEDFILEINFO)
+    gives it; empty if it has none."""
+    index = data.find(b"\xbd\x04\xef\xfe")  # its signature, 0xFEEF04BD
+    if index < 0 or len(data) < index + 16:
+        return ""
+    most, least = struct.unpack_from("<II", data, index + 8)
+    return f"{most >> 16}.{most & 0xFFFF}.{least >> 16}.{least & 0xFFFF}"
+
+
+#: Microsoft's runtime libraries: the name a build lists them under, the
+#: files that are part of each, and the terms Microsoft redistributes it under.
+MICROSOFT_RUNTIMES = (
+    ("Microsoft Visual C++ runtime", MSVC_RUNTIME_FILE, "Microsoft Visual Studio licence terms (Distributable Code)"),
+    ("Microsoft Universal C Runtime", UCRT_FILE, "Windows SDK licence terms (Distributable Code)"),
+)
+
+
+def microsoft_runtimes(build: Build) -> List[Tuple[Component, List[str]]]:
+    """The Microsoft runtime libraries a Windows build carries, each with the
+    files of it that ship (one of each name; Python and PySide6 may both
+    bring a copy)."""
+    if build.platform != "win32":
+        return []
+    found = []
+    for name, pattern, terms in MICROSOFT_RUNTIMES:
+        files = sorted({file.lower(): file for file in build.files if pattern.fullmatch(file)}.values(), key=str.lower)
+        if not files:
+            continue
+        versions = sorted({version for version in (file_version(build.data(file) or b"") for file in files) if version},
+                          key=lambda text: tuple(int(part) for part in text.split(".")))
+        found.append((Component(
+            name, ", ".join(versions), terms, "Copyright (c) Microsoft Corporation. All rights reserved.",
+            "https://learn.microsoft.com/cpp/windows/redistributing-visual-cpp-files", "",
+        ), files))
+    return found
+
+
 # -- the file ---------------------------------------------------------------------------
 
 def _table(components: List[Component]) -> List[str]:
@@ -853,6 +896,7 @@ def _sentence(text: str) -> str:
 def render(build: Optional[Build] = None) -> str:
     """The whole file, for `build` (by default, what this environment would ship)."""
     build = build or Build.from_environment()
+    windows_openssl_for_qt(build)
     version = app_version()
     repository = repository_url()
     qt = qt_version()
@@ -892,8 +936,8 @@ def render(build: Optional[Build] = None) -> str:
         f"https://www.python.org/ftp/python/{release}/Python-{python}.tar.xz", "PSF-2.0",
     )
     libraries = python_libraries(build)
-    qt_libs = qt_libraries(build)
     in_qt = inside_qt(build)
+    runtimes = microsoft_runtimes(build)
     in_python = inside_python(build)
     pyobjc_parts = [
         Component(name, number, "MIT", "Copyright 2002, 2003 - Bill Bumgarner, Ronald Oussoren, Steve Majewski, "
@@ -909,7 +953,7 @@ def render(build: Optional[Build] = None) -> str:
             "Giovanni Bajo; based on previous work under copyright (c) 2002 McMillan Enterprises, Inc.",
             f"https://github.com/pyinstaller/pyinstaller/tree/v{pyinstaller}", "Apache-2.0",
         ))
-    everything = qt_parts + qt_libs + [python_part] + libraries + pyobjc_parts + tools
+    everything = qt_parts + [python_part] + libraries + pyobjc_parts + tools + [item for item, _files in runtimes]
 
     def inside_lines(items: List[Inside]) -> List[str]:
         lines = []
@@ -976,15 +1020,20 @@ def render(build: Optional[Build] = None) -> str:
             *inside_lines(in_qt),
             "",
         ]
-    if qt_libs:
+    if build.qt("qopensslbackend") is not None:
         out += [
-            "### OpenSSL for Qt Network",
+            "### TLS in Qt Network",
             "",
-            "Qt Network's OpenSSL backend loads OpenSSL from files of its own, and this build ships them: a "
-            "separate copy from Python's (below), which can be a different version.",
+            "The app's HTTPS connections go through Qt Network's OpenSSL backend, which uses the copy of OpenSSL "
+            "that comes with Python (below); the build ships no other.",
             "",
-            *[f"- {_named(item)}: {item.licence}, {use(item.text)}. {_sentence(item.copyright)} "
-              f"Source: <{item.source}>" for item in qt_libs],
+        ]
+    elif build.platform == "win32":
+        out += [
+            "### TLS in Qt Network",
+            "",
+            "The app's HTTPS connections go through Windows' own TLS (Schannel), so this build ships no OpenSSL for "
+            "Qt; the OpenSSL below is Python's.",
             "",
         ]
     out += [
@@ -1046,6 +1095,28 @@ def render(build: Optional[Build] = None) -> str:
             f"Source: <{item.source}>",
             "",
         ]
+    if runtimes:
+        ucrt = any(item.name == "Microsoft Universal C Runtime" for item, _files in runtimes)
+        out += [
+            "## Microsoft runtime libraries (Windows)",
+            "",
+            "Python and Qt are built with Microsoft Visual C++, and the Windows app carries the runtime libraries "
+            "this needs, unmodified:",
+            "",
+            *[f"- {_named(item)}: {', '.join(f'`{file}`' for file in files)}" for item, files in runtimes],
+            "",
+            "They are copyright (c) Microsoft Corporation and are not open source: Microsoft provides them for "
+            "shipping with applications, as Distributable Code under its licence terms (for the Visual C++ "
+            "runtime, Visual Studio's: <https://visualstudio.microsoft.com/license-terms/>), and publishes no "
+            "source for them.",
+            "",
+        ]
+        if not ucrt:
+            out += [
+                "Windows 10 and later include the Universal C Runtime, which they also need, and keep it up to "
+                "date, so the app uses Windows' own and carries no copy.",
+                "",
+            ]
     out += [
         "## Windows installer",
         "",

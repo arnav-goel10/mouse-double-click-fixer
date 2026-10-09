@@ -81,6 +81,10 @@ Qt's libraries and plugins in this build contain code from others, each under it
 - libpsl's Public Suffix List lookup, in Qt Network: BSD-3-Clause, [libpsl's licence (BSD-3-Clause)](#libpsls-licence-bsd-3-clause). Copyright 2014-2016 The Chromium Authors. All rights reserved.
 - libdbus-1 headers, in Qt D-Bus: AFL-2.1, [Academic Free License, version 2.1](#academic-free-license-version-21). Copyright (C) 2002, 2003 CodeFactory AB; Copyright (C) 2004, 2005 Red Hat, Inc. Offered under AFL-2.1 or GPL-2.0-or-later, and used under AFL-2.1.
 
+### TLS in Qt Network
+
+The app's HTTPS connections go through Qt Network's OpenSSL backend, which uses the copy of OpenSSL that comes with Python (below); the build ships no other.
+
 ## Python
 
 The app runs on its own copy of Python 3.14.8, under [Python's licence (PSF License Agreement and history)](#pythons-licence-psf-license-agreement-and-history).
