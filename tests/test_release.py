@@ -522,6 +522,8 @@ class SignPathWorkflowTests(unittest.TestCase):
         check = step(self.windows, "Check what SignPath checks, and every signature")
         self.assertIn("SIGNED: ${{ steps.signpath.outputs.sign }}", check)
         self.assertIn('if ($env:SIGNED -eq "true" -and $signature.Status -ne "Valid") { throw', check)
+        # Inno Setup pads the installer's product name and version with spaces.
+        self.assertIn("if ($info.ProductName.Trim() -ne $name -or $info.ProductVersion.Trim() -ne $version) {", check)
         self.assertNotIn(SIGN_IF, check, "the metadata check runs on every build")
 
     def test_the_files_sent_for_signing_never_become_release_files(self) -> None:

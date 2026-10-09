@@ -210,8 +210,10 @@ jobs:
       - name: Check what SignPath checks, and every signature
         # SignPath refuses a file whose product name and version differ from
         # its artifact configuration's (tools/signpath/), so a build that
-        # would be refused fails here, signed or not. Then each program file
-        # in the downloads, with its signature: the Microsoft Store's EXE
+        # would be refused fails here, signed or not. Inno Setup writes the
+        # installer's into fixed-size fields padded with spaces, so they are
+        # compared trimmed and shown in quotes. Then each program file in the
+        # installed folder, with its signature: the Microsoft Store's EXE
         # route needs every one signed (docs/DISTRIBUTION.md).
         shell: pwsh
         env:
@@ -223,9 +225,9 @@ jobs:
           foreach ($file in $ours) {
             $info = (Get-Item $file).VersionInfo
             $signature = Get-AuthenticodeSignature $file
-            Write-Host "${file}: product '$($info.ProductName)' $($info.ProductVersion), signature $($signature.Status) $($signature.SignerCertificate.Subject)"
-            if ($info.ProductName -ne $name -or $info.ProductVersion -ne $version) {
-              throw "$file says it is '$($info.ProductName)' $($info.ProductVersion), not '$name' $version; SignPath would refuse to sign it"
+            Write-Host "${file}: product '$($info.ProductName)' '$($info.ProductVersion)', signature $($signature.Status) $($signature.SignerCertificate.Subject)"
+            if ($info.ProductName.Trim() -ne $name -or $info.ProductVersion.Trim() -ne $version) {
+              throw "$file says it is '$($info.ProductName)' '$($info.ProductVersion)', not '$name' '$version'; SignPath would refuse to sign it"
             }
             if ($env:SIGNED -eq "true" -and $signature.Status -ne "Valid") { throw "$file isn't validly signed: $($signature.StatusMessage)" }
           }

@@ -66,6 +66,23 @@ no draft goes up; re-run the job after approving.
 `tools/signpath/windows-installer.xml` are the two artifact configurations.
 `tests/test_release.py` checks that they match what the job uploads.
 
+Only a signed run can prove the following. Check them on the first one (see
+step 4 of [After acceptance](#after-acceptance)):
+
+- **The installer's padded version details.** Inno Setup writes the
+  installer's product name and version into fixed-size fields padded with
+  spaces ("Mouse Double-Click Fixer" followed by spaces). The workflow's
+  check compares them trimmed. If SignPath compares the raw text, it will
+  refuse the installer. Ask SignPath how its restrictions treat trailing
+  spaces before the first signed release.
+- **Which version SignPath compares.** Each file's text version is `1.0.0`;
+  its numeric version is 1.0.0.0. The configurations pass `1.0.0`.
+- **SignPath fetching the artifacts.** It reads them with the job's token,
+  which has `actions: read`.
+- **The signed portable exe.** The release run's install test runs the
+  signed installer and the installed exe. Nothing in the run starts the
+  signed portable exe, so start it once on Windows.
+
 ### Eligibility, against the [terms](https://signpath.org/terms)
 
 | Condition | This project |
