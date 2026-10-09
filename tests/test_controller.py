@@ -228,6 +228,17 @@ class ControllerStateTests(unittest.TestCase):
         self.assertEqual(len(FakeFilter.instances), 2)
         self.assertEqual(self.controller.failure, "")
 
+    def test_the_updater_saves_its_state_through_a_public_setter(self) -> None:
+        from app import settings
+
+        self.controller.store_update_state(auto_check=False, update_attempt_version="1.2.0", update_attempt_count=1)
+        saved = settings.load()
+        self.assertFalse(saved["auto_check"])
+        self.assertEqual((saved["update_attempt_version"], saved["update_attempt_count"]), ("1.2.0", 1))
+        with self.assertRaises(ValueError):
+            self.controller.store_update_state(fix_enabled=True)
+        self.assertFalse(settings.load()["fix_enabled"], "only the updater's own settings")
+
     def test_tap_check_defaults_to_alive(self) -> None:
         self.assertTrue(self.controller.tap_alive(), "no filter: nothing to check")
         self.controller.set_active(True)

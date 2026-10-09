@@ -17,6 +17,9 @@ from .platform import GlobalClickFilter, HookError, is_supported
 
 log = logging.getLogger(__name__)
 
+#: The settings the updater keeps, through store_update_state().
+UPDATE_STATE_KEYS = frozenset({"auto_check", "update_attempt_version", "update_attempt_count"})
+
 
 class AppController(QObject):
     """Owns the filter and the saved settings; everything else observes it."""
@@ -405,7 +408,16 @@ class AppController(QObject):
         self._store(tray_hint_shown=True)
 
     def set_auto_update(self, enabled: bool) -> None:
+        """Install updates without asking (the updater's auto_install)."""
         self._store(auto_update=bool(enabled))
+
+    def store_update_state(self, **values: object) -> None:
+        """Save the updater's own settings (UPDATE_STATE_KEYS) with all the
+        others, so the next save of anything else keeps them."""
+        unknown = sorted(set(values) - UPDATE_STATE_KEYS)
+        if unknown:
+            raise ValueError(f"Not an update setting: {', '.join(unknown)}")
+        self._store(**values)
 
     def set_last_update_check(self) -> None:
         import time
