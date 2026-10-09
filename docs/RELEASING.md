@@ -19,10 +19,12 @@ reaches users unsigned.
 ### The release environment
 
 The macOS code-signing certificate is kept in a GitHub environment called
-`release`, which only tags matching `v*.*.*` may use. The release workflow's
-macOS job loads it only for the push of a tag; a manual run never does.
-Create the environment, put the two secrets in it, and delete the
-repository-wide copies:
+`release`, which only tags matching `v*.*.*` may use. Once SignPath is set
+up, its API token and the three IDs go there too (see
+[Distribution](DISTRIBUTION.md#after-acceptance)). The release workflow's
+macOS and Windows jobs load the environment only for the push of a tag; a
+manual run never does. Create the environment, put the two macOS secrets in
+it, and delete the repository-wide copies:
 
 ```bash
 gh api -X PUT repos/arnav-goel10/mouse-double-click-fixer/environments/release \
@@ -121,11 +123,12 @@ when every one of its jobs passes:
 - **Windows build** refuses CI's update key (see
   [CI's update key](#cis-update-key)), builds the portable exe and the
   installed folder, which must ship the same third-party notices, checks
-  that neither carries CI's key, and builds the installer. Once SignPath is
-  set up, a tag's build has the executables, then the installer, signed
-  before they become release files, so the checksums and their signature
-  cover the signed files; each signing request waits for you to approve it
-  in SignPath (see [Distribution](DISTRIBUTION.md)).
+  that neither carries CI's key, runs the portable exe's self-test, and
+  builds the installer. Once SignPath is set up, a tag's build has the
+  executables, then the installer, signed before they become release files,
+  so the checksums and their signature cover the signed files; each signing
+  request waits for you to approve it in SignPath (see
+  [Distribution](DISTRIBUTION.md)).
 - **Windows install and upgrade, with the release's own installer** installs
   0.2.6 and 0.5.3, installs the new installer over each while it runs,
   checks that quitting works and an unsigned update is refused, and

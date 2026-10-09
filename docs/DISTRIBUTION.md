@@ -8,14 +8,18 @@ those steps is yours.
 
 | Channel | Ready in the repository | Blocked by | Your steps |
 | --- | --- | --- | --- |
-| Signed Windows downloads | `release.yml` signs through SignPath once it is set up; until then it builds unsigned, as before | SignPath Foundation accepting the project | [Apply](#the-application), then [set it up](#after-acceptance) |
+| Signed Windows downloads | `release.yml` signs through SignPath once it is set up; until then it builds unsigned, as before | SignPath Foundation accepting the project. For programs it requires a verifiable reputation, which this project doesn't have yet, so acceptance may wait on that ([Eligibility](#eligibility-against-the-terms)) | [Apply](#the-application), then [set it up](#after-acceptance) |
 | winget | `tools/winget_manifest.py` writes and checks the manifests | Nothing: a published release is enough. Signing isn't required | [Submit](#2-winget) the first version, then each new one |
-| Microsoft Store, existing installer (EXE) | The installer installs silently, from a versioned URL. The Python, Qt and Microsoft libraries inside are already signed by their publishers | Every program file must be signed by a trusted CA: our exe and the installer (SignPath), and Inno Setup's uninstaller, which SignPath can't reach as set up | [See the checklist](#route-a-the-existing-installer-exe) |
+| Microsoft Store, existing installer (EXE) | The installer installs silently, from a versioned URL. The Python, Qt and Microsoft libraries inside are already signed by their publishers | Every program file must be signed by a trusted CA: our exe and the installer (SignPath), and Inno Setup's uninstaller, which would take a third signing request per release. So this waits on SignPath's acceptance too | [See the checklist](#route-a-the-existing-installer-exe) |
 | Microsoft Store, MSIX | Nothing yet | Packaging work in the app (no blocker outside it) | [See route B](#route-b-msix) |
 
-A sensible order: apply to SignPath now, since its review takes the longest
-and the Store depends on it. Submit 1.0.0 to winget once it is published.
-Leave the Store for last.
+A sensible order: submit 1.0.0 to winget once it is published. winget
+needs no signature, and it checks the installer and its URLs, not how well
+known the project is. Apply to SignPath once the project can show that
+people other than you use it: reputation is the condition most likely to
+stop the application, and SignPath asks applicants not to argue its
+decisions ([Eligibility](#eligibility-against-the-terms)). The Store's EXE
+route waits on SignPath; its MSIX route waits only on work in the app.
 
 ## 1. Code signing with SignPath Foundation
 
@@ -41,11 +45,15 @@ The Windows job in `.github/workflows/release.yml`:
    `unsigned-windows-executables`. SignPath signs them under the artifact
    configuration `windows-executables`, and the job puts them back in
    place;
-4. compiles the installer around the signed executable. SignPath can't sign
+4. runs the portable exe's `--self-test`, signed or not, so a portable
+   build that can't start (and so could never update itself) never ships.
+   The installed exe's self-test runs in the install test, from the
+   installer;
+5. compiles the installer around the signed executable. SignPath can't sign
    files inside an Inno Setup installer, so the executables go first;
-5. uploads the installer as `unsigned-windows-installer`. SignPath signs it
+6. uploads the installer as `unsigned-windows-installer`. SignPath signs it
    under `windows-installer`, and the job puts it back;
-6. checks every build, signed or not, for the product name and version
+7. checks every build, signed or not, for the product name and version
    SignPath will enforce. When signing ran, it also checks that each of the
    three files carries a valid signature. It then lists every program file
    in the installed folder with its signature status.
@@ -63,9 +71,10 @@ approval. A request that is denied or times out fails the Windows job, so
 no draft goes up. Approving a request after its wait has ended does
 nothing: the job that would have collected the signed file has already
 failed. Re-run the failed jobs instead. The re-run submits two new requests,
-and you approve each within its 30 minutes. SignPath checks its build
-policies on at most 3 re-runs of a build and fails later ones, and a signing
-policy set to `disallow_reruns` refuses re-runs altogether
+and you approve each within its 30 minutes. SignPath evaluates build
+policies (GitHub-hosted runners only, say) for at most 3 re-runs of a build,
+and later re-runs fail while any such policy is active; a policy set to
+`disallow_reruns` refuses re-runs altogether
 ([SignPath with GitHub](https://docs.signpath.io/trusted-build-systems/github)).
 Past either, delete the tag and push it again, which starts a new run rather
 than a re-run.
@@ -87,17 +96,19 @@ step 4 of [After acceptance](#after-acceptance)):
   its numeric version is 1.0.0.0. The configurations pass `1.0.0`.
 - **SignPath fetching the artifacts.** It reads them with the job's token,
   which has `actions: read`.
-- **The signed portable exe.** The release run's install test runs the
-  signed installer and the installed exe. Nothing in the run starts the
-  signed portable exe, so start it once on Windows.
+
+The signed executables themselves need no check by hand: the run starts the
+signed portable exe's self-test, and its install test runs the signed
+installer and the installed exe's self-test.
 
 ### Eligibility, against the [terms](https://signpath.org/terms)
 
 | Condition | This project |
 | --- | --- |
-| OSI-approved licence, no commercial dual-licensing | MIT. The app bundles Qt through PySide6 (LGPL-3.0), which The Qt Company also sells under a commercial licence. The terms don't say whether that counts; mention it in the application |
+| **Reputation.** Under "Common misunderstandings" the terms say SignPath won't sign binaries built from code nobody knows, and that for programs people download and run on the strength of its signature, "we require a certain verifiable reputation" (libraries are exempt) | **Not yet, and the condition most likely to stop the application.** The repository was created on 2026-09-17. On 2026-10-10 it had 0 stars, 0 forks, no issues, and pull requests only from you and Dependabot. Its release files show 146 downloads in all, but 112 of them are of the 0.2.6 and 0.5.3 installers, which CI's install tests fetch on every run, and the rest look like one installed copy updating itself (a macOS update archive and a `SHA256SUMS.txt` per release). Nothing yet shows use by anyone else |
+| OSI-approved licence, no commercial dual-licensing | MIT. The app bundles Qt through PySide6 (LGPL-3.0), which The Qt Company also sells under a commercial licence. The terms don't say whether that counts; mention it in the application. SignPath's [project list](https://signpath.org/projects) includes Qt applications, Flameshot and Stellarium among them |
 | No malware or potentially unwanted programs | None. The app filters mouse input and never invents a click |
-| No proprietary components | Python, Qt/PySide6 and the other bundled packages are open source (`THIRD_PARTY_NOTICES-windows.md`) |
+| No proprietary components, though System Libraries (as section 1 of the GPL v3 defines them) may be included | Python, Qt/PySide6 and the other bundled packages are open source. The exception is Microsoft's Visual C++ runtime (`VCRUNTIME140.dll`, `VCRUNTIME140_1.dll` and the `MSVCP140*.dll` files), the runtime of the compiler Python and Qt are built with. It is proprietary, shipped unmodified as Microsoft's Distributable Code, and `THIRD_PARTY_NOTICES-windows.md` says so. Python's two copies are signed by Microsoft, and the copies inside PySide6 and shiboken6 by The Qt Company. It fits GPL v3 section 1's System Libraries, which come with a Major Component, and a Major Component includes "a compiler used to produce the work". Name it in the application |
 | Actively maintained, already released in the form to be signed | Releases since 0.2.0 (2026-09-19). Each ships `DoubleClickFixer-Setup.exe` and `DoubleClickFixer.exe` |
 | Functionality described on the download page | The README and every release page |
 | The signing team is the development team and owns the repository | One maintainer: Arnav Goel |
@@ -110,15 +121,37 @@ step 4 of [After acceptance](#after-acceptance)):
 | System changes announced; an uninstaller | Start at login is off unless chosen. The installer registers an uninstaller; the portable exe is one file to delete |
 | A "Code signing policy" on the home page | **To do once accepted:** add [the section below](#the-code-signing-policy-section) to the README and the release page |
 
-SignPath Foundation decides on each application and needn't accept any. The
-project is young (first release 2026-09-19); the terms set no minimum age
-or download count.
+SignPath Foundation decides on each application and needn't accept any.
+The terms put no number on reputation, and SignPath says it generally
+doesn't discuss its policy, so there is no threshold to aim for. What can
+show it:
+
+- people other than you using the app and saying so: issues, discussions,
+  stars and forks on the repository;
+- posts, reviews or forum answers elsewhere that recommend it;
+- a winget listing, which Microsoft's moderators reviewed and scanned
+  ([winget](#2-winget));
+- download counts, once CI's own are taken out. CI's install tests download
+  the 0.2.6 and 0.5.3 installers from their release pages on every run, so
+  the raw counts overstate use.
+
+Count again before applying:
+
+```bash
+repo=arnav-goel10/mouse-double-click-fixer
+gh api repos/$repo --jq '{created_at, stargazers_count, forks_count, open_issues_count}'
+gh api repos/$repo/releases --paginate \
+  --jq '.[] | select(.draft | not) | .tag_name as $tag | .assets[] | "\($tag) \(.name) \(.download_count)"'
+```
 
 ### The application
 
 Apply at <https://signpath.org/apply>. The form loads from HubSpot and
 couldn't be read in advance, so the text below covers what applications
-usually ask for. Paste the parts the form wants.
+usually ask for. Paste the parts the form wants. Fill in **Use so far** when
+you apply, with links to what the list under
+[Eligibility](#eligibility-against-the-terms) names; it answers the
+condition most likely to stop the application.
 
 > **Project:** Mouse Double-Click Fixer
 >
@@ -128,9 +161,19 @@ usually ask for. Paste the parts the form wants.
 > **Licence:** MIT (`LICENSE` in the repository). Bundled third-party
 > components are open source: CPython (PSF), Qt 6 via PySide6 (LGPL-3.0),
 > and others listed in `THIRD_PARTY_NOTICES-windows.md` on every release.
+> The one exception is Microsoft's Visual C++ runtime (`VCRUNTIME140*.dll`,
+> `MSVCP140*.dll`), the runtime of the compiler Python and Qt are built
+> with, shipped unmodified as Microsoft's redistributable and signed by
+> Microsoft or The Qt Company.
 >
 > **Downloads:** https://github.com/arnav-goel10/mouse-double-click-fixer/releases
 > (free; no account, no payment)
+>
+> **Use so far:** (fill in when applying: links that show people other than
+> the maintainer using it, such as their issues or discussions, posts that
+> recommend it, and the winget listing once merged,
+> `winget install ArnavGoel.MouseDoubleClickFixer`. Leave out release
+> download counts unless CI's own downloads are taken out.)
 >
 > **What it does:** a tray app for Windows 10 1809+/11 and macOS 13+ that
 > fixes mice whose worn switches send two clicks for one ("switch bounce"
@@ -262,17 +305,24 @@ provided by SignPath.io, certificate by SignPath Foundation. See the
 - **Upstream libraries.** The installed folder ships Python's, Qt's and
   Microsoft's DLLs and extension modules as their publishers built them,
   and SignPath's terms forbid signing them ourselves. They don't need it.
-  On the 0.5.3 build ([release run 37958775165](https://github.com/arnav-goel10/mouse-double-click-fixer/actions/runs/37958775165)),
-  the final check found 49 of the folder's 50 program files validly signed:
-  by the Python Software Foundation, The Qt Company and Microsoft. The 50th
-  is `DoubleClickFixer.exe`, which SignPath signs.
-- **The uninstaller.** Inno Setup writes `unins000.exe` at install time.
-  It is signed only when the installer is compiled with
-  `SignedUninstaller=yes` and a `SignTool` that the compiler runs itself,
-  while it compiles. The workflow's SignPath steps run outside the
-  compiler, so the uninstaller stays unsigned. Signing it would take a third
-  signing request made from inside the compile (with SignPath's PowerShell
-  module or REST API), and so a third approval per release.
+  The workflow's last check lists every program file in the installed
+  folder with its signer. A build of 2026-10-09 listed 49 of the 50 as
+  validly signed: 18 by the Python Software Foundation, 29 by The Qt Company
+  (its copies of the Visual C++ runtime among them) and 2 by Microsoft
+  (Python's copies of that runtime). The 50th is `DoubleClickFixer.exe`,
+  which SignPath signs.
+- **The uninstaller.** Inno Setup writes `unins000.exe` at install time,
+  unsigned unless the installer is compiled with `SignedUninstaller=yes`
+  ([help](https://jrsoftware.org/ishelp/topic_setup_signeduninstaller.htm)).
+  The compiler then either signs it on the fly with a `SignTool` it runs
+  itself, or embeds the signature of a copy signed beforehand and kept in
+  `SignedUninstallerDir`. That copy only fits while the uninstaller's
+  contents stay the same, and they change with the `VersionInfo`
+  directives: `installer/windows.iss` sets `VersionInfoVersion` to each
+  release's version, so every release needs a newly signed copy. Either way
+  that is a third signing request per release (for the copy: compile once
+  to write it, have SignPath sign it, compile again), and a third approval.
+  Neither is built.
 - **SmartScreen.** A signature lets reputation build up for the
   certificate, not separately for each file. It doesn't by itself stop the
   first-run warning.
@@ -358,7 +408,7 @@ Then submit it one of two ways:
 The first pull request asks you to accept Microsoft's Contributor License
 Agreement (the bot comments with the link). Validation then:
 
-- checks the URLs;
+- checks the URLs: reachable, HTTPS, and not flagged by SmartScreen;
 - downloads the installer and checks its hash;
 - scans it with several antivirus engines;
 - installs it silently as a standard user;
@@ -403,8 +453,8 @@ and the
 | A privacy policy URL. Policy 10.5.1 requires one when a product accesses, collects or transmits personal information, and always for Win32 products, which it counts among those that "inherently have access to Personal Information" | `https://github.com/arnav-goel10/mouse-double-click-fixer#privacy` |
 
 This route opens once SignPath signs releases and the uninstaller is
-signed too. That needs a third signing request from inside the installer's
-compile (see [What signing doesn't cover](#what-signing-doesnt-cover)).
+signed too. That needs a third signing request per release, for the
+uninstaller (see [What signing doesn't cover](#what-signing-doesnt-cover)).
 Alternatively, ask Microsoft whether an uninstaller written at install time
 counts among "all of its PE files". Neither is built.
 
@@ -458,8 +508,10 @@ unproven here. This is a separate project, not a release step.
 
 Checked on 2026-10-10.
 
-- SignPath Foundation terms: <https://signpath.org/terms>; application:
-  <https://signpath.org/apply>
+- SignPath Foundation terms (the reputation condition is under "Common
+  misunderstandings"): <https://signpath.org/terms>; application:
+  <https://signpath.org/apply>; projects it signs:
+  <https://signpath.org/projects>
 - SignPath GitHub action, `v3.0` = commit
   `f6d04783b4569d051e0c80105fe66e82819d0092` (2026-09-10), inputs in its
   `action.yml`: <https://github.com/SignPath/github-action-submit-signing-request>
@@ -490,6 +542,8 @@ Checked on 2026-10-10.
   package fields:
   <https://learn.microsoft.com/en-us/windows/apps/publish/publish-your-app/msi/upload-app-packages>
 - Inno Setup: exit codes
-  <https://jrsoftware.org/ishelp/topic_setupexitcodes.htm>; the version
+  <https://jrsoftware.org/ishelp/topic_setupexitcodes.htm>; signing the
+  uninstaller, `SignedUninstaller`:
+  <https://jrsoftware.org/ishelp/topic_setup_signeduninstaller.htm>; the version
   details' defaults, `VersionInfoProductName` and
   `VersionInfoProductTextVersion`, in the same help
