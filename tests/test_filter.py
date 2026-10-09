@@ -1159,6 +1159,32 @@ class CrossButtonOrderTests(unittest.TestCase):
         rig.filter._give_up_all()
         self.assertTrue(rig.handle(Button.RIGHT, True, 100.160, "rdown").accepted)
 
+    def test_giving_up_on_everything_sends_what_waits_in_the_order_it_came(self) -> None:
+        # Each button has a press on its way. Motion waits behind the left
+        # one, then a right release and a left release that cannot be held
+        # wait behind their own button's press, in that order.
+        rig = Pipeline(self, buttons=(Button.LEFT, Button.RIGHT))
+        rig.round_trip = None
+        rig.handle(Button.LEFT, True, 100.000, "ldown1")
+        rig.handle(Button.RIGHT, True, 100.020, "rdown1")
+        rig.handle(Button.LEFT, False, 100.050, "lup1")
+        rig.handle(Button.RIGHT, False, 100.070, "rup1")
+        self.assertTrue(rig.handle(Button.LEFT, True, 100.100, "ldown2").deferred)
+        come_back(rig.filter, Button.LEFT)                            # lup1 back, ldown2 on its way
+        self.assertTrue(rig.handle(Button.RIGHT, True, 100.120, "rdown2").deferred)
+        come_back(rig.filter, Button.RIGHT)                           # rup1 back, rdown2 on its way
+        self.assertFalse(rig.move(100.130, "m", (0, 0)))
+        rup2 = rig.filter._handle(Button.RIGHT, False, 100.140, "rup2", allow_hold=False, location=(0, 0))
+        lup2 = rig.filter._handle(Button.LEFT, False, 100.150, "lup2", allow_hold=False, location=(0, 0))
+        self.assertTrue(rup2.deferred and lup2.deferred)
+        sent = len(rig.sent)
+        rig.filter._give_up_all()                                     # as when macOS re-arms its tap
+        self.assertEqual(rig.sent[sent:], [
+            (Button.LEFT, None, "m"),
+            (Button.RIGHT, False, "rup2"),
+            (Button.LEFT, False, "lup2"),
+        ])
+
     def test_a_press_follows_another_buttons_release_waiting_behind_its_press(self) -> None:
         # rup2 waits behind rdown2, a press on its way: no right release is
         # on its way, but one happened before ldown and has not reached apps.
