@@ -157,11 +157,13 @@ begin
     // found from the folder PowerShell starts in, so no path is ever
     // quoted into the command. It uses cmdlets only, no .NET methods: where
     // application control puts PowerShell in Constrained Language Mode, a
-    // method call fails. It switches itself to that mode first, so every
-    // machine (and the end-to-end test) runs it the way those do.
-    // Wait-Process fails both when time is up and when the copy is already
-    // gone; which one it was is told by whether the copy is still there.
+    // method call fails. It switches itself to that mode first (and won't
+    // run in any other), so every machine, and the end-to-end test, runs it
+    // the way those do. Wait-Process fails both when time is up and when the
+    // copy is already gone; which one it was is told by whether the copy is
+    // still there.
     Script := 'try { $ExecutionContext.SessionState.LanguageMode = ''ConstrainedLanguage'' } catch { }; ' +
+      'if ($ExecutionContext.SessionState.LanguageMode -ne ''ConstrainedLanguage'') { exit 5 }; ' +
       '$ErrorActionPreference = ''Stop''; ' +
       'try { $p = Start-Process -FilePath (Join-Path -Path (Get-Location).ProviderPath -ChildPath ''' +
       ExtractFileName(Exe) + ''') -ArgumentList ''--quit'' -WindowStyle Hidden -PassThru } catch { exit 4 }; ' +
@@ -177,6 +179,8 @@ begin
       Log('Quit: --quit finished')
     else if ResultCode = 3 then
       Log(Format('Quit: --quit did not finish within %d s; stopped it', [QuitWaitSeconds]))
+    else if ResultCode = 5 then
+      Log('Quit: --quit wasn''t run: PowerShell didn''t take Constrained Language Mode')
     else
       Log(Format('Quit: --quit couldn''t be run (PowerShell exit code %d)', [ResultCode]));
     Sleep(800);
