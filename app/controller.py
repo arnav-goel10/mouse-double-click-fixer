@@ -52,6 +52,9 @@ class AppController(QObject):
                     pass
         self._filter: Optional[GlobalClickFilter] = None
         self._suspended = False
+        # Set at quit. Nothing may start a hook after that: the window still
+        # hears hide events, and AppKit notifications, as the app goes down.
+        self._shut_down = False
         # Why the filter isn't running although the user has it on: a short
         # line for the menus, and the full message for the window.
         self.failure = ""
@@ -117,6 +120,8 @@ class AppController(QObject):
             return False
         if self.active:
             return True
+        if self._shut_down:
+            return False
         # Turning the filter on (from the menu bar, say) ends a pause.
         self._suspended = False
         self._stop_filter()  # release a filter whose hook thread died
@@ -233,7 +238,9 @@ class AppController(QObject):
             return "Paused for calibration"
         if self.waiting_for_permission:
             return f"Waiting for {permissions.pane_name()} permission"
-        if self.failure and self.settings["fix_enabled"]:
+        if self.failure:
+            # Kept until the filter starts or the user turns it off, so a
+            # failure with the window closed is still explained.
             return self.failure
         return "Off"
 
@@ -256,6 +263,7 @@ class AppController(QObject):
         return self._suspended
 
     def shutdown(self) -> None:
+        self._shut_down = True
         self._stop_filter()
         self.flush_stats()
 

@@ -85,6 +85,15 @@ class ControllerStateTests(unittest.TestCase):
         self.assertEqual(self.controller.status_text(), "Couldn't start the filter")
         self.assertIn("refused", self.controller.failure_detail)
 
+    def test_a_failed_turn_on_from_the_menu_is_explained(self) -> None:
+        # The window is closed, so no dialog: the status line has to say it.
+        FakeFilter.fail_with = "busy"
+        self.controller.set_active(True)
+        self.assertFalse(self.controller.settings["fix_enabled"], "never got as far as on")
+        self.assertEqual(self.controller.status_text(), "Couldn't start the filter")
+        self.controller.set_active(False)
+        self.assertEqual(self.controller.status_text(), "Off")
+
     def test_a_good_start_clears_the_failure(self) -> None:
         self.controller._store(fix_enabled=True)
         FakeFilter.fail_with = "busy"
@@ -142,6 +151,18 @@ class ControllerStateTests(unittest.TestCase):
         self.assertEqual(self.controller.tooltip_text(), "DoubleClick Fixer: paused for calibration")
         self.controller.resume()
         self.assertEqual(self.controller.tooltip_text(), f"DoubleClick Fixer: on, {self.controller.threshold_ms} ms")
+
+    def test_nothing_starts_a_hook_after_quitting(self) -> None:
+        # Quitting mid-calibration: the window's hide event resumes the
+        # pause as the app goes down, and must not start a new hook.
+        self.controller.set_active(True)
+        self.controller.suspend()
+        self.controller.shutdown()
+        self.controller.resume()
+        self.assertFalse(self.controller.active)
+        self.assertFalse(self.controller.set_active(True))
+        self.assertEqual(len(FakeFilter.instances), 1)
+        self.assertTrue(self.controller.settings["fix_enabled"], "still on at the next launch")
 
     def test_tap_check_defaults_to_alive(self) -> None:
         self.assertTrue(self.controller.tap_alive(), "no filter: nothing to check")

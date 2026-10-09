@@ -267,7 +267,7 @@ class FilterPage(Page):
             self.status_row.set_detail("Paused during calibration.")
         elif waiting_for_permission:
             self.status_row.set_detail(f"Waiting for {permissions.pane_name()} permission.")
-        elif controller.failure and not controller.active and controller.settings["fix_enabled"]:
+        elif controller.failure and not controller.active:
             # Kept here too: the failure may have happened while the window
             # was closed, with only the menu's status line to show it.
             self.status_row.set_detail(f"{controller.failure}. {controller.failure_detail}".strip())
@@ -493,6 +493,7 @@ class CalibratePage(Page):
         if self.phase == "intro":
             self._set_phase("single")
         elif self.phase == "single":
+            self._pair_button = None
             self._set_phase("double")
         elif self.phase == "double":
             self._finish()
