@@ -122,19 +122,24 @@ jobs:
         run: |
           # The app installs only signed updates. This build alone also trusts
           # a key made for this run, so the update leg can sign its stand-in
-          # release (tools/ci_update_key.py); release.yml refuses the key.
+          # release: with DCF_CI_UPDATE_KEY set, the spec freezes a start-up
+          # hook into it that names the key (tools/ci_update_key.py). The same
+          # holds when release.yml runs this job for a tag; release.yml's own
+          # builds refuse the variable and are checked for the hook.
           python tools/ci_update_key.py make "$env:RUNNER_TEMP\dcf-ci-key"
           $env:DCF_CI_UPDATE_KEY = "$env:RUNNER_TEMP\dcf-ci-key\dcf-ci-update-key.pub"
           .\installer\build_windows.ps1
           $version = (python -c "import app; print(app.__version__)")
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" "installer\windows.iss"
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed to build the installer" }
-      - name: The release guard finds CI's key in this build
+      - name: The release guard finds CI's key in each build
         shell: pwsh
         run: |
           $PSNativeCommandUseErrorActionPreference = $false
-          python tools/ci_update_key.py check dist\DoubleClickFixer.exe dist\onedir
-          if ($LASTEXITCODE -ne 1) { throw "the check release.yml runs missed CI's key in a build that carries it" }
+          foreach ($build in "dist\DoubleClickFixer.exe", "dist\onedir") {
+            python tools/ci_update_key.py check $build
+            if ($LASTEXITCODE -ne 1) { throw "the check release.yml runs missed CI's key in $build, which carries it" }
+          }
           exit 0
       - name: What the installed folder ships
         shell: pwsh
