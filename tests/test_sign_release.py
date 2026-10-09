@@ -134,12 +134,16 @@ class ReleaseFolderTests(unittest.TestCase):
     def sign(self, version="1.0.1", **options):
         return sign_folder(self.folder, version, self.secret, keys=self.keys, **options)
 
-    def test_a_signed_folder_verifies(self) -> None:
+    def test_a_signed_folder_is_what_the_app_accepts(self) -> None:
+        from app.updater import verified_claim
+
         claim = self.sign("v1.0.1")
         self.assertEqual(claim.comment(), "dcf 1.0.1")
         signature = (self.folder / SIGNATURE).read_bytes()
         self.assertIn(b"\ntrusted comment: dcf 1.0.1\n", signature)
-        self.assertEqual(verify((self.folder / CHECKSUMS).read_bytes(), signature, self.keys), "dcf 1.0.1")
+        with mock.patch("app.updater.__version__", "1.0.0"):
+            accepted = verified_claim((self.folder / CHECKSUMS).read_bytes(), signature, "1.0.1", self.keys)
+        self.assertEqual(accepted, claim)
         self.assertEqual(verify_release(self.folder, "1.0.1", self.keys), claim)
 
     def test_a_new_signing_identity_is_named_in_the_comment(self) -> None:

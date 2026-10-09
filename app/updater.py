@@ -1,12 +1,17 @@
 """Updates from GitHub Releases.
 
-The updater asks GitHub for the latest release, downloads the file for this
-platform, checks it against the release's SHA-256 list, and replaces the app:
+The updater asks GitHub for the latest release and downloads its
+SHA256SUMS.txt with that file's minisign signature. The signature must come
+from one of the release keys below, which the owner keeps offline, and its
+signed comment must name the release's version (app/update_signature.py has
+the format, tools/sign_release.py makes it). Only then is the file for this
+platform downloaded, checked against the signed checksums, and installed:
 
-* macOS: a zipped app bundle. It must carry a valid signature whose
+* macOS: a zipped app bundle. It must carry a valid code signature whose
   designated requirement matches the running app's. That is what macOS keys
   the Accessibility grant on, so an update that passes this check keeps the
-  permission, and a bundle signed by anyone else is refused.
+  permission. A release that moves to a new signing identity says so in its
+  signed comment. The bundle must also say it is the release's version.
 * Windows (installed): the Inno Setup installer, run silently; it upgrades in
   place and relaunches the app.
 * Windows (portable): the executable itself, swapped once the app has quit.
@@ -21,6 +26,7 @@ import hashlib
 import json
 import os
 import platform
+import plistlib
 import re
 import shutil
 import subprocess
@@ -34,6 +40,7 @@ from PySide6.QtCore import QObject, QTimer, QUrl, Signal
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 
 from . import __version__
+from .update_signature import PublicKey, ReleaseClaim, SignatureError, parse_claim, parse_public_key, verify
 
 REPOSITORY = "arnav-goel10/doubleclick-fixer"
 LATEST_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
@@ -44,6 +51,20 @@ MAC_ASSET = "DoubleClickFixer-macos.zip"
 WINDOWS_INSTALLER_ASSET = "DoubleClickFixer-Setup.exe"
 WINDOWS_PORTABLE_ASSET = "DoubleClickFixer.exe"
 CHECKSUM_ASSET = "SHA256SUMS.txt"
+SIGNATURE_ASSET = CHECKSUM_ASSET + ".minisig"
+
+#: The minisign public keys a release must be signed with (the same keys are
+#: in tools/keys/). The owner keeps the secret keys offline. The backup key is
+#: built in from the start, so a lost or retired primary key can be replaced
+#: without stranding every installed copy.
+RELEASE_KEYS = (
+    "RWR9XcCRL9bZ1OD22V5J6uVhJgblDA9o4UFwJBjMU6CtTyqCeWOC6jDf",  # primary, D4D9D62F91C05D7D
+    "RWTUZv3t2LmICpA6R0C6kmRCHkbU8DUvmw5kDkjIXZ1yJnUNuTXlEq7Z",  # backup, 0A88B9D8EDFD66D4
+)
+#: A throwaway public key that tests sign their stand-in releases with. Only a
+#: copy running from source reads it: a packaged app never takes a key from its
+#: environment, which whatever starts the app controls.
+TEST_KEY_ENV = "DCF_UPDATE_TEST_KEY"
 
 #: The Windows update scripts find the running app and the download through
 #: these. cmd reads a batch file in the OEM code page, which can't spell every
@@ -57,6 +78,8 @@ FIRST_CHECK_DELAY_MS = 20 * 1000
 #: connection ends in "Try Again" rather than a spinner that never stops.
 STALL_TIMEOUT_MS = 30 * 1000
 WORKDIR_PREFIX = "dcf-update-"
+
+UNSIGNED = "This update isn’t signed, so it wasn’t installed."
 
 
 # -- pure helpers (unit tested) ---------------------------------------------------
@@ -100,6 +123,8 @@ class Release:
     asset_name: str
     asset_url: str
     checksum_url: str
+    #: Empty when the release has no signature; installing it is refused.
+    signature_url: str = ""
 
 
 def installation_kind() -> str:
@@ -142,7 +167,39 @@ def release_from_json(data: dict, kind: str) -> Optional[Release]:
         asset_name=wanted,
         asset_url=str(assets[wanted]),
         checksum_url=str(assets[CHECKSUM_ASSET]),
+        signature_url=str(assets.get(SIGNATURE_ASSET) or ""),
     )
+
+
+def trusted_keys() -> list[PublicKey]:
+    """The release keys, plus the test key when running from source."""
+    keys = [parse_public_key(text) for text in RELEASE_KEYS]
+    test_key = os.environ.get(TEST_KEY_ENV, "")
+    if test_key and not getattr(sys, "frozen", False):
+        keys.append(parse_public_key(test_key))
+    return keys
+
+
+def verified_claim(
+    checksums: bytes, signature: bytes, version: str, keys: Optional[list[PublicKey]] = None
+) -> ReleaseClaim:
+    """What a release's signature says, once it checks out.
+
+    The signature must be one of the release keys' over exactly these
+    checksums, and its trusted comment must name this release's version, so a
+    signed older release can't be passed off under a newer tag. Raises
+    UpdateError with the message to show.
+    """
+    try:
+        comment = verify(checksums, signature, trusted_keys() if keys is None else keys)
+    except SignatureError as error:
+        raise UpdateError("This update’s signature isn’t valid, so it wasn’t installed.") from error
+    claim = parse_claim(comment)
+    if claim is None or claim.version != version:
+        raise UpdateError("This update’s signature is for another version, so it wasn’t installed.")
+    if not is_newer(claim.version, __version__):
+        raise UpdateError("This update isn’t newer than the installed version, so it wasn’t installed.")
+    return claim
 
 
 def bundle_path() -> Optional[Path]:
@@ -152,6 +209,14 @@ def bundle_path() -> Optional[Path]:
         if parent.suffix == ".app":
             return parent
     return None
+
+
+def bundle_version(app: Path) -> str:
+    try:
+        with open(app / "Contents" / "Info.plist", "rb") as handle:
+            return str(plistlib.load(handle).get("CFBundleShortVersionString", ""))
+    except (OSError, ValueError):  # plistlib.InvalidFileException is a ValueError
+        return ""
 
 
 def designated_requirement(app: Path) -> str:
@@ -176,6 +241,20 @@ def requirement_is_stable(requirement: str) -> bool:
     """Ad-hoc signatures pin a hash of the files ("cdhash"), which changes with
     every build; only a certificate-based requirement survives an update."""
     return bool(requirement) and "certificate" in requirement and "cdhash" not in requirement
+
+
+def requirement_accepted(installed: str, incoming: str, signed: str) -> bool:
+    """May an app whose designated requirement is `incoming` replace one whose
+    requirement is `installed`?
+
+    It has to stay the same to keep the Accessibility grant, unless the
+    release's signed comment names the new requirement (`signed`): that is how
+    a release moves to a new signing identity. The new one must still be
+    certificate-based, or the check would be off for every later update.
+    """
+    if not requirement_is_stable(installed) or incoming == installed:
+        return True
+    return incoming == signed and requirement_is_stable(incoming)
 
 
 def mac_swap_script(
@@ -281,6 +360,9 @@ class Updater(QObject):
         # A verified download waiting for a good moment to restart the app.
         self._ready_file: Optional[Path] = None
         self._unattended = False
+        # From the verified checksums and signature of the update in progress.
+        self._checksums: dict[str, str] = {}
+        self._claim: Optional[ReleaseClaim] = None
         self._timer = QTimer(self)
         self._timer.setInterval(CHECK_INTERVAL_MS)
         self._timer.timeout.connect(lambda: self.check(user_initiated=False))
@@ -320,8 +402,12 @@ class Updater(QObject):
             return
         if self.release is None or self.state in (self.DOWNLOADING, self.INSTALLING):
             return
+        if not self.release.signature_url:
+            self._set(self.FAILED, UNSIGNED)
+            return
         self._unattended = unattended
         self._workdir = Path(tempfile.mkdtemp(prefix=WORKDIR_PREFIX))
+        self._claim = None
         self._set(self.DOWNLOADING, "")
         self._download(self.release.checksum_url, self._workdir / CHECKSUM_ASSET, self._on_checksums)
 
@@ -402,7 +488,7 @@ class Updater(QObject):
             write(bytes(reply.readAll()))
 
         def on_progress(received: int, total: int) -> None:
-            if total > 0 and target.name != CHECKSUM_ASSET:
+            if total > 0 and target.name not in (CHECKSUM_ASSET, SIGNATURE_ASSET):
                 self.progress = received / total
                 self.changed.emit()
 
@@ -427,15 +513,29 @@ class Updater(QObject):
         reply.downloadProgress.connect(on_progress)
         reply.finished.connect(on_finished)
 
-    def _on_checksums(self, path: Path) -> None:
-        try:
-            self._checksums = parse_checksums(path.read_text(encoding="utf-8", errors="replace"))
-        except OSError:
-            self._fail("Couldn’t read the update’s checksums.")
-            return
+    def _on_checksums(self, _path: Path) -> None:
         if self.release is None or self._workdir is None:
             self._fail("The update was cancelled.")
             return
+        self._download(self.release.signature_url, self._workdir / SIGNATURE_ASSET, self._on_signature)
+
+    def _on_signature(self, path: Path) -> None:
+        if self.release is None or self._workdir is None:
+            self._fail("The update was cancelled.")
+            return
+        try:
+            checksums = (self._workdir / CHECKSUM_ASSET).read_bytes()
+            signature = path.read_bytes()
+        except OSError:
+            self._fail("Couldn’t read the update’s checksums.")
+            return
+        try:
+            self._claim = verified_claim(checksums, signature, self.release.version)
+        except UpdateError as error:
+            self._fail(str(error))
+            return
+        # The hash comes from the exact bytes the signature covers.
+        self._checksums = parse_checksums(checksums.decode("utf-8", errors="replace"))
         self._download(self.release.asset_url, self._workdir / self.release.asset_name, self._on_asset)
 
     def _on_asset(self, path: Path) -> None:
@@ -496,9 +596,12 @@ class Updater(QObject):
         new_app = candidates[0]
         if not signature_is_valid(new_app):
             raise UpdateError("The update isn’t signed correctly, so it wasn’t installed.")
+        assert self.release is not None
+        if bundle_version(new_app) != self.release.version:
+            raise UpdateError("The update isn’t the version it claims to be, so it wasn’t installed.")
         installed = designated_requirement(current)
         incoming = designated_requirement(new_app)
-        if requirement_is_stable(installed) and incoming != installed:
+        if not requirement_accepted(installed, incoming, self._claim.requirement if self._claim else ""):
             raise UpdateError("The update is signed by someone else, so it wasn’t installed.")
 
         # Stage beside the current app, so the final move is a rename on the
