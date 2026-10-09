@@ -1,12 +1,17 @@
 """Updates from GitHub Releases.
 
-The updater asks GitHub for the latest release, downloads the file for this
-platform, checks it against the release's SHA-256 list, and replaces the app:
+The updater asks GitHub for the latest release and downloads its
+SHA256SUMS.txt with that file's minisign signature. The signature must come
+from one of the release keys below, which the owner keeps offline, and its
+signed comment must name the release's version (app/update_signature.py has
+the format, tools/sign_release.py makes it). Only then is the file for this
+platform downloaded, checked against the signed checksums, and installed:
 
-* macOS: a zipped app bundle. It must carry a valid signature whose
+* macOS: a zipped app bundle. It must carry a valid code signature whose
   designated requirement matches the running app's. That is what macOS keys
   the Accessibility grant on, so an update that passes this check keeps the
-  permission, and a bundle signed by anyone else is refused.
+  permission. A release that moves to a new signing identity says so in its
+  signed comment. The bundle must also say it is the release's version.
 * Windows (installed): the Inno Setup installer, run silently; it upgrades in
   place and relaunches the app.
 * Windows (portable): the executable itself, swapped once the app has quit.
@@ -21,6 +26,7 @@ import hashlib
 import json
 import os
 import platform
+import plistlib
 import re
 import shutil
 import subprocess
@@ -34,6 +40,7 @@ from PySide6.QtCore import QObject, QTimer, QUrl, Signal
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 
 from . import __version__
+from .update_signature import PublicKey, ReleaseClaim, SignatureError, parse_claim, parse_public_key, verify
 
 REPOSITORY = "arnav-goel10/doubleclick-fixer"
 LATEST_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
@@ -44,6 +51,26 @@ MAC_ASSET = "DoubleClickFixer-macos.zip"
 WINDOWS_INSTALLER_ASSET = "DoubleClickFixer-Setup.exe"
 WINDOWS_PORTABLE_ASSET = "DoubleClickFixer.exe"
 CHECKSUM_ASSET = "SHA256SUMS.txt"
+SIGNATURE_ASSET = CHECKSUM_ASSET + ".minisig"
+
+#: The minisign public keys a release must be signed with (the same keys are
+#: in tools/keys/). The owner keeps the secret keys offline. The backup key is
+#: built in from the start, so a lost or retired primary key can be replaced
+#: without stranding every installed copy.
+RELEASE_KEYS = (
+    "RWR9XcCRL9bZ1OD22V5J6uVhJgblDA9o4UFwJBjMU6CtTyqCeWOC6jDf",  # primary, D4D9D62F91C05D7D
+    "RWTUZv3t2LmICpA6R0C6kmRCHkbU8DUvmw5kDkjIXZ1yJnUNuTXlEq7Z",  # backup, 0A88B9D8EDFD66D4
+)
+#: A throwaway public key that tests sign their stand-in releases with. Only a
+#: copy running from source reads it: a packaged app never takes a key from its
+#: environment, which whatever starts the app controls.
+TEST_KEY_ENV = "DCF_UPDATE_TEST_KEY"
+
+#: The Windows update scripts find the running app and the download through
+#: these. cmd reads a batch file in the OEM code page, which can't spell every
+#: path, but expands variables from its Unicode environment intact.
+APP_ENV = "DCF_APP"
+SOURCE_ENV = "DCF_SRC"
 
 CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000
 FIRST_CHECK_DELAY_MS = 20 * 1000
@@ -51,6 +78,13 @@ FIRST_CHECK_DELAY_MS = 20 * 1000
 #: connection ends in "Try Again" rather than a spinner that never stops.
 STALL_TIMEOUT_MS = 30 * 1000
 WORKDIR_PREFIX = "dcf-update-"
+#: A version that failed to install this many times is no longer installed
+#: unattended, only when the user asks. Retrying it would quit the app again at
+#: every sign-in.
+GIVE_UP_AFTER = 2
+
+UNSIGNED = "This update isn’t signed, so it wasn’t installed."
+MOVE_TO_APPLICATIONS = "Move DoubleClick Fixer to Applications to update it."
 
 
 # -- pure helpers (unit tested) ---------------------------------------------------
@@ -94,6 +128,8 @@ class Release:
     asset_name: str
     asset_url: str
     checksum_url: str
+    #: Empty when the release has no signature; installing it is refused.
+    signature_url: str = ""
 
 
 def installation_kind() -> str:
@@ -136,7 +172,39 @@ def release_from_json(data: dict, kind: str) -> Optional[Release]:
         asset_name=wanted,
         asset_url=str(assets[wanted]),
         checksum_url=str(assets[CHECKSUM_ASSET]),
+        signature_url=str(assets.get(SIGNATURE_ASSET) or ""),
     )
+
+
+def trusted_keys() -> list[PublicKey]:
+    """The release keys, plus the test key when running from source."""
+    keys = [parse_public_key(text) for text in RELEASE_KEYS]
+    test_key = os.environ.get(TEST_KEY_ENV, "")
+    if test_key and not getattr(sys, "frozen", False):
+        keys.append(parse_public_key(test_key))
+    return keys
+
+
+def verified_claim(
+    checksums: bytes, signature: bytes, version: str, keys: Optional[list[PublicKey]] = None
+) -> ReleaseClaim:
+    """What a release's signature says, once it checks out.
+
+    The signature must be one of the release keys' over exactly these
+    checksums, and its trusted comment must name this release's version, so a
+    signed older release can't be passed off under a newer tag. Raises
+    UpdateError with the message to show.
+    """
+    try:
+        comment = verify(checksums, signature, trusted_keys() if keys is None else keys)
+    except SignatureError as error:
+        raise UpdateError("This update’s signature isn’t valid, so it wasn’t installed.") from error
+    claim = parse_claim(comment)
+    if claim is None or claim.version != version:
+        raise UpdateError("This update’s signature is for another version, so it wasn’t installed.")
+    if not is_newer(claim.version, __version__):
+        raise UpdateError("This update isn’t newer than the installed version, so it wasn’t installed.")
+    return claim
 
 
 def bundle_path() -> Optional[Path]:
@@ -146,6 +214,45 @@ def bundle_path() -> Optional[Path]:
         if parent.suffix == ".app":
             return parent
     return None
+
+
+def install_location_problem(kind: str) -> str:
+    """Why this copy can't replace itself, or "" when it can.
+
+    Checked before anything is downloaded, so a copy that can never update
+    says so at once instead of downloading the update every few hours.
+    """
+    if kind == "mac":
+        bundle = bundle_path()
+        if bundle is None:
+            return "Couldn’t find the installed app."
+        # The swap renames the bundle inside its folder. A copy opened from the
+        # disk image, or translocated by Gatekeeper, is on a read-only volume,
+        # which access() reports too.
+        if os.access(bundle.parent, os.W_OK):
+            return ""
+        if bundle.parent in (Path("/Applications"), Path.home() / "Applications"):
+            return "Your account can’t change apps in Applications. Ask an administrator to update it."
+        return MOVE_TO_APPLICATIONS
+    if kind in ("windows-installed", "windows-portable"):
+        folder = Path(sys.executable).parent
+        # On Windows access() reads only the read-only attribute, not the
+        # folder's permissions, so try writing a file there.
+        probe = folder / f".{WORKDIR_PREFIX}probe"
+        try:
+            probe.write_bytes(b"")
+            probe.unlink()
+        except OSError:
+            return f"No permission to replace the app in {folder}."
+    return ""
+
+
+def bundle_version(app: Path) -> str:
+    try:
+        with open(app / "Contents" / "Info.plist", "rb") as handle:
+            return str(plistlib.load(handle).get("CFBundleShortVersionString", ""))
+    except (OSError, ValueError):  # plistlib.InvalidFileException is a ValueError
+        return ""
 
 
 def designated_requirement(app: Path) -> str:
@@ -170,6 +277,20 @@ def requirement_is_stable(requirement: str) -> bool:
     """Ad-hoc signatures pin a hash of the files ("cdhash"), which changes with
     every build; only a certificate-based requirement survives an update."""
     return bool(requirement) and "certificate" in requirement and "cdhash" not in requirement
+
+
+def requirement_accepted(installed: str, incoming: str, signed: str) -> bool:
+    """May an app whose designated requirement is `incoming` replace one whose
+    requirement is `installed`?
+
+    It has to stay the same to keep the Accessibility grant, unless the
+    release's signed comment names the new requirement (`signed`): that is how
+    a release moves to a new signing identity. The new one must still be
+    certificate-based, or the check would be off for every later update.
+    """
+    if not requirement_is_stable(installed) or incoming == installed:
+        return True
+    return incoming == signed and requirement_is_stable(incoming)
 
 
 def mac_swap_script(
@@ -208,15 +329,15 @@ xattr -dr com.apple.quarantine {quoted(current)} 2>/dev/null
 """
 
 
-def windows_portable_script(pid: int, current: Path, downloaded: Path, relaunch_args: list[str]) -> str:
-    """Swap the portable executable once the app has quit, then reopen it.
+def windows_portable_script(pid: int, relaunch_args: list[str]) -> str:
+    """Swap the portable executable (%DCF_APP%) for the download (%DCF_SRC%)
+    once the app has quit, then reopen it.
 
     The move is retried: in a one-file build the launcher process holds the
     executable for a moment after the app itself has exited. `ping` is the
     delay because `timeout` refuses to run without a console. After 30 failed
     tries the old copy is reopened rather than leaving the user with nothing.
     """
-    batch = lambda value: str(value).replace("%", "%%")  # noqa: E731
     args = " ".join(relaunch_args)
     return f"""@echo off
 setlocal
@@ -224,27 +345,26 @@ set tries=0
 :wait
 tasklist /FI "PID eq {pid}" 2>nul | find "{pid}" >nul && (ping -n 2 127.0.0.1 >nul & goto wait)
 :move
-move /Y "{batch(downloaded)}" "{batch(current)}" >nul 2>&1 && goto done
+move /Y "%{SOURCE_ENV}%" "%{APP_ENV}%" >nul 2>&1 && goto done
 set /a tries+=1
 if %tries% GEQ 30 goto done
 ping -n 2 127.0.0.1 >nul
 goto move
 :done
-start "" "{batch(current)}" {args}
+start "" "%{APP_ENV}%" {args}
 del "%~f0"
 """
 
 
-def windows_installer_script(installer: Path, current: Path, relaunch: str, relaunch_args: list[str]) -> str:
-    """Run the installer silently; if it fails, reopen the copy that was
-    running, so a failed update never leaves the user without the app. On
-    success the installer relaunches the new copy itself."""
-    batch = lambda value: str(value).replace("%", "%%")  # noqa: E731
+def windows_installer_script(relaunch: str, relaunch_args: list[str]) -> str:
+    """Run the installer (%DCF_SRC%) silently; if it fails, reopen the copy
+    that was running (%DCF_APP%), so a failed update never leaves the user
+    without the app. On success the installer relaunches the new copy itself."""
     flags = f"/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS {relaunch}"
     return f"""@echo off
 setlocal
-"{batch(installer)}" {flags}
-if errorlevel 1 start "" "{batch(current)}" {" ".join(relaunch_args)}
+"%{SOURCE_ENV}%" {flags}
+if errorlevel 1 start "" "%{APP_ENV}%" {" ".join(relaunch_args)}
 del "%~f0"
 """
 
@@ -276,6 +396,9 @@ class Updater(QObject):
         # A verified download waiting for a good moment to restart the app.
         self._ready_file: Optional[Path] = None
         self._unattended = False
+        # From the verified checksums and signature of the update in progress.
+        self._checksums: dict[str, str] = {}
+        self._claim: Optional[ReleaseClaim] = None
         self._timer = QTimer(self)
         self._timer.setInterval(CHECK_INTERVAL_MS)
         self._timer.timeout.connect(lambda: self.check(user_initiated=False))
@@ -284,6 +407,31 @@ class Updater(QObject):
     @property
     def supported(self) -> bool:
         return self.kind != "source" or bool(os.environ.get(URL_OVERRIDE_ENV))
+
+    @property
+    def auto_check(self) -> bool:
+        """Look for updates in the background."""
+        return bool(self.controller.settings.get("auto_check", True))
+
+    @property
+    def auto_install(self) -> bool:
+        """Install what a background check finds without asking. It has no
+        effect while `auto_check` is off, since only background checks install
+        on their own."""
+        return bool(self.controller.settings.get("auto_update", True))
+
+    def set_auto_check(self, enabled: bool) -> None:
+        self._remember(auto_check=bool(enabled))
+        self.changed.emit()
+
+    def set_auto_install(self, enabled: bool) -> None:
+        self.controller.set_auto_update(bool(enabled))
+        if not enabled and self.state == self.READY:
+            # It was going to install when the window closed; now it waits to
+            # be asked, and the window says so.
+            self._discard_download()
+        else:
+            self.changed.emit()
 
     def start(self) -> None:
         """Begin the background schedule."""
@@ -294,9 +442,11 @@ class Updater(QObject):
         self._timer.start()
 
     def check(self, user_initiated: bool = True) -> None:
-        if not self.supported or self.state in (self.CHECKING, self.DOWNLOADING, self.INSTALLING):
+        # While READY a verified download is waiting for the window to close;
+        # checking again would only download the same update a second time.
+        if not self.supported or self.state in (self.CHECKING, self.DOWNLOADING, self.READY, self.INSTALLING):
             return
-        if not user_initiated and not self.controller.settings.get("auto_update", True):
+        if not user_initiated and not self.auto_check:
             return
         self._set(self.CHECKING, "")
         request = QNetworkRequest(QUrl(os.environ.get(URL_OVERRIDE_ENV) or LATEST_URL))
@@ -315,8 +465,14 @@ class Updater(QObject):
             return
         if self.release is None or self.state in (self.DOWNLOADING, self.INSTALLING):
             return
+        problem = UNSIGNED if not self.release.signature_url else install_location_problem(self.kind)
+        if problem:
+            self._set(self.FAILED, problem)
+            return
         self._unattended = unattended
+        self._remove_workdir()
         self._workdir = Path(tempfile.mkdtemp(prefix=WORKDIR_PREFIX))
+        self._claim = None
         self._set(self.DOWNLOADING, "")
         self._download(self.release.checksum_url, self._workdir / CHECKSUM_ASSET, self._on_checksums)
 
@@ -349,12 +505,14 @@ class Updater(QObject):
             return
         self.release = release
         self._set(self.AVAILABLE, "")
-        if not user_initiated and self.controller.settings.get("auto_update", True):
+        if not user_initiated and self.auto_install and self._attempts(release.version) < GIVE_UP_AFTER:
             self.install(unattended=True)
 
     def note_relaunch(self, result: str) -> None:
         """Say how the update that just restarted the app went."""
         if result == "updated":
+            if self.controller.settings.get("update_attempt_version"):
+                self._remember(update_attempt_version="", update_attempt_count=0)
             self._set(self.CURRENT, f"Updated to {__version__}")
         elif result == "failed":
             self._set(self.FAILED, "The update didn’t install. Try again.")
@@ -362,8 +520,12 @@ class Updater(QObject):
     def apply_if_ready(self) -> None:
         """A good moment to restart (the window was closed): finish a
         background update that was waiting."""
-        if self.state == self.READY and self._unattended and not self.controller.suspended:
-            self._apply(self._ready_file)
+        if self.state != self.READY or not self._unattended or self.controller.suspended:
+            return
+        if not self.auto_install:
+            self._discard_download()
+            return
+        self._apply(self._ready_file)
 
     def _download(self, url: str, target: Path, done) -> None:
         request = QNetworkRequest(QUrl(url))
@@ -397,7 +559,7 @@ class Updater(QObject):
             write(bytes(reply.readAll()))
 
         def on_progress(received: int, total: int) -> None:
-            if total > 0 and target.name != CHECKSUM_ASSET:
+            if total > 0 and target.name not in (CHECKSUM_ASSET, SIGNATURE_ASSET):
                 self.progress = received / total
                 self.changed.emit()
 
@@ -422,15 +584,29 @@ class Updater(QObject):
         reply.downloadProgress.connect(on_progress)
         reply.finished.connect(on_finished)
 
-    def _on_checksums(self, path: Path) -> None:
-        try:
-            self._checksums = parse_checksums(path.read_text(encoding="utf-8", errors="replace"))
-        except OSError:
-            self._fail("Couldn’t read the update’s checksums.")
-            return
+    def _on_checksums(self, _path: Path) -> None:
         if self.release is None or self._workdir is None:
             self._fail("The update was cancelled.")
             return
+        self._download(self.release.signature_url, self._workdir / SIGNATURE_ASSET, self._on_signature)
+
+    def _on_signature(self, path: Path) -> None:
+        if self.release is None or self._workdir is None:
+            self._fail("The update was cancelled.")
+            return
+        try:
+            checksums = (self._workdir / CHECKSUM_ASSET).read_bytes()
+            signature = path.read_bytes()
+        except OSError:
+            self._fail("Couldn’t read the update’s checksums.")
+            return
+        try:
+            self._claim = verified_claim(checksums, signature, self.release.version)
+        except UpdateError as error:
+            self._fail(str(error))
+            return
+        # The hash comes from the exact bytes the signature covers.
+        self._checksums = parse_checksums(checksums.decode("utf-8", errors="replace"))
         self._download(self.release.asset_url, self._workdir / self.release.asset_name, self._on_asset)
 
     def _on_asset(self, path: Path) -> None:
@@ -438,6 +614,10 @@ class Updater(QObject):
         expected = self._checksums.get(self.release.asset_name)
         if not expected or sha256_of(path) != expected:
             self._fail("The download didn’t match its checksum, so it wasn’t installed.")
+            return
+        if self._unattended and not self.auto_install:
+            # Installing automatically was turned off while this downloaded.
+            self._discard_download()
             return
         if self._unattended and (self.window_visible() or self.controller.suspended):
             # Don't restart the app under someone using it; finish when the
@@ -452,6 +632,13 @@ class Updater(QObject):
             return
         self._ready_file = None
         self._set(self.INSTALLING, "")
+        # Counted before trying, so an attempt that never comes back (the app
+        # quits and the new copy doesn't start) counts too. A successful one
+        # changes the running version, after which the count no longer applies.
+        self._remember(
+            update_attempt_version=self.release.version,
+            update_attempt_count=self._attempts(self.release.version) + 1,
+        )
         try:
             if self.kind == "mac":
                 self._install_mac(path)
@@ -491,9 +678,12 @@ class Updater(QObject):
         new_app = candidates[0]
         if not signature_is_valid(new_app):
             raise UpdateError("The update isn’t signed correctly, so it wasn’t installed.")
+        assert self.release is not None
+        if bundle_version(new_app) != self.release.version:
+            raise UpdateError("The update isn’t the version it claims to be, so it wasn’t installed.")
         installed = designated_requirement(current)
         incoming = designated_requirement(new_app)
-        if requirement_is_stable(installed) and incoming != installed:
+        if not requirement_accepted(installed, incoming, self._claim.requirement if self._claim else ""):
             raise UpdateError("The update is signed by someone else, so it wasn’t installed.")
 
         # Stage beside the current app, so the final move is a rename on the
@@ -513,39 +703,52 @@ class Updater(QObject):
 
     def _install_windows_installer(self, installer: Path) -> None:
         relaunch = "/RELAUNCH=1" if self.window_visible() else "/RELAUNCH=2"
-        script = installer.parent / "apply-update.cmd"
-        script.write_text(
-            windows_installer_script(installer, Path(sys.executable), relaunch, self._relaunch_args()),
-            encoding="oem" if platform.system() == "Windows" else "utf-8",
-            errors="replace",
+        start_windows_script(
+            installer.parent / "apply-update.cmd",
+            windows_installer_script(relaunch, self._relaunch_args()),
+            app=Path(sys.executable),
+            source=installer,
         )
-        subprocess.Popen(["cmd", "/c", str(script)], creationflags=_detached_flags())
 
     def _install_windows_portable(self, downloaded: Path) -> None:
-        current = Path(sys.executable)
-        # Find out now, not after quitting, whether the file can be replaced.
-        probe = current.parent / f".{WORKDIR_PREFIX}probe"
-        try:
-            probe.write_bytes(b"")
-            probe.unlink()
-        except OSError as error:
-            raise UpdateError(f"No permission to replace the app in {current.parent}.") from error
-        script = downloaded.parent / "apply-update.cmd"
-        # cmd.exe reads batch files in the OEM code page, not the ANSI one
-        # Python writes by default; non-ASCII paths would otherwise break.
-        encoding = "oem" if platform.system() == "Windows" else "utf-8"
-        script.write_text(
-            windows_portable_script(os.getpid(), current, downloaded, self._relaunch_args()),
-            encoding=encoding,
-            errors="replace",
+        # install_location_problem() already found that the folder is writable.
+        start_windows_script(
+            downloaded.parent / "apply-update.cmd",
+            windows_portable_script(os.getpid(), self._relaunch_args()),
+            app=Path(sys.executable),
+            source=downloaded,
         )
-        subprocess.Popen(["cmd", "/c", str(script)], creationflags=_detached_flags())
 
     # -- state ------------------------------------------------------------------------
-    def _fail(self, message: str) -> None:
+    def _attempts(self, version: str) -> int:
+        """How many times installing `version` has been tried."""
+        settings = self.controller.settings
+        if settings.get("update_attempt_version") != version:
+            return 0
+        try:
+            return max(0, int(settings.get("update_attempt_count", 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    def _remember(self, **values: object) -> None:
+        # The updater's own settings are written by the controller with all the
+        # others, so they survive its next save.
+        self.controller._store(**values)
+
+    def _remove_workdir(self) -> None:
         if self._workdir is not None:
             shutil.rmtree(self._workdir, ignore_errors=True)
             self._workdir = None
+
+    def _discard_download(self) -> None:
+        """Drop a waiting download: the update stays available, to install
+        when the user asks."""
+        self._remove_workdir()
+        self._ready_file = None
+        self._set(self.AVAILABLE, "")
+
+    def _fail(self, message: str) -> None:
+        self._remove_workdir()
         self._set(self.FAILED, message)
 
     def _set(self, state: str, message: str) -> None:
@@ -558,6 +761,17 @@ class Updater(QObject):
 
 class UpdateError(RuntimeError):
     pass
+
+
+def start_windows_script(script: Path, text: str, app: Path, source: Path) -> None:
+    """Write an update script as plain ASCII and run it detached, handing it
+    the paths through its environment (see APP_ENV)."""
+    try:
+        script.write_text(text, encoding="ascii")
+    except (OSError, UnicodeError) as error:
+        raise UpdateError("Couldn’t prepare the update.") from error
+    environment = {**os.environ, APP_ENV: str(app), SOURCE_ENV: str(source)}
+    subprocess.Popen(["cmd", "/c", str(script)], env=environment, creationflags=_detached_flags())
 
 
 def _detached_flags() -> int:
