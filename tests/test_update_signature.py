@@ -1,6 +1,9 @@
 """Release signatures: Ed25519 (RFC 8032) and minisign's file format."""
 
+import hashlib
+import types
 import unittest
+from unittest import mock
 
 from app import update_signature as signatures
 from app.update_signature import (
@@ -171,6 +174,30 @@ class ReleaseClaimTests(unittest.TestCase):
         self.assertEqual(ReleaseClaim("1.0.1").comment(), "dcf 1.0.1")
         for wrong in ("", "dcf", "dcf ", "dcf 1.0.1 ", "dcf 1.0.1 dr=", "dcf 1.0.1 extra", "DCF 1.0.1"):
             self.assertIsNone(parse_claim(wrong), wrong)
+
+
+class SelfTestTests(unittest.TestCase):
+    """update_signature.self_test, which a packaged build runs before release."""
+
+    def test_passes_with_the_standard_library(self) -> None:
+        signatures.self_test()
+
+    def test_a_build_without_blake2b_fails_it(self) -> None:
+        # What a frozen build that lost hashlib's _blake2 module looks like.
+        without_blake2 = types.SimpleNamespace(sha512=hashlib.sha512)
+        with mock.patch.object(signatures, "hashlib", without_blake2), \
+                self.assertRaisesRegex(SignatureError, "can't be checked in this build.*blake2b"):
+            signatures.self_test()
+
+    def test_a_verifier_that_accepts_anything_fails_it(self) -> None:
+        with mock.patch.object(signatures, "ed25519_verify", return_value=True), \
+                self.assertRaisesRegex(SignatureError, "RFC 8032"):
+            signatures.self_test()
+        # A prehash that ignores the file would let any file through.
+        ignores_the_file = hashlib.blake2b(b"hello world\n").digest()
+        with mock.patch.object(signatures, "signed_payload", return_value=ignores_the_file), \
+                self.assertRaisesRegex(SignatureError, "changed file passed"):
+            signatures.self_test()
 
 
 if __name__ == "__main__":
