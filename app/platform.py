@@ -33,6 +33,10 @@ INJECTED_MARK = 0x44434658  # "DCFX"
 INJECTED_MOTION_MARKS = {INJECTED_MARK + 1 + index: button for index, button in enumerate(Button)}
 MOTION_MARK_FOR = {button: mark for mark, button in INJECTED_MOTION_MARKS.items()}
 
+#: Marks the pointer motion this app posts to put the pointer back after a
+#: re-sent release pulled it to where the button came up (see _run_macos).
+RESTORE_MARK = max(INJECTED_MOTION_MARKS) + 1
+
 #: A release this close to where apps saw its press counts as a click made in
 #: place (not the end of a drag). Motion that takes the pointer this far from
 #: where the button came up settles it; less is a hand resting on the mouse.
@@ -665,8 +669,36 @@ class GlobalClickFilter:
             if Quartz.CGEventGetType(template) in DRAGGED:
                 # By the time queued motion goes out, the button is up.
                 Quartz.CGEventSetType(template, Quartz.kCGEventMouseMoved)
+            positions = pointer_and_release(template) if pressed is False else None
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, template)
+            if positions is not None:
+                restore_pointer(*positions)
             return True
+
+        def pointer_and_release(template: object) -> Optional[tuple]:
+            # Where the hand has the pointer now, read before the release goes
+            # out, and where the button came up.
+            try:
+                return Quartz.CGEventGetLocation(Quartz.CGEventCreate(None)), Quartz.CGEventGetLocation(template)
+            except Exception:  # noqa: BLE001 - the release must go out regardless
+                return None
+
+        def restore_pointer(pointer: object, released_at: object) -> None:
+            # A release posted where the button came up takes the pointer
+            # there. After a drag let go while moving, the hand has carried
+            # the pointer on since, so put it back. The move is not tracked:
+            # the motion tap is usually off then and would never see it come
+            # back, which would hold the next click for IN_FLIGHT_TIMEOUT_S.
+            try:
+                if math.hypot(pointer.x - released_at.x, pointer.y - released_at.y) < STATIONARY_PX:
+                    return
+                move = Quartz.CGEventCreateMouseEvent(
+                    None, Quartz.kCGEventMouseMoved, pointer, Quartz.kCGMouseButtonLeft
+                )
+                Quartz.CGEventSetIntegerValueField(move, Quartz.kCGEventSourceUserData, RESTORE_MARK)
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, move)
+            except Exception:  # noqa: BLE001 - the release itself already went out
+                pass
 
         self._inject = inject
         click_counts = ClickCountRepair()
@@ -758,6 +790,8 @@ class GlobalClickFilter:
                     Quartz.CGEventTapEnable(motion_state["tap"], True)
                 return event
             mark = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventSourceUserData)
+            if mark == RESTORE_MARK:
+                return event  # puts the pointer back after a re-sent release
             if mark in INJECTED_MOTION_MARKS:
                 self._injected_passed(INJECTED_MOTION_MARKS[mark])
                 return event  # re-sent by this app; already decided

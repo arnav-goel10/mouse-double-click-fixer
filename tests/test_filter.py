@@ -1,12 +1,22 @@
 """Tests for the platform-facing filter that do not need a real mouse."""
 
 import platform
+import sys
+import threading
 import unittest
 from time import monotonic
+from types import SimpleNamespace
 from unittest import mock
 
 from app.core import Button, ClickEvent
-from app.platform import ClickCountRepair, GlobalClickFilter, HookError, is_supported
+from app.platform import (
+    INJECTED_MARK,
+    RESTORE_MARK,
+    ClickCountRepair,
+    GlobalClickFilter,
+    HookError,
+    is_supported,
+)
 
 
 class HandlerTests(unittest.TestCase):
@@ -709,6 +719,186 @@ class MacTimestampTests(unittest.TestCase):
         with mock.patch("app.platform._timebase_ratio", return_value=(1, 1)):
             to_seconds = _mach_timebase()
         self.assertEqual(to_seconds(self.ns(self.now - 0.5), self.now), self.now - 0.5)
+
+
+class FakeCGEvent:
+    """A CGEvent as the fake Quartz below hands it around."""
+
+    def __init__(self, kind: int, x: float = 0.0, y: float = 0.0, timestamp: int = 0, fields=None) -> None:
+        self.kind = kind
+        self.location = SimpleNamespace(x=float(x), y=float(y))
+        self.timestamp = timestamp
+        self.fields = dict(fields or {})
+
+    def copy(self) -> "FakeCGEvent":
+        return FakeCGEvent(self.kind, self.location.x, self.location.y, self.timestamp, self.fields)
+
+
+class FakeQuartz:
+    """Just enough of Quartz for GlobalClickFilter._run_macos. Taps keep their
+    callbacks so a test can feed them events; posted events are recorded,
+    never sent anywhere."""
+
+    kCGEventLeftMouseDown, kCGEventLeftMouseUp = 1, 2
+    kCGEventRightMouseDown, kCGEventRightMouseUp = 3, 4
+    kCGEventMouseMoved, kCGEventLeftMouseDragged, kCGEventRightMouseDragged = 5, 6, 7
+    kCGEventOtherMouseDown, kCGEventOtherMouseUp, kCGEventOtherMouseDragged = 25, 26, 27
+    kCGEventTapDisabledByTimeout, kCGEventTapDisabledByUserInput = 0xFFFFFFFE, 0xFFFFFFFF
+    kCGMouseEventClickState, kCGMouseEventButtonNumber = 1, 3
+    kCGEventSourceUserData, kCGEventSourceStateID = 42, 45
+    kCGEventSourceStateHIDSystemState = 1
+    kCGHIDEventTap = kCGHeadInsertEventTap = kCGEventTapOptionDefault = kCGMouseButtonLeft = 0
+    kCFRunLoopCommonModes, kCFRunLoopDefaultMode = "common", "default"
+
+    def __init__(self) -> None:
+        self.taps = []
+        self.posted = []
+        self.pointer = (0.0, 0.0)
+        self._wake = threading.Event()
+
+    def CGEventMaskBit(self, kind):
+        return 1 << kind
+
+    def CGEventTapCreate(self, where, place, options, mask, callback, refcon):
+        tap = SimpleNamespace(mask=mask, callback=callback, enabled=False, invalidated=False)
+        self.taps.append(tap)
+        return tap
+
+    def CGEventTapEnable(self, tap, enabled):
+        tap.enabled = bool(enabled)
+
+    def CGEventTapIsEnabled(self, tap):
+        return tap.enabled
+
+    def CFMachPortInvalidate(self, tap):
+        tap.invalidated = True
+
+    def CFMachPortCreateRunLoopSource(self, allocator, tap, order):
+        return ("source", id(tap))
+
+    def CFRunLoopGetCurrent(self):
+        return "run loop"
+
+    def CFRunLoopAddSource(self, loop, source, mode):
+        pass
+
+    def CFRunLoopRemoveSource(self, loop, source, mode):
+        pass
+
+    def CFRunLoopRunInMode(self, mode, seconds, return_after_source):
+        self._wake.wait(0.002)
+        self._wake.clear()
+
+    def CFRunLoopStop(self, loop):
+        self._wake.set()
+
+    def CGEventGetIntegerValueField(self, event, field):
+        return event.fields.get(field, 0)
+
+    def CGEventSetIntegerValueField(self, event, field, value):
+        event.fields[field] = value
+
+    def CGEventGetLocation(self, event):
+        return event.location
+
+    def CGEventGetTimestamp(self, event):
+        return event.timestamp
+
+    def CGEventCreateCopy(self, event):
+        return event.copy()
+
+    def CGEventGetType(self, event):
+        return event.kind
+
+    def CGEventSetType(self, event, kind):
+        event.kind = kind
+
+    def CGEventPost(self, where, event):
+        self.posted.append(event.copy())
+
+    def CGEventCreate(self, source):
+        return FakeCGEvent(0, *self.pointer)
+
+    def CGEventCreateMouseEvent(self, source, kind, point, button):
+        return FakeCGEvent(kind, point.x, point.y)
+
+
+class MacTapTests(unittest.TestCase):
+    """The macOS tap callbacks, run against a fake Quartz: no real tap is
+    installed and nothing is posted to the system."""
+
+    Q = FakeQuartz
+
+    def setUp(self) -> None:
+        self.quartz = FakeQuartz()
+        self.timers = FakeTimer.reset()
+        for patch in (
+            mock.patch.dict(sys.modules, {"Quartz": self.quartz}),
+            mock.patch("app.platform.platform.system", return_value="Darwin"),
+            mock.patch("app.platform.threading.Timer", FakeTimer),
+            mock.patch("app.platform._timebase_ratio", return_value=(125, 3)),
+            mock.patch("app.platform._double_click_interval", return_value=0.5),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.events = []
+        self.errors = []
+        self.filter = GlobalClickFilter(60, [Button.LEFT], on_event=self.events.append, on_error=self.errors.append)
+        self.filter.start()
+        self.addCleanup(self.filter.stop)  # runs before the patches are undone
+        self.main_tap, self.motion_tap = self.quartz.taps
+        # Event times, as offsets in seconds from here, always near now.
+        self.base = monotonic() - 0.5
+
+    def ticks(self, offset: float) -> int:
+        return round((self.base + offset) * 1e9 * 3 / 125)
+
+    def button(self, kind, at, offset, state=1, ns=False):
+        """Feed one hardware button event to the main tap."""
+        stamp = round((self.base + offset) * 1e9) if ns else self.ticks(offset)
+        event = FakeCGEvent(kind, *at, timestamp=stamp, fields={
+            self.Q.kCGEventSourceStateID: self.Q.kCGEventSourceStateHIDSystemState,
+            self.Q.kCGMouseEventClickState: state,
+        })
+        return self.main_tap.callback(None, kind, event, None)
+
+    def motion(self, at, mark=0):
+        event = FakeCGEvent(self.Q.kCGEventMouseMoved, *at, fields={self.Q.kCGEventSourceUserData: mark})
+        return self.motion_tap.callback(None, event.kind, event, None)
+
+    def pass_back(self, posted):
+        """A posted event comes back through the tap that watches its kind."""
+        tap = self.motion_tap if posted.kind == self.Q.kCGEventMouseMoved else self.main_tap
+        return tap.callback(None, posted.kind, posted, None)
+
+    def mark(self, event):
+        return event.fields.get(self.Q.kCGEventSourceUserData)
+
+    def test_a_drag_let_go_while_moving_puts_the_pointer_back(self) -> None:
+        self.assertIsNotNone(self.button(self.Q.kCGEventLeftMouseDown, (0, 0), 0.0))
+        self.assertIsNone(self.button(self.Q.kCGEventLeftMouseUp, (50, 0), 0.5), "held back")
+        self.quartz.pointer = (90.0, 0.0)  # the hand carried on
+        self.timers[-1].fire()
+        release, restore = self.quartz.posted
+        self.assertEqual((release.kind, release.location.x, self.mark(release)), (self.Q.kCGEventLeftMouseUp, 50, INJECTED_MARK))
+        self.assertEqual((restore.kind, restore.location.x, self.mark(restore)), (self.Q.kCGEventMouseMoved, 90, RESTORE_MARK))
+        self.assertIs(self.pass_back(release), release)
+        self.assertIs(self.pass_back(restore), restore, "the restore passes untouched")
+        self.assertEqual(self.filter._in_flight[Button.LEFT], 0, "the restore is not waited for")
+
+    def test_a_release_made_in_place_posts_no_restore(self) -> None:
+        self.button(self.Q.kCGEventLeftMouseDown, (10, 10), 0.0)
+        self.button(self.Q.kCGEventLeftMouseUp, (10, 10), 0.1)
+        self.quartz.pointer = (11.0, 10.0)
+        self.timers[-1].fire()
+        self.assertEqual([event.kind for event in self.quartz.posted], [self.Q.kCGEventLeftMouseUp])
+
+    def test_restore_motion_never_settles_a_held_release(self) -> None:
+        self.button(self.Q.kCGEventLeftMouseDown, (100, 100), 0.0)
+        self.button(self.Q.kCGEventLeftMouseUp, (100, 100), 0.1)
+        self.assertIsNotNone(self.motion((300, 100), mark=RESTORE_MARK))
+        self.assertEqual(self.quartz.posted, [])
+        self.assertTrue(self.filter._filters[Button.LEFT].holding_release)
 
 
 if __name__ == "__main__":
