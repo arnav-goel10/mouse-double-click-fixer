@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- The hardened runtime's one exception for this app. Its self-signed
+	     certificate has no Team ID, and library validation would then refuse
+	     the bundled Python and Qt libraries. Nothing else is needed: the
+	     self-test's callback checks pass without allow-jit or
+	     allow-unsigned-executable-memory (ctypes and PyObjC use the system
+	     libffi, which needs neither). Never add
+	     allow-dyld-environment-variables. -->
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+</dict>
+</plist>
