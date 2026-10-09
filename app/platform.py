@@ -9,6 +9,7 @@ bounce through.
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import platform
@@ -19,6 +20,8 @@ from typing import Callable, Iterable, Optional
 from dataclasses import replace
 
 from .core import BounceFilter, Button, ClickEvent, clamp_threshold
+
+log = logging.getLogger(__name__)
 
 #: Set to 1 to let the filter act on synthetic clicks. Only used by the
 #: automated end-to-end tests, which have no other way to produce input.
@@ -74,6 +77,25 @@ def _filter_injected() -> bool:
     return os.environ.get(FILTER_INJECTED_ENV, "") == "1"
 
 
+# Places that ignored an error and have logged it. Most run on every event,
+# so each logs its first error only. The app logs through a queue, so this is
+# safe from the hook thread and timer threads alike.
+_logged_sites: set[str] = set()
+_logged_sites_lock = threading.Lock()
+
+
+def _log_ignored(site: str) -> None:
+    """Call from an `except` block that carries on regardless."""
+    try:
+        with _logged_sites_lock:
+            if site in _logged_sites:
+                return
+            _logged_sites.add(site)
+        log.warning("Ignored an error in %s (later ones there are not logged)", site, exc_info=True)
+    except Exception:  # noqa: BLE001 - logging must never break the event stream
+        pass
+
+
 class GlobalClickFilter:
     """Install a system-wide filter that suppresses switch bounce."""
 
@@ -101,6 +123,8 @@ class GlobalClickFilter:
         self._run_loop = None
         self._use_os_time: Optional[bool] = None
         self._started = False
+        # Why the hook last ended, for the log.
+        self._end_reason = "stopped"
         # Per button: the event kept for a release that is being held back.
         self._held_templates: dict = {}
         # Per button: whether the release being held landed where apps saw its
@@ -147,6 +171,7 @@ class GlobalClickFilter:
         self._startup_error = None
         self._use_os_time = None
         self._started = False
+        self._end_reason = "stopped"
         self._held_templates.clear()
         self._held_stationary.clear()
         self._held_points.clear()
@@ -210,6 +235,7 @@ class GlobalClickFilter:
 
             return bool(Quartz.CGEventTapIsEnabled(tap))
         except Exception:  # noqa: BLE001 - unsure: don't make a health check churn the filter
+            _log_ignored("the tap health check")
             return True
 
     def _request_thread_stop(self) -> None:
@@ -304,8 +330,8 @@ class GlobalClickFilter:
         self._update_motion_tap()
         try:
             self._on_event(event)
-        except Exception:  # a UI callback must never break the hook
-            pass
+        except Exception:  # noqa: BLE001 - a UI callback must never break the hook
+            _log_ignored("the click event callback")
         return event
 
     def _enqueue(self, button: Button, pressed: Optional[bool], template: object) -> None:
@@ -418,7 +444,7 @@ class GlobalClickFilter:
             try:
                 self._set_motion_tap(wanted)
             except Exception:  # noqa: BLE001 - never break the event stream
-                pass
+                _log_ignored("switching the motion tap")
 
     # -- keeping re-sent events in order ------------------------------------
     def _track(self, button: Button, count: int) -> None:
@@ -472,6 +498,7 @@ class GlobalClickFilter:
         try:
             sent = self._inject(button, pressed, template) is not False
         except Exception:  # noqa: BLE001 - never break the event stream
+            _log_ignored("re-sending an event")
             sent = False
         if not sent:
             # It will never come back through the hook; don't wait for it.
@@ -507,8 +534,19 @@ class GlobalClickFilter:
                 # it here as well would show two dialogs for one failure.
                 self._startup_error = error
                 self._ready.set()
-            elif not self._stop_event.is_set():
-                self._on_error(str(error))
+            else:
+                if self._end_reason == "stopped":
+                    self._end_reason = f"failed: {error}"
+                if not self._stop_event.is_set():
+                    self._on_error(str(error))
+        finally:
+            if self._started:
+                log.info(
+                    "Hook ended, %s (tap resets %d, hook re-arms %d)",
+                    self._end_reason,
+                    self.tap_resets,
+                    self.hook_rearms,
+                )
 
     # -- Windows -----------------------------------------------------------
     def _run_windows(self) -> None:
@@ -720,6 +758,7 @@ class GlobalClickFilter:
             try:
                 return Quartz.CGEventGetLocation(Quartz.CGEventCreate(None)), Quartz.CGEventGetLocation(template)
             except Exception:  # noqa: BLE001 - the release must go out regardless
+                _log_ignored("reading the pointer before a re-sent release")
                 return None
 
         def restore_pointer(pointer: object, released_at: object) -> None:
@@ -737,7 +776,7 @@ class GlobalClickFilter:
                 Quartz.CGEventSetIntegerValueField(move, Quartz.kCGEventSourceUserData, RESTORE_MARK)
                 Quartz.CGEventPost(Quartz.kCGHIDEventTap, move)
             except Exception:  # noqa: BLE001 - the release itself already went out
-                pass
+                _log_ignored("putting the pointer back after a re-sent release")
 
         self._inject = inject
         click_counts = ClickCountRepair()
@@ -763,6 +802,7 @@ class GlobalClickFilter:
             try:
                 return decide(event_type, event)
             except Exception:  # noqa: BLE001
+                _log_ignored("the click tap")
                 return event
 
         def decide(event_type: int, event: object) -> object:
@@ -834,6 +874,7 @@ class GlobalClickFilter:
             try:
                 return motion_decide(event_type, event)
             except Exception:  # noqa: BLE001 - never drop motion on a bug
+                _log_ignored("the motion tap")
                 return event
 
         def motion_decide(event_type: int, event: object) -> object:
@@ -1108,7 +1149,7 @@ class ClickCountRepair:
             try:
                 self._interval = float(self._read_interval())
             except Exception:  # noqa: BLE001 - keep the last good value
-                pass
+                _log_ignored("reading the double-click interval")
         return self._interval
 
     def correct(self, button: Button, pressed: bool, state: int, timestamp: float) -> int:
@@ -1188,6 +1229,7 @@ def _timebase_ratio() -> tuple[int, int]:
     try:
         status = ctypes.CDLL("/usr/lib/libSystem.B.dylib").mach_timebase_info(ctypes.byref(info))
     except (OSError, AttributeError):
+        _log_ignored("reading the mach timebase")
         status = -1
     if status != 0 or not info.numer or not info.denom:
         return 1, 1  # ticks read as nanoseconds; posted events still time right

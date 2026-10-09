@@ -21,6 +21,12 @@ from app.platform import (
 )
 
 
+def fresh_error_log():
+    """Each place that ignores an error logs only its first one per run of
+    the app; start a test with none of them logged yet."""
+    return mock.patch("app.platform._logged_sites", set())
+
+
 class HandlerTests(unittest.TestCase):
     """Drive the code path both native hooks call, without installing one."""
 
@@ -77,7 +83,11 @@ class HandlerTests(unittest.TestCase):
             raise ValueError("UI is gone")
 
         click_filter = GlobalClickFilter(60, [Button.LEFT], on_event=explode)
-        self.assertTrue(click_filter._handle(Button.LEFT, True, 1.0).accepted)
+        with fresh_error_log(), self.assertLogs("app.platform", "WARNING") as logged:
+            self.assertTrue(click_filter._handle(Button.LEFT, True, 1.0).accepted)
+            self.assertTrue(click_filter._handle(Button.LEFT, False, 1.1).held)
+        self.assertEqual(len(logged.records), 1, "logged once, not on every click")
+        self.assertIsInstance(logged.records[0].exc_info[1], ValueError)
 
 
 class ClockTests(unittest.TestCase):
@@ -396,9 +406,10 @@ class ClickCountRepairTests(unittest.TestCase):
 
     def test_an_unreadable_setting_keeps_the_last_value(self) -> None:
         def broken():
-            raise RuntimeError("no AppKit")
+            raise RuntimeError("no preferences")
 
-        self.assertEqual(ClickCountRepair(interval=broken).interval(), 0.5)
+        with fresh_error_log(), self.assertLogs("app.platform", "WARNING"):
+            self.assertEqual(ClickCountRepair(interval=broken).interval(), 0.5)
 
 
 class ResendOrderTests(unittest.TestCase):
@@ -1022,6 +1033,12 @@ class MacTapTests(unittest.TestCase):
         self.assertTrue(self.main_tap.invalidated and self.motion_tap.invalidated)
         released = [event for event in self.quartz.posted if event.kind == self.Q.kCGEventLeftMouseUp]
         self.assertEqual(len(released), 1, "the held release still reaches apps")
+
+    def test_the_hook_logs_its_rearms_when_it_ends(self) -> None:
+        self.disable(self.main_tap)
+        with self.assertLogs("app.platform", "INFO") as logged:
+            self.filter.stop()
+        self.assertIn("tap resets 1, hook re-arms 0", "\n".join(logged.output))
 
 
 if __name__ == "__main__":
