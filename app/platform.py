@@ -35,7 +35,7 @@ FILTER_INJECTED_ENV = "DCF_FILTER_INJECTED"
 INJECTED_MARK = 0x44434658  # "DCFX"
 
 #: Marks pointer motion this app re-sends, one value per button whose queue it
-#: waited in, so the motion tap knows which button's in-flight count it settles.
+#: waited in, so the hook knows which button's in-flight count it settles.
 INJECTED_MOTION_MARKS = {INJECTED_MARK + 1 + index: button for index, button in enumerate(Button)}
 MOTION_MARK_FOR = {button: mark for mark, button in INJECTED_MOTION_MARKS.items()}
 
@@ -205,8 +205,14 @@ class GlobalClickFilter:
         # Set by the platform runner: re-posts an event the hook suppressed.
         # `pressed` is None for pointer motion.
         self._inject: Callable[[Button, Optional[bool], object], object] = lambda _b, _p, _t: None
-        # Set by the platform runner: turns the pointer-motion tap on or off.
-        # Motion only needs watching while a release is held or re-sent.
+        # Whether pointer motion needs judging (see _update_motion_tap): read
+        # on every move by the macOS tap, without a lock. Raised with the lock
+        # held the moment something becomes pending, so every move decided
+        # after that is judged.
+        self._motion_wanted = False
+        # Set by the Windows runner: turns its hook's motion watch on or off
+        # (WindowsHook.set_watch). Motion only needs watching while a release
+        # is held or re-sent.
         self._set_motion_tap: Callable[[bool], None] = lambda _wanted: None
         self._motion_tap_lock = threading.Lock()
         self.filtered_count = 0
@@ -237,6 +243,7 @@ class GlobalClickFilter:
         for button in Button:
             self._in_flight[button] = 0
             self._queued[button].clear()
+        self._motion_wanted = False
         self._thread = threading.Thread(target=self._run, name="dcf-hook", daemon=True)
         self._thread.start()
         if not self._ready.wait(timeout=5):
@@ -350,6 +357,8 @@ class GlobalClickFilter:
                 self._held_stationary[button] = event.hold_reason == "lift" and self._is_near(
                     self._press_points.get(button), location
                 )
+                if self._held_stationary[button]:
+                    self._motion_wanted = True
                 timer = threading.Timer(
                     click_filter.threshold_ms / 1000.0, self._commit_held, (button, click_filter.held_id)
                 )
@@ -393,6 +402,7 @@ class GlobalClickFilter:
 
     def _enqueue(self, button: Button, pressed: Optional[bool], template: object) -> None:
         """With the lock held: queue an event behind the re-sent ones."""
+        self._motion_wanted = True
         if not self._queued[button]:
             # Should the re-sent event never come back, don't keep this one
             # waiting for the next event to notice.
@@ -487,9 +497,12 @@ class GlobalClickFilter:
         return passes
 
     def _update_motion_tap(self) -> None:
-        """Watch pointer motion only while it matters: a release held in place
+        """Judge pointer motion only while it matters: a release held in place
         (motion settles it) or re-sent events still on their way (motion
-        must wait behind them). Call without the lock held."""
+        must wait behind them). Otherwise the hook lets every move straight
+        through after one look at _motion_wanted. The flag is raised as soon
+        as something becomes pending (with the lock held); this lowers it
+        once nothing is. Call without the lock held."""
         with self._motion_tap_lock:
             with self._lock:
                 wanted = any(
@@ -498,6 +511,7 @@ class GlobalClickFilter:
                     or bool(self._queued[button])
                     for button in Button
                 )
+                self._motion_wanted = wanted
             try:
                 self._set_motion_tap(wanted)
             except Exception:  # noqa: BLE001 - never break the event stream
@@ -506,6 +520,7 @@ class GlobalClickFilter:
     # -- keeping re-sent events in order ------------------------------------
     def _track(self, button: Button, count: int) -> None:
         """Count events about to be re-sent. Call with the lock held."""
+        self._motion_wanted = True
         if not self._in_flight[button]:
             self._in_flight_since[button] = monotonic()
         self._in_flight[button] += count
@@ -796,11 +811,12 @@ class GlobalClickFilter:
             Quartz.kCGEventRightMouseDragged,
             Quartz.kCGEventOtherMouseDragged,
         )
+        MOTION = frozenset((Quartz.kCGEventMouseMoved, *DRAGGED))
         DISABLED = (Quartz.kCGEventTapDisabledByTimeout, Quartz.kCGEventTapDisabledByUserInput)
 
         def inject(button: Button, pressed: Optional[bool], template: object) -> bool:
             # Re-post the kept copy of a suppressed event, tagged so this app's
-            # taps let it through. It keeps its own timestamp and its own
+            # tap lets it through. It keeps its own timestamp and its own
             # location, so apps see the click when and where it happened: a
             # release that moved would land off the button that was clicked.
             if template is None:
@@ -830,9 +846,8 @@ class GlobalClickFilter:
             # there. The hand may have carried the pointer on since: far, after
             # a drag let go while moving, or a little, after a click whose
             # small motion passed while its release was held. So put it back.
-            # The move is not tracked: the motion tap is usually off then and
-            # would never see it come back, which would hold the next click
-            # for IN_FLIGHT_TIMEOUT_S.
+            # The move is not tracked: the tap lets it through by its mark,
+            # and nothing waits behind it.
             try:
                 if math.hypot(pointer.x - released_at.x, pointer.y - released_at.y) <= RESTORE_MIN_PX:
                     return
@@ -880,34 +895,25 @@ class GlobalClickFilter:
             self.tap_resets += 1
             Quartz.CGEventTapEnable(tap, True)
 
-        def rearm_motion() -> None:
-            # Only a motion tap meant to be on is re-armed. Its disables don't
-            # count toward giving up: one system event can disable both taps,
-            # and the main tap's count already says how often that happens.
-            if not motion_state["enabled"]:
-                return
-            if not permission_still_ok():
-                end_hook(PERMISSION_GONE)
-                return
-            with self._motion_tap_lock:
-                # A timer thread may have switched it off in the meantime.
-                if motion_state["enabled"] and motion_state["tap"] is not None:
-                    self.tap_resets += 1
-                    Quartz.CGEventTapEnable(motion_state["tap"], True)
-
         def callback(proxy: object, event_type: int, event: object, refcon: object) -> object:
             # An exception here would make PyObjC return nothing, which drops
-            # the click. Whatever goes wrong, the event goes through untouched.
+            # the event. Whatever goes wrong, the event goes through untouched.
             try:
+                # The hot path: every pointer move comes here. While nothing
+                # is pending it goes straight back after this one check.
+                if event_type in MOTION and not self._motion_wanted:
+                    return event
                 return decide(event_type, event)
             except Exception:  # noqa: BLE001
-                _log_ignored("the click tap")
+                _log_ignored("the event tap")
                 return event
 
         def decide(event_type: int, event: object) -> object:
             if event_type in DISABLED:
                 rearm_main()
                 return event
+            if event_type in MOTION:
+                return decide_motion(event)
 
             entry = BUTTONS.get(event_type)
             if entry is None:
@@ -943,8 +949,27 @@ class GlobalClickFilter:
             click_counts.record(button, result)
             return event if result.accepted else None
 
+        def decide_motion(event: object) -> object:
+            # Motion while a release is held in place or re-sent events are
+            # on their way (see _update_motion_tap).
+            mark = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventSourceUserData)
+            if mark == RESTORE_MARK:
+                return event  # puts the pointer back after a re-sent release
+            if mark in INJECTED_MOTION_MARKS:
+                self._injected_passed(INJECTED_MOTION_MARKS[mark])
+                return event  # re-sent by this app; already decided
+            location = Quartz.CGEventGetLocation(event)
+            return event if self._motion(Quartz.CGEventCreateCopy(event), (location.x, location.y)) else None
+
+        # One tap sees clicks and pointer motion alike. WindowServer delivers
+        # one tap's events to it strictly in order, and holds each until the
+        # callback answers, so a move can never reach apps ahead of a release
+        # decided before it. A second tap for motion, switched on only while
+        # a release is held, let the first moves after a click overtake the
+        # held release: switching a tap on takes effect tens of ms later, and
+        # two taps' ports are not serviced in any set order.
         mask = 0
-        for event_type in BUTTONS:
+        for event_type in (*BUTTONS, *MOTION):
             mask |= Quartz.CGEventMaskBit(event_type)
 
         tap = Quartz.CGEventTapCreate(
@@ -965,70 +990,14 @@ class GlobalClickFilter:
             self._ready.set()
             return
 
-        # A second tap sees pointer motion. It is only switched on while a
-        # release is held in place or re-sent events are on their way (see
-        # _update_motion_tap), so ordinary motion costs nothing.
-        motion_state = {"tap": None, "enabled": False}
-
-        def motion_callback(proxy: object, event_type: int, event: object, refcon: object) -> object:
-            try:
-                return motion_decide(event_type, event)
-            except Exception:  # noqa: BLE001 - never drop motion on a bug
-                _log_ignored("the motion tap")
-                return event
-
-        def motion_decide(event_type: int, event: object) -> object:
-            if event_type in DISABLED:
-                rearm_motion()
-                return event
-            mark = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventSourceUserData)
-            if mark == RESTORE_MARK:
-                return event  # puts the pointer back after a re-sent release
-            if mark in INJECTED_MOTION_MARKS:
-                self._injected_passed(INJECTED_MOTION_MARKS[mark])
-                return event  # re-sent by this app; already decided
-            location = Quartz.CGEventGetLocation(event)
-            return event if self._motion(Quartz.CGEventCreateCopy(event), (location.x, location.y)) else None
-
-        motion_mask = 0
-        for event_type in (Quartz.kCGEventMouseMoved, *DRAGGED):
-            motion_mask |= Quartz.CGEventMaskBit(event_type)
-        motion_tap = Quartz.CGEventTapCreate(
-            Quartz.kCGHIDEventTap,
-            Quartz.kCGHeadInsertEventTap,
-            Quartz.kCGEventTapOptionDefault,
-            motion_mask,
-            motion_callback,
-            None,
-        )
-        motion_source = None
-        if motion_tap is not None:
-            Quartz.CGEventTapEnable(motion_tap, False)
-            motion_state["tap"] = motion_tap
-
-            def set_motion_tap(wanted: bool) -> None:
-                if wanted != motion_state["enabled"]:
-                    motion_state["enabled"] = wanted
-                    Quartz.CGEventTapEnable(motion_tap, wanted)
-
-            self._set_motion_tap = set_motion_tap
-
-        def close_taps() -> None:
+        def close_tap() -> None:
             # Out of the event stream: from here on clicks pass untouched.
-            with self._motion_tap_lock:
-                self._set_motion_tap = lambda _wanted: None
-                if motion_tap is not None:
-                    Quartz.CGEventTapEnable(motion_tap, False)
-                    motion_state["enabled"] = False
             Quartz.CGEventTapEnable(tap, False)
 
         self._tap = tap
         source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
         self._run_loop = Quartz.CFRunLoopGetCurrent()
         Quartz.CFRunLoopAddSource(self._run_loop, source, Quartz.kCFRunLoopCommonModes)
-        if motion_tap is not None:
-            motion_source = Quartz.CFMachPortCreateRunLoopSource(None, motion_tap, 0)
-            Quartz.CFRunLoopAddSource(self._run_loop, motion_source, Quartz.kCFRunLoopCommonModes)
         Quartz.CGEventTapEnable(tap, True)
         self._started = True
         self._ready.set()
@@ -1039,23 +1008,19 @@ class GlobalClickFilter:
                 # run loop is woken for reasons of its own.
                 Quartz.CFRunLoopRunInMode(Quartz.kCFRunLoopDefaultMode, 0.25, False)
             if ending and not self._stop_event.is_set():
-                # Fail open. The taps go first: nothing answers them once the
-                # run loop has stopped, so an enabled one would stall every
+                # Fail open. The tap goes first: nothing answers it once the
+                # run loop has stopped, so left enabled it would stall every
                 # event, the releases about to be re-sent included. Then what
                 # is held back goes out, and every later click passes untouched.
-                close_taps()
+                close_tap()
                 for button in Button:
                     self._commit_held(button)
                     self._release_queue(button)
                 failed_open = ending[0]
         finally:
-            close_taps()
+            close_tap()
             # Disabling a tap is not enough: macOS keeps it registered, for
             # the life of the process, until its port is invalidated.
-            if motion_tap is not None:
-                Quartz.CFRunLoopRemoveSource(self._run_loop, motion_source, Quartz.kCFRunLoopCommonModes)
-                Quartz.CFMachPortInvalidate(motion_tap)
-                motion_state["tap"] = None
             Quartz.CFRunLoopRemoveSource(self._run_loop, source, Quartz.kCFRunLoopCommonModes)
             Quartz.CFMachPortInvalidate(tap)
             self._tap = None

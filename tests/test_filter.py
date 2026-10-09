@@ -148,14 +148,14 @@ class LifecycleTests(unittest.TestCase):
 
         before = taps_of_this_process()
         for _ in range(10):
-            # No buttons: nothing is held back or re-sent; the taps only watch.
+            # No buttons: nothing is held back or re-sent; the tap only watches.
             click_filter = GlobalClickFilter(60, [])
             try:
                 click_filter.start()
             except HookError as error:
                 self.skipTest(f"macOS refused the event tap here: {error}")
             try:
-                self.assertEqual(taps_of_this_process(), before + 2, "the click tap and the motion tap")
+                self.assertEqual(taps_of_this_process(), before + 1, "one tap sees clicks and motion")
             finally:
                 click_filter.stop()
         self.assertEqual(taps_of_this_process(), before, "a stopped filter leaves no tap registered")
@@ -781,9 +781,21 @@ class MotionFlushTests(unittest.TestCase):
         self.handle(False, 0.600, "up2", (81, 0))
         self.assertTrue(self.filter._held_stationary.get(Button.LEFT), "measured from down2, not the bounce")
 
-    def test_motion_tap_is_wanted_only_while_it_matters(self) -> None:
+    def watched(self) -> list:
+        """Each time the filter says whether motion needs judging, as the
+        Windows hook hears it (its switch) and as the macOS tap reads it
+        (the flag): both must agree every time."""
         calls = []
-        self.filter._set_motion_tap = calls.append
+
+        def switch(wanted: bool) -> None:
+            self.assertEqual(self.filter._motion_wanted, wanted, "the flag and the switch agree")
+            calls.append(wanted)
+
+        self.filter._set_motion_tap = switch
+        return calls
+
+    def test_motion_is_judged_only_while_it_matters(self) -> None:
+        calls = self.watched()
         self.handle(True, 0.0, "down", (0, 0))
         self.assertEqual(calls[-1], False)
         self.handle(False, 0.08, "up", (0, 0))
@@ -794,19 +806,30 @@ class MotionFlushTests(unittest.TestCase):
         self.filter._injected_passed(Button.LEFT)
         self.assertEqual(calls[-1], False)
 
-    def test_moving_hold_does_not_want_the_motion_tap(self) -> None:
-        calls = []
-        self.filter._set_motion_tap = calls.append
+    def test_a_moving_hold_leaves_motion_alone(self) -> None:
+        calls = self.watched()
         self.handle(True, 0.0, "down", (0, 0))
         self.handle(False, 0.08, "up", (30, 0))
         self.assertEqual(calls[-1], False)
 
-    def test_closing_hold_does_not_want_the_motion_tap(self) -> None:
-        calls = []
-        self.filter._set_motion_tap = calls.append
+    def test_a_closing_hold_leaves_motion_alone(self) -> None:
+        calls = self.watched()
         self.handle(True, 0.0, "down", (0, 0))
         self.handle(False, 0.004, "flicker", (0, 0))
         self.assertEqual(calls[-1], False)
+
+    def test_motion_is_judged_before_a_release_is_resent(self) -> None:
+        # The timer delivers a drag's release from its own thread. A move the
+        # tap decides while the release is going out must already be judged,
+        # so it waits behind the release instead of overtaking it.
+        self.handle(True, 0.0, "down", (0, 0))
+        self.handle(False, 0.08, "up", (30, 0))
+        self.assertFalse(self.filter._motion_wanted, "a moving hold leaves motion alone")
+        judged_as_sent = []
+        self.filter._inject = lambda button, pressed, template: judged_as_sent.append(self.filter._motion_wanted)
+        self.fire_all()
+        self.assertEqual(judged_as_sent, [True])
+        self.assertFalse(self.filter._motion("m", (40, 0)), "it waits behind the release")
 
     def test_a_release_with_no_known_location_is_left_to_the_timer(self) -> None:
         # Windows passes none where the pointer's place means nothing (a
@@ -1053,11 +1076,24 @@ class FakeQuartz:
         return FakeCGEvent(kind, point.x, point.y)
 
 
+class UntouchableEvent:
+    """An event nothing may look inside: any Quartz call on it fails."""
+
+    def __getattr__(self, name):
+        raise AssertionError(f"the event's {name} was read")
+
+
 class MacTapTests(unittest.TestCase):
-    """The macOS tap callbacks, run against a fake Quartz: no real tap is
+    """The macOS tap callback, run against a fake Quartz: no real tap is
     installed and nothing is posted to the system."""
 
     Q = FakeQuartz
+    MOTION_KINDS = (
+        FakeQuartz.kCGEventMouseMoved,
+        FakeQuartz.kCGEventLeftMouseDragged,
+        FakeQuartz.kCGEventRightMouseDragged,
+        FakeQuartz.kCGEventOtherMouseDragged,
+    )
 
     def setUp(self) -> None:
         self.quartz = FakeQuartz()
@@ -1087,33 +1123,130 @@ class MacTapTests(unittest.TestCase):
         )
         self.filter.start()
         self.addCleanup(self.filter.stop)  # runs before the patches are undone
-        self.main_tap, self.motion_tap = self.quartz.taps
+        (self.tap,) = self.quartz.taps
         # Event times, as offsets in seconds from here, always near now.
         self.base = monotonic() - 0.5
 
     def ticks(self, offset: float) -> int:
         return round((self.base + offset) * 1e9 * 3 / 125)
 
-    def button(self, kind, at, offset, state=1, ns=False):
-        """Feed one hardware button event to the main tap."""
+    def hid(self, kind, at, offset, state=1, ns=False) -> FakeCGEvent:
+        """A hardware button event."""
         stamp = round((self.base + offset) * 1e9) if ns else self.ticks(offset)
-        event = FakeCGEvent(kind, *at, timestamp=stamp, fields={
+        return FakeCGEvent(kind, *at, timestamp=stamp, fields={
             self.Q.kCGEventSourceStateID: self.Q.kCGEventSourceStateHIDSystemState,
             self.Q.kCGMouseEventClickState: state,
         })
-        return self.main_tap.callback(None, kind, event, None)
+
+    def move(self, at, mark=0, kind=FakeQuartz.kCGEventMouseMoved) -> FakeCGEvent:
+        return FakeCGEvent(kind, *at, fields={self.Q.kCGEventSourceUserData: mark})
+
+    def button(self, kind, at, offset, state=1, ns=False):
+        """Feed one hardware button event to the tap."""
+        event = self.hid(kind, at, offset, state, ns)
+        return self.tap.callback(None, kind, event, None)
 
     def motion(self, at, mark=0):
-        event = FakeCGEvent(self.Q.kCGEventMouseMoved, *at, fields={self.Q.kCGEventSourceUserData: mark})
-        return self.motion_tap.callback(None, event.kind, event, None)
+        event = self.move(at, mark)
+        return self.tap.callback(None, event.kind, event, None)
 
     def pass_back(self, posted):
-        """A posted event comes back through the tap that watches its kind."""
-        tap = self.motion_tap if posted.kind == self.Q.kCGEventMouseMoved else self.main_tap
-        return tap.callback(None, posted.kind, posted, None)
+        """A posted event comes back through the tap."""
+        return self.tap.callback(None, posted.kind, posted, None)
+
+    def stream(self, *events) -> list:
+        """Run events through the tap as WindowServer does with one tap: one
+        at a time, in order, each held until the callback answers. What the
+        app posts joins the stream behind the events already in it. Returns
+        what apps see, in order, as (kind, x)."""
+        seen = []
+        waiting = list(events)
+        posted = len(self.quartz.posted)
+        while waiting:
+            event = waiting.pop(0)
+            answer = self.tap.callback(None, event.kind, event, None)
+            if answer is not None:
+                seen.append((answer.kind, answer.location.x))
+            waiting += self.quartz.posted[posted:]
+            posted = len(self.quartz.posted)
+        return seen
 
     def mark(self, event):
         return event.fields.get(self.Q.kCGEventSourceUserData)
+
+    def test_one_tap_sees_clicks_and_motion(self) -> None:
+        self.assertEqual(len(self.quartz.taps), 1)
+        clicks = (
+            self.Q.kCGEventLeftMouseDown, self.Q.kCGEventLeftMouseUp,
+            self.Q.kCGEventRightMouseDown, self.Q.kCGEventRightMouseUp,
+            self.Q.kCGEventOtherMouseDown, self.Q.kCGEventOtherMouseUp,
+        )
+        for kind in clicks + self.MOTION_KINDS:
+            self.assertTrue(self.tap.mask & self.quartz.CGEventMaskBit(kind), f"event type {kind}")
+        self.assertTrue(self.tap.enabled)
+
+    def assert_motion_goes_straight_through(self) -> None:
+        with mock.patch.object(self.filter, "_motion") as judged, fresh_error_log():
+            with self.assertNoLogs("app.platform", "WARNING"):
+                for kind in self.MOTION_KINDS:
+                    event = UntouchableEvent()
+                    self.assertIs(self.tap.callback(None, kind, event, None), event)
+        judged.assert_not_called()
+
+    def test_motion_with_nothing_pending_goes_straight_through(self) -> None:
+        self.assertFalse(self.filter._motion_wanted)
+        self.assert_motion_goes_straight_through()
+
+    def test_motion_during_a_moving_hold_goes_straight_through(self) -> None:
+        self.button(self.Q.kCGEventLeftMouseDown, (0, 0), 0.0)
+        self.assertIsNone(self.button(self.Q.kCGEventLeftMouseUp, (50, 0), 0.5), "held: a drag let go")
+        self.assert_motion_goes_straight_through()
+
+    def test_motion_once_a_click_is_over_goes_straight_through(self) -> None:
+        self.button(self.Q.kCGEventLeftMouseDown, (100, 100), 0.0)
+        self.button(self.Q.kCGEventLeftMouseUp, (100, 100), 0.1)
+        self.quartz.pointer = (100.0, 100.0)
+        self.stream(self.move((106, 100)))                            # the up, then the motion
+        self.assertEqual(self.filter._in_flight[Button.LEFT], 0)
+        self.assert_motion_goes_straight_through()
+
+    def test_motion_during_a_hold_in_place_is_judged_and_queued(self) -> None:
+        self.button(self.Q.kCGEventLeftMouseDown, (100, 100), 0.0)
+        self.assertIsNone(self.button(self.Q.kCGEventLeftMouseUp, (100, 100), 0.1))
+        self.assertTrue(self.filter._motion_wanted, "a release is held in place")
+        self.quartz.pointer = (100.0, 100.0)
+        with mock.patch.object(self.filter, "_motion", wraps=self.filter._motion) as judged:
+            self.assertIsNone(self.motion((106, 100)), "queued behind the release it settled")
+        judged.assert_called_once()
+        self.assertEqual(judged.call_args.args[1], (106.0, 100.0))
+        self.assertEqual([self.mark(event) for event in self.quartz.posted], [INJECTED_MARK])
+        self.assertEqual([pressed for pressed, _template in self.filter._queued[Button.LEFT]], [None])
+
+    def test_a_held_release_reaches_apps_before_the_motion_after_it(self) -> None:
+        # The first moves after a click made in place: the one that leaves
+        # the spot settles the release, and every move waits behind it.
+        self.quartz.pointer = (100.0, 100.0)
+        seen = self.stream(
+            self.hid(self.Q.kCGEventLeftMouseDown, (100, 100), 0.00),
+            self.hid(self.Q.kCGEventLeftMouseUp, (100, 100), 0.08),
+            self.move((106, 100)),
+            self.move((112, 100)),
+            self.move((118, 100), kind=self.Q.kCGEventLeftMouseDragged),
+        )
+        moved, up = self.Q.kCGEventMouseMoved, self.Q.kCGEventLeftMouseUp
+        self.assertEqual(
+            [(event.kind, event.location.x) for event in self.quartz.posted],
+            [(up, 100), (moved, 106), (moved, 112), (moved, 118)],
+            "posted in order: the release, then the motion",
+        )
+        self.assertEqual(
+            seen, [(self.Q.kCGEventLeftMouseDown, 100), (up, 100), (moved, 106), (moved, 112), (moved, 118)]
+        )
+        self.assertEqual(self.filter._in_flight[Button.LEFT], 0, "everything re-sent came back")
+        self.assertFalse(self.filter._motion_wanted)
+        for timer in list(self.timers):
+            timer.fire()
+        self.assertEqual(len(self.quartz.posted), 4, "the timers must not resend anything")
 
     def test_a_drag_let_go_while_moving_puts_the_pointer_back(self) -> None:
         self.assertIsNotNone(self.button(self.Q.kCGEventLeftMouseDown, (0, 0), 0.0))
@@ -1155,10 +1288,9 @@ class MacTapTests(unittest.TestCase):
             self.timers[-1].fire()
         self.assertEqual([(event.kind, self.mark(event)) for event in self.quartz.posted], [(self.Q.kCGEventLeftMouseUp, INJECTED_MARK)])
 
-    def test_the_motion_tap_judges_motion_by_where_it_went(self) -> None:
+    def test_motion_is_judged_by_where_it_went(self) -> None:
         self.button(self.Q.kCGEventLeftMouseDown, (100, 100), 0.0)
         self.assertIsNone(self.button(self.Q.kCGEventLeftMouseUp, (100, 100), 0.1))
-        self.assertTrue(self.motion_tap.enabled, "a release is held in place")
         self.quartz.pointer = (100.0, 100.0)
         self.assertIsNotNone(self.motion((101, 100)), "a nudge passes")
         self.assertEqual(self.quartz.posted, [])
@@ -1201,111 +1333,69 @@ class MacTapTests(unittest.TestCase):
         press = [event for event in self.quartz.posted if event.kind == self.Q.kCGEventLeftMouseDown][-1]
         self.assertEqual(press.fields[self.Q.kCGMouseEventClickState], 1)
 
-    def test_stopping_invalidates_both_taps(self) -> None:
+    def test_stopping_invalidates_the_tap(self) -> None:
         self.filter.stop()
         self.assertFalse(self.filter.running)
-        for tap in (self.main_tap, self.motion_tap):
-            self.assertTrue(tap.invalidated, "a disabled tap stays registered until invalidated")
-            self.assertFalse(tap.enabled)
+        self.assertTrue(self.tap.invalidated, "a disabled tap stays registered until invalidated")
+        self.assertFalse(self.tap.enabled)
         self.assertFalse(self.filter.tap_alive())
 
-    def test_tap_alive_follows_the_main_tap(self) -> None:
+    def test_tap_alive_follows_the_tap(self) -> None:
         self.assertTrue(self.filter.tap_alive())
-        self.main_tap.enabled = False  # macOS disabled it
+        self.tap.enabled = False  # macOS disabled it
         self.assertFalse(self.filter.tap_alive())
 
-    def disable(self, tap) -> object:
-        tap.enabled = False
-        return tap.callback(None, self.Q.kCGEventTapDisabledByTimeout, None, None)
+    def disable(self) -> object:
+        self.tap.enabled = False
+        return self.tap.callback(None, self.Q.kCGEventTapDisabledByTimeout, None, None)
 
     def test_a_disabled_tap_is_rearmed(self) -> None:
-        self.disable(self.main_tap)
-        self.assertTrue(self.main_tap.enabled)
+        self.disable()
+        self.assertTrue(self.tap.enabled)
         self.assertEqual(self.filter.tap_resets, 1)
         self.assertTrue(self.filter.running)
+
+    def test_a_disabled_tap_is_rearmed_while_motion_is_judged(self) -> None:
+        self.button(self.Q.kCGEventLeftMouseDown, (0, 0), 0.0)
+        self.button(self.Q.kCGEventLeftMouseUp, (0, 0), 0.1)            # held in place
+        self.assertTrue(self.filter._motion_wanted)
+        self.disable()
+        self.assertTrue(self.tap.enabled)
+        self.assertEqual(self.filter.tap_resets, 1)
 
     def test_macos_disabling_the_tap_again_and_again_stops_the_filter(self) -> None:
         self.button(self.Q.kCGEventLeftMouseDown, (0, 0), 0.0)
         self.button(self.Q.kCGEventLeftMouseUp, (30, 0), 0.4)          # held when it happens
-        self.disable(self.main_tap)
-        self.disable(self.main_tap)
+        self.disable()
+        self.disable()
         self.assertEqual(self.errors, [])
-        self.disable(self.main_tap)
+        self.disable()
         self.filter._thread.join(2)
         self.assertFalse(self.filter.running)
         self.assertEqual(self.errors, [TAP_DISABLED_MESSAGE])
         self.assertEqual(self.filter.tap_resets, 2, "not re-armed a third time")
-        self.assertTrue(self.main_tap.invalidated and self.motion_tap.invalidated)
+        self.assertTrue(self.tap.invalidated)
         released = [event for event in self.quartz.posted if event.kind == self.Q.kCGEventLeftMouseUp]
         self.assertEqual(len(released), 1, "the held release still reaches apps")
         self.assertEqual(self.lost, [])
 
-    def test_motion_tap_disables_do_not_count_toward_giving_up(self) -> None:
-        # One system event can disable both taps; only the main tap counts.
+    def test_a_tap_disabled_after_the_permission_is_gone_fails_open(self) -> None:
         self.button(self.Q.kCGEventLeftMouseDown, (0, 0), 0.0)
-        self.button(self.Q.kCGEventLeftMouseUp, (0, 0), 0.1)            # held in place: motion tap on
-        for _ in range(TAP_DISABLE_LIMIT):
-            self.disable(self.motion_tap)
-        self.assertTrue(self.motion_tap.enabled, "re-armed each time")
-        self.disable(self.main_tap)
-        self.assertTrue(self.filter.running)
-        self.assertEqual(self.filter.tap_resets, TAP_DISABLE_LIMIT + 1)
-        self.assertEqual(self.errors, [])
-
-    def test_a_motion_tap_disable_while_it_is_meant_to_be_off_is_ignored(self) -> None:
-        asked = []
-        self.filter._permission_ok = lambda: asked.append(True) or True
-        self.assertFalse(self.motion_tap.enabled)
-        self.disable(self.motion_tap)
-        self.assertFalse(self.motion_tap.enabled, "not switched on by a re-arm")
-        self.assertEqual((self.filter.tap_resets, asked), (0, []))
-
-    def test_a_motion_tap_switched_off_during_its_rearm_stays_off(self) -> None:
-        self.button(self.Q.kCGEventLeftMouseDown, (0, 0), 0.0)
-        self.button(self.Q.kCGEventLeftMouseUp, (0, 0), 0.1)            # held in place: motion tap on
-
-        def release_settles_meanwhile() -> bool:
-            # While the motion tap is being re-armed, the hold's timer (on
-            # another thread) re-sends the release, it comes back, and with
-            # nothing left to watch the tap is switched off.
-            self.timers[-1].fire()
-            self.pass_back(self.quartz.posted[0])
-            self.assertFalse(self.motion_tap.enabled)
-            return True
-
-        self.filter._permission_ok = release_settles_meanwhile
-        self.disable(self.motion_tap)
-        self.assertEqual(len(self.quartz.posted), 1, "the release went out")
-        self.assertFalse(self.motion_tap.enabled, "left on while nothing needs it")
-        self.assertEqual(self.filter.tap_resets, 0)
-
-    def lose_permission_then_disable(self, tap) -> None:
-        self.button(self.Q.kCGEventLeftMouseDown, (0, 0), 0.0)
-        self.button(self.Q.kCGEventLeftMouseUp, (0, 0), 0.1)            # held in place: motion tap on
-        self.assertTrue(self.motion_tap.enabled)
+        self.button(self.Q.kCGEventLeftMouseUp, (0, 0), 0.1)            # held in place
+        self.assertTrue(self.filter._motion_wanted)
         self.permitted = False
-        with self.assertLogs("app.platform", "INFO") as self.logged:
-            self.disable(tap)
+        with self.assertLogs("app.platform", "INFO") as logged:
+            self.disable()
             self.filter._thread.join(2)
-
-    def assert_failed_open_for_permission(self) -> None:
         self.assertFalse(self.filter.running, "the hook ends")
         self.assertEqual(self.errors, [], "not reported as an error")
         self.assertEqual(self.lost, [("dcf-hook", 1)], "told once, from the hook thread, after the release went out")
         released = [event for event in self.quartz.posted if event.kind == self.Q.kCGEventLeftMouseUp]
         self.assertEqual(len(released), 1, "the held release still reaches apps")
-        self.assertEqual(self.quartz.taps_enabled_at_post, [[False, False]], "posted once both taps were off")
-        self.assertTrue(self.main_tap.invalidated and self.motion_tap.invalidated)
+        self.assertEqual(self.quartz.taps_enabled_at_post, [[False]], "posted once the tap was off")
+        self.assertTrue(self.tap.invalidated)
         self.assertEqual((self.filter.tap_resets, self.filter._tap_disables), (0, []))
-        self.assertIn("permission gone", "\n".join(self.logged.output))
-
-    def test_a_main_tap_disabled_after_the_permission_is_gone_fails_open(self) -> None:
-        self.lose_permission_then_disable(self.main_tap)
-        self.assert_failed_open_for_permission()
-
-    def test_a_motion_tap_disabled_after_the_permission_is_gone_fails_open(self) -> None:
-        self.lose_permission_then_disable(self.motion_tap)
-        self.assert_failed_open_for_permission()
+        self.assertIn("permission gone", "\n".join(logged.output))
 
     def test_a_failing_permission_check_still_rearms(self) -> None:
         def broken() -> bool:
@@ -1313,12 +1403,12 @@ class MacTapTests(unittest.TestCase):
 
         self.filter._permission_ok = broken
         with fresh_error_log(), self.assertLogs("app.platform", "WARNING"):
-            self.disable(self.main_tap)
-        self.assertTrue(self.main_tap.enabled)
+            self.disable()
+        self.assertTrue(self.tap.enabled)
         self.assertEqual(self.filter.tap_resets, 1)
 
     def test_the_hook_logs_its_rearms_when_it_ends(self) -> None:
-        self.disable(self.main_tap)
+        self.disable()
         with self.assertLogs("app.platform", "INFO") as logged:
             self.filter.stop()
         self.assertIn("tap resets 1, hook re-arms 0", "\n".join(logged.output))
@@ -1331,8 +1421,8 @@ class MacTapTests(unittest.TestCase):
                 GlobalClickFilter(60, [Button.LEFT]).start()
         self.assertEqual(
             str(raised.exception),
-            "macOS refused the event tap. Allow DoubleClick Fixer in System Settings \u203a Privacy & Security "
-            "\u203a Device Control and Data Access, then try again.",
+            "macOS refused the event tap. Allow DoubleClick Fixer in System Settings › Privacy & Security "
+            "› Device Control and Data Access, then try again.",
         )
 
 
