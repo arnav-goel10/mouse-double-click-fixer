@@ -1149,12 +1149,14 @@ class MainWindow(QWidget):
         self._enable_when_granted = True
         self.controller.stop_for_permission()
 
-    def _on_permission_lost(self) -> None:
+    def _on_permission_lost(self, reporter: object = None) -> None:
         """The filter found its access withdrawn when macOS disabled its
         tap, let every click through and stopped. Wait for access to come
         back, as when the permission poll is first to notice."""
         if not self.controller.settings["fix_enabled"]:
             return
+        if reporter is not None and reporter is not self.controller._filter:
+            return  # from a filter since replaced (turned off and on again)
         log.warning("The filter lost its permission")
         self._wait_for_permission()
         self.refresh()

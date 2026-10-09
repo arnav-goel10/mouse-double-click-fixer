@@ -369,6 +369,9 @@ class FakeController:
     def set_pending_update(self, version: str) -> None:
         self._store(pending_update=version)
 
+    def store_update_state(self, **values) -> None:
+        self._store(**values)
+
 
 @unittest.skipIf(os.environ.get("QT_QPA_PLATFORM") != "offscreen", "needs offscreen Qt")
 class NetworkTests(unittest.TestCase):
@@ -557,7 +560,7 @@ class NetworkTests(unittest.TestCase):
         base, _files = self.release_files(signature=forged)
         instance = self.refused(base, user_initiated=False, auto_update=True)
         self.assertIn("signature isn’t valid", instance.message)
-        self.assertNotIn("update_attempt_version", instance.controller.settings)
+        self.assertEqual(instance.controller.settings.get("update_attempt_count", 0), 0, "no attempt counted")
 
     def test_a_signature_of_other_checksums_is_not_offered(self) -> None:
         base, _files = self.release_files(signature=sign(f"{'1' * 64}  {MAC_ASSET}\n".encode()))
@@ -642,6 +645,35 @@ class NetworkTests(unittest.TestCase):
             self.wait_for(instance, {instance.FAILED, instance.READY})
         self.assertEqual((instance.state, instance.message), (instance.FAILED, updater.INSTALL_FAILED))
         self.assertEqual(quits, [], "the app isn't quit for an update that didn't start")
+
+    def test_restart_now_failing_doesnt_leave_it_stuck(self) -> None:
+        # READY is reached without _step around _apply, so its own catch is
+        # what keeps INSTALLING from sticking.
+        base = self.matching_files()
+        instance = self.available(base, auto_update=True)
+        instance.window_visible = lambda: True
+        with mock.patch.object(instance, "_install_mac", side_effect=FileNotFoundError("ditto")), \
+                self.assertLogs("app.updater", "ERROR"):
+            instance.install(unattended=True)
+            self.wait_for(instance, {instance.READY, instance.FAILED})
+            self.assertEqual(instance.state, instance.READY, instance.message)
+            instance.install()  # Restart Now
+            self.wait_for(instance, {instance.FAILED})
+        self.assertEqual((instance.state, instance.message), (instance.FAILED, updater.INSTALL_FAILED))
+
+    def test_a_check_that_finds_an_unsigned_release_forgets_the_old_one(self) -> None:
+        base = self.matching_files()
+        instance = self.available(base)
+        self.assertIsNotNone(instance.release)
+        unsigned, _files = self.release_files(version="9.9.10", signature=b"")
+        with mock.patch.object(instance, "_install_mac") as install, \
+                mock.patch.dict(os.environ, {updater.URL_OVERRIDE_ENV: f"{unsigned}/latest"}):
+            instance.check(user_initiated=True)
+            self.wait_for(instance, {instance.FAILED, instance.AVAILABLE})
+            self.assertIsNone(instance.release, "the earlier release is no longer offered")
+            instance.install()
+            self.settle()
+        install.assert_not_called()
 
     def test_a_full_disk_fails_instead_of_hanging(self) -> None:
         base = self.matching_files()
@@ -732,7 +764,7 @@ class NetworkTests(unittest.TestCase):
         self.assertEqual(instance.state, instance.AVAILABLE, "left for the user to install")
         self.assertIn(MAC_ASSET, self.requested, "the download did finish")
         self.assertFalse(workdir.exists(), "and was thrown away")
-        self.assertNotIn("update_attempt_version", instance.controller.settings)
+        self.assertEqual(instance.controller.settings.get("update_attempt_count", 0), 0, "no attempt counted")
 
     def background_check(self, base: str, **settings):
         instance = self.make_updater(f"{base}/latest", **settings)

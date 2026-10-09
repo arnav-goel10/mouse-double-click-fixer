@@ -478,6 +478,19 @@ class KeepFilterAliveTests(LiveWindowTests):
             self.assertTrue(self.controller.active, "starts once access is back")
             self.assertFalse(self.controller.waiting_for_permission)
 
+    def test_a_background_launch_refused_for_lack_of_access_schedules_no_retries(self) -> None:
+        # The login-item path (background=True) is the one that schedules
+        # retries for other failures; a missing permission must wait instead.
+        self.controller._store(fix_enabled=True)
+        FakeFilter.fail_with = "macOS refused the event tap."
+        with self.mac_access(ax=True, tap=False):
+            self.window._permission_granted = True
+            self.window.restore_filter(background=True)
+            self.assertTrue(self.controller.waiting_for_permission)
+            self.assertFalse(self.window._retry_timer.isActive())
+            self.assertEqual(self.window._retry_waits, [])
+        FakeFilter.fail_with = None
+
     def test_a_tap_refused_with_access_in_place_is_a_failure(self) -> None:
         self.controller._store(fix_enabled=True)
         self.window.show()
@@ -510,6 +523,42 @@ class KeepFilterAliveTests(LiveWindowTests):
         with self.mac_access(ax=True, tap=True):
             self.window._check_permission()
             self.assertTrue(self.controller.active, "back on once access returns")
+
+    def test_turning_off_as_access_is_lost_stays_off(self) -> None:
+        import threading
+
+        self.controller.set_active(True)
+        filter_ = self.controller._filter
+        with self.mac_access(ax=True, tap=False):
+            self.window._permission_granted = True
+            hook = threading.Thread(target=filter_.on_permission_lost)
+            hook.start()
+            hook.join()
+            self.window.request_filter(False)  # before the queued signal arrives
+            self.application.processEvents()
+            self.assertFalse(self.controller.waiting_for_permission)
+            self.assertFalse(self.controller.settings["fix_enabled"])
+        with self.mac_access(ax=True, tap=True):
+            self.window._check_permission()
+            self.assertFalse(self.controller.active, "it must not turn itself on when access returns")
+
+    def test_a_late_signal_from_a_replaced_filter_is_ignored(self) -> None:
+        import threading
+
+        self.controller.set_active(True)
+        old = self.controller._filter
+        with self.mac_access(ax=True, tap=True):
+            hook = threading.Thread(target=old.on_permission_lost)
+            hook.start()
+            hook.join()
+            self.controller.set_active(False)
+            self.controller.set_active(True)  # a new, healthy filter
+            new = self.controller._filter
+            self.application.processEvents()
+        self.assertIsNot(new, old)
+        self.assertTrue(self.controller.active)
+        self.assertFalse(new.stopped)
+        self.assertFalse(self.controller.waiting_for_permission)
 
     def test_the_probe_only_runs_while_it_matters(self) -> None:
         with mock.patch("app.permissions.needs_accessibility", return_value=True), \

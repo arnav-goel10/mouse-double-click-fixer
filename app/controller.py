@@ -34,7 +34,9 @@ class AppController(QObject):
     hook_failed = Signal(str)
     #: macOS: the filter found its permission withdrawn, let every click
     #: through and stopped. Emitted from the hook's thread.
-    permission_lost = Signal()
+    #: A running filter found its access withdrawn and stopped. Carries that
+    #: filter, so a late signal from one since replaced can be ignored.
+    permission_lost = Signal(object)
 
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
@@ -147,6 +149,7 @@ class AppController(QObject):
             self.filter_state_changed.emit(False, message)
             return False
         try:
+            reporter: list = []
             self._filter = GlobalClickFilter(
                 self.threshold_ms,
                 self.buttons,
@@ -155,8 +158,9 @@ class AppController(QObject):
                 # macOS re-arms a tap it disabled only while access is still
                 # there; without it the filter lets clicks through and stops.
                 permission_ok=permissions.event_tap_allowed if permissions.needs_accessibility() else None,
-                on_permission_lost=self.permission_lost.emit,
+                on_permission_lost=lambda: self.permission_lost.emit(reporter[0] if reporter else None),
             )
+            reporter.append(self._filter)
             self._filter.start()
         except HookError as error:
             self._filter = None

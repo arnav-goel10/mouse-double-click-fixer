@@ -812,10 +812,8 @@ class Updater(QObject):
 
     def _remember(self, **values: object) -> None:
         # The updater's own settings are written by the controller with all the
-        # others, so they survive its next save. A controller without
-        # store_update_state predates it, and its _store does the same.
-        store = getattr(self.controller, "store_update_state", None) or self.controller._store
-        store(**values)
+        # others, so they survive its next save.
+        self.controller.store_update_state(**values)
 
     def _remove_workdir(self) -> None:
         if self._workdir is not None:
