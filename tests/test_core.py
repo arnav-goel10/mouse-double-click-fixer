@@ -185,13 +185,24 @@ class DragDropoutTests(unittest.TestCase):
         self.assertTrue(release.held)
         self.assertEqual(release.hold_reason, "closing")
 
-    def test_closing_is_measured_from_the_contact_coming_back(self) -> None:
-        # The comeback press never reaches apps, but the contact did close.
+    def test_a_bounce_as_the_contact_closes_restarts_the_closing_time(self) -> None:
+        # The comeback press never reaches apps, but the contact did close,
+        # and it is still settling: a second bounce soon after is closing too.
         f = BounceFilter(60)
         f.press(timestamp=0.0)
-        self.assertEqual(f.release(timestamp=0.5).hold_reason, "lift")
-        self.assertTrue(f.press(timestamp=0.508).cancels_held)
-        self.assertEqual(f.release(timestamp=0.512).hold_reason, "closing")
+        self.assertEqual(f.release(timestamp=0.004).hold_reason, "closing")
+        self.assertTrue(f.press(timestamp=0.008).cancels_held)
+        self.assertEqual(f.release(timestamp=0.015).hold_reason, "closing", "7 ms after the contact closed again")
+
+    def test_release_chatter_is_still_a_lift(self) -> None:
+        # The finger lets go and the contact chatters open: the comeback
+        # cancels a lift, so the release after it is the finger letting go.
+        f = BounceFilter(60)
+        f.press(timestamp=0.0)
+        self.assertEqual(f.release(timestamp=0.090).hold_reason, "lift")
+        self.assertTrue(f.press(timestamp=0.093).cancels_held)
+        self.assertEqual(f.release(timestamp=0.096).hold_reason, "lift")
+        self.assertTrue(f.commit_held(), "one click, delivered")
 
     def test_only_held_releases_carry_a_reason(self) -> None:
         f = BounceFilter(60, hold_releases=False)
@@ -209,6 +220,9 @@ class DragDropoutTests(unittest.TestCase):
                 self.assertTrue(f.press(timestamp=0.0078).cancels_held)
                 release = f.release(timestamp=second_bounce)
                 self.assertTrue(release.held, "a release delivered here would turn the drag into a click")
+                # 4.9 ms after the contact closed again: still closing. At
+                # 20 ms it reads as a lift, which is held all the same.
+                self.assertEqual(release.hold_reason, "closing" if second_bounce < 0.019 else "lift")
                 self.assertTrue(f.press(timestamp=second_bounce + 0.0008).cancels_held)
                 lift = f.release(timestamp=1.365)
                 self.assertTrue(lift.held)

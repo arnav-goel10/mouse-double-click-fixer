@@ -540,6 +540,35 @@ class MotionFlushTests(unittest.TestCase):
         self.assertEqual(self.injected, [])
         self.assertTrue(self.handle(True, 0.008, "back", (10, 0)).cancels_held, "the drag starts")
 
+    def test_release_chatter_then_moving_off_delivers_the_click_on_the_way(self) -> None:
+        # The finger lets go, the contact chatters open once more, and the
+        # hand moves straight on: the first motion past the click spot
+        # delivers the release, as for a clean click, not the timer.
+        self.handle(True, 0.000, "down", (100, 100))
+        self.assertTrue(self.handle(False, 0.090, "up", (100, 100)).held)
+        self.assertTrue(self.handle(True, 0.093, "back", (100, 100)).cancels_held)
+        self.assertEqual(self.handle(False, 0.096, "up2", (100, 100)).hold_reason, "lift")
+        self.assertTrue(self.filter._motion("m1", (102, 100)))
+        self.assertEqual(self.injected, [])
+        self.assertFalse(self.filter._motion("m2", (106, 100)), "waits behind the release")
+        self.assertEqual(self.injected, [(False, "up2")])
+        self.fire_all()
+        self.assertEqual(self.injected, [(False, "up2")], "delivered once")
+
+    def test_two_bounces_as_the_contact_closes_never_settle_on_motion(self) -> None:
+        # D, U at 4.7 ms, D at 7.8 ms, U again at 12.7 ms with the hand
+        # already moving: the start of a drag, not two clicks.
+        self.handle(True, 0.0000, "down", (0, 0))
+        self.assertEqual(self.handle(False, 0.0047, "u1", (0, 0)).hold_reason, "closing")
+        self.assertTrue(self.handle(True, 0.0078, "d1", (0, 0)).cancels_held)
+        self.assertEqual(self.handle(False, 0.0127, "u2", (1, 0)).hold_reason, "closing")
+        self.assertTrue(self.filter._motion("m", (10, 0)))
+        self.assertTrue(self.handle(True, 0.0135, "d2", (10, 0)).cancels_held, "the drag starts")
+        self.assertEqual(self.injected, [])
+        self.handle(False, 1.0, "lift", (200, 0))
+        self.fire_all()
+        self.assertEqual(self.injected, [(False, "lift")])
+
     def test_two_dropouts_within_the_click_keep_the_drag(self) -> None:
         self.handle(True, 0.000, "down", (0, 0))
         self.assertTrue(self.handle(False, 0.300, "drop1", (0, 0)).held)
