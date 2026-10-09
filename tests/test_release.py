@@ -107,7 +107,8 @@ class ReleaseNotesTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, root, True)
         (root / "installer").mkdir()
         (root / "installer" / "release_notes.md").write_text(
-            "## Download\n\n[Mac](https://github.com/__REPO__/releases/download/v__VERSION__/DoubleClickFixer.dmg)\n",
+            "## Download\n\n[Mac](https://github.com/__REPO__/releases/download/v__VERSION__/DoubleClickFixer.dmg)\n\n"
+            "__UPDATES__\n\nFirst launch help.\n\n__CHECKSUMS__\n",
             encoding="utf-8",
         )
         (root / "CHANGELOG.md").write_text(self.CHANGELOG, encoding="utf-8")
@@ -147,8 +148,9 @@ class ReleaseNotesTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             release_notes.notes("1.1.0", REPOSITORY)  # a full release needs its own entry
 
-    def gh(self, releases, latest="v1.0.0"):
+    def gh(self, releases, latest="v1.0.0", bodies=None):
         calls = []
+        bodies = {} if bodies is None else bodies
 
         def run(*arguments):
             calls.append(arguments)
@@ -156,9 +158,12 @@ class ReleaseNotesTests(unittest.TestCase):
                 return latest + "\n"
             if arguments[:2] == ("release", "list"):
                 return json.dumps(releases)
+            if arguments[:2] == ("release", "view"):
+                return bodies.get(arguments[2], f"## Download\n\nThe {arguments[2]} page as published.\n") + "\n"
             if arguments[:2] == ("release", "edit"):
                 page = Path(arguments[arguments.index("--notes-file") + 1]).read_text(encoding="utf-8")
                 self.assertIn(f"[DoubleClick Fixer {latest[1:]}]", page)
+                bodies[arguments[2]] = page
                 return ""
             raise AssertionError(f"unexpected gh {arguments}")
 
@@ -174,16 +179,57 @@ class ReleaseNotesTests(unittest.TestCase):
             {"tagName": "v0.1.9", "isDraft": False},  # no changelog entry
             {"tagName": "nightly", "isDraft": False},
         ]
+        older = ["v1.0.0-rc.1", "v0.5.3", "v0.1.9"]
         gh, calls = self.gh(releases)
         said = []
-        self.assertEqual(release_notes.point_older(REPOSITORY, gh=gh, say=said.append), ["v1.0.0-rc.1", "v0.5.3"])
+        self.assertEqual(release_notes.point_older(REPOSITORY, gh=gh, say=said.append), older)
         self.assertFalse([call for call in calls if call[:2] == ("release", "edit")], "a dry run edited a page")
-        gh, calls = self.gh(releases)
-        self.assertEqual(release_notes.point_older(REPOSITORY, apply=True, gh=gh, say=said.append), ["v1.0.0-rc.1", "v0.5.3"])
+        bodies = {}
+        gh, calls = self.gh(releases, bodies=bodies)
+        self.assertEqual(release_notes.point_older(REPOSITORY, apply=True, gh=gh, say=said.append), older)
         edited = [call[2] for call in calls if call[:2] == ("release", "edit")]
-        self.assertEqual(edited, ["v1.0.0-rc.1", "v0.5.3"])
-        self.assertTrue(any("v0.1.9: left alone" in line for line in said))
+        self.assertEqual(edited, older)
         self.assertTrue(any(line.startswith("v1.1.0-beta.2: left alone") for line in said))
+        for tag in older:
+            self.assertTrue(bodies[tag].startswith("> **A newer version is available:** [DoubleClick Fixer 1.0.0]"))
+            self.assertIn(f"The {tag} page as published.", bodies[tag], "the rest of the page is kept")
+        gh, calls = self.gh(releases, bodies=bodies)
+        self.assertEqual(release_notes.point_older(REPOSITORY, apply=True, gh=gh, say=said.append), [], "a second run changes nothing")
+
+    def test_an_older_page_keeps_its_own_text_and_gets_one_newer_line(self) -> None:
+        published = release_notes.notes("0.5.3", REPOSITORY, latest="0.5.4")
+        page = release_notes.point_at(published, "1.0.0", REPOSITORY)
+        self.assertEqual(page.count("A newer version is available"), 1)
+        self.assertIn("[DoubleClick Fixer 1.0.0]", page)
+        self.assertNotIn("[DoubleClick Fixer 0.5.4]", page)
+        self.assertEqual(
+            page.split("\n", 2)[2].lstrip("\n"), published.split("\n", 2)[2].lstrip("\n"), "everything below the line is kept"
+        )
+        never_pointed = "## Download\n\nAn old page.\n"
+        self.assertTrue(release_notes.point_at(never_pointed, "1.0.0", REPOSITORY).endswith(never_pointed))
+
+    def test_the_real_template_has_each_marker_once(self) -> None:
+        template = (ROOT / "installer" / "release_notes.md").read_text(encoding="utf-8")
+        for marker in ("__UPDATES__", "__CHECKSUMS__"):
+            self.assertEqual(template.count(marker), 1, marker)
+            self.assertIn(f"\n{marker}\n", template, f"{marker} must be a line of its own")
+
+    def test_only_signed_full_releases_say_so_and_only_full_releases_update_themselves(self) -> None:
+        signed = "SHA256SUMS.txt.minisig"
+        updates = "It updates itself"
+        page = release_notes.notes("1.0.0", REPOSITORY)
+        self.assertIn(signed, page)
+        self.assertIn(updates, page)
+        page = release_notes.notes("0.5.3", REPOSITORY)
+        self.assertNotIn(signed, page)
+        self.assertIn("SHA256SUMS.txt", page)
+        self.assertIn(updates, page)
+        page = release_notes.notes("1.0.0-rc.1", REPOSITORY)
+        self.assertNotIn(signed, page)
+        self.assertNotIn(updates, page)
+        for version in ("1.0.0", "0.5.3", "1.0.0-rc.1"):
+            self.assertNotIn("__", release_notes.notes(version, REPOSITORY), "a template marker was left in")
+            self.assertNotIn("\n\n\n", release_notes.notes(version, REPOSITORY))
 
     def test_a_pre_release_of_the_next_version_is_never_told_an_older_one_is_newer(self) -> None:
         for tag, latest, pointed in (

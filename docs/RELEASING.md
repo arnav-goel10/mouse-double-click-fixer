@@ -100,8 +100,9 @@ password (see [Keys and certificates](#keys-and-certificates)).
    up at their next check, within six hours.
 
 Publishing a release (not a pre-release) starts the Release pages workflow
-(`.github/workflows/release-pages.yml`), which rewrites every older release
-page to say a newer version exists and link to it.
+(`.github/workflows/release-pages.yml`), which puts a line at the top of every
+older release page saying a newer version exists, with a link to it. The rest
+of each page stays as it was published.
 
 ### What CI checks before a draft exists
 
@@ -193,7 +194,8 @@ python3 tools/release_notes.py 1.2.3 arnav-goel10/doubleclick-fixer > notes.md
 gh release edit v1.2.3 --notes-file notes.md
 # an older page, pointing at the latest release:
 python3 tools/release_notes.py 1.2.2 arnav-goel10/doubleclick-fixer --latest 1.2.3 > notes.md
-# every older page, as the Release pages workflow does (without --apply it only prints):
+# the newer-version line on every older page, as the Release pages workflow does
+# (without --apply it only prints):
 python3 tools/release_notes.py --point-older arnav-goel10/doubleclick-fixer --apply
 ```
 
