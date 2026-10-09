@@ -57,6 +57,21 @@ class SelfTestTests(unittest.TestCase):
         self.assertEqual(result["code signature"], "skipped: " + ("not a built app" if IS_MAC else "macOS only"))
         self.assertEqual(result["child processes"], "skipped: " + ("not a built app" if IS_MAC else "macOS only"))
 
+    def test_every_module_of_the_app_is_walked_and_imported(self) -> None:
+        detail = selftest.check_app_modules()
+        on_disk = {
+            ".".join(path.relative_to(ROOT).with_suffix("").parts).removesuffix(".__init__")
+            for path in (ROOT / "app").rglob("*.py")
+        } - {"app"}
+        self.assertEqual(detail, f"{len(on_disk)} modules imported")
+        for name in on_disk:
+            self.assertIn(name, sys.modules)
+
+    def test_a_missing_core_module_fails(self) -> None:
+        with mock.patch.object(selftest, "APP_MODULES", selftest.APP_MODULES + ("app.gone",)):
+            with self.assertRaisesRegex(RuntimeError, "not found in the app package: app.gone"):
+                selftest.check_app_modules()
+
     def test_a_failed_check_fails_the_run_and_the_rest_still_run(self) -> None:
         ran = []
 

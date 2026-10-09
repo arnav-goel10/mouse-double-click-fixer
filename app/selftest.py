@@ -30,7 +30,9 @@ RUN_LOOP_MODE = "com.doubleclickfixer.selftest"
 #: The PyObjC timer check gives up after this long.
 TIMER_WAIT_S = 0.5
 
-#: The modules the app needs at launch, beyond what the checks import.
+#: Modules every build must have; the check imports these and every other
+#: module of the app it finds (a module imported only later, when a menu or
+#: an update needs it, fails here rather than in front of the user).
 APP_MODULES = ("app.main", "app.platform", "app.updater", "app.ui.window")
 
 #: CS_RUNTIME in the code-signing flags of a running process (cs_blobs.h).
@@ -270,11 +272,23 @@ def check_notices() -> str:
 
 
 def check_app_modules() -> str:
+    """Every module of the app imports: walked from the package itself, so a
+    module imported only later (by a menu, or an update) is checked too."""
     import importlib
+    import pkgutil
 
-    for name in APP_MODULES:
+    import app
+
+    def unreadable(name: str) -> None:
+        raise RuntimeError(f"couldn't look inside {name}")
+
+    found = [info.name for info in pkgutil.walk_packages(app.__path__, "app.", onerror=unreadable)]
+    missing = sorted(set(APP_MODULES) - set(found))
+    if missing:
+        raise RuntimeError("not found in the app package: " + ", ".join(missing))
+    for name in found:
         importlib.import_module(name)
-    return ", ".join(APP_MODULES)
+    return f"{len(found)} modules imported"
 
 
 #: Name and check, in the order they run. The environment goes first, before
