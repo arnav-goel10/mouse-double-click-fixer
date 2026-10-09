@@ -878,6 +878,33 @@ class InFlightCheckTests(unittest.TestCase):
         self.assertEqual(rig.sent[-1], (Button.LEFT, None, "m"))
         self.assertEqual(rig.checks(), [])
 
+    def test_a_check_with_nothing_waiting_gives_nothing_up(self) -> None:
+        # A busy machine runs the check set for up1 45 ms late. By then up1
+        # has come back, down2, re-sent behind it, has left nothing waiting,
+        # and the way has stalled. up2, made before down2 went out, is ahead
+        # of it on the way: were down2 given up on, up2 would reach apps first.
+        rig = Pipeline(self)
+        rig.round_trip = None
+        rig.handle(Button.LEFT, True, 100.000, "down1")
+        rig.handle(Button.LEFT, False, 100.100, "up1")
+        rig.run_until(100.150)                                        # up1 re-sent
+        self.assertTrue(rig.handle(Button.LEFT, True, 100.160, "down2").deferred)
+        (check,) = rig.checks()
+        rig.clock[0] = 100.190
+        come_back(rig.filter, Button.LEFT)                            # down2 re-sent: nothing waits
+        rig.clock[0] = check.due + 0.045
+        check.alive = False
+        check.function(*check.args)
+        self.assertEqual(rig.checks(), [], "nothing waits: nothing to check")
+        up2 = rig.filter._handle(Button.LEFT, False, 100.185, "up2", allow_hold=False, location=(0, 0))
+        self.assertTrue(up2.deferred, "behind down2")
+        come_back(rig.filter, Button.LEFT)
+        self.assertEqual(rig.sent, [
+            (Button.LEFT, False, "up1"),
+            (Button.LEFT, True, "down2"),
+            (Button.LEFT, False, "up2"),
+        ])
+
     def test_a_check_left_from_before_stop_does_nothing(self) -> None:
         rig = Pipeline(self)
         rig.round_trip = None

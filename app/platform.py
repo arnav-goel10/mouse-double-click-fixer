@@ -887,9 +887,9 @@ class GlobalClickFilter:
     def _arm_check(self, button: Button) -> None:
         """With the lock held: events wait behind `button`'s re-sent ones.
         Should those never come back, a check gives up on them once they are
-        overdue, rather than waiting for a later event to show it (see
-        _expire_check). One check per button is ever pending, set for when
-        the oldest re-send in flight is due."""
+        overdue, if events still wait then, rather than waiting for a later
+        event to show it (see _expire_check). One check per button is ever
+        pending, set for when the oldest re-send in flight is due."""
         if button in self._checks or not self._in_flight[button]:
             return
         sent_at = self._in_flight[button][0][1]
@@ -907,6 +907,14 @@ class GlobalClickFilter:
             if check is None or check[1] is not token:
                 return  # stop() cancelled it
             del self._checks[button]
+            if not self._queued[button]:
+                # What it was set for came back, and what waited went out.
+                # Giving up on re-sends still on their way would only let a
+                # real event made before they went out, so ahead of them on
+                # the way, pass them.
+                return
+            # What waits goes out behind those given up on, so it reaches
+            # apps after them even if they were only slow.
             self._give_up(button)
             if self._queued[button]:
                 # Events still wait: for the same re-send, now given longer
