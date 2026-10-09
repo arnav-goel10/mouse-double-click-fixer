@@ -1,5 +1,5 @@
-"""Third-party notices: the generator, the committed copy, and finding the
-file in a build."""
+"""Third-party notices: the generator, the committed copy, finding the file in
+a build, and the General pane's Acknowledgements button."""
 
 import os
 import re
@@ -119,6 +119,51 @@ class ResolverTests(unittest.TestCase):
                 # Windows: beside the bundled program files.
                 (frameworks / notices.NOTICES_FILE).write_text("notices", encoding="utf-8")
                 self.assertEqual(notices.notices_path(), (frameworks / notices.NOTICES_FILE).resolve())
+
+
+class AcknowledgementsButtonTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        from PySide6.QtWidgets import QApplication
+
+        cls.application = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        from app import settings
+
+        directory = Path(tempfile.mkdtemp())
+        for patcher in (
+            mock.patch.object(settings, "config_dir", return_value=directory),
+            mock.patch.object(settings, "LEGACY_PATH", directory / "absent.json"),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        from app.controller import AppController
+        from app.ui.window import GeneralPage
+
+        self.page = GeneralPage(AppController())
+        self.addCleanup(self.page.deleteLater)
+
+    def test_general_has_an_acknowledgements_button(self) -> None:
+        button = self.page.acknowledgements_button
+        self.assertTrue(button.text().startswith("Acknowledgements"))
+        self.assertTrue(self.page.isAncestorOf(button))
+        self.assertTrue(button.isEnabled())
+
+    def test_it_opens_the_notices_file(self) -> None:
+        with mock.patch.object(notices, "open_file", return_value=True) as opened, mock.patch(
+            "app.ui.window.QMessageBox.information"
+        ) as message:
+            self.page.acknowledgements_button.click()
+        opened.assert_called_once_with(COMMITTED.resolve())
+        message.assert_not_called()
+
+    def test_it_says_where_the_file_is_when_nothing_opens_it(self) -> None:
+        with mock.patch.object(notices, "open_file", return_value=False), mock.patch(
+            "app.ui.window.QMessageBox.information"
+        ) as message:
+            self.page.acknowledgements_button.click()
+        self.assertIn(str(COMMITTED.resolve()), message.call_args.args[2])
 
 
 if __name__ == "__main__":

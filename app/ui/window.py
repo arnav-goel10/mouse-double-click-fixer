@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import __version__, diagnostics, permissions, startup
+from .. import __version__, diagnostics, notices, permissions, startup
 from ..controller import AppController
 from ..core import (
     BOUNCE_CANDIDATE_MS,
@@ -75,6 +75,7 @@ COLUMN_MIN = 440
 FRAME_ALLOWANCE = (16, 48)
 
 DIAGNOSTICS_DETAIL = "Version, settings and the recent log, for a bug report. Never your clicks."
+ACKNOWLEDGEMENTS_DETAIL = "Qt, Python and the other software it is built on, with their licences."
 
 PAGES = [
     ("filter", "Bounce Filter"),
@@ -719,6 +720,14 @@ class GeneralPage(Page):
         self._diagnostics_timer.setInterval(4000)
         self._diagnostics_timer.timeout.connect(lambda: self.diagnostics_row.set_detail(DIAGNOSTICS_DETAIL))
 
+        self.header("About")
+        about = self.section()
+        self.acknowledgements_button = _button("Acknowledgements…")
+        self.acknowledgements_button.clicked.connect(self._open_acknowledgements)
+        self.acknowledgements_row = about.add(
+            Row("Open-source software", ACKNOWLEDGEMENTS_DETAIL, self.acknowledgements_button, card_icon("info"))
+        )
+
         self.body.addStretch(1)
         version = TextLabel(f"DoubleClick Fixer {__version__}", "caption", "tertiary")
         version.setAlignment(Qt.AlignmentFlag.AlignHCenter)
@@ -822,6 +831,21 @@ class GeneralPage(Page):
         QApplication.clipboard().setText(text)
         self.diagnostics_row.set_detail("Copied. Paste it into your bug report.")
         self._diagnostics_timer.start()
+
+    def _open_acknowledgements(self) -> None:
+        """Open the third-party notices (THIRD_PARTY_NOTICES.md) that ship
+        with the app; say where they are if nothing on this computer opens
+        that kind of file."""
+        path = notices.notices_path()
+        if path is not None and notices.open_file(path):
+            return
+        QMessageBox.information(
+            self,
+            "Acknowledgements",
+            f"The licences of the software DoubleClick Fixer is built on are in:\n\n{path}"
+            if path is not None
+            else f"This copy has no {notices.NOTICES_FILE}. It is in DoubleClick Fixer's source on GitHub.",
+        )
 
     def _confirm_reset(self) -> None:
         answer = QMessageBox.question(
