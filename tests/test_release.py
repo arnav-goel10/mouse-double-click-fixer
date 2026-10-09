@@ -658,6 +658,36 @@ class SignPathDecisionTests(unittest.TestCase):
             self.assertEqual((code, outputs), (0, {"sign": "false"}), (event, ref))
             self.assertIn("Not signed: only the push of a release tag is signed", said)
 
+    def test_distribution_md_sets_signing_up_and_stops_it_as_the_step_expects(self) -> None:
+        # The gh commands docs/DISTRIBUTION.md gives the owner, applied in
+        # order to the release environment as gh would apply them.
+        decide = step(job((ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8"), "windows"),
+                      "Decide whether SignPath signs this build")
+        kinds = {name: {"secrets": "secret", "vars": "variable"}[kind]
+                 for name, kind in re.findall(r"(SIGNPATH_\w+): \$\{\{ (secrets|vars)\.\1 \}\}", decide)}
+        self.assertEqual(sorted(kinds), sorted(SIGNPATH_NAMES))
+        doc = (ROOT / "docs" / "DISTRIBUTION.md").read_text(encoding="utf-8")
+        commands = re.findall(r"^\s*gh (secret|variable) (set|delete) (\w+) (.*)$", doc, re.MULTILINE)
+        environment: dict = {}
+        states = []
+        for kind, verb, name, rest in commands:
+            self.assertEqual(kind, kinds.get(name), f"gh {kind} {verb} {name}")
+            self.assertTrue(rest.startswith("--env release --repo $repo"), f"gh {kind} {verb} {name} {rest}")
+            if verb == "set":
+                environment[name] = f"value of {name}"
+            else:
+                environment.pop(name)
+            states.append((verb, dict(environment)))
+        verbs = [verb for verb, _state in states]
+        self.assertIn("delete", verbs, "DISTRIBUTION.md says how to stop signing")
+        set_up = states[len(verbs) - 1 - verbs[::-1].index("set")][1]
+        code, said, outputs = self.decide("push", "refs/tags/v1.0.0", **set_up)
+        self.assertEqual((code, outputs), (0, {"sign": "true", "version": app.__version__}), said)
+        # Stopped, a tag goes out unsigned rather than failing as half set up.
+        code, said, outputs = self.decide("push", "refs/tags/v1.0.0", **states[-1][1])
+        self.assertEqual((code, outputs), (0, {"sign": "false"}), said)
+        self.assertIn("Not signed: SignPath isn't set up", said)
+
 
 class CiUpdateKeyGuardTests(unittest.TestCase):
     """doubleclick-fixer.spec's guard for CI's update key, run as each Windows

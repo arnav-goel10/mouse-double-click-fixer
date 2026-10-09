@@ -60,7 +60,15 @@ release files: `publish` doesn't download them.
 Each release makes two signing requests, and SignPath Foundation requires a
 person to approve each one. The job waits up to 30 minutes for each
 approval. A request that is denied or times out fails the Windows job, so
-no draft goes up; re-run the job after approving.
+no draft goes up. Approving a request after its wait has ended does
+nothing: the job that would have collected the signed file has already
+failed. Re-run the failed jobs instead. The re-run submits two new requests,
+and you approve each within its 30 minutes. SignPath checks its build
+policies on at most 3 re-runs of a build and fails later ones, and a signing
+policy set to `disallow_reruns` refuses re-runs altogether
+([SignPath with GitHub](https://docs.signpath.io/trusted-build-systems/github)).
+Past either, delete the tag and push it again, which starts a new run rather
+than a re-run.
 
 `tools/signpath/windows-executables.xml` and
 `tools/signpath/windows-installer.xml` are the two artifact configurations.
@@ -98,7 +106,7 @@ step 4 of [After acceptance](#after-acceptance)):
 | Manual approval of every release | Two requests per release, both approved by you |
 | Product name and version enforced by metadata restrictions | Both artifact configurations require product name "Mouse Double-Click Fixer" and the release's version |
 | Only your own code signed | Only the three files built here. The Python and Qt libraries beside the installed exe are never sent to SignPath |
-| Privacy | No telemetry. The only network use is the update check and download from GitHub, which **General › Check for updates automatically** turns off (README, [Privacy](../README.md#privacy)) |
+| Privacy: software that collects user data and transfers it to systems the user didn't name must describe this in a privacy policy, show that policy during installation, and offer an option at install time to turn it off | No telemetry, and nothing about the user is collected. The only network use is the update check and download from the project's GitHub Releases. The check is on by default; it asks GitHub for the latest release, with the app's version in its User-Agent and nothing else beyond what any web request carries (the IP address). **General › Check for updates automatically** turns it off (README, [Privacy](../README.md#privacy)). Be ready to argue that this isn't user data. If SignPath disagrees, the installer must show the privacy policy and offer a checkbox that turns the automatic check off; that isn't built |
 | System changes announced; an uninstaller | Start at login is off unless chosen. The installer registers an uninstaller; the portable exe is one file to delete |
 | A "Code signing policy" on the home page | **To do once accepted:** add [the section below](#the-code-signing-policy-section) to the README and the release page |
 
@@ -155,6 +163,13 @@ usually ask for. Paste the parts the form wants.
 >
 > **Releases so far:** 0.2.0 to 0.5.3 (since 2026-09-19); 1.0.0 is next.
 > macOS builds are signed separately and aren't part of this request.
+>
+> **One question:** Inno Setup writes the installer's product name and
+> version into fixed-size version fields, padded with trailing spaces
+> ("Mouse Double-Click Fixer" followed by spaces). Do the `product-name`
+> and `product-version` restrictions compare these values trimmed, and
+> against the string version or the numeric one? If not trimmed, how should
+> the installer's artifact configuration be written?
 
 ### After acceptance
 
@@ -174,6 +189,10 @@ steps differ.
      ref, limit it to the release tags.
    - Create a CI user with the submitter role on that policy, and generate
      its API token. The token is shown only once.
+   - If the application's question about the installer's padded version
+     details is still unanswered, get the answer now and change
+     `tools/signpath/windows-installer.xml` to match before the first
+     signed tag (see [How the release workflow signs](#how-the-release-workflow-signs)).
 2. **GitHub:** put the token in the `release` environment, which only tags
    may use, and the three IDs beside it:
 
@@ -186,15 +205,32 @@ steps differ.
    ```
 
 3. **README and release page:** add the code signing policy below.
-4. **Try it on a pre-release.** Tag `v1.0.1-rc.1` (or the next
-   pre-release), approve the two requests in SignPath as the run reaches
+4. **Try it on a pre-release.** A release tag must carry the version in
+   `app/__init__.py` (`tests/test_release.py` checks it on every tag), and
+   the changelog needs a heading for that version, which for a pre-release
+   needs no date. So the simplest trial is a pre-release of a version not
+   yet released. If 1.0.0 isn't tagged yet, tag `v1.0.0-rc.1` at the commit
+   you'd release. Once 1.0.0 is out, first commit the next version, such
+   as `__version__ = "1.0.1"` and a `## 1.0.1` changelog entry, then tag
+   `v1.0.1-rc.1`. Approve the two requests in SignPath as the run reaches
    them, and check the Windows job's "Check what SignPath checks, and every
    signature" step: all three files `Valid`, signed by SignPath Foundation.
    Then delete the draft and the tag. The first real signed release is the
    next tag after that.
 
-To stop signing, delete the secret: the next release logs "Not signed" and
-goes out unsigned.
+**To stop signing,** delete the token and all three variables, and revoke
+the CI user's token in SignPath. The next tag's build then logs "Not
+signed" and goes out unsigned. Deleting only some of them makes the next
+tag's Windows build fail instead, naming what is missing, because a
+half-finished setup is more likely a mistake than a choice:
+
+```bash
+repo=arnav-goel10/mouse-double-click-fixer
+gh secret delete SIGNPATH_API_TOKEN --env release --repo $repo
+gh variable delete SIGNPATH_ORGANIZATION_ID --env release --repo $repo
+gh variable delete SIGNPATH_PROJECT_SLUG --env release --repo $repo
+gh variable delete SIGNPATH_POLICY_SLUG --env release --repo $repo
+```
 
 ### The code signing policy section
 
@@ -204,21 +240,22 @@ release pages. For the README, below **Privacy**:
 ```markdown
 ## Code signing policy
 
-Free code signing on Windows provided by [SignPath.io](https://about.signpath.io),
+Free code signing provided by [SignPath.io](https://about.signpath.io),
 certificate by [SignPath Foundation](https://signpath.org).
 
 - Committers and reviewers: [Arnav Goel](https://github.com/arnav-goel10)
 - Approvers: [Arnav Goel](https://github.com/arnav-goel10)
 
-Only files the release workflow builds from this repository, on GitHub's own
-runners, are signed, and each signing request is approved by hand. The
-Python and Qt libraries the app ships are their publishers' own files.
-Privacy policy: see [Privacy](#privacy).
+This covers the Windows downloads. Only files the release workflow builds
+from this repository, on GitHub's own runners, are signed, and each signing
+request is approved by hand. The Python and Qt libraries the app ships are
+their publishers' own files. Privacy policy: see [Privacy](#privacy).
 ```
 
-And a line for `installer/release_notes.md`: "Windows downloads are signed
-through SignPath.io with a certificate by SignPath Foundation. See the
-[code signing policy](https://github.com/arnav-goel10/mouse-double-click-fixer#code-signing-policy)."
+The first sentence is the terms' wording; keep it exactly. And a line for
+`installer/release_notes.md`: "Windows downloads: free code signing
+provided by SignPath.io, certificate by SignPath Foundation. See the
+[Code signing policy](https://github.com/arnav-goel10/mouse-double-click-fixer#code-signing-policy)."
 
 ### What signing doesn't cover
 
@@ -280,7 +317,13 @@ What the manifests say, and why:
   itself stay in step with winget.
 - **`AppsAndFeaturesEntries`** records the uninstall entry's name ("Mouse
   Double-Click Fixer 1.0.0") and publisher ("Mouse Double-Click Fixer"),
-  which differ from the package's name and publisher.
+  which differ from the package's name and publisher. winget-pkgs'
+  [Authoring guide](https://github.com/microsoft/winget-pkgs/blob/master/doc/Authoring.md)
+  (Testing) asks for the entry when they differ. The version isn't a
+  reason: Inno Setup writes a `DisplayVersion` equal to `PackageVersion`,
+  which the same guide's "When is AppsAndFeaturesEntries needed?" says
+  needs no entry. If a moderator asks to drop it, drop it; the
+  `ProductCode` still ties the installed copy to the package.
 - **No portable entry.** The portable exe replaces itself when it updates,
   but winget tracks a portable package by the file it put down. The two
   would disagree.
@@ -357,7 +400,7 @@ and the
 | Silent install with no UI (UAC is allowed) | `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART`, as CI's install test runs it. Per-user, no UAC |
 | A standalone installer, not a downloader | Yes |
 | PC only | Yes |
-| A privacy policy URL (required for every Win32 app, policy 10.5.1) | `https://github.com/arnav-goel10/mouse-double-click-fixer#privacy` |
+| A privacy policy URL. Policy 10.5.1 requires one when a product accesses, collects or transmits personal information, and always for Win32 products, which it counts among those that "inherently have access to Personal Information" | `https://github.com/arnav-goel10/mouse-double-click-fixer#privacy` |
 
 This route opens once SignPath signs releases and the uninstaller is
 signed too. That needs a third signing request from inside the installer's
