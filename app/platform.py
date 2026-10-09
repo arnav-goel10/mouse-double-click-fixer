@@ -893,11 +893,16 @@ class GlobalClickFilter:
         Should those never come back, a check gives up on them once they are
         overdue, if events still wait then, rather than waiting for a later
         event to show it (see _expire_check). One check per button is ever
-        pending, set for when the oldest re-send in flight is due."""
+        pending, set for when the oldest re-send in flight is due, or sooner,
+        for when the late event that lengthens the wait stops counting: the
+        wait is shorter from then on, and the check looks again."""
         if button in self._checks or not self._in_flight[button]:
             return
+        now = monotonic()
         sent_at = self._in_flight[button][0][1]
-        seconds = max(0.0, sent_at + self._in_flight_timeout() - monotonic()) + IN_FLIGHT_CHECK_SLACK_S
+        due = sent_at + self._in_flight_timeout()
+        due = min(due, max(sent_at + IN_FLIGHT_TIMEOUT_S, self._peak_lateness.counts_until(now)))
+        seconds = max(0.0, due - now) + IN_FLIGHT_CHECK_SLACK_S
         token = object()
         timer = threading.Timer(seconds, self._expire_check, (button, token))
         timer.daemon = True
@@ -921,9 +926,10 @@ class GlobalClickFilter:
             # apps after them even if they were only slow.
             self._give_up(button)
             if self._queued[button]:
-                # Events still wait: for the same re-send, now given longer
-                # (an event came late since), or for one sent after it, which
-                # is due later. The check moves on to when that is due.
+                # Events still wait: for the same re-send, not overdue yet (an
+                # event came late since, or a less late one still lengthens
+                # the wait), or for one sent after it, which is due later.
+                # The check moves on to when that is due.
                 self._arm_check(button)
         self._send_outbox()
         self._update_motion_tap()

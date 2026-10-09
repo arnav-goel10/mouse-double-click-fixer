@@ -1187,6 +1187,22 @@ class InFlightTimeoutTests(unittest.TestCase):
         rig.run_until(97.901 + PEAK_WINDOW_S)
         self.assertAlmostEqual(rig.filter._in_flight_timeout(), IN_FLIGHT_TIMEOUT_S, places=9)
 
+    def test_a_wait_a_late_event_lengthened_shortens_when_it_stops_counting(self) -> None:
+        rig = Pipeline(self)
+        rig.round_trip = None
+        rig.move(99.750, "slow", (0, 0), late_ms=250)                 # waits 500 ms until 102.000
+        rig.handle(Button.LEFT, True, 101.800, "down1", late_ms=0)
+        rig.handle(Button.LEFT, False, 101.900, "up1", late_ms=0)
+        rig.run_until(101.950)                                        # up1 re-sent, never back
+        sent_at = rig.filter._in_flight[Button.LEFT][0][1]
+        self.assertTrue(rig.handle(Button.LEFT, True, 101.960, "down2", late_ms=0).deferred)
+        # From 102.000 the wait is 150 ms again: up1 is overdue 150 ms after
+        # it went out, not 500.
+        rig.run_until(sent_at + IN_FLIGHT_TIMEOUT_S + IN_FLIGHT_CHECK_SLACK_S - 0.001)
+        self.assertEqual(rig.sent, [(Button.LEFT, False, "up1")])
+        rig.run_until(sent_at + IN_FLIGHT_TIMEOUT_S + IN_FLIGHT_CHECK_SLACK_S)
+        self.assertEqual(rig.sent[1:], [(Button.LEFT, True, "down2")])
+
 
 def quantized_tick(ms: float) -> int:
     """GetTickCount at `ms` milliseconds since boot: it advances only with the

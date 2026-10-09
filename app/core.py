@@ -347,6 +347,12 @@ class PeakLateness:
         self._forget(now)
         return self._peaks[0][1] if self._peaks else 0.0
 
+    def counts_until(self, now: float) -> float:
+        """Until when the worst lateness counted at `now` keeps counting (see
+        worst_ms); `now` if none does. Something less late may count after."""
+        self._forget(now)
+        return self._peaks[0][0] + self._window if self._peaks else now
+
     def _forget(self, now: float) -> None:
         while self._peaks and now - self._peaks[0][0] > self._window:
             self._peaks.popleft()
