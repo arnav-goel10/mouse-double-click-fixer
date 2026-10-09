@@ -10,7 +10,7 @@ those steps is yours.
 | --- | --- | --- | --- |
 | Signed Windows downloads | `release.yml` signs through SignPath once it is set up; until then it builds unsigned, as before | SignPath Foundation accepting the project | [Apply](#the-application), then [set it up](#after-acceptance) |
 | winget | `tools/winget_manifest.py` writes and checks the manifests | Nothing: a published release is enough. Signing isn't required | [Submit](#2-winget) the first version, then each new one |
-| Microsoft Store, existing installer (EXE) | The installer installs silently, from a versioned URL | Every program file inside it must be signed by a trusted CA. SignPath can sign only ours, not the Python and Qt libraries or Inno Setup's uninstaller | [See the checklist](#route-a-the-existing-installer-exe) |
+| Microsoft Store, existing installer (EXE) | The installer installs silently, from a versioned URL. The Python, Qt and Microsoft libraries inside are already signed by their publishers | Every program file must be signed by a trusted CA: our exe and the installer (SignPath), and Inno Setup's uninstaller, which SignPath can't reach as set up | [See the checklist](#route-a-the-existing-installer-exe) |
 | Microsoft Store, MSIX | Nothing yet | Packaging work in the app (no blocker outside it) | [See route B](#route-b-msix) |
 
 A sensible order: apply to SignPath now, since its review takes the longest
@@ -222,15 +222,20 @@ through SignPath.io with a certificate by SignPath Foundation. See the
 
 ### What signing doesn't cover
 
-- **Upstream libraries.** The installed folder ships Python's and Qt's DLLs
-  and extension modules as their publishers built them. The run's final
-  check lists which carry a signature. SignPath's terms forbid signing them
-  ourselves.
+- **Upstream libraries.** The installed folder ships Python's, Qt's and
+  Microsoft's DLLs and extension modules as their publishers built them,
+  and SignPath's terms forbid signing them ourselves. They don't need it.
+  On the 0.5.3 build ([release run 37958775165](https://github.com/arnav-goel10/mouse-double-click-fixer/actions/runs/37958775165)),
+  the final check found 49 of the folder's 50 program files validly signed:
+  by the Python Software Foundation, The Qt Company and Microsoft. The 50th
+  is `DoubleClickFixer.exe`, which SignPath signs.
 - **The uninstaller.** Inno Setup writes `unins000.exe` at install time.
   It is signed only when the installer is compiled with
-  `SignedUninstaller=yes` and a sign tool Inno Setup can call itself. A
-  remote signing service like SignPath doesn't fit that, so the uninstaller
-  stays unsigned.
+  `SignedUninstaller=yes` and a `SignTool` that the compiler runs itself,
+  while it compiles. The workflow's SignPath steps run outside the
+  compiler, so the uninstaller stays unsigned. Signing it would take a third
+  signing request made from inside the compile (with SignPath's PowerShell
+  module or REST API), and so a third approval per release.
 - **SmartScreen.** A signature lets reputation build up for the
   certificate, not separately for each file. It doesn't by itself stop the
   first-run warning.
@@ -347,16 +352,18 @@ and the
 | Requirement | Status |
 | --- | --- |
 | An `.exe` or `.msi` installer | `DoubleClickFixer-Setup.exe` |
-| The installer **and all of its PE files** signed with a certificate from a CA in the Microsoft Trusted Root Program | **Blocked.** SignPath would sign the installer and our exe. The Python and Qt DLLs and `.pyd` files are as their publishers ship them, and some are unsigned; the release run's last check lists which. The uninstaller is unsigned (see above) |
+| The installer **and all of its PE files** signed with a certificate from a CA in the Microsoft Trusted Root Program | **Blocked.** SignPath would sign our exe and the installer, but the uninstaller stays unsigned. The libraries are already signed by their publishers (49 of 50 files; see [What signing doesn't cover](#what-signing-doesnt-cover)) |
 | A versioned HTTPS URL whose file never changes | `https://github.com/arnav-goel10/mouse-double-click-fixer/releases/download/v1.0.0/DoubleClickFixer-Setup.exe` |
 | Silent install with no UI (UAC is allowed) | `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART`, as CI's install test runs it. Per-user, no UAC |
 | A standalone installer, not a downloader | Yes |
 | PC only | Yes |
 | A privacy policy URL (required for every Win32 app, policy 10.5.1) | `https://github.com/arnav-goel10/mouse-double-click-fixer#privacy` |
 
-Until every PE file is signed, this route is closed. Opening it means either
-upstream packages that ship signed binaries, or signing the libraries with a
-certificate whose terms allow it (SignPath Foundation's don't).
+This route opens once SignPath signs releases and the uninstaller is
+signed too. That needs a third signing request from inside the installer's
+compile (see [What signing doesn't cover](#what-signing-doesnt-cover)).
+Alternatively, ask Microsoft whether an uninstaller written at install time
+counts among "all of its PE files". Neither is built.
 
 When it opens, Partner Center asks for each package:
 
