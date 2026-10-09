@@ -63,9 +63,11 @@ Fixer as administrator as well.
 ## Games
 
 The app never invents a click, but it re-sends some: a release held back for
-the filter window, and a press that lands just as that window ends, reach
-games as software input (on Windows, marked as injected). Some anti-cheat
-systems watch for that; turn the filter off before playing those games.
+the filter window, and whatever comes while that release is on its way (a
+press, another button's click, pointer movement), so that games see them in
+the order they happened. Those reach games as software input (on Windows,
+marked as injected). Some anti-cheat systems watch for that; turn the filter
+off before playing those games.
 
 ## I can't find the window
 

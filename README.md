@@ -105,7 +105,7 @@ No. The only network request is the update check to this repository's GitHub rel
 <details>
 <summary><b>Will it get me flagged in games?</b></summary>
 
-The app never invents a click, but it does re-send some: a release it held back for the filter window, and a press that arrives just as that window ends, reach apps as software input (on Windows, marked as injected). Most games don't care, but some anti-cheat systems watch for software-sent input; turn the filter off before playing those.
+The app never invents a click, but it does re-send some: a release it held back for the filter window, and whatever comes while that release is on its way to apps (a press, another button's click, pointer movement), so that apps see them in the order they happened. Those reach apps as software input (on Windows, marked as injected). Most games don't care, but some anti-cheat systems watch for software-sent input; turn the filter off before playing those.
 </details>
 
 ## Build from source
