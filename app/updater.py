@@ -410,8 +410,11 @@ class Updater(QObject):
 
     @property
     def auto_check(self) -> bool:
-        """Look for updates in the background."""
-        return bool(self.controller.settings.get("auto_check", True))
+        """Look for updates in the background. Until this is set, it follows
+        the install switch: before the two were separate, turning that off
+        stopped the checks too, and a copy updated from then still does."""
+        settings = self.controller.settings
+        return bool(settings.get("auto_check", settings.get("auto_update", True)))
 
     @property
     def auto_install(self) -> bool:
@@ -732,8 +735,10 @@ class Updater(QObject):
 
     def _remember(self, **values: object) -> None:
         # The updater's own settings are written by the controller with all the
-        # others, so they survive its next save.
-        self.controller._store(**values)
+        # others, so they survive its next save. A controller without
+        # store_update_state predates it, and its _store does the same.
+        store = getattr(self.controller, "store_update_state", None) or self.controller._store
+        store(**values)
 
     def _remove_workdir(self) -> None:
         if self._workdir is not None:

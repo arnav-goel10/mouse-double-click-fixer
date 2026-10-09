@@ -18,6 +18,7 @@ from run import _unhide_qt_plugins
 
 _unhide_qt_plugins()
 
+from app import settings as settings_store
 from app import updater
 from app.updater import (
     CHECKSUM_ASSET,
@@ -335,14 +336,16 @@ class _Server(http.server.ThreadingHTTPServer):
 
 
 class FakeController:
-    """The settings side of AppController, kept in memory."""
+    """The settings side of AppController, kept in memory. `settings` are
+    what the settings file holds; they are read the way the app reads them,
+    defaults and all."""
 
     def __init__(self, **settings) -> None:
-        self.settings = {"auto_update": False, **settings}
+        self.settings = settings_store.coerce(settings)
         self.suspended = False
 
     def _store(self, **values) -> None:
-        self.settings = {**self.settings, **values}
+        self.settings = settings_store.coerce({**self.settings, **values})
 
     def set_auto_update(self, enabled: bool) -> None:
         self._store(auto_update=bool(enabled))
@@ -653,6 +656,17 @@ class NetworkTests(unittest.TestCase):
         self.assertEqual(instance.controller.settings["update_attempt_version"], "9.9.9")
         self.assertEqual(instance.controller.settings["update_attempt_count"], 1)
 
+    def test_an_old_opt_out_still_stops_background_checks(self) -> None:
+        # Before checking and installing were separate, auto_update off meant
+        # no checks either; a copy updated from then has no auto_check yet.
+        base = self.matching_files()
+        instance, _install = self.background_check(base, auto_update=False)
+        self.assertEqual((instance.state, self.requested), (instance.IDLE, []), "no background request")
+        self.assertFalse(instance.auto_check)
+
+        instance, _install = self.background_check(base, auto_update=False, auto_check=True)
+        self.assertEqual(instance.state, instance.AVAILABLE, "checking was turned back on by itself")
+
     def test_a_version_that_failed_twice_is_not_retried_unattended(self) -> None:
         base = self.matching_files()
         instance, install = self.background_check(
@@ -679,11 +693,15 @@ class NetworkTests(unittest.TestCase):
     def test_settings_switches(self) -> None:
         instance = self.make_updater("http://127.0.0.1:9/latest")
         self.assertTrue(instance.auto_check, "on unless turned off")
+        self.assertTrue(instance.auto_install, "on unless turned off")
         instance.set_auto_check(False)
         self.assertFalse(instance.auto_check)
         self.assertFalse(instance.controller.settings["auto_check"])
-        instance.set_auto_install(True)
-        self.assertTrue(instance.auto_install)
+        instance.set_auto_install(False)
+        self.assertFalse(instance.auto_install)
+        instance.set_auto_check(True)
+        self.assertTrue(instance.auto_check, "each switch is its own")
+        self.assertFalse(instance.auto_install)
 
 
 class AssetStateTests(unittest.TestCase):
@@ -760,6 +778,52 @@ class WindowsPortableSwapTests(unittest.TestCase):
         self.assertEqual(marker.read_text().strip(), "new --updated", "the new copy is moved in and started")
         self.assertFalse(downloaded.exists())
         self.assertFalse(script.exists(), "the script removes itself")
+
+
+class StoredSettingsTests(unittest.TestCase):
+    """The update settings as the real AppController reads and writes them."""
+
+    def controller(self, stored: dict):
+        from app.controller import AppController
+
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, folder, True)
+        for patch in (
+            mock.patch("app.settings.config_dir", return_value=folder),
+            mock.patch("app.settings.LEGACY_PATH", folder / "legacy.json"),
+            mock.patch("app.startup.is_supported", return_value=False),  # leave the real login item alone
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+        (folder / "settings.json").write_text(json.dumps(stored))
+        return AppController()
+
+    def updater_for(self, controller):
+        from app.updater import Updater
+
+        instance = Updater(controller)
+        self.addCleanup(instance.deleteLater)
+        instance.kind = "mac"
+        instance._network = mock.Mock()
+        return instance
+
+    def test_an_opt_out_saved_before_the_split_stops_background_checks(self) -> None:
+        instance = self.updater_for(self.controller({"auto_update": False}))
+        instance.check(user_initiated=False)
+        instance._network.get.assert_not_called()
+        self.assertEqual(instance.state, instance.IDLE)
+        instance.check(user_initiated=True)  # asking still works
+        instance._network.get.assert_called_once()
+
+    def test_the_controllers_own_method_is_used_when_it_has_one(self) -> None:
+        from app.updater import Updater
+
+        controller = FakeController()
+        controller.store_update_state = mock.Mock()
+        instance = Updater(controller)
+        self.addCleanup(instance.deleteLater)
+        instance.set_auto_check(False)
+        controller.store_update_state.assert_called_once_with(auto_check=False)
 
 
 class RelaunchNoticeTests(unittest.TestCase):
