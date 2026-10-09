@@ -45,11 +45,20 @@ if sys.platform == "darwin":
 # app, before any other code runs (see the hook for which and why).
 RUNTIME_HOOKS = ["installer/runtime_hooks/scrub_env.py"] if sys.platform == "darwin" else []
 
+# Every build carries the licences of what it bundles (Qt's LGPL among them),
+# written for the exact versions in this environment: Contents/Resources on
+# macOS, beside the program files on Windows (app/notices.py finds it).
+import subprocess
+
+NOTICES = Path("build", "notices", "THIRD_PARTY_NOTICES.md")
+subprocess.run([sys.executable, "tools/make_notices.py", "--output", str(NOTICES)], check=True)
+DATAS = [(str(NOTICES), ".")]
+
 analysis = Analysis(
     ["run.py"],
     pathex=["."],
     binaries=[],
-    datas=[],
+    datas=DATAS,
     hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=RUNTIME_HOOKS,
