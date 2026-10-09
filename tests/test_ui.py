@@ -1026,6 +1026,60 @@ class CalibrationFlowTests(LiveWindowTests):
         self.assertEqual(len(page.timeline._gaps), 3)
 
 
+class AppKitCallbackTests(unittest.TestCase):
+    """Work AppKit asks for runs from Qt's event loop, not inside AppKit."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.application = QApplication.instance() or QApplication([])
+
+    def test_system_notifications_are_handled_from_the_event_loop(self) -> None:
+        import sys
+
+        from app.ui import dock
+
+        class NSObject:  # stands in for PyObjC's; nothing registers with AppKit
+            @classmethod
+            def alloc(cls):
+                return cls()
+
+            def init(self):
+                return self
+
+        calls = []
+        with mock.patch.dict(sys.modules, {"AppKit": mock.MagicMock(), "Foundation": mock.MagicMock(NSObject=NSObject)}), \
+                mock.patch.object(dock, "_available", return_value=True), \
+                mock.patch.object(dock, "_SYSTEM_OBSERVER", []):
+            dock.observe_system(
+                on_wake=lambda: calls.append("wake"),
+                on_session_active=lambda: calls.append("active"),
+                on_session_inactive=lambda: calls.append("inactive"),
+                on_permission_change=lambda: calls.append("permission"),
+            )
+            observer = dock._SYSTEM_OBSERVER[0]
+        observer.woke_(None)
+        observer.sessionInactive_(None)
+        observer.sessionActive_(None)
+        observer.permissionChanged_(None)
+        self.assertEqual(calls, [], "nothing runs inside AppKit's dispatch")
+        self.application.processEvents()
+        self.assertEqual(calls, ["wake", "inactive", "active", "permission"])
+
+    def test_an_exception_in_one_reaches_the_log_not_appkit(self) -> None:
+        import sys
+
+        from app.ui import dock
+
+        def broken() -> None:
+            raise RuntimeError("not a HookError")
+
+        with mock.patch.object(sys, "excepthook") as excepthook:
+            dock._deferred(broken)()  # what AppKit calls: returns cleanly
+            self.application.processEvents()
+        excepthook.assert_called_once()
+        self.assertIs(excepthook.call_args[0][0], RuntimeError)
+
+
 class MenuBarItemTests(unittest.TestCase):
     """macOS uses a native status item; Qt's own crashes on macOS 27."""
 
