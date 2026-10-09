@@ -1,0 +1,29 @@
+name: Release pages
+
+# Once a release is published (python3 tools/sign_release.py publish), every
+# older release page says a newer version exists and links to it.
+on:
+  release:
+    types: [released]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-pages
+  cancel-in-progress: false
+
+jobs:
+  point-older-pages:
+    name: Point older release pages at the latest
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      # The published tag's own changelog, which has every older entry.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rewrite the older release pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 tools/release_notes.py --point-older "$GITHUB_REPOSITORY" --apply

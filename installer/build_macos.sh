@@ -13,10 +13,23 @@ set -euo pipefail
 APP="dist/DoubleClick Fixer.app"
 LOCAL_SIGNING="$HOME/.doubleclick-fixer-signing"
 
-# Skip the install step when the environment already has what it needs
-# (a uv-managed virtualenv has no pip of its own, for example).
-if ! python3 -c "import PyInstaller, PySide6, dmgbuild" 2>/dev/null; then
-  python3 -m pip install -r requirements.txt pyinstaller dmgbuild
+# Build with exactly the pinned packages and build tools, each file checked
+# against its hash (requirements-build.txt; see requirements-build.in). A
+# uv-managed virtualenv has no pip of its own; uv installs the same files.
+install_pinned() {
+  if python3 -m pip --version >/dev/null 2>&1; then
+    python3 -m pip install --require-hashes --only-binary :all: -r requirements-build.txt
+  elif command -v uv >/dev/null 2>&1; then
+    uv pip install --python "$(command -v python3)" --require-hashes --only-binary :all: -r requirements-build.txt
+  else
+    printf 'error: neither pip nor uv can install packages for %s\n' "$(command -v python3)" >&2
+    return 1
+  fi
+}
+if ! install_pinned; then
+  printf 'error: could not install requirements-build.txt. Build in a virtualenv:\n' >&2
+  printf '  python3 -m venv .venv-build && . .venv-build/bin/activate && bash installer/build_macos.sh\n' >&2
+  exit 1
 fi
 
 python3 -m PyInstaller --clean --noconfirm doubleclick-fixer.spec
