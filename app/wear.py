@@ -162,6 +162,9 @@ class WearHistory:
         # day ("YYYY-MM-DD") -> button name or WHEEL -> counts
         self._days: dict[str, dict[str, dict[str, Any]]] = {}
         self._dirty = False
+        # Whether what wear.json holds is in memory (or there is nothing to
+        # read): until it is, nothing may be written over the file.
+        self._stored_read = False
         self._saved_at = clock()
         self._day_key = ""
         self._day_ends = 0.0
@@ -319,10 +322,21 @@ class WearHistory:
         for key in [key for key in self._days if key < oldest]:
             del self._days[key]
 
-    def load(self) -> None:
-        """Read wear.json (or its spare). A missing or damaged file starts an
-        empty history; the counts are only ever added to."""
-        content = settings_store.read_json(self.path, self.backup)
+    def load(self) -> bool:
+        """Add what wear.json (or its spare) holds to the counts in memory.
+        A missing or damaged file starts an empty history; the counts are only
+        ever added to.
+
+        When the file stays unreadable (a backup tool or virus scanner
+        holding it) and its spare can't stand in, nothing changes and this
+        returns False. save() then reads again before it writes: writing the
+        counts since launch over the file would replace a year of history,
+        and a second write would replace its spare too.
+        """
+        content, stored = settings_store.read_json_checked(self.path, self.backup)
+        if not stored:
+            log.warning("Couldn't read the wear history; it is read again before anything is saved")
+            return False
         days = _valid_days(content.get("days"))
         with self._lock:
             # Anything counted before the file was read is kept on top.
@@ -334,12 +348,19 @@ class WearHistory:
                     else:
                         _add(mine, entry)
             self._prune()
+            self._stored_read = True
+        return True
 
     def save(self) -> bool:
         """Write the history if anything changed. Returns whether it wrote."""
         with self._lock:
             if not self._dirty:
                 return False
+        if not self._stored_read and not self.load():
+            # Still unreadable: keep the counts and try at the next save.
+            self._saved_at = self._clock()
+            return False
+        with self._lock:
             self._prune()
             content = {
                 "version": FORMAT_VERSION,
@@ -365,9 +386,11 @@ class WearHistory:
         return self.save()
 
     def clear(self) -> None:
+        """Start afresh: the next save replaces whatever the file holds."""
         with self._lock:
             self._days.clear()
             self._dirty = True
+            self._stored_read = True
 
 
 def _count(value: Any) -> int:

@@ -362,6 +362,31 @@ class DurabilityTests(unittest.TestCase):
         settings.save({"filtered_total": 1}, current=settings.load())
         self.assertFalse((self.directory / "settings.json.bak").exists(), "the old copy is gone too")
 
+    def test_a_read_says_when_empty_means_unreadable(self) -> None:
+        path, spare = self.directory / "data.json", self.directory / "data.json.bak"
+        real = Path.read_bytes
+        locked: set = set()
+
+        def read_bytes(file):
+            if file.name in locked:
+                raise PermissionError(32, "locked")
+            return real(file)
+
+        with mock.patch.object(Path, "read_bytes", read_bytes), mock.patch.object(settings, "sleep"):
+            self.assertEqual(settings.read_json_checked(path, spare), ({}, True), "nothing stored")
+            path.write_text("{cut sho")
+            self.assertEqual(settings.read_json_checked(path, spare), ({}, True), "damaged, and no spare")
+            path.write_text('{"a": 1}')
+            locked.add("data.json")
+            self.assertEqual(settings.read_json_checked(path, spare), ({}, False), "locked, and no spare")
+            spare.write_text('{"a": 0}')
+            self.assertEqual(settings.read_json_checked(path, spare), ({"a": 0}, True), "the spare stands in")
+            locked.add("data.json.bak")
+            self.assertEqual(settings.read_json_checked(path, spare), ({}, False))
+            self.assertEqual(settings.read_json(path, spare), {}, "read_json's own answer is unchanged")
+            locked.clear()
+            self.assertEqual(settings.read_json_checked(path, spare), ({"a": 1}, True))
+
     def test_a_briefly_locked_file_is_read_on_a_later_try(self) -> None:
         real = Path.read_bytes
         failures = [PermissionError(32, "locked")]

@@ -242,20 +242,33 @@ def read_json(path: Path, backup: Path) -> dict[str, Any]:
     kept beside it (`backup`) stands in. A missing file means nothing stored:
     deleting it is how users start afresh, so the copy must not bring the old
     values back."""
+    return read_json_checked(path, backup)[0]
+
+
+def read_json_checked(path: Path, backup: Path) -> tuple[dict[str, Any], bool]:
+    """read_json, and whether its answer stands for what is stored. That is
+    False only when the file stayed unreadable through every try (a backup
+    tool or virus scanner holding it) and its copy couldn't stand in: the
+    empty answer then means "couldn't read", not "nothing stored", and
+    writing over the file would replace what it holds."""
+    locked = False
     for _attempt in range(READ_ATTEMPTS):
         try:
             values = _read(path)
         except OSError:
             # A backup tool or virus scanner has it open; it lets go quickly.
+            locked = True
             sleep(0.1)
             continue
         if values or not path.exists():
-            return values
+            return values, True
+        locked = False  # damaged, not locked: the copy is all there is
         break
     try:
-        return _read(backup)
+        values = _read(backup)
     except OSError:
-        return {}
+        return {}, False
+    return values, bool(values) or not locked
 
 
 def write_json(destination: Path, backup: Path, content: Any) -> None:

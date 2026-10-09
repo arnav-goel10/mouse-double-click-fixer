@@ -183,6 +183,77 @@ class WearTests(unittest.TestCase):
         loaded.load()
         self.assertEqual(loaded.daily(Button.LEFT)[-1].presses, 2)
 
+    def locked(self, *names: str):
+        """Make the files called `names` unreadable, as a backup tool or a
+        virus scanner holding them would."""
+        real = Path.read_bytes
+
+        def read_bytes(path):
+            if path.name in names:
+                raise PermissionError(32, "locked")
+            return real(path)
+
+        return mock.patch.object(Path, "read_bytes", read_bytes)
+
+    def a_year_on_file(self) -> str:
+        (self.directory / "wear.json").write_text(json.dumps({"version": 1, "days": {
+            "2026-01-05": {"left": {"presses": 900, "bounces": 30}},
+            "2026-10-08": {"left": {"presses": 500, "bounces": 9}},
+        }}))
+        return (self.directory / "wear.json").read_text()
+
+    def test_a_file_locked_at_launch_is_never_written_over(self) -> None:
+        # Locked through every try, and no spare to stand in.
+        stored = self.a_year_on_file()
+        with self.locked("wear.json"), mock.patch.object(settings, "sleep"):
+            self.assertFalse(self.history.load())
+            self.clicks(3)
+            self.assertFalse(self.history.save(), "nothing is written over what couldn't be read")
+        self.assertEqual((self.directory / "wear.json").read_text(), stored)
+        self.assertFalse((self.directory / "wear.json.bak").exists())
+        self.assertEqual(self.history.daily(Button.LEFT)[-1].presses, 3, "the counts since launch are kept")
+        # The lock lifts: the next save reads the file first and adds to it.
+        self.assertTrue(self.history.save())
+        days = json.loads((self.directory / "wear.json").read_text())["days"]
+        self.assertEqual(days["2026-01-05"]["left"]["presses"], 900)
+        self.assertEqual(days["2026-10-08"]["left"]["presses"], 500)
+        self.assertEqual(days["2026-10-09"]["left"]["presses"], 3)
+        self.clicks(1)
+        self.assertTrue(self.history.save())
+        spare = json.loads((self.directory / "wear.json.bak").read_text())["days"]
+        self.assertEqual(spare["2026-01-05"]["left"]["presses"], 900, "the spare is the whole history too")
+        self.assertEqual(self.history.daily(Button.LEFT)[-1].presses, 4, "nothing counted twice")
+
+    def test_a_locked_spare_does_not_stand_in_for_a_locked_file(self) -> None:
+        self.a_year_on_file()
+        (self.directory / "wear.json.bak").write_text(json.dumps({"version": 1, "days": {}}))
+        with self.locked("wear.json", "wear.json.bak"), mock.patch.object(settings, "sleep"):
+            self.assertFalse(self.history.load())
+            self.clicks(1)
+            self.assertFalse(self.history.save())
+            self.history._saved_at -= wear.SAVE_INTERVAL_S
+            self.assertFalse(self.history.save_if_due(), "tried again when due, still locked")
+        self.assertIn("2026-01-05", json.loads((self.directory / "wear.json").read_text())["days"])
+
+    def test_a_good_spare_stands_in_for_a_locked_file(self) -> None:
+        self.clicks(2)
+        self.history.save()
+        self.clicks(3)
+        self.history.save()  # the 2-press file is now the spare
+        loaded = WearHistory(clock=self.clock)
+        with self.locked("wear.json"), mock.patch.object(settings, "sleep"):
+            self.assertTrue(loaded.load())
+        self.assertEqual(loaded.daily(Button.LEFT)[-1].presses, 2)
+
+    def test_starting_afresh_needs_no_read(self) -> None:
+        self.a_year_on_file()
+        with self.locked("wear.json"), mock.patch.object(settings, "sleep"):
+            self.assertFalse(self.history.load())
+        self.history.clear()
+        self.clicks(1)
+        self.assertTrue(self.history.save())
+        self.assertEqual(list(json.loads((self.directory / "wear.json").read_text())["days"]), ["2026-10-09"])
+
     def test_a_failed_write_is_tried_again(self) -> None:
         self.clicks(1)
         with mock.patch.object(settings, "write_json", side_effect=OSError("disk full")):
