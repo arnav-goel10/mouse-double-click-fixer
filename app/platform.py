@@ -361,6 +361,10 @@ class GlobalClickFilter:
         self._thread = None
         self._thread_id = None
         self._run_loop = None
+        # The hook went on deciding until it ended: what it held back or
+        # queued since the flush above would be left to timers. Send it now,
+        # and leave no timer behind.
+        self._let_everything_go()
 
     def tap_alive(self) -> bool:
         """Whether the filter is still in the event stream. On macOS that is

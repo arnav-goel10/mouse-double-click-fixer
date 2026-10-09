@@ -180,6 +180,28 @@ class LifecycleTests(unittest.TestCase):
                 click_filter.stop()
         self.assertEqual(taps_of_this_process(), before, "a stopped filter leaves no tap registered")
 
+    def test_what_the_hook_decides_while_it_stops_goes_out_before_stop_returns(self) -> None:
+        # The hook goes on deciding until its thread ends: a release it held
+        # then must not be left to its timer.
+        rig = Pipeline(self)
+        rig.handle(Button.LEFT, True, 100.000, "down")
+
+        class Hook:
+            alive = True
+
+            def is_alive(self) -> bool:
+                return self.alive
+
+            def join(self, timeout=None) -> None:
+                if self.alive:
+                    self.alive = False
+                    rig.filter._handle(Button.LEFT, False, 100.100, "up", location=(0, 0))
+
+        rig.filter._thread = Hook()
+        rig.filter.stop()
+        self.assertEqual(rig.sent, [(Button.LEFT, False, "up")])
+        self.assertEqual([timer for timer in rig.timers if timer.alive], [], "no timer left behind")
+
 
 class FakeTimer:
     """Stands in for threading.Timer: records each timer instead of starting
