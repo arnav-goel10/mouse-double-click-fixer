@@ -80,10 +80,12 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(page.clicks, 0)
         self.assertEqual(page.count_value.text(), "0")
 
-    def test_calibration_pauses_the_filter(self) -> None:
+    def test_opening_calibrate_alone_does_not_pause_the_filter(self) -> None:
+        # Only measuring pauses it (see CalibrationPauseTests); the intro
+        # is just reading.
         with mock.patch.object(self.controller, "suspend") as suspend:
             self.window._show_page(self.page_index("calibrate"))
-            suspend.assert_called_once()
+            suspend.assert_not_called()
 
     def test_calibration_runs_end_to_end_and_applies(self) -> None:
         from app.core import REQUIRED_DOUBLE_CLICKS, REQUIRED_SINGLE_CLICKS
@@ -224,6 +226,172 @@ class WindowTests(unittest.TestCase):
         self.window.show()
         self.window.closeEvent(QEvent(QEvent.Type.Close))
         self.assertTrue(self.window.isHidden())
+
+
+class FakeFilter:
+    """Stands in for GlobalClickFilter: the lifecycle without a hook."""
+
+    fail_with = None
+
+    def __init__(self, *_args, **_kwargs) -> None:
+        self.started = self.stopped = False
+
+    @property
+    def running(self) -> bool:
+        return self.started and not self.stopped
+
+    def start(self) -> None:
+        if FakeFilter.fail_with:
+            from app.platform import HookError
+
+            raise HookError(FakeFilter.fail_with)
+        self.started = True
+
+    def stop(self) -> None:
+        self.stopped = True
+
+    def update(self, **_changes) -> None:
+        pass
+
+
+@unittest.skipIf(QApplication is None, "PySide6 is not installed")
+class LiveWindowTests(unittest.TestCase):
+    """A shown window over a controller whose filter really starts and stops
+    (a stand-in hook), with the window's activation under the test's control."""
+
+    application = None
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.application = QApplication.instance() or QApplication([])
+
+    def setUp(self) -> None:
+        from app import settings
+
+        directory = Path(tempfile.mkdtemp())
+        FakeFilter.fail_with = None
+        patches = [
+            mock.patch.object(settings, "config_dir", return_value=directory),
+            mock.patch.object(settings, "LEGACY_PATH", directory / "absent.json"),
+            mock.patch("app.controller.GlobalClickFilter", FakeFilter),
+            # Granted, so the window takes the plain path on every platform.
+            mock.patch("app.permissions.needs_accessibility", return_value=False),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        from app.controller import AppController
+        from app.ui.window import MainWindow
+
+        self.controller = AppController()
+        self.window = MainWindow(self.controller)
+        self.addCleanup(self.window.deleteLater)
+        self.active_window = True
+        self.window.isActiveWindow = lambda: self.active_window
+        self.window.setMinimumSize(300, 200)
+
+    def page_index(self, key: str) -> int:
+        from app.ui.window import PAGES
+
+        return [name for name, _title in PAGES].index(key)
+
+    def set_active_window(self, active: bool) -> None:
+        from PySide6.QtCore import QEvent
+
+        self.active_window = active
+        self.window.changeEvent(QEvent(QEvent.Type.ActivationChange))
+
+    def close(self) -> None:
+        from PySide6.QtCore import QEvent
+
+        self.window.closeEvent(QEvent(QEvent.Type.Close))
+
+
+class CalibrationPauseTests(LiveWindowTests):
+    def open_calibrate(self) -> None:
+        self.controller.set_active(True)
+        self.window.show()
+        self.window._show_page(self.page_index("calibrate"))
+
+    def test_the_intro_does_not_pause_and_begin_does(self) -> None:
+        self.open_calibrate()
+        self.assertTrue(self.controller.active, "reading the intro leaves filtering on")
+        self.window.calibrate._advance()  # Begin
+        self.assertFalse(self.controller.active)
+        self.assertTrue(self.controller.suspended)
+
+    def test_leaving_the_window_resumes_and_coming_back_pauses(self) -> None:
+        self.open_calibrate()
+        self.window.calibrate._advance()
+        self.set_active_window(False)
+        self.assertTrue(self.controller.active, "clicks in the other app are filtered")
+        self.set_active_window(True)
+        self.assertFalse(self.controller.active)
+
+    def test_minimizing_resumes(self) -> None:
+        from PySide6.QtCore import QEvent
+
+        self.open_calibrate()
+        self.window.calibrate._advance()
+        with mock.patch.object(self.window, "isMinimized", return_value=True):
+            self.window.changeEvent(QEvent(QEvent.Type.WindowStateChange))
+            self.assertTrue(self.controller.active)
+
+    def test_finishing_resumes(self) -> None:
+        self.open_calibrate()
+        page = self.window.calibrate
+        page._advance()
+        page._finish()
+        self.assertEqual(page.phase, "done")
+        self.assertTrue(self.controller.active, "the result screen measures nothing")
+
+    def test_reopening_after_a_result_does_not_pause(self) -> None:
+        self.open_calibrate()
+        page = self.window.calibrate
+        page._advance()
+        page._finish()
+        self.close()
+        self.assertEqual(page.phase, "intro", "an unapplied result starts over")
+        self.window.show()
+        self.assertTrue(self.controller.active)
+
+    def test_closing_mid_measurement_resumes_and_starts_over(self) -> None:
+        self.open_calibrate()
+        self.window.calibrate._advance()
+        self.close()
+        self.assertTrue(self.controller.active)
+        self.assertEqual(self.window.calibrate.phase, "intro")
+
+    def test_the_menu_toggle_on_the_result_screen_turns_filtering_on(self) -> None:
+        self.window.show()
+        self.window._show_page(self.page_index("calibrate"))
+        page = self.window.calibrate
+        page._advance()
+        page._finish()
+        self.window.request_filter(True)
+        self.assertTrue(self.controller.active)
+
+    def test_the_menu_toggle_while_measuring_waits_for_the_end(self) -> None:
+        self.window.show()
+        self.window._show_page(self.page_index("calibrate"))
+        page = self.window.calibrate
+        page._advance()
+        self.window.request_filter(True)
+        self.assertFalse(self.controller.active, "the pad keeps measuring raw clicks")
+        self.assertTrue(self.controller.wanted)
+        self.assertTrue(self.window.filter_page.switch.isChecked())
+        page._finish()
+        self.assertTrue(self.controller.active)
+
+    def test_the_menu_toggle_while_paused_turns_it_off(self) -> None:
+        self.open_calibrate()
+        self.window.calibrate._advance()
+        self.assertTrue(self.controller.wanted)
+        self.window.request_filter(not self.controller.wanted)
+        self.assertFalse(self.controller.wanted)
+        self.assertFalse(self.controller.settings["fix_enabled"])
+        self.window.calibrate._finish()
+        self.assertFalse(self.controller.active, "stays off after calibration")
 
 
 class MenuBarItemTests(unittest.TestCase):

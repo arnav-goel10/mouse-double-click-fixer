@@ -389,6 +389,9 @@ class CalibratePage(Page):
     """Two measured phases, then a recommendation."""
 
     threshold_chosen = Signal(int)
+    #: The phase moved: "intro", "single", "double" or "done". Filtering
+    #: pauses only while a measuring phase is on screen.
+    phase_changed = Signal(str)
 
     def __init__(self, controller: AppController, parent: Optional[QWidget] = None) -> None:
         super().__init__("Calibrate", parent)
@@ -450,18 +453,27 @@ class CalibratePage(Page):
         self.restart()
 
     # -- flow ------------------------------------------------------------------
+    @property
+    def measuring(self) -> bool:
+        return self.phase in ("single", "double")
+
+    def _set_phase(self, phase: str) -> None:
+        if phase != self.phase:
+            self.phase = phase
+            self.phase_changed.emit(phase)
+
     def restart(self) -> None:
         self.calibrator = Calibrator()
-        self.phase = "intro"
         self.suggestion = None
         self.pad.reset()
+        self._set_phase("intro")
         self._render()
 
     def _advance(self) -> None:
         if self.phase == "intro":
-            self.phase = "single"
+            self._set_phase("single")
         elif self.phase == "single":
-            self.phase = "double"
+            self._set_phase("double")
         elif self.phase == "double":
             self._finish()
             return
@@ -475,7 +487,7 @@ class CalibratePage(Page):
 
     def _finish(self) -> None:
         self.suggestion = self.calibrator.suggest()
-        self.phase = "done"
+        self._set_phase("done")
         self._render()
 
     def _on_pad_press(self, gap_ms: Optional[float], _interval_ms: Optional[float]) -> None:
@@ -486,7 +498,7 @@ class CalibratePage(Page):
             if not counted:
                 note = f"Bounce detected ({gap_ms:.0f} ms)."
             if self.calibrator.has_enough_singles:
-                self.phase = "double"
+                self._set_phase("double")
                 self.pad.reset()
                 note = ""
         elif self.phase == "double":
@@ -778,6 +790,7 @@ class MainWindow(QWidget):
         self.sidebar.current_changed.connect(self._show_page)
         self.filter_page.switch.toggled.connect(self._on_switch)
         self.calibrate.threshold_chosen.connect(self._apply_calibration)
+        self.calibrate.phase_changed.connect(lambda _phase: self._sync_pause())
         controller.filter_state_changed.connect(self._on_filter_state)
         controller.settings_changed.connect(self.refresh)
         controller.global_event.connect(self.filter_page.note_global_event)
@@ -821,11 +834,12 @@ class MainWindow(QWidget):
             self._material = native.apply(self, self.sidebar.width(), look().dark)
         self.sidebar.paint_background = not (self.translucent and self._material)
         self._tint_title_bar()
-        # Reopening on the Calibrate pane pauses filtering again; closing the
-        # window resumed it (see closeEvent).
-        if PAGES[self.stack.currentIndex()][0] == "calibrate":
-            self.controller.suspend()
+        self._sync_pause()
         self.update()
+
+    def hideEvent(self, event) -> None:  # noqa: N802
+        super().hideEvent(event)
+        self._sync_pause()
 
     def paintEvent(self, _event) -> None:  # noqa: N802
         lk = look()
@@ -847,7 +861,12 @@ class MainWindow(QWidget):
         if event.type() == QEvent.Type.ActivationChange:
             self.sidebar.window_active = self.isActiveWindow()
             self.sidebar.update()
-        elif (
+            # Calibrating in a window left behind another app would leave
+            # every click in that app unfiltered.
+            self._sync_pause()
+        elif event.type() == QEvent.Type.WindowStateChange:
+            self._sync_pause()
+        if (
             event.type() == QEvent.Type.WindowStateChange
             and not IS_MAC
             and self.isMinimized()
@@ -883,11 +902,7 @@ class MainWindow(QWidget):
         self.sidebar.set_current(index, emit=False)
         self.stack.setCurrentIndex(index)
         self.title_label.setText(PAGES[index][1])
-        if PAGES[index][0] == "calibrate":
-            # Calibration has to see the raw clicks, so filtering pauses.
-            self.controller.suspend()
-        else:
-            self.controller.resume()
+        self._sync_pause()
         self.refresh()
 
     def show_page(self, key: str) -> None:
@@ -897,6 +912,26 @@ class MainWindow(QWidget):
 
     def show_calibration(self) -> None:
         self.show_page("calibrate")
+
+    # -- calibration pause -------------------------------------------------------
+    def _should_pause(self) -> bool:
+        """Calibration has to see the raw clicks, so filtering pauses, but
+        only while it is measuring in front of the user: not on the intro or
+        the result, and not while the window is hidden, minimized or behind
+        another app, where those clicks would go unfiltered."""
+        return (
+            PAGES[self.stack.currentIndex()][0] == "calibrate"
+            and self.calibrate.measuring
+            and self.isVisible()
+            and not self.isMinimized()
+            and self.isActiveWindow()
+        )
+
+    def _sync_pause(self) -> None:
+        if self._should_pause():
+            self.controller.suspend()
+        else:
+            self.controller.resume()
 
     # -- state -------------------------------------------------------------------
     def refresh(self) -> None:
@@ -913,9 +948,10 @@ class MainWindow(QWidget):
             return
         self._permission_granted = granted
         if granted and self._enable_when_granted:
-            # The user already asked for the filter; finish the job.
+            # The user already asked for the filter; finish the job (after
+            # calibration, if it is measuring).
             self._enable_when_granted = False
-            self.controller.set_active(True)
+            self._on_switch(True, prompt=False)
         elif not granted and self.controller.active:
             # Without permission the tap cannot block anything, so an "on"
             # switch would be lying. The saved choice stays on, so the filter
@@ -944,7 +980,7 @@ class MainWindow(QWidget):
             if prompt:
                 permissions.open_accessibility_settings()
             return
-        if checked and self.isVisible() and PAGES[self.stack.currentIndex()][0] == "calibrate":
+        if checked and self._should_pause():
             # Turned on from the menu while calibrating: the pad must keep
             # seeing raw clicks, so filtering starts when calibration ends.
             self.controller.enable_after_calibration()
@@ -979,9 +1015,12 @@ class MainWindow(QWidget):
 
     def closeEvent(self, event) -> None:  # noqa: N802
         event.ignore()
-        # Calibration pauses filtering only while its pane is on screen.
-        self.controller.resume()
+        # A calibration left half done, or finished but not applied, starts
+        # over next time, so reopening the window never pauses filtering.
+        if self.calibrate.phase != "intro":
+            self.calibrate.restart()
         self.save_geometry()
         self.controller.flush_stats()
         self.hide()
+        self._sync_pause()
         self.closed_to_tray.emit()
