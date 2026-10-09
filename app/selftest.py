@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import sys
 import time
+from dataclasses import dataclass, field
 from typing import Callable, List, Tuple
 
 #: The Qt platform the check loads unless the caller names another one (a
@@ -48,6 +50,14 @@ BUNDLE_PATHS = ("QT_PLUGIN_PATH", "QML2_IMPORT_PATH")
 #: The hook pins PATH to the system's own folders, so whatever the app starts
 #: by name comes from there.
 SYSTEM_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+
+#: OpenSSL's libraries, under every name Qt's OpenSSL backend asks dyld for
+#: (libssl.3.dylib, libcrypto.so.3, crypto.3.bundle, ...) and macOS's own
+#: (libcrypto.46.dylib), but not libboringssl or libcorecrypto.
+OPENSSL_IMAGE = re.compile(r"^(?:lib)?(?:ssl|crypto)(?:[.-]|$)", re.IGNORECASE)
+#: Where macOS keeps its own libraries: the sealed system volume and the
+#: dyld shared cache, which nothing but a system update changes.
+SYSTEM_LIBRARY_FOLDERS = ("/usr/lib/", "/System/")
 
 
 class Skipped(Exception):
@@ -326,6 +336,122 @@ def check_notices() -> str:
     return f"{path}, {path.stat().st_size:,} bytes"
 
 
+@dataclass
+class TlsFacts:
+    """What the tls check finds, gathered apart from judging it so the
+    judgement can be tested with made-up facts."""
+
+    platform: str
+    frozen: bool
+    available: List[str]  # Qt's TLS backends that can start here
+    active: str
+    supports_ssl: bool
+    library: str  # the TLS library's own version string
+    protocols: List[str]  # "TLS 1.2", "TLS 1.3": the ones it supports of those
+    images: List[str] = field(default_factory=list)  # macOS: every library loaded
+    bundle: str = ""  # a built macOS app's Contents folder
+    python_openssl: str = ""  # the OpenSSL Python's ssl module runs
+
+
+def judge_tls(facts: TlsFacts) -> str:
+    """The tls line for `facts`; raises if they are wrong for this build."""
+    if not facts.supports_ssl:
+        raise RuntimeError(f"Qt's {facts.active} backend can't make TLS connections")
+    if not facts.protocols:
+        raise RuntimeError(f"Qt's {facts.active} backend can't make TLS 1.2 or later connections")
+    detail = f"{facts.active}, {facts.library}, {' and '.join(facts.protocols)}"
+    if facts.platform == "win32":
+        if facts.active != "schannel":
+            raise RuntimeError(f"Qt is using its {facts.active} backend, not Windows' own Schannel")
+        if facts.frozen and "openssl" in facts.available:
+            raise RuntimeError("this build has Qt's OpenSSL backend, which Windows builds leave out")
+        return detail + ("; no OpenSSL backend in this build" if facts.frozen else "")
+    if facts.platform != "darwin":
+        return detail
+    loaded = [path for path in facts.images if OPENSSL_IMAGE.match(os.path.basename(path))]
+    system = [path for path in loaded if path.startswith(SYSTEM_LIBRARY_FOLDERS)]
+    others = [path for path in loaded if path not in system]
+    if facts.frozen:
+        root = os.path.realpath(facts.bundle) + os.sep
+        outside = [path for path in others if not os.path.realpath(path).startswith(root)]
+        if outside:
+            raise RuntimeError("OpenSSL loaded from outside the app: " + ", ".join(outside))
+        if facts.active != "openssl":
+            raise RuntimeError(f"Qt is using its {facts.active} backend, not OpenSSL from inside the app")
+        if not others:
+            raise RuntimeError("Qt's OpenSSL backend is running, but no OpenSSL from inside the app is loaded")
+        if facts.python_openssl and facts.library != facts.python_openssl:
+            raise RuntimeError(f"Qt runs {facts.library}, but Python's ssl module {facts.python_openssl}")
+        where = "inside the app, as Python's ssl"
+    else:
+        where = ", ".join(sorted({os.path.dirname(path) for path in others})) or "nowhere"
+    names = ", ".join(sorted({os.path.basename(path) for path in others})) or "no OpenSSL"
+    detail += f"; {names} from {where}"
+    if system:
+        detail += f" (macOS's own {', '.join(sorted({os.path.basename(path) for path in system}))} aside)"
+    return detail
+
+
+def loaded_images() -> List[str]:
+    """macOS: the path of every library loaded into this process."""
+    import ctypes
+
+    libc = ctypes.CDLL(None)
+    count = libc._dyld_image_count
+    count.argtypes, count.restype = [], ctypes.c_uint32
+    name = libc._dyld_get_image_name
+    name.argtypes, name.restype = [ctypes.c_uint32], ctypes.c_char_p
+    images = (name(index) for index in range(count()))
+    return [os.fsdecode(image) for image in images if image]
+
+
+def check_tls() -> str:
+    """Qt's TLS backend is the one the app chooses (app/tls.py), and starts
+    and loads its library without touching the network. On Windows that is
+    Schannel. A built macOS app runs Qt's OpenSSL backend on the OpenSSL
+    inside it: every libssl and libcrypto loaded, macOS's own aside, must
+    lie inside the app, and be the version Python's ssl module runs."""
+    from PySide6.QtCore import QCoreApplication
+    from PySide6.QtNetwork import QSsl, QSslConfiguration, QSslSocket
+
+    from . import tls
+
+    # Qt's plugin loader expects an application, as the app has one.
+    application = QCoreApplication(["DoubleClickFixer"]) if QCoreApplication.instance() is None else None
+    try:
+        try:
+            tls.use_preferred_backend()
+        except tls.Unavailable as error:
+            raise RuntimeError(str(error)) from None
+        QSslConfiguration.defaultConfiguration()  # the backend loads its library and sets itself up
+        supported = QSslSocket.supportedProtocols()
+        try:
+            import _ssl
+
+            python_openssl = _ssl.OPENSSL_VERSION
+        except ImportError:
+            python_openssl = ""
+        frozen = bool(getattr(sys, "frozen", False))
+        facts = TlsFacts(
+            platform=sys.platform,
+            frozen=frozen,
+            available=list(QSslSocket.availableBackends()),
+            active=QSslSocket.activeBackend(),
+            supports_ssl=QSslSocket.supportsSsl(),
+            library=QSslSocket.sslLibraryVersionString(),
+            protocols=[label for protocol, label in ((QSsl.SslProtocol.TlsV1_2, "TLS 1.2"),
+                                                     (QSsl.SslProtocol.TlsV1_3, "TLS 1.3")) if protocol in supported],
+            images=loaded_images() if sys.platform == "darwin" else [],
+            bundle=os.path.dirname(os.path.realpath(getattr(sys, "_MEIPASS", sys.executable))) if frozen else "",
+            python_openssl=python_openssl,
+        )
+    finally:
+        if application is not None:
+            application.shutdown()
+            del application
+    return judge_tls(facts)
+
+
 def check_app_modules() -> str:
     """Every module of the app imports: walked from the package itself, so a
     module imported only later (by a menu, or an update) is checked too."""
@@ -357,6 +483,7 @@ CHECKS: List[Tuple[str, Callable[[], str]]] = [
     ("event tap", check_event_tap),
     ("Qt platform plugin", check_qt_platform),
     ("app icons", check_app_icons),
+    ("tls", check_tls),
     ("app modules", check_app_modules),
     ("child processes", check_child_processes),
     ("third-party notices", check_notices),

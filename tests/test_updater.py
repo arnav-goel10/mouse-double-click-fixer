@@ -513,6 +513,36 @@ class NetworkTests(unittest.TestCase):
         self.assertEqual(instance.state, instance.AVAILABLE, instance.message)
         return instance
 
+    def test_the_tls_backend_is_chosen_before_the_first_request(self) -> None:
+        base = self.matching_files()
+        instance = self.make_updater(f"{base}/latest")
+        requested_by_then = []
+        choose = updater.tls.use_preferred_backend
+
+        def choosing() -> str:
+            requested_by_then.append(list(self.requested))
+            return choose()
+
+        with mock.patch.object(updater.tls, "use_preferred_backend", side_effect=choosing), \
+                mock.patch.dict(os.environ, {updater.URL_OVERRIDE_ENV: f"{base}/latest"}):
+            instance.check(user_initiated=True)
+            self.wait_for(instance, {instance.AVAILABLE, instance.FAILED})
+        self.assertEqual(instance.state, instance.AVAILABLE, instance.message)
+        self.assertEqual(requested_by_then, [[]])
+
+    def test_without_a_tls_backend_it_may_use_the_check_says_so(self) -> None:
+        base = self.matching_files()
+        instance = self.make_updater(f"{base}/latest")
+        missing = updater.tls.Unavailable("Qt has no schannel TLS backend here, only openssl, cert-only")
+        with mock.patch.object(updater.tls, "use_preferred_backend", side_effect=missing), \
+                mock.patch.dict(os.environ, {updater.URL_OVERRIDE_ENV: f"{base}/latest"}), \
+                self.assertLogs("app.updater", "ERROR") as logged:
+            instance.check(user_initiated=True)
+        self.assertEqual((instance.state, instance.message), (instance.FAILED, updater.NO_SECURE_CONNECTION))
+        self.assertIn("only openssl, cert-only", logged.output[0])
+        self.settle()
+        self.assertEqual(self.requested, [], "nothing is fetched over another library")
+
     def test_finds_a_newer_release(self) -> None:
         base = self.matching_files()
         instance = self.available(base)

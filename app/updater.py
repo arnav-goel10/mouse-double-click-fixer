@@ -19,6 +19,8 @@ signed checksums, and installs it:
 
 The swap happens in a small detached script after the app exits, since a
 running program cannot replace its own files.
+
+Every request goes over the TLS library app/tls.py chooses before the first.
 """
 
 from __future__ import annotations
@@ -42,7 +44,7 @@ from typing import Optional
 from PySide6.QtCore import QObject, QTimer, QUrl, Signal
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 
-from . import __version__
+from . import __version__, tls
 from .update_signature import PublicKey, ReleaseClaim, SignatureError, parse_claim, parse_public_key, verify
 
 log = logging.getLogger(__name__)
@@ -104,6 +106,8 @@ SMALL_FILE_LIMIT = 64 * 1024
 UNSIGNED = "This update isn’t signed, so it can’t be installed."
 MOVE_TO_APPLICATIONS = "Move DoubleClick Fixer to Applications to update it."
 CHECK_FAILED = "Couldn’t check for updates."
+#: Qt has none of the TLS backends the app may use (app/tls.py).
+NO_SECURE_CONNECTION = "Couldn’t check for updates: the app can’t make a secure connection here."
 INSTALL_FAILED = "The update didn’t install. Try again."
 
 
@@ -500,6 +504,13 @@ class Updater(QObject):
         if not user_initiated and not self.auto_check:
             return
         self._forget_release()
+        try:
+            # Before the first request: Qt keeps the TLS backend it first uses.
+            tls.use_preferred_backend()
+        except tls.Unavailable as error:
+            log.error("No TLS backend the app may use: %s", error)
+            self._set(self.FAILED, NO_SECURE_CONNECTION)
+            return
         self._set(self.CHECKING, "")
         request = self._request(os.environ.get(URL_OVERRIDE_ENV) or LATEST_URL)
         request.setRawHeader(b"Accept", b"application/vnd.github+json")

@@ -4,8 +4,13 @@
 # the app, so code that gets itself loaded there inherits the grant.
 #
 # It builds a canary library that leaves a file behind if it is ever loaded,
-# then runs the app's --self-test (never the app itself) three times:
+# then runs the app's --self-test (never the app itself) four times:
 #   dyld     DYLD_INSERT_LIBRARIES=<canary>; the hardened runtime must ignore it
+#   cwd      started in a folder holding the canary under every bare name Qt's
+#            OpenSSL backend asks dyld for (libcrypto.so.3, libssl.3.dylib,
+#            crypto, ...). The self-test starts that backend; dyld must answer
+#            with the app's own OpenSSL, never a file in the current folder
+#            (it refuses relative paths in a hardened program).
 #   openssl  OPENSSL_CONF=<a config whose provider module is the canary>; the
 #            runtime hook must remove it before hashlib starts OpenSSL
 #   path     PATH starting with a folder of canary programs (pgrep, bash,
@@ -33,6 +38,7 @@ for argument in "$@"; do
 done
 binary="$app/Contents/MacOS/DoubleClickFixer"
 [[ -x "$binary" ]] || { echo "error: no app at $app" >&2; exit 2; }
+binary="$(cd "$(dirname "$binary")" && pwd)/$(basename "$binary")"  # the cwd run starts elsewhere
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -70,6 +76,15 @@ C
 }
 
 dyld_canary="$(build_canary dyld)"
+cwd_canary="$(build_canary cwd)"
+cwd_folder="$work/cwd"
+mkdir -p "$cwd_folder"
+for library in crypto ssl; do  # qsslsocket_openssl_symbols.cpp asks for these, through QLibrary
+  for name in "lib$library.so.3" "lib$library.3.bundle" "lib$library.3.dylib" "lib$library" \
+      "$library.so.3" "$library.3.bundle" "$library.3.dylib" "$library"; do
+    cp "$cwd_canary" "$cwd_folder/$name"
+  done
+done
 openssl_canary="$(build_canary openssl)"
 cat > "$work/openssl.cnf" <<CNF
 openssl_conf = openssl_init
@@ -121,6 +136,9 @@ run() {  # name, then the environment to run the self-test with
 
 codesign -dv "$app" 2>&1 | grep -E '^CodeDirectory' || true
 run dyld DYLD_INSERT_LIBRARIES="$dyld_canary"
+pushd "$cwd_folder" >/dev/null
+run cwd
+popd >/dev/null
 run openssl OPENSSL_CONF="$work/openssl.cnf"
 run path PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" BASH_ENV="$work/startup.sh" ENV="$work/startup.sh" \
   "BASH_FUNC_sleep%%=() { echo 'exported function ran' >> '$marks/dcf-canary-path'; }"

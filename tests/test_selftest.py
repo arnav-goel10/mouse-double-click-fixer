@@ -53,6 +53,9 @@ class SelfTestTests(unittest.TestCase):
         self.assertTrue(result["Qt platform plugin"].startswith("ok"))
         self.assertTrue(result["app icons"].startswith("ok"), result["app icons"])
         self.assertTrue(result["third-party notices"].startswith("ok"))
+        self.assertRegex(result["tls"], r"^ok \((schannel|openssl|securetransport), .+, TLS 1\.2")
+        if sys.platform == "win32":
+            self.assertTrue(result["tls"].startswith("ok (schannel, "), result["tls"])
         if IS_MAC:
             self.assertTrue(result["PyObjC callback"].startswith("ok"))
             self.assertIn(result["event tap"].split(" ")[0], ("ok", "skipped:"))
@@ -139,6 +142,118 @@ class SelfTestTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "no 'nosuchplatform' platform plugin"):
                 selftest.check_qt_platform()
+
+
+BUNDLE = "/Applications/Example.app/Contents"
+
+
+def tls_facts(**changes):
+    """What a built macOS app's tls check finds when all is well."""
+    facts = dict(
+        platform="darwin", frozen=True, available=["securetransport", "openssl", "cert-only"], active="openssl",
+        supports_ssl=True, library="OpenSSL 3.6.5 29 Sep 2026", protocols=["TLS 1.2", "TLS 1.3"],
+        images=[
+            "/usr/lib/libSystem.B.dylib",
+            "/usr/lib/libcrypto.46.dylib",  # macOS's own, which system frameworks load
+            "/usr/lib/libssl.48.dylib",
+            "/usr/lib/libboringssl.dylib",
+            "/System/Library/Frameworks/CryptoKit.framework/Versions/A/CryptoKit",
+            f"{BUNDLE}/Frameworks/libcrypto.3.dylib",
+            f"{BUNDLE}/Frameworks/python3.14/lib-dynload/_ssl.cpython-314-darwin.so",
+            f"{BUNDLE}/Frameworks/libssl.3.dylib",
+            f"{BUNDLE}/Frameworks/PySide6/Qt/plugins/tls/libqopensslbackend.dylib",
+        ],
+        bundle=BUNDLE, python_openssl="OpenSSL 3.6.5 29 Sep 2026",
+    )
+    facts.update(changes)
+    return selftest.TlsFacts(**facts)
+
+
+class TlsCheckTests(unittest.TestCase):
+    """The tls check's verdict on what it finds, with made-up findings."""
+
+    def test_a_built_mac_app_on_its_own_openssl_passes(self) -> None:
+        self.assertEqual(
+            selftest.judge_tls(tls_facts()),
+            "openssl, OpenSSL 3.6.5 29 Sep 2026, TLS 1.2 and TLS 1.3; libcrypto.3.dylib, libssl.3.dylib from inside "
+            "the app, as Python's ssl (macOS's own libcrypto.46.dylib, libssl.48.dylib aside)",
+        )
+
+    def test_openssl_from_outside_the_app_fails(self) -> None:
+        for path in (
+            "/usr/local/lib/libssl.3.dylib",  # Qt's own search reaches here when the app's copy won't load
+            "/opt/homebrew/opt/openssl@3/lib/libcrypto.3.dylib",
+            "/Users/someone/Downloads/libcrypto.so.3",  # the first name Qt asks dyld for
+            "/tmp/crypto.3.bundle",
+            "/Applications/Example.app.evil/Contents/Frameworks/libssl.3.dylib",  # a neighbour, not the app
+        ):
+            facts = tls_facts()
+            facts.images.append(path)
+            with self.subTest(path=path), self.assertRaisesRegex(RuntimeError, "OpenSSL loaded from outside the app"):
+                selftest.judge_tls(facts)
+
+    def test_a_built_mac_app_must_run_qts_openssl_backend(self) -> None:
+        facts = tls_facts(active="securetransport", library="Secure Transport, macOS 26", protocols=["TLS 1.2"])
+        with self.assertRaisesRegex(RuntimeError, "using its securetransport backend, not OpenSSL from inside"):
+            selftest.judge_tls(facts)
+        # A library Qt tried and gave up on is still the finding that matters.
+        facts.images.append("/Users/someone/libcrypto.so.3")
+        with self.assertRaisesRegex(RuntimeError, "OpenSSL loaded from outside the app: /Users/someone/libcrypto.so.3"):
+            selftest.judge_tls(facts)
+
+    def test_the_openssl_backend_without_the_apps_openssl_fails(self) -> None:
+        facts = tls_facts(images=["/usr/lib/libcrypto.46.dylib", "/usr/lib/libssl.48.dylib"])
+        with self.assertRaisesRegex(RuntimeError, "no OpenSSL from inside the app is loaded"):
+            selftest.judge_tls(facts)
+
+    def test_qt_and_python_must_run_the_same_openssl(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "Qt runs OpenSSL 3.6.5 .*, but Python's ssl module OpenSSL 3.5.0"):
+            selftest.judge_tls(tls_facts(python_openssl="OpenSSL 3.5.0 8 Apr 2025"))
+
+    def test_tls_older_than_1_2_alone_fails(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "can't make TLS 1.2 or later connections"):
+            selftest.judge_tls(tls_facts(protocols=[]))
+        with self.assertRaisesRegex(RuntimeError, "can't make TLS connections"):
+            selftest.judge_tls(tls_facts(supports_ssl=False))
+
+    def test_from_source_it_says_where_openssl_came_from(self) -> None:
+        facts = tls_facts(frozen=False, bundle="", python_openssl="", images=[
+            "/usr/lib/libssl.48.dylib", "/opt/homebrew/Cellar/openssl@3/3.6.5/lib/libssl.3.dylib",
+            "/opt/homebrew/Cellar/openssl@3/3.6.5/lib/libcrypto.3.dylib",
+        ])
+        self.assertTrue(selftest.judge_tls(facts).endswith(
+            "libcrypto.3.dylib, libssl.3.dylib from /opt/homebrew/Cellar/openssl@3/3.6.5/lib "
+            "(macOS's own libssl.48.dylib aside)"))
+        fallback = tls_facts(frozen=False, active="securetransport", library="Secure Transport", images=[],
+                             protocols=["TLS 1.2"])
+        self.assertEqual(selftest.judge_tls(fallback), "securetransport, Secure Transport, TLS 1.2; no OpenSSL from nowhere")
+
+    def windows(self, **changes):
+        facts = dict(platform="win32", frozen=True, available=["schannel", "cert-only"], active="schannel",
+                     library="Secure Channel, Windows 10.0.26100", protocols=["TLS 1.2", "TLS 1.3"], images=[],
+                     bundle="", python_openssl="OpenSSL 3.0.21 1 Jul 2026")
+        facts.update(changes)
+        return tls_facts(**facts)
+
+    def test_windows_uses_schannel(self) -> None:
+        self.assertEqual(selftest.judge_tls(self.windows()), "schannel, Secure Channel, Windows 10.0.26100, TLS 1.2 "
+                         "and TLS 1.3; no OpenSSL backend in this build")
+        self.assertEqual(selftest.judge_tls(self.windows(frozen=False, available=["schannel", "openssl"])),
+                         "schannel, Secure Channel, Windows 10.0.26100, TLS 1.2 and TLS 1.3")
+        with self.assertRaisesRegex(RuntimeError, "using its openssl backend, not Windows' own Schannel"):
+            selftest.judge_tls(self.windows(active="openssl", available=["openssl", "schannel"]))
+
+    def test_a_windows_build_with_qts_openssl_backend_fails(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "this build has Qt's OpenSSL backend"):
+            selftest.judge_tls(self.windows(available=["openssl", "schannel", "cert-only"]))
+
+    @unittest.skipUnless(IS_MAC, "macOS only")
+    def test_loaded_libraries_are_listed(self) -> None:
+        images = selftest.loaded_images()
+        self.assertTrue(any(path.endswith("/libSystem.B.dylib") for path in images), images[:5])
+        from PySide6 import QtCore
+
+        self.assertIn(os.path.realpath(QtCore.__file__), {os.path.realpath(path) for path in images})
 
 
 @unittest.skipUnless(IS_MAC, "the built-app checks are macOS only")
