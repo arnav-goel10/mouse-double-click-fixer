@@ -188,31 +188,64 @@ class BuiltAppCheckTests(unittest.TestCase):
             with self.subTest(path=path), self.assertRaisesRegex(RuntimeError, "PATH"):
                 self.check_environment({"OPENSSL_CONF": os.devnull}, path=path)
 
-    def test_child_processes_run_from_the_system(self) -> None:
+    def check_child_processes(self, pgrep=None, path=selftest.SYSTEM_PATH):
         import app.main
 
-        with mock.patch.object(sys, "frozen", True, create=True), mock.patch.dict(
-            os.environ, {"PATH": selftest.SYSTEM_PATH}
-        ), mock.patch.object(app.main, "_other_copies_running", return_value=False) as pgrep:
-            self.assertEqual(
-                selftest.check_child_processes(), "pgrep ran (no other copy), bash -p runs /bin/sleep"
-            )
-        pgrep.assert_called_once_with()
+        command = mock.patch.object(app.main, "_pgrep_command", return_value=pgrep) if pgrep else contextlib.nullcontext()
+        with mock.patch.object(sys, "frozen", True, create=True), mock.patch.dict(os.environ, {"PATH": path}), \
+                command, mock.patch.object(app.main, "_other_copies_running", side_effect=AssertionError("not run")):
+            return selftest.check_child_processes()
+
+    def fake_pgrep(self, folder: Path, script: str) -> list:
+        fake = folder / "pgrep"
+        fake.write_text("#!/bin/sh\n" + script)
+        fake.chmod(0o755)
+        return [str(fake), "-x", "DoubleClickFixer"]
+
+    def test_child_processes_run_from_the_system(self) -> None:
+        # The real /usr/bin/pgrep, with the app's own arguments.
+        import app.main
+
+        self.assertEqual(app.main._pgrep_command(), ["/usr/bin/pgrep", "-x", os.path.basename(sys.executable)])
+        self.assertRegex(
+            self.check_child_processes(),
+            r"^pgrep ran \((no other copy|another copy is running)\), bash -p runs /bin/sleep$",
+        )
+
+    def test_pgrep_runs_itself_and_its_answer_is_read(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            called = folder / "called"
+            command = self.fake_pgrep(folder, f'echo "$@" > "{called}"; echo {os.getpid()}; echo 999999; exit 0\n')
+            self.assertTrue(self.check_child_processes(command).startswith("pgrep ran (another copy is running)"))
+            self.assertEqual(called.read_text().split(), ["-x", "DoubleClickFixer"])
+            command = self.fake_pgrep(folder, f"echo {os.getpid()}; exit 0\n")  # only itself
+            self.assertTrue(self.check_child_processes(command).startswith("pgrep ran (no other copy)"))
+            command = self.fake_pgrep(folder, "exit 1\n")
+            self.assertTrue(self.check_child_processes(command).startswith("pgrep ran (no other copy)"))
+
+    def test_a_pgrep_that_cannot_look_fails_the_child_process_check(self) -> None:
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            for code in (2, 3):
+                with self.subTest(code=code), self.assertRaisesRegex(RuntimeError, f"pgrep exited {code}: no"):
+                    self.check_child_processes(self.fake_pgrep(folder, f"echo no >&2; exit {code}\n"))
+            with self.assertRaises(FileNotFoundError):
+                self.check_child_processes([str(folder / "missing"), "-x", "DoubleClickFixer"])
 
     def test_a_program_earlier_on_path_fails_the_child_process_check(self) -> None:
         import tempfile
-
-        import app.main
 
         with tempfile.TemporaryDirectory() as folder:
             fake = Path(folder) / "sleep"
             fake.write_text("#!/bin/sh\nexit 0\n")
             fake.chmod(0o755)
-            with mock.patch.object(sys, "frozen", True, create=True), mock.patch.dict(
-                os.environ, {"PATH": f"{folder}:{selftest.SYSTEM_PATH}"}
-            ), mock.patch.object(app.main, "_other_copies_running", return_value=False):
-                with self.assertRaisesRegex(RuntimeError, "bash -p found sleep at '.*/sleep'"):
-                    selftest.check_child_processes()
+            with self.assertRaisesRegex(RuntimeError, "bash -p found sleep at '.*/sleep'"):
+                self.check_child_processes(path=f"{folder}:{selftest.SYSTEM_PATH}")
 
     def test_openssl_conf_must_point_at_an_empty_file(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "OPENSSL_CONF"):

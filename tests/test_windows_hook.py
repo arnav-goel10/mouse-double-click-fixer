@@ -454,13 +454,38 @@ class WindowsHookLogicTests(unittest.TestCase):
 
     def test_the_hand_moves_on_from_where_another_program_put_the_pointer(self) -> None:
         self.click()
+        # Nothing of the hand's is held back, so the pointer stays where the
+        # other program put it, and the hand's steps are taken from there.
         self.win.queue.append(("move", normalized_absolute(600, 600, *self.win.screen), 0))
-        self.win.move(2, 0)                                           # small: the hold stays
-        self.win.move(30, 0)                                          # leaves the spot: the up goes out
+        # Only 2 px, but 400 px from where the button came up: it leaves the
+        # spot, so the up goes out there (taken to the click and back) and
+        # this step waits behind it.
+        self.win.move(2, 0)
+        self.win.move(30, 0)                                          # waits behind it too
+        self.win.run()
+        self.assertEqual(self.win.buttons()[1][:3], ("up", Button.LEFT, (200, 200)))
+        after_up = [entry[1] for entry in self.win.seen[self.win.seen.index(self.win.buttons()[1]) + 1:]]
+        self.assertEqual(after_up, [(600, 600), (602, 600), (632, 600)], "back, then the hand's two steps")
+        self.assertEqual(self.win.cursor, (632, 600))
+        self.fire_timers()
+        self.assertEqual(len(self.win.buttons()), 2, "the up went out once")
+
+    def test_another_programs_move_while_the_hands_moves_are_held_back(self) -> None:
+        # The hand leaves the click: the up is re-sent and the hand's move
+        # waits behind it. Another program's move gets in before the up comes
+        # back, then the hand moves on. The hand's held moves still land, after
+        # the other program's, so its next step goes on from where they lead,
+        # not from where the other program put the pointer.
+        self.click()
+        self.win.move(30, 0)                                          # held: (230, 200)
+        self.win.queue.append(("move", normalized_absolute(600, 600, *self.win.screen), 0))
+        self.win.move(10, 0)                                          # held: 10 px on from (230, 200)
         self.win.run()
         self.fire_timers()
-        self.assertEqual(self.win.buttons()[1][:3], ("up", Button.LEFT, (200, 200)))
-        self.assertEqual(self.win.cursor, (632, 600))
+        moves = [entry[1] for entry in self.win.seen if entry[0] == "move"]
+        self.assertEqual(moves, [(600, 600), (230, 200), (240, 200)], "the hand's path, after the other program's move")
+        self.assertEqual(self.win.cursor, (240, 200))
+        self.assertFalse(self.win.hook.watch[0])
 
     def test_pen_motion_rebases_like_another_programs(self) -> None:
         self.click()                                                  # the mouse's click

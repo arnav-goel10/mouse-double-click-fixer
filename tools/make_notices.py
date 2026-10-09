@@ -57,6 +57,10 @@ UNUSED_QT_PLUGINS = frozenset({
 })
 #: Qt libraries only those plugins need.
 UNUSED_QT_LIBRARIES = frozenset({"Svg", "Pdf"})
+#: Other files PySide6 ships that the app never loads: opengl32sw.dll is Mesa's
+#: software OpenGL (llvmpipe), which Qt falls back on on Windows when asked for
+#: OpenGL without a working driver. The app draws only widgets, which never ask.
+UNUSED_FILES = frozenset({"opengl32sw.dll"})
 
 
 @dataclass
@@ -284,6 +288,8 @@ class Build:
             modules.add(module)
             if spec.origin and spec.origin.endswith((".so", ".pyd")):
                 files[Path(spec.origin).name] = Path(spec.origin)
+        for path in _openssl_files_in_environment():
+            files.setdefault(path.name, path)
         return cls(files, modules)
 
 
@@ -338,6 +344,43 @@ def _qt_files_in_environment() -> List[Path]:
     return found
 
 
+def _openssl_files_in_environment() -> List[Path]:
+    """OpenSSL's libraries where a build collects them from: beside Python's
+    _ssl module (Windows keeps them there), inside PySide6, and on Windows the
+    files Qt's OpenSSL backend loads by name, from the first folder on PATH
+    that has them (PyInstaller's Qt Network hook collects them from there)."""
+    folders = []
+    for module in ("_ssl", "PySide6"):
+        try:
+            spec = importlib.util.find_spec(module)
+        except (ImportError, ValueError):
+            spec = None
+        if spec is not None and spec.submodule_search_locations:
+            folders += [(Path(folder), "**/") for folder in spec.submodule_search_locations]
+        elif spec is not None and spec.origin and os.path.isfile(spec.origin):
+            folders.append((Path(spec.origin).parent, ""))
+    found = [
+        path for folder, depth in folders for pattern in ("libcrypto*", "libssl*")
+        for path in sorted(folder.glob(depth + pattern)) if _OPENSSL_FILE.match(path.name) and path.is_file()
+    ]
+    backend = [path for path in _qt_files_in_environment() if qt_plugin_name(path.name) == "qopensslbackend"]
+    if sys.platform == "win32" and backend:
+        for name in sorted({stem.decode("ascii") + ".dll" for stem in _QT_OPENSSL_NAME.findall(backend[0].read_bytes())}):
+            folder = next((folder for folder in os.environ.get("PATH", "").split(os.pathsep)
+                           if folder and os.path.isfile(os.path.join(folder, name))), None)
+            if folder is not None:
+                found.append(Path(folder) / name)
+    return found
+
+
+#: OpenSSL's libraries, as they are named on each platform: libcrypto-3.dll,
+#: libcrypto-3-x64.dll, libcrypto.3.dylib, libssl.so.3 and so on.
+_OPENSSL_FILE = re.compile(r"lib(crypto|ssl)([-.]|\.so\.)\d", re.IGNORECASE)
+#: The OpenSSL files Qt's OpenSSL backend loads at run time, as it names them
+#: ("libcrypto-3-x64" on 64-bit Windows).
+_QT_OPENSSL_NAME = re.compile(rb"(?<![\w-])(lib(?:crypto|ssl)-[\w-]+)\x00")
+
+
 def qt_plugin_name(file_name: str) -> str:
     """libqjpeg.dylib, qjpeg.dll -> qjpeg."""
     return file_name.split(".")[0].removeprefix("lib")
@@ -345,10 +388,13 @@ def qt_plugin_name(file_name: str) -> str:
 
 def unused_qt_file(destination: str) -> bool:
     """Whether a file a build would collect is one the app never uses: a
-    plugin in UNUSED_QT_PLUGINS, or the Qt library (and its PySide6
-    binding) that only those plugins need. The spec leaves these out."""
+    plugin in UNUSED_QT_PLUGINS, the Qt library (and its PySide6 binding)
+    that only those plugins need, or one of UNUSED_FILES. The spec leaves
+    these out."""
     parts = Path(destination).parts
     name = parts[-1] if parts else ""
+    if name.lower() in UNUSED_FILES:
+        return True
     if len(parts) >= 2 and parts[-2] in ("imageformats", "iconengines"):
         return qt_plugin_name(name) in UNUSED_QT_PLUGINS
     for library in UNUSED_QT_LIBRARIES:
@@ -397,6 +443,22 @@ def _search(pattern: bytes) -> Callable[[bytes], str]:
 
 #: hb_version_string(), a few strings before one of HarfBuzz's own.
 _HARFBUZZ_VERSION = rb"\x00(\d{1,2}\.\d{1,2}\.\d{1,2})\x00(?:[^\x00]{0,8}\x00){0,4}start table morx"
+#: libpng's version text is in png_get_copyright(), which only a Qt GUI that
+#: exports libpng's functions keeps (macOS); every build has its version check,
+#: which names libpng and compares against the bare version string.
+_LIBPNG = (b"libpng version", b"Application built with libpng-")
+
+
+def _libpng_version(data: bytes) -> str:
+    """The version libpng's text gives, or else its bare version string
+    ("1.6.58"), when that is the only one of its kind in the library."""
+    found = _search(rb"libpng version (1\.\d+\.\d+)")(data)
+    if found:
+        return found
+    bare = {match.decode("ascii") for match in re.findall(rb"(?<=\x00)1\.6\.\d{1,3}(?=\x00)", data)}
+    return bare.pop() if len(bare) == 1 else ""
+
+
 #: The first of double-conversion's cached powers of ten, as it is stored.
 _DOUBLE_CONVERSION = bytes.fromhex("88021c08a0d58ffa")
 _PUBLIC = "Dedicated to the public domain under CC0-1.0, which sets no conditions"
@@ -470,7 +532,7 @@ QT_RULES: List[Rule] = [
          "Gui", (b"start table morx",), version=_search(_HARFBUZZ_VERSION)),
     Rule(Inside("libpng", "Qt GUI", "libpng-2.0", "Copyright (c) 1995-2026 The PNG Reference Library Authors; "
                 "Copyright (c) 2018-2026 Cosmin Truta", "libpng"),
-         "Gui", (b"libpng version",), version=_search(rb"libpng version (1\.\d+\.\d+)")),
+         "Gui", _LIBPNG, version=_libpng_version),
     Rule(Inside("MD4C", "Qt GUI", "MIT", "Copyright © 2016-2024 Martin Mitáš", "md4c"),
          "Gui", (b"QTextMarkdownImporter",)),
     Rule(Inside("Smooth scaling algorithm", "Qt GUI", "BSD-2-Clause AND Imlib2", "Copyright (C) 2004, 2005 "
@@ -511,12 +573,15 @@ QT_RULES: List[Rule] = [
 
 #: Code no rule above covers, by a string it leaves: a build that ships it
 #: fails, rather than shipping it unattributed. libjpeg, libtiff and libwebp
-#: are in the image-format plugins every build leaves out.
+#: are in the image-format plugins every build leaves out, and Mesa is
+#: PySide6's opengl32sw.dll (see UNUSED_FILES): llvmpipe names itself with
+#: this string as its OpenGL renderer.
 UNATTRIBUTED = {
     b"libjpeg-turbo version": "libjpeg-turbo",
     b"not supported by libtiff": "libtiff",
     b"QWebpHandler": "libwebp",
     b"pixman_": "Pixman",
+    b"llvmpipe (LLVM ": "Mesa (software OpenGL)",
 }
 
 
@@ -605,23 +670,93 @@ def inside_python(build: Build) -> List[Inside]:
     return found
 
 
+#: OPENSSL_VERSION_TEXT, which every libcrypto carries: "OpenSSL 3.0.13 30 Jan 2024".
+_OPENSSL_VERSION = re.compile(rb"OpenSSL (\d+\.\d+\.\d+[a-z]?) +\d{1,2} [A-Z][a-z]{2} \d{4}\x00")
+
+
+@dataclass(frozen=True)
+class OpenSSLCopy:
+    """One copy of OpenSSL a build ships: its libcrypto (and libssl, if it
+    ships one beside it), the version the libcrypto file says it is, and
+    whether it is the one Qt Network's OpenSSL backend loads rather than the
+    one Python's ssl and hashlib modules link to."""
+
+    crypto: str
+    ssl: str
+    version: str
+    for_qt: bool
+
+
+def openssl_copies(build: Build) -> List[OpenSSLCopy]:
+    """Each copy of OpenSSL's libraries among the build's files, and whose it
+    is: Python's ssl and hashlib modules link to theirs by file name, and Qt's
+    OpenSSL backend names the files it loads. A Windows build ships both, and
+    they may be different versions. A copy neither names fails the build."""
+    python = b"\x00".join(build.extension(module) or b"" for module in ("_ssl", "_hashlib")).lower()
+    qt = b"\x00".join(build.qt(library) or b"" for library in ("qopensslbackend", "Network"))
+    qt_names = {stem.decode("ascii").lower() for stem in _QT_OPENSSL_NAME.findall(qt)}
+    copies = []
+    for name in sorted(build.files, key=str.lower):
+        match = _OPENSSL_FILE.match(name)
+        if not match or match.group(1).lower() != "crypto":
+            continue
+        partner = next((other for other in build.files if other.lower() == "libssl" + name[len("libcrypto"):].lower()),
+                       "")
+        found = _OPENSSL_VERSION.search(build.data(name) or b"")
+        version = found.group(1).decode("ascii") if found else ""
+        if name.lower().encode() in python:
+            copies.append(OpenSSLCopy(name, partner, version, for_qt=False))
+        elif name.lower().removesuffix(".dll") in qt_names:
+            copies.append(OpenSSLCopy(name, partner, version, for_qt=True))
+        else:
+            raise SystemExit(f"This build ships {name}, which neither Python's ssl modules nor Qt's OpenSSL backend "
+                             "load; tools/make_notices.py can't say whose copy it is")
+    return copies
+
+
+def _openssl(name: str, version: str) -> Component:
+    if not version.startswith("3."):
+        raise SystemExit(f"{name} is OpenSSL {version or '(version unknown)'}; tools/make_notices.py has the "
+                         "licence of OpenSSL 3 (Apache-2.0) only")
+    return Component(
+        name, version, "Apache-2.0",
+        "Copyright (c) The OpenSSL Project Authors; Copyright (c) 1995-1998 Eric A. Young, Tim J. Hudson. "
+        "All rights reserved.",
+        f"https://github.com/openssl/openssl/releases/download/openssl-{version}/openssl-{version}.tar.gz",
+        "Apache-2.0",
+    )
+
+
+def qt_libraries(build: Build) -> List[Component]:
+    """Libraries Qt loads that the build ships beside it: the OpenSSL copy Qt
+    Network's OpenSSL backend loads (on Windows, where PyInstaller collects
+    it)."""
+    found = []
+    for copy in openssl_copies(build):
+        if copy.for_qt:
+            if not copy.version:
+                raise SystemExit(f"Couldn't read which OpenSSL {copy.crypto} is")
+            files = ", ".join(name for name in (copy.crypto, copy.ssl) if name)
+            found.append(_openssl(f"OpenSSL for Qt Network ({files})", copy.version))
+    return found
+
+
 def python_libraries(build: Build) -> List[Component]:
     """Libraries Python's own modules use, where the build carries its own copy."""
     found = []
     try:
         import ssl
 
-        version = ssl.OPENSSL_VERSION.split()[1]
-        if ssl.OPENSSL_VERSION.startswith("OpenSSL") and build.bundles("_hashlib", "libcrypto"):
-            found.append(Component(
-                "OpenSSL (libcrypto, libssl)", version, "Apache-2.0",
-                "Copyright (c) The OpenSSL Project Authors; Copyright (c) 1995-1998 Eric A. Young, Tim J. Hudson. "
-                "All rights reserved.",
-                f"https://github.com/openssl/openssl/releases/download/openssl-{version}/openssl-{version}.tar.gz",
-                "Apache-2.0",
-            ))
+        running = ssl.OPENSSL_VERSION.split()[1] if ssl.OPENSSL_VERSION.startswith("OpenSSL ") else ""
     except (ImportError, IndexError):
-        pass
+        running = ""
+    # Python's copy as its file says (where the build lists its files), or
+    # as the Python making the build reports it.
+    own = [copy for copy in openssl_copies(build) if not copy.for_qt]
+    for copy in own:
+        found.append(_openssl("OpenSSL (libcrypto, libssl)", copy.version or running))
+    if not own and running and build.bundles("_hashlib", "libcrypto"):
+        found.append(_openssl("OpenSSL (libcrypto, libssl)", running))
     try:
         from compression import zstd  # Python 3.14+
 
@@ -757,6 +892,7 @@ def render(build: Optional[Build] = None) -> str:
         f"https://www.python.org/ftp/python/{release}/Python-{python}.tar.xz", "PSF-2.0",
     )
     libraries = python_libraries(build)
+    qt_libs = qt_libraries(build)
     in_qt = inside_qt(build)
     in_python = inside_python(build)
     pyobjc_parts = [
@@ -773,7 +909,7 @@ def render(build: Optional[Build] = None) -> str:
             "Giovanni Bajo; based on previous work under copyright (c) 2002 McMillan Enterprises, Inc.",
             f"https://github.com/pyinstaller/pyinstaller/tree/v{pyinstaller}", "Apache-2.0",
         ))
-    everything = qt_parts + [python_part] + libraries + pyobjc_parts + tools
+    everything = qt_parts + qt_libs + [python_part] + libraries + pyobjc_parts + tools
 
     def inside_lines(items: List[Inside]) -> List[str]:
         lines = []
@@ -838,6 +974,17 @@ def render(build: Optional[Build] = None) -> str:
             "source is part of the Qt source above.",
             "",
             *inside_lines(in_qt),
+            "",
+        ]
+    if qt_libs:
+        out += [
+            "### OpenSSL for Qt Network",
+            "",
+            "Qt Network's OpenSSL backend loads OpenSSL from files of its own, and this build ships them: a "
+            "separate copy from Python's (below), which can be a different version.",
+            "",
+            *[f"- {_named(item)}: {item.licence}, {use(item.text)}. {_sentence(item.copyright)} "
+              f"Source: <{item.source}>" for item in qt_libs],
             "",
         ]
     out += [

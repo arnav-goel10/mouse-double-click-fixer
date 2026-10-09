@@ -57,8 +57,13 @@ class GeneratorTests(unittest.TestCase):
             ("Network", "- The Public Suffix List, in Qt Network: MPL-2.0"),
             ("DBus", "- libdbus-1 headers, in Qt D-Bus: AFL-2.1"),
         ):
-            if build.qt(library) is not None:
-                self.assertIn(line, self.text)
+            data = build.qt(library)
+            if data is not None and line not in self.text:
+                # What the library has that looks like it, to go by.
+                word = line[2:].split(",")[0].split()[0].encode()
+                evidence = sorted(set(re.findall(rb"[ -~]{0,40}" + re.escape(word) + rb"[ -~]{0,40}", data)))[:12]
+                versions = sorted(set(re.findall(rb"(?<=\x00)\d{1,2}\.\d{1,2}\.\d{1,3}(?=\x00)", data)))
+                self.fail(f"no {line!r} in the notices; {library} has {evidence}, bare versions {versions}")
         # The FreeType License asks for this sentence in the documentation.
         self.assertIn("based in part on the work of the FreeType Team", self.text)
         for heading in ("The FreeType Project License", "Mozilla Public License, version 2.0", "Unicode License v3"):
@@ -170,6 +175,15 @@ class BuildScanTests(unittest.TestCase):
         found = make_notices.inside_qt(self.build([gui]))
         self.assertIn("FreeType", self.names(found))
         self.assertEqual([item.version for item in found if item.name == "libpng"], ["1.6.99"])
+        # Windows' Qt GUI keeps only libpng's version check and its bare
+        # version string (zlib's, which it also names, is not 1.6).
+        windows = fake_binary(self.folder, "Qt6Gui.dll", b"Application built with libpng-", b" but running with ",
+                              b"1.3.1", b"1.6.58", b"PNG: Compression %d out of range")
+        found = make_notices.inside_qt(self.build([windows], platform="win32"))
+        self.assertEqual([item.version for item in found if item.name == "libpng"], ["1.6.58"])
+        unsure = fake_binary(self.folder, "Qt6Gui.dll", b"Application built with libpng-", b"1.6.57", b"1.6.58", b"")
+        found = make_notices.inside_qt(self.build([unsure], platform="win32"))
+        self.assertEqual([item.version for item in found if item.name == "libpng"], [""])
         self.assertNotIn("HarfBuzz", self.names(found))  # no mark of it
         self.assertNotIn("PCRE2", self.names(found))  # no Qt Core at all
         self.assertIn("Smooth scaling algorithm", self.names(found))  # always part of Qt GUI
@@ -190,6 +204,56 @@ class BuildScanTests(unittest.TestCase):
         plugin = fake_binary(self.folder, "libqjpeg.dylib", b"libjpeg-turbo version 3.2.0 (build )")
         with self.assertRaisesRegex(SystemExit, "libjpeg-turbo"):
             make_notices.inside_qt(self.build([plugin]))
+
+    def test_mesa_software_opengl_fails_the_build(self) -> None:
+        # PySide6's opengl32sw.dll, as llvmpipe names itself to OpenGL.
+        mesa = fake_binary(self.folder, "opengl32sw.dll", b"llvmpipe (LLVM 15.0.7, 256 bits)")
+        with self.assertRaisesRegex(SystemExit, r"Mesa .*opengl32sw\.dll"):
+            make_notices.inside_qt(self.build([mesa], platform="win32"))
+        gui = fake_binary(self.folder, "Qt6Gui.dll", b"llvmpipe", b"Mesa")  # Qt naming it is not Mesa itself
+        make_notices.inside_qt(self.build([gui], platform="win32"))
+
+    def windows_openssl(self, qt_version: bytes = b"OpenSSL 3.5.5 27 Jan 2026") -> list:
+        """A Windows build's two copies: Python's, which its modules link to,
+        and the one Qt's OpenSSL backend loads by name."""
+        return [
+            fake_binary(self.folder, "libcrypto-3.dll", b"OpenSSL 3.0.15 3 Sep 2024", b"x"),
+            fake_binary(self.folder, "libssl-3.dll", b"no version text in libssl"),
+            fake_binary(self.folder, "_hashlib.pyd", b"LIBCRYPTO-3.dll"),
+            fake_binary(self.folder, "_ssl.pyd", b"libssl-3.dll", b"libcrypto-3.dll"),
+            fake_binary(self.folder, "libcrypto-3-x64.dll", qt_version, b"x"),
+            fake_binary(self.folder, "libssl-3-x64.dll"),
+            fake_binary(self.folder, "qopensslbackend.dll", b"libssl-3-x64", b"libcrypto-3-x64", b"libssl-3", b""),
+        ]
+
+    def test_each_openssl_copy_is_listed_with_the_version_its_file_carries(self) -> None:
+        build = self.build(self.windows_openssl(), platform="win32")
+        self.assertEqual(
+            [(item.name, item.version) for item in make_notices.python_libraries(build) if "OpenSSL" in item.name],
+            [("OpenSSL (libcrypto, libssl)", "3.0.15")],
+        )
+        self.assertEqual(
+            [(item.name, item.version, item.licence) for item in make_notices.qt_libraries(build)],
+            [("OpenSSL for Qt Network (libcrypto-3-x64.dll, libssl-3-x64.dll)", "3.5.5", "Apache-2.0")],
+        )
+        text = make_notices.render(build)
+        self.assertIn("| OpenSSL (libcrypto, libssl) | 3.0.15 | Apache-2.0 |", text)
+        self.assertIn("| OpenSSL for Qt Network (libcrypto-3-x64.dll, libssl-3-x64.dll) | 3.5.5 | Apache-2.0 |", text)
+        self.assertIn("openssl-3.5.5/openssl-3.5.5.tar.gz", text)
+        self.assertIn("### OpenSSL for Qt Network", text)
+
+    def test_an_openssl_copy_without_a_readable_version_fails_the_build(self) -> None:
+        build = self.build(self.windows_openssl(b"nothing to go by"), platform="win32")
+        with self.assertRaisesRegex(SystemExit, "Couldn't read which OpenSSL libcrypto-3-x64.dll is"):
+            make_notices.qt_libraries(build)
+        build = self.build(self.windows_openssl(b"OpenSSL 1.1.1w  11 Sep 2023"), platform="win32")
+        with self.assertRaisesRegex(SystemExit, "OpenSSL 1.1.1w"):
+            make_notices.qt_libraries(build)
+
+    def test_an_openssl_copy_neither_python_nor_qt_loads_fails_the_build(self) -> None:
+        files = [path for path in self.windows_openssl() if path.name != "qopensslbackend.dll"]
+        with self.assertRaisesRegex(SystemExit, "ships libcrypto-3-x64.dll, which neither"):
+            make_notices.python_libraries(self.build(files, platform="win32"))
 
     def test_python_notices_follow_the_modules_that_ship(self) -> None:
         select = fake_binary(self.folder, "select.cpython-314-darwin.so", b"kqueue")
@@ -235,7 +299,7 @@ class BuildScanTests(unittest.TestCase):
             "PySide6/Qt/plugins/imageformats/libqjpeg.dylib", "PySide6/plugins/imageformats/qtiff.dll",
             "PySide6/Qt/plugins/iconengines/libqsvgicon.dylib", "PySide6/Qt/lib/QtSvg.framework/Versions/A/QtSvg",
             "PySide6/Qt/lib/QtSvg.framework/Resources/Info.plist", "QtSvg", "PySide6/Qt6Svg.dll",
-            "PySide6/QtSvg.abi3.so",
+            "PySide6/QtSvg.abi3.so", "PySide6/opengl32sw.dll", "opengl32sw.dll",
         ):
             self.assertTrue(make_notices.unused_qt_file(destination), destination)
         for destination in (
@@ -253,6 +317,45 @@ class BuildScanTests(unittest.TestCase):
             path = make_notices.LICENSES / f"{key}.txt"
             self.assertTrue(path.is_file(), path)
             self.assertGreater(len(path.read_text(encoding="utf-8").strip()), 100, path)
+
+
+class EnvironmentFilesTests(unittest.TestCase):
+    """The markers and version strings, against this environment's real
+    files where it has them (PySide6's Windows wheels do)."""
+
+    def pyside6_file(self, name: str) -> Path:
+        import PySide6
+
+        path = Path(PySide6.__file__).parent / name
+        if not path.is_file():
+            self.skipTest(f"PySide6 has no {name} here")
+        return path
+
+    def test_the_mesa_marker_is_in_pyside6s_software_opengl(self) -> None:
+        path = self.pyside6_file("opengl32sw.dll")
+        data = path.read_bytes()
+        markers = [marker for marker, name in make_notices.UNATTRIBUTED.items() if name.startswith("Mesa")]
+        context = [data[max(0, index - 40):index + 60] for index in
+                   (data.find(b"llvmpipe"), data.find(b"Mesa ")) if index >= 0]
+        self.assertTrue(any(marker in data for marker in markers), f"none of {markers} in {path}: {context}")
+        self.assertTrue(make_notices.unused_qt_file(str(path.relative_to(path.parent.parent))))
+
+    def test_each_openssl_copy_here_says_its_version(self) -> None:
+        import ssl
+
+        build = make_notices.Build.from_environment()
+        copies = make_notices.openssl_copies(build)
+        if not copies:
+            self.skipTest("no OpenSSL files among what a build here collects")
+        text = make_notices.render(build)
+        for copy in copies:
+            self.assertRegex(copy.version, r"^3\.\d+\.\d+", copy)
+            if copy.for_qt:
+                files = ", ".join(name for name in (copy.crypto, copy.ssl) if name)
+                self.assertIn(f"| OpenSSL for Qt Network ({files}) | {copy.version} |", text)
+            else:
+                self.assertEqual(copy.version, ssl.OPENSSL_VERSION.split()[1], "Python's copy is the one ssl runs")
+                self.assertIn(f"| OpenSSL (libcrypto, libssl) | {copy.version} |", text)
 
 
 class ResolverTests(unittest.TestCase):

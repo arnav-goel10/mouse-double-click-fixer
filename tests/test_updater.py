@@ -8,6 +8,7 @@ import http.server
 import json
 import os
 import plistlib
+import re
 import shutil
 import subprocess
 import sys
@@ -933,17 +934,42 @@ class WindowsScriptTests(unittest.TestCase):
         self.assertIn('move /Y "%DCF_SRC%" "%DCF_APP%"', portable)
         self.assertIn('start "" "%DCF_APP%" --updated', portable)
 
+    def test_scripts_run_windows_own_programs_by_their_full_path(self) -> None:
+        # A program named alone is looked for in the current folder first.
+        for script in (
+            updater.windows_installer_script("/RELAUNCH=1", ["--updated"]),
+            updater.windows_portable_script(1234, ["--updated"]),
+        ):
+            rest = re.sub(r'"%DCF_SYSTEM%\\\w+\.exe"', "", script)
+            self.assertEqual(re.findall(r"\b(?:tasklist|find|ping|timeout|cmd|taskkill|powershell)\b", rest, re.I), [])
+        portable = updater.windows_portable_script(1234, ["--updated"])
+        for program in ("tasklist.exe", "find.exe", "ping.exe"):
+            self.assertIn(f'"%DCF_SYSTEM%\\{program}"', portable)
+
+    def test_windows_programs_come_from_system32(self) -> None:
+        with mock.patch.dict(os.environ, {"SystemRoot": r"D:\WINNT"}):
+            self.assertEqual(updater.system_program("cmd.exe"), r"D:\WINNT\System32\cmd.exe")
+        for root in ("", "Windows", r"\Windows", "..\\Windows", None):
+            with self.subTest(root=root), mock.patch.dict(os.environ):
+                os.environ.pop("SystemRoot", None)
+                if root is not None:
+                    os.environ["SystemRoot"] = root
+                self.assertEqual(updater.system_program("cmd.exe"), r"C:\Windows\System32\cmd.exe")
+
     def test_paths_go_through_the_environment(self) -> None:
         folder = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, folder, True)
         app = Path(r"C:\Users\Łukasz 张伟\AppData\Local\Programs\DoubleClick Fixer\DoubleClickFixer.exe")
         setup = Path(r"C:\Users\Łukasz 张伟\AppData\Local\Temp\dcf-update-1\DoubleClickFixer-Setup.exe")
         script = folder / "apply-update.cmd"
-        with mock.patch.object(updater.subprocess, "Popen") as popen:
+        with mock.patch.object(updater.subprocess, "Popen") as popen, mock.patch.dict(
+            os.environ, {"SystemRoot": r"C:\WINDOWS"}
+        ):
             updater.start_windows_script(script, updater.windows_installer_script("/RELAUNCH=2", []), app, setup)
-        self.assertEqual(popen.call_args.args[0], ["cmd", "/c", str(script)])
+        self.assertEqual(popen.call_args.args[0], [r"C:\WINDOWS\System32\cmd.exe", "/c", str(script)])
         environment = popen.call_args.kwargs["env"]
         self.assertEqual((environment["DCF_APP"], environment["DCF_SRC"]), (str(app), str(setup)))
+        self.assertEqual(environment["DCF_SYSTEM"], r"C:\WINDOWS\System32")
         script.read_bytes().decode("ascii")
 
         with mock.patch.object(updater.subprocess, "Popen") as popen, self.assertRaises(updater.UpdateError):
@@ -956,6 +982,28 @@ class WindowsPortableSwapTests(unittest.TestCase):
     def test_swap_works_in_a_folder_outside_the_oem_code_page(self) -> None:
         root = Path(tempfile.mkdtemp(prefix="dcf-Łł张-"))
         self.addCleanup(shutil.rmtree, root, True)
+        self.swap(root)
+
+    def test_programs_planted_in_the_current_folder_never_run(self) -> None:
+        # Opened from Downloads, the app's current folder is Downloads, and
+        # Windows looks there first for a program named alone.
+        planted = Path(tempfile.mkdtemp(prefix="dcf-planted-"))
+        self.addCleanup(shutil.rmtree, planted, True)
+        ran = planted / "ran.txt"
+        for name in ("tasklist", "find", "ping"):
+            (planted / f"{name}.bat").write_text(f'echo {name}>> "%~dp0ran.txt"\n', encoding="ascii")
+        here = os.getcwd()
+        os.chdir(planted)
+        self.addCleanup(os.chdir, here)
+        subprocess.run([updater.system_program("cmd.exe"), "/c", "find /?"], capture_output=True, check=False)
+        self.assertTrue(ran.exists(), "a name alone didn't run the planted copy here, so this proves nothing")
+        ran.unlink()
+        root = Path(tempfile.mkdtemp(prefix="dcf-swap-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        self.swap(root)
+        self.assertFalse(ran.exists(), f"the update script ran {ran.read_text().split() if ran.exists() else ''}")
+
+    def swap(self, root: Path) -> None:
         marker = root / "relaunched.txt"
         # The "app" is a batch file that notes how it was started.
         app = root / "DoubleClick Fixer.cmd"
@@ -963,7 +1011,7 @@ class WindowsPortableSwapTests(unittest.TestCase):
         downloaded = root / "dcf-update-1" / "new.cmd"
         downloaded.parent.mkdir()
         downloaded.write_text('echo new %*> "%~dp0relaunched.txt"\nexit\n', encoding="ascii")
-        finished = subprocess.Popen(["cmd", "/c", "exit"])
+        finished = subprocess.Popen([updater.system_program("cmd.exe"), "/c", "exit"])
         finished.wait()
         script = downloaded.parent / "apply-update.cmd"
         text = updater.windows_portable_script(finished.pid, ["--updated"])
