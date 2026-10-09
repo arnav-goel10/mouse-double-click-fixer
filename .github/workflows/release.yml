@@ -48,7 +48,18 @@ jobs:
     name: Windows build
     needs: version
     runs-on: windows-latest
-    timeout-minutes: 40
+    # Long enough for two SignPath signing requests, each waiting up to 30
+    # minutes for the owner to approve it.
+    timeout-minutes: 80
+    # SignPath fetches the files to sign from this run's artifacts with the
+    # job's token, which must be able to read them.
+    permissions:
+      contents: read
+      actions: read
+    # SignPath's API token is kept in the "release" environment, which only
+    # tags may use, and only the push of a tag loads it (as for the macOS
+    # job). A manual run never signs.
+    environment: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && 'release' || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -85,12 +96,143 @@ jobs:
       - name: Confirm no build carries CI's update key or its start-up hook
         shell: pwsh
         run: python tools/ci_update_key.py check dist\DoubleClickFixer.exe dist\onedir
+      # Code signing with SignPath (docs/DISTRIBUTION.md). The executables are
+      # signed before the installer is compiled around them, then the
+      # installer itself, so every release file is the signed one: the
+      # artifacts, the draft, SHA256SUMS.txt and its signature all cover
+      # signed files. Until SignPath is set up, nothing is signed.
+      - name: Decide whether SignPath signs this build
+        id: signpath
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          SIGNPATH_POLICY_SLUG: ${{ vars.SIGNPATH_POLICY_SLUG }}
+        run: |
+          set -eu
+          names="SIGNPATH_API_TOKEN SIGNPATH_ORGANIZATION_ID SIGNPATH_PROJECT_SLUG SIGNPATH_POLICY_SLUG"
+          missing=""
+          for name in $names; do
+            if [ -z "$(printenv "$name" || true)" ]; then missing="$missing $name"; fi
+          done
+          version="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' app/__init__.py)"
+          if [ "$EVENT" != push ] || [ "${REF#refs/tags/}" = "$REF" ]; then
+            echo "Not signed: only the push of a release tag is signed, and this is a $EVENT run of $REF."
+            echo "sign=false" >> "$GITHUB_OUTPUT"
+          elif [ "$missing" = " $names" ]; then
+            echo "::warning::Not signed: SignPath isn't set up (docs/DISTRIBUTION.md), so the Windows files go out unsigned."
+            echo "sign=false" >> "$GITHUB_OUTPUT"
+          elif [ -n "$missing" ]; then
+            echo "::error::SignPath is only partly set up. Missing:$missing (docs/DISTRIBUTION.md)."
+            exit 1
+          else
+            echo "Signing the Windows files of $version with SignPath."
+            echo "sign=true" >> "$GITHUB_OUTPUT"
+            echo "version=$version" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Gather the executables to sign
+        if: steps.signpath.outputs.sign == 'true'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory signing\unsigned\portable, signing\unsigned\installed | Out-Null
+          Copy-Item dist\DoubleClickFixer.exe signing\unsigned\portable\
+          Copy-Item dist\onedir\DoubleClickFixer\DoubleClickFixer.exe signing\unsigned\installed\
+      - name: Hand the executables to SignPath
+        id: unsigned-executables
+        if: steps.signpath.outputs.sign == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unsigned-windows-executables
+          path: signing/unsigned/
+          if-no-files-found: error
+      - name: Sign the executables (SignPath artifact configuration windows-executables)
+        if: steps.signpath.outputs.sign == 'true'
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG }}
+          artifact-configuration-slug: windows-executables
+          github-artifact-id: ${{ steps.unsigned-executables.outputs.artifact-id }}
+          parameters: |
+            version: "${{ steps.signpath.outputs.version }}"
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 1800
+          output-artifact-directory: signing/signed-executables
+      - name: Put the signed executables in place
+        if: steps.signpath.outputs.sign == 'true'
+        shell: pwsh
+        run: |
+          Copy-Item signing\signed-executables\portable\DoubleClickFixer.exe dist\DoubleClickFixer.exe -Force
+          Copy-Item signing\signed-executables\installed\DoubleClickFixer.exe dist\onedir\DoubleClickFixer\DoubleClickFixer.exe -Force
+          python tools/ci_update_key.py check dist\DoubleClickFixer.exe dist\onedir
       - name: Build the Windows installer
         shell: pwsh
         run: |
           $version = (python -c "import app; print(app.__version__)")
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" "installer\windows.iss"
           if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed to build the installer" }
+      - name: Hand the installer to SignPath
+        id: unsigned-installer
+        if: steps.signpath.outputs.sign == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unsigned-windows-installer
+          path: installer/Output/DoubleClickFixer-Setup.exe
+          if-no-files-found: error
+      - name: Sign the installer (SignPath artifact configuration windows-installer)
+        if: steps.signpath.outputs.sign == 'true'
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG }}
+          artifact-configuration-slug: windows-installer
+          github-artifact-id: ${{ steps.unsigned-installer.outputs.artifact-id }}
+          parameters: |
+            version: "${{ steps.signpath.outputs.version }}"
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 1800
+          output-artifact-directory: signing/signed-installer
+      - name: Put the signed installer in place
+        if: steps.signpath.outputs.sign == 'true'
+        shell: pwsh
+        run: Copy-Item signing\signed-installer\DoubleClickFixer-Setup.exe installer\Output\DoubleClickFixer-Setup.exe -Force
+      - name: Check what SignPath checks, and every signature
+        # SignPath refuses a file whose product name and version differ from
+        # its artifact configuration's (tools/signpath/), so a build that
+        # would be refused fails here, signed or not. Then each program file
+        # in the downloads, with its signature: the Microsoft Store's EXE
+        # route needs every one signed (docs/DISTRIBUTION.md).
+        shell: pwsh
+        env:
+          SIGNED: ${{ steps.signpath.outputs.sign }}
+        run: |
+          $version = (python -c "import app; print(app.__version__)")
+          $name = (python -c "import app; print(app.DISPLAY_NAME)")
+          $ours = "dist\DoubleClickFixer.exe", "dist\onedir\DoubleClickFixer\DoubleClickFixer.exe", "installer\Output\DoubleClickFixer-Setup.exe"
+          foreach ($file in $ours) {
+            $info = (Get-Item $file).VersionInfo
+            $signature = Get-AuthenticodeSignature $file
+            Write-Host "${file}: product '$($info.ProductName)' $($info.ProductVersion), signature $($signature.Status) $($signature.SignerCertificate.Subject)"
+            if ($info.ProductName -ne $name -or $info.ProductVersion -ne $version) {
+              throw "$file says it is '$($info.ProductName)' $($info.ProductVersion), not '$name' $version; SignPath would refuse to sign it"
+            }
+            if ($env:SIGNED -eq "true" -and $signature.Status -ne "Valid") { throw "$file isn't validly signed: $($signature.StatusMessage)" }
+          }
+          $files = Get-ChildItem dist\onedir -Recurse -File -Include *.exe, *.dll, *.pyd
+          $rows = foreach ($file in $files) {
+            $signature = Get-AuthenticodeSignature $file.FullName
+            [pscustomobject]@{ Status = $signature.Status; Signer = $signature.SignerCertificate.Subject; File = $file.FullName.Substring((Resolve-Path dist\onedir).Path.Length + 1) }
+          }
+          $rows | Sort-Object Status, File | Format-Table -AutoSize | Out-String -Width 300 | Write-Host
+          $unsigned = @($rows | Where-Object { $_.Status -ne "Valid" }).Count
+          Write-Host "$unsigned of $($rows.Count) program files in the installed folder carry no valid signature."
       - name: Collect the release files
         shell: pwsh
         run: |

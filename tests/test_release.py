@@ -330,8 +330,10 @@ class WorkflowTests(unittest.TestCase):
             for line in path.read_text(encoding="utf-8").splitlines():
                 match = re.search(r"\buses:\s*(\S+)(.*)$", line)
                 if match and not match.group(1).startswith("./"):
+                    # The comment names the release the commit is: v1.2.3, or
+                    # v3.0 for an action that tags its releases with two numbers.
                     self.assertRegex(
-                        match.group(1) + match.group(2), r"^[\w.-]+/[\w.-]+@[0-9a-f]{40} # v\d+\.\d+\.\d+$",
+                        match.group(1) + match.group(2), r"^[\w.-]+/[\w.-]+@[0-9a-f]{40} # v\d+\.\d+(?:\.\d+)?$",
                         f"{path.name}: {line.strip()}",
                     )
 
@@ -347,7 +349,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("--draft", release)
         self.assertIn("--latest=false", release)
         self.assertNotIn("make_latest: true", release)
-        self.assertEqual(release.count("secrets."), 2, "the signing secrets belong to the macOS job alone")
+        # The certificate belongs to the macOS job, SignPath's token to the
+        # Windows job's signing steps, and nothing else reads a secret.
+        self.assertEqual(release.count("secrets."), 5)
+        self.assertEqual(job(release, "macos").count("secrets.MACOS_SIGNING_P12"), 2)
+        self.assertEqual(job(release, "windows").count("secrets.SIGNPATH_API_TOKEN"), 3)
         self.assertIn(f"expected='{APP_REQUIREMENT}'", release)
 
     def test_a_manual_run_never_loads_the_certificate_or_puts_up_a_draft(self) -> None:
@@ -444,6 +450,200 @@ def step(job_text: str, name: str) -> str:
     match = re.search(rf"^      - (?:name: )?{re.escape(name)}.*?(?=^      - |\Z)", job_text, re.MULTILINE | re.DOTALL)
     assert match, f"no step {name}"
     return match.group(0)
+
+
+SIGN_IF = "if: steps.signpath.outputs.sign == 'true'\n"
+SIGNPATH_ACTION = "uses: signpath/github-action-submit-signing-request@"
+SIGNPATH_NAMES = ("SIGNPATH_API_TOKEN", "SIGNPATH_ORGANIZATION_ID", "SIGNPATH_PROJECT_SLUG", "SIGNPATH_POLICY_SLUG")
+SIGNPATH_CONFIGS = ROOT / "tools" / "signpath"
+SIGNPATH_NS = {"sp": "http://signpath.io/artifact-configuration/v1"}
+
+
+def run_block(step_text: str) -> str:
+    """The script of a step's `run: |` block, as the runner gets it."""
+    lines = step_text.split("        run: |\n", 1)[1].splitlines()
+    return "\n".join(line[10:] for line in lines if line.strip()) + "\n"
+
+
+class SignPathWorkflowTests(unittest.TestCase):
+    """release.yml's Windows job has SignPath sign the executables and then
+    the installer built around them, before they become release files, so
+    the artifacts `publish` compares the draft with, SHA256SUMS.txt and its
+    signature all cover the signed files (docs/DISTRIBUTION.md)."""
+
+    def setUp(self) -> None:
+        self.release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        self.windows = job(self.release, "windows")
+
+    def test_every_signing_step_runs_only_when_the_decision_says_so(self) -> None:
+        for name in ("Gather the executables to sign", "Hand the executables to SignPath", "Sign the executables",
+                     "Put the signed executables in place", "Hand the installer to SignPath", "Sign the installer",
+                     "Put the signed installer in place"):
+            self.assertIn(SIGN_IF, step(self.windows, name), name)
+        self.assertEqual(self.release.count(SIGNPATH_ACTION), 2)
+        self.assertEqual(self.windows.count(SIGNPATH_ACTION), 2)
+        self.assertEqual(self.release.count(SIGN_IF), 7)
+        self.assertIn("        id: signpath\n", step(self.windows, "Decide whether SignPath signs this build"))
+
+    def test_signing_comes_before_the_release_files_and_their_checksums(self) -> None:
+        order = [self.windows.index(text) for text in (
+            "Confirm no build carries CI's update key",
+            "Decide whether SignPath signs this build",
+            "Gather the executables to sign",
+            "Hand the executables to SignPath",
+            "Sign the executables",
+            "Put the signed executables in place",
+            "Build the Windows installer",
+            "Hand the installer to SignPath",
+            "Sign the installer",
+            "Put the signed installer in place",
+            "Check what SignPath checks, and every signature",
+            "Collect the release files",
+            "name: DoubleClickFixer-windows\n",
+            "Keep what the install test compares the installed copy with",
+        )]
+        self.assertEqual(order, sorted(order))
+        # SHA256SUMS.txt is written from the artifacts, after every job that
+        # builds them; the install test runs the signed installer.
+        publish = job(self.release, "publish")
+        self.assertIn("needs: [checks, windows, macos, windows-e2e]", publish)
+        self.assertIn("sha256sum * > SHA256SUMS.txt", step(publish, "Check the files and write their checksums"))
+        self.assertIn("needs: windows\n", job(self.release, "windows-e2e"))
+        # The signed files replace the built ones where the installer and the
+        # release files are taken from, and are checked for CI's key again.
+        put = step(self.windows, "Put the signed executables in place")
+        self.assertIn("signing\\signed-executables\\portable\\DoubleClickFixer.exe dist\\DoubleClickFixer.exe -Force", put)
+        self.assertIn("signing\\signed-executables\\installed\\DoubleClickFixer.exe dist\\onedir\\DoubleClickFixer\\DoubleClickFixer.exe -Force", put)
+        self.assertIn("python tools/ci_update_key.py check dist\\DoubleClickFixer.exe dist\\onedir", put)
+        self.assertIn("signing\\signed-installer\\DoubleClickFixer-Setup.exe installer\\Output\\DoubleClickFixer-Setup.exe -Force",
+                      step(self.windows, "Put the signed installer in place"))
+        self.assertIn("Copy-Item dist\\DoubleClickFixer.exe, installer\\Output\\DoubleClickFixer-Setup.exe release\\",
+                      step(self.windows, "Collect the release files"))
+        check = step(self.windows, "Check what SignPath checks, and every signature")
+        self.assertIn("SIGNED: ${{ steps.signpath.outputs.sign }}", check)
+        self.assertIn('if ($env:SIGNED -eq "true" -and $signature.Status -ne "Valid") { throw', check)
+        self.assertNotIn(SIGN_IF, check, "the metadata check runs on every build")
+
+    def test_the_files_sent_for_signing_never_become_release_files(self) -> None:
+        names = re.findall(r"name: (unsigned-[\w-]+)\n", self.windows)
+        self.assertEqual(names, ["unsigned-windows-executables", "unsigned-windows-installer"])
+        download = step(job(self.release, "publish"), "uses: actions/download-artifact")
+        self.assertIn("pattern: DoubleClickFixer-*", download)
+        for name in names:
+            self.assertFalse(fnmatch.fnmatch(name, "DoubleClickFixer-*"))
+            self.assertNotIn(name, ARTIFACTS)
+
+    def test_each_request_names_an_artifact_configuration_kept_here(self) -> None:
+        slugs = re.findall(r"artifact-configuration-slug: ([\w-]+)\n", self.windows)
+        self.assertEqual(slugs, ["windows-executables", "windows-installer"])
+        self.assertEqual(sorted(path.stem for path in SIGNPATH_CONFIGS.glob("*.xml")), slugs)
+        for name in ("Sign the executables", "Sign the installer"):
+            request = step(self.windows, name)
+            self.assertIn("api-token: ${{ secrets.SIGNPATH_API_TOKEN }}", request)
+            self.assertIn("organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}", request)
+            self.assertIn("project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}", request)
+            self.assertIn("signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG }}", request)
+            self.assertIn('version: "${{ steps.signpath.outputs.version }}"', request)
+            self.assertIn("wait-for-completion: true", request)
+        self.assertIn("github-artifact-id: ${{ steps.unsigned-executables.outputs.artifact-id }}", step(self.windows, "Sign the executables"))
+        self.assertIn("github-artifact-id: ${{ steps.unsigned-installer.outputs.artifact-id }}", step(self.windows, "Sign the installer"))
+        self.assertIn("        id: unsigned-executables\n", step(self.windows, "Hand the executables to SignPath"))
+        self.assertIn("        id: unsigned-installer\n", step(self.windows, "Hand the installer to SignPath"))
+
+    def test_the_artifact_configurations_match_what_the_job_uploads(self) -> None:
+        import xml.etree.ElementTree as ElementTree
+
+        def config(name: str):
+            root = ElementTree.parse(SIGNPATH_CONFIGS / f"{name}.xml").getroot()
+            self.assertEqual(root.tag, "{%s}artifact-configuration" % SIGNPATH_NS["sp"])
+            parameter = root.find("sp:parameters/sp:parameter", SIGNPATH_NS)
+            self.assertEqual((parameter.get("name"), parameter.get("required")), ("version", "true"))
+            return root.find("sp:zip-file", SIGNPATH_NS)
+
+        # SignPath Foundation requires the product name and version enforced.
+        executables = config("windows-executables").find("sp:pe-file-set", SIGNPATH_NS)
+        self.assertEqual(executables.get("product-name"), app.DISPLAY_NAME)
+        self.assertEqual(executables.get("product-version"), "${version}")
+        included = [include.get("path") for include in executables.findall("sp:include", SIGNPATH_NS)]
+        self.assertEqual(included, ["portable/DoubleClickFixer.exe", "installed/DoubleClickFixer.exe"])
+        self.assertIsNotNone(executables.find("sp:for-each/sp:authenticode-sign", SIGNPATH_NS))
+        gather = step(self.windows, "Gather the executables to sign")
+        self.assertIn("Copy-Item dist\\DoubleClickFixer.exe signing\\unsigned\\portable\\", gather)
+        self.assertIn("Copy-Item dist\\onedir\\DoubleClickFixer\\DoubleClickFixer.exe signing\\unsigned\\installed\\", gather)
+        self.assertIn("path: signing/unsigned/\n", step(self.windows, "Hand the executables to SignPath"))
+
+        installer = config("windows-installer").find("sp:pe-file", SIGNPATH_NS)
+        self.assertEqual(installer.get("path"), "DoubleClickFixer-Setup.exe")
+        self.assertEqual(installer.get("product-name"), app.DISPLAY_NAME)
+        self.assertEqual(installer.get("product-version"), "${version}")
+        self.assertIsNotNone(installer.find("sp:authenticode-sign", SIGNPATH_NS))
+        self.assertIn("path: installer/Output/DoubleClickFixer-Setup.exe\n", step(self.windows, "Hand the installer to SignPath"))
+        iss = (ROOT / "installer" / "windows.iss").read_text(encoding="utf-8")
+        self.assertIn("\nOutputBaseFilename=DoubleClickFixer-Setup\n", iss)
+        # Inno Setup's version details default to AppName and AppVersion.
+        self.assertIn(f"\nAppName={app.DISPLAY_NAME}\n", iss)
+        self.assertIn("\nAppVersion={#AppVersion}\n", iss)
+        self.assertNotRegex(iss, r"\nVersionInfoProduct(Name|Version|TextVersion)=")
+
+    def test_signpath_can_read_the_artifacts_and_a_manual_run_never_signs(self) -> None:
+        self.assertIn("    permissions:\n      contents: read\n      actions: read\n", self.windows)
+        pushed_tag = "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')"
+        self.assertIn(f"environment: ${{{{ {pushed_tag} && 'release' || '' }}}}", self.windows)
+        decide = step(self.windows, "Decide whether SignPath signs this build")
+        self.assertIn("EVENT: ${{ github.event_name }}", decide)
+        self.assertIn("REF: ${{ github.ref }}", decide)
+        self.assertIn("SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}", decide)
+        for name in SIGNPATH_NAMES[1:]:
+            self.assertIn(f"{name}: ${{{{ vars.{name} }}}}", decide)
+
+
+@unittest.skipIf(sys.platform == "win32" or shutil.which("bash") is None, "runs the step's bash script")
+class SignPathDecisionTests(unittest.TestCase):
+    """The step that decides, run as the Windows job runs it (in bash)."""
+
+    def setUp(self) -> None:
+        release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        self.script = run_block(step(job(release, "windows"), "Decide whether SignPath signs this build"))
+        self.folder = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.folder, True)
+
+    def decide(self, event: str, ref: str, **values: str) -> tuple[int, str, dict]:
+        output = self.folder / "output"
+        output.write_text("", encoding="utf-8")
+        environ = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "GITHUB_OUTPUT": str(output),
+                   "EVENT": event, "REF": ref, **values}
+        done = subprocess.run(["bash", "-c", self.script], cwd=ROOT, env=environ, capture_output=True, text=True)
+        outputs = dict(line.split("=", 1) for line in output.read_text(encoding="utf-8").splitlines())
+        return done.returncode, done.stdout + done.stderr, outputs
+
+    def every(self) -> dict:
+        return {name: f"value of {name}" for name in SIGNPATH_NAMES}
+
+    def test_a_tag_is_not_signed_until_signpath_is_set_up(self) -> None:
+        code, said, outputs = self.decide("push", "refs/tags/v1.0.0")
+        self.assertEqual((code, outputs), (0, {"sign": "false"}))
+        self.assertIn("::warning::Not signed: SignPath isn't set up", said)
+        code, said, outputs = self.decide("push", "refs/tags/v1.0.0", **{name: "" for name in SIGNPATH_NAMES})
+        self.assertEqual((code, outputs), (0, {"sign": "false"}))
+
+    def test_a_tag_is_signed_once_the_token_and_the_ids_are_set(self) -> None:
+        code, said, outputs = self.decide("push", "refs/tags/v1.0.0", **self.every())
+        self.assertEqual(code, 0, said)
+        self.assertEqual(outputs, {"sign": "true", "version": app.__version__})
+
+    def test_half_set_up_stops_the_build_and_names_what_is_missing(self) -> None:
+        for missing in SIGNPATH_NAMES:
+            values = {name: value for name, value in self.every().items() if name != missing}
+            code, said, outputs = self.decide("push", "refs/tags/v1.0.0", **values)
+            self.assertEqual((code, outputs), (1, {}), missing)
+            self.assertIn(f"::error::SignPath is only partly set up. Missing: {missing} ", said)
+
+    def test_a_manual_run_or_a_branch_is_never_signed(self) -> None:
+        for event, ref in (("workflow_dispatch", "refs/tags/v1.0.0"), ("workflow_dispatch", "refs/heads/main"),
+                           ("push", "refs/heads/main")):
+            code, said, outputs = self.decide(event, ref, **self.every())
+            self.assertEqual((code, outputs), (0, {"sign": "false"}), (event, ref))
+            self.assertIn("Not signed: only the push of a release tag is signed", said)
 
 
 class CiUpdateKeyGuardTests(unittest.TestCase):
