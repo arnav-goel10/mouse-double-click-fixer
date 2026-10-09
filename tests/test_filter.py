@@ -132,6 +132,31 @@ class LifecycleTests(unittest.TestCase):
         click_filter.stop()
         self.assertFalse(click_filter.running)
 
+    @unittest.skipUnless(platform.system() == "Darwin", "macOS event tap")
+    def test_macos_taps_are_released_on_stop(self) -> None:
+        import os
+
+        import Quartz
+
+        def taps_of_this_process() -> int:
+            error, taps, count = Quartz.CGGetEventTapList(64, None, None)
+            self.assertEqual(error, 0)
+            return sum(1 for tap in (taps or [])[:count] if tap.tappingProcess == os.getpid())
+
+        before = taps_of_this_process()
+        for _ in range(10):
+            # No buttons: nothing is held back or re-sent; the taps only watch.
+            click_filter = GlobalClickFilter(60, [])
+            try:
+                click_filter.start()
+            except HookError as error:
+                self.skipTest(f"macOS refused the event tap here: {error}")
+            try:
+                self.assertEqual(taps_of_this_process(), before + 2, "the click tap and the motion tap")
+            finally:
+                click_filter.stop()
+        self.assertEqual(taps_of_this_process(), before, "a stopped filter leaves no tap registered")
+
 
 class FakeTimer:
     """Stands in for threading.Timer: records each timer instead of starting
