@@ -1,11 +1,11 @@
 # Releasing
 
-Installed copies of DoubleClick Fixer update themselves from GitHub Releases.
-They look at the latest published release, download its `SHA256SUMS.txt` and
-the signature beside it, `SHA256SUMS.txt.minisig`, and install nothing unless
-that signature comes from one of the release keys built into the app and
-names the release's version. The download for their platform must then match
-the signed checksums.
+Installed copies of Mouse Double-Click Fixer update themselves from GitHub
+Releases. They look at the latest published release, download its
+`SHA256SUMS.txt` and the signature beside it, `SHA256SUMS.txt.minisig`, and
+install nothing unless that signature comes from one of the release keys built
+into the app and names the release's version. The download for their platform
+must then match the signed checksums.
 
 So CI never publishes. Pushing a tag makes the release workflow build and
 test the release and put it up as a draft. Then, on the Mac where the release
@@ -25,13 +25,13 @@ Create the environment, put the two secrets in it, and delete the
 repository-wide copies:
 
 ```bash
-gh api -X PUT repos/arnav-goel10/doubleclick-fixer/environments/release \
+gh api -X PUT repos/arnav-goel10/mouse-double-click-fixer/environments/release \
   -F 'deployment_branch_policy[protected_branches]=false' -F 'deployment_branch_policy[custom_branch_policies]=true'
-gh api -X POST repos/arnav-goel10/doubleclick-fixer/environments/release/deployment-branch-policies -f name='v*.*.*' -f type=tag
-base64 -i ~/.doubleclick-fixer-signing/signing.p12 | gh secret set MACOS_SIGNING_P12 --env release --repo arnav-goel10/doubleclick-fixer
-printf %s "$(cat ~/.doubleclick-fixer-signing/p12.password)" | gh secret set MACOS_SIGNING_P12_PASSWORD --env release --repo arnav-goel10/doubleclick-fixer
-gh secret delete MACOS_SIGNING_P12 --repo arnav-goel10/doubleclick-fixer
-gh secret delete MACOS_SIGNING_P12_PASSWORD --repo arnav-goel10/doubleclick-fixer
+gh api -X POST repos/arnav-goel10/mouse-double-click-fixer/environments/release/deployment-branch-policies -f name='v*.*.*' -f type=tag
+base64 -i ~/.doubleclick-fixer-signing/signing.p12 | gh secret set MACOS_SIGNING_P12 --env release --repo arnav-goel10/mouse-double-click-fixer
+printf %s "$(cat ~/.doubleclick-fixer-signing/p12.password)" | gh secret set MACOS_SIGNING_P12_PASSWORD --env release --repo arnav-goel10/mouse-double-click-fixer
+gh secret delete MACOS_SIGNING_P12 --repo arnav-goel10/mouse-double-click-fixer
+gh secret delete MACOS_SIGNING_P12_PASSWORD --repo arnav-goel10/mouse-double-click-fixer
 ```
 
 ### The publishing Mac
@@ -68,14 +68,14 @@ password (see [Keys and certificates](#keys-and-certificates)).
 
    ```bash
    GITHUB_REF=refs/tags/v1.2.3 python3 -m unittest tests.test_release
-   git commit -am "DoubleClick Fixer 1.2.3"
+   git commit -am "Mouse Double-Click Fixer 1.2.3"
    git push origin main
    ```
 
 3. Tag that commit and push the tag. The release workflow builds it:
 
    ```bash
-   git tag -a v1.2.3 -m "DoubleClick Fixer 1.2.3"
+   git tag -a v1.2.3 -m "Mouse Double-Click Fixer 1.2.3"
    git push origin v1.2.3
    ```
 
@@ -190,13 +190,13 @@ first-launch help) followed by the changelog entry, assembled by
 `tools/release_notes.py`. To redo a page by hand:
 
 ```bash
-python3 tools/release_notes.py 1.2.3 arnav-goel10/doubleclick-fixer > notes.md
+python3 tools/release_notes.py 1.2.3 arnav-goel10/mouse-double-click-fixer > notes.md
 gh release edit v1.2.3 --notes-file notes.md
 # an older page, pointing at the latest release:
-python3 tools/release_notes.py 1.2.2 arnav-goel10/doubleclick-fixer --latest 1.2.3 > notes.md
+python3 tools/release_notes.py 1.2.2 arnav-goel10/mouse-double-click-fixer --latest 1.2.3 > notes.md
 # the newer-version line on every older page, as the Release pages workflow does
 # (without --apply it only prints):
-python3 tools/release_notes.py --point-older arnav-goel10/doubleclick-fixer --apply
+python3 tools/release_notes.py --point-older arnav-goel10/mouse-double-click-fixer --apply
 ```
 
 ### Build tools
@@ -266,7 +266,9 @@ maintainer's Mac:
   stranding anyone. These keys never go to GitHub or CI.
 - `signing.keychain-db`, `keychain.password`, `signing.p12` and
   `p12.password`: the macOS code-signing certificate, "DoubleClick Fixer
-  Signing". CI has it too, as the secrets `MACOS_SIGNING_P12` (the `.p12`,
+  Signing", the name it was made with before the app was renamed (a renamed
+  certificate would be a new one, and every Mac would have to allow the app
+  again). CI has it too, as the secrets `MACOS_SIGNING_P12` (the `.p12`,
   base64-encoded) and `MACOS_SIGNING_P12_PASSWORD` in the `release`
   environment (see [One-time setup](#one-time-setup)); the release workflow
   refuses to build a tagged macOS release without them.
@@ -329,8 +331,9 @@ and publish it with:
 python3 tools/sign_release.py publish v1.3.0 --requirement '<new requirement>'
 ```
 
-where the requirement is exactly what `codesign -d -r- "DoubleClick Fixer.app"`
-prints after `designated =>`. It must be certificate-based.
+where the requirement is exactly what
+`codesign -d -r- "Mouse Double-Click Fixer.app"` prints after
+`designated =>`. It must be certificate-based.
 
 ## Checks before a release
 

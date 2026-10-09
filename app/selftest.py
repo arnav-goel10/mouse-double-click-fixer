@@ -516,11 +516,11 @@ def use_default_qt_platform() -> None:
 
 def main() -> int:
     use_default_qt_platform()
-    from . import __version__
+    from . import DISPLAY_NAME, __version__
 
     where = "built app" if getattr(sys, "frozen", False) else "from source"
     print(
-        f"DoubleClick Fixer {__version__} self-test ({where}, {platform.system()} {platform.release()} "
+        f"{DISPLAY_NAME} {__version__} self-test ({where}, {platform.system()} {platform.release()} "
         f"{platform.machine()}, Python {platform.python_version()})",
         flush=True,
     )

@@ -6,6 +6,11 @@
 move, on both platforms, and signs every update. Requires macOS 13 or later
 on Apple silicon, or 64-bit Windows 10 version 1809 or later, or Windows 11.
 
+- **DoubleClick Fixer is now Mouse Double-Click Fixer.** Your settings, the
+  macOS permission and the open-at-login setting carry over. A Mac copy that
+  updates itself to 1.0 keeps its old name in Applications until its next
+  update.
+
 ### Filtering
 
 - **Drags are protected from the first moment.** Every release is now held
@@ -116,8 +121,8 @@ on Apple silicon, or 64-bit Windows 10 version 1809 or later, or Windows 11.
   64-bit Windows 10 version 1809 or later and says so instead of installing
   something that can't start. It closes a running copy through the installed
   one and never waits on it for more than 20 seconds.
-- Ticking "Start DoubleClick Fixer when I sign in" clears an earlier "off"
-  in Task Manager's Startup apps; uninstalling removes both.
+- Ticking "Start Mouse Double-Click Fixer when I sign in" clears an earlier
+  "off" in Task Manager's Startup apps; uninstalling removes both.
 - Updates now finish in folders whose names use characters outside the
   system's code page (a user name like Łukasz on an English system).
   Before, the app didn't come back after updating there.
@@ -153,7 +158,7 @@ on Apple silicon, or 64-bit Windows 10 version 1809 or later, or Windows 11.
   turning off automatic installs no longer stops the checks. If you turned
   updates off before 1.0, both stay off.
 - A copy that can't replace itself says so before downloading anything, for
-  example "Move DoubleClick Fixer to Applications to update it."
+  example "Move Mouse Double-Click Fixer to Applications to update it."
 - A version that failed to install twice is no longer retried at every
   sign-in; it waits for you. A download waiting to install is no longer
   fetched again by the next check, and "Update to X" in the menu opens

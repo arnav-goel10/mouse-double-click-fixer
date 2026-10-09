@@ -1,6 +1,6 @@
 """Sign and publish a release with the update key.
 
-An installed copy of DoubleClick Fixer installs an update only when the
+An installed copy of Mouse Double-Click Fixer installs an update only when the
 release's SHA256SUMS.txt carries a minisign signature from one of the keys
 built into the app: RELEASE_KEYS in app/updater.py, which this tool reads too
 (tools/keys/ has copies for the minisign tool). The secret keys never go to
@@ -17,10 +17,10 @@ prints them too):
     #    top of CHANGELOG.md into "## 1.0.1 — YYYY-MM-DD" (today's date), and
     #    check both as release.yml will, then commit and push:
     GITHUB_REF=refs/tags/v1.0.1 python3 -m unittest tests.test_release
-    git commit -am "DoubleClick Fixer 1.0.1"
+    git commit -am "Mouse Double-Click Fixer 1.0.1"
     git push origin main
     # 3. Tag that commit and push the tag; release.yml builds it:
-    git tag -a v1.0.1 -m "DoubleClick Fixer 1.0.1"
+    git tag -a v1.0.1 -m "Mouse Double-Click Fixer 1.0.1"
     git push origin v1.0.1
     # 4. Wait until the tag's run exists (it can take a few seconds to
     #    appear), then until it finishes; it puts up the draft:
@@ -63,7 +63,7 @@ look at the latest full release anyway, can never install it.
     --key PATH          sign with another secret key (default: the primary key)
     --requirement DR    for a release that moves the macOS app to a new signing
                         identity: the new designated requirement, exactly as
-                        `codesign -d -r- "DoubleClick Fixer.app"` prints it after
+                        `codesign -d -r- "Mouse Double-Click Fixer.app"` prints it after
                         "designated =>". The app must have it, the signed
                         comment then names it, and installed copies accept it.
     --repo OWNER/NAME   another repository (default: the one copies update from)
@@ -73,7 +73,7 @@ artifacts):
 
     gh release download v1.0.1 --dir ~/dcf-release-1.0.1
     ditto -x -k ~/dcf-release-1.0.1/DoubleClickFixer-macos.zip ~/dcf-app-1.0.1
-    bash tools/macos_injection_check.sh ~/dcf-app-1.0.1/"DoubleClick Fixer.app" --require-sip
+    bash tools/macos_injection_check.sh ~/dcf-app-1.0.1/"Mouse Double-Click Fixer.app" --require-sip
     python3 tools/sign_release.py sign 1.0.1 ~/dcf-release-1.0.1
     gh release upload v1.0.1 ~/dcf-release-1.0.1/SHA256SUMS.txt.minisig
     gh release edit v1.0.1 --draft=false --latest
@@ -140,6 +140,7 @@ from xml.parsers.expat import ExpatError
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from app import DISPLAY_NAME  # noqa: E402
 from app.update_signature import (  # noqa: E402
     BASE,
     L,
@@ -214,7 +215,7 @@ def _checksum(key_id: bytes, secret: bytes) -> bytes:
 
 def public_key_text(key_id: bytes, public: bytes, name: str) -> str:
     return (
-        f"{UNTRUSTED_PREFIX}minisign public key {key_id_text(key_id)}, DoubleClick Fixer {name} update key\n"
+        f"{UNTRUSTED_PREFIX}minisign public key {key_id_text(key_id)}, {DISPLAY_NAME} {name} update key\n"
         f"{_b64(LEGACY + key_id + public)}\n"
     )
 
@@ -226,7 +227,7 @@ def secret_key_text(key_id: bytes, seed: bytes, name: str) -> str:
         + key_id + secret + _checksum(key_id, secret)
     )
     return (
-        f"{UNTRUSTED_PREFIX}minisign secret key {key_id_text(key_id)}, DoubleClick Fixer {name} "
+        f"{UNTRUSTED_PREFIX}minisign secret key {key_id_text(key_id)}, {DISPLAY_NAME} {name} "
         f"update key, not encrypted\n{_b64(body)}\n"
     )
 
@@ -287,7 +288,7 @@ def signature_text(message: bytes, key_id: bytes, seed: bytes, trusted_comment: 
     signature = ed25519_sign(seed, signed_payload(PREHASHED, message))
     global_signature = ed25519_sign(seed, signature + trusted_comment.encode("utf-8"))
     lines = [
-        f"{UNTRUSTED_PREFIX}signature from DoubleClick Fixer update key {key_id_text(key_id)}",
+        f"{UNTRUSTED_PREFIX}signature from {DISPLAY_NAME} update key {key_id_text(key_id)}",
         _b64(PREHASHED + key_id + signature),
         TRUSTED_PREFIX + trusted_comment,
         _b64(global_signature),
@@ -807,7 +808,7 @@ def _ask_password() -> str:
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Sign DoubleClick Fixer releases.", epilog=release_steps(),
+        description=f"Sign {DISPLAY_NAME} releases.", epilog=release_steps(),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     commands = parser.add_subparsers(dest="command", required=True)

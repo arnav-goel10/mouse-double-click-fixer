@@ -29,6 +29,10 @@ from pathlib import Path
 from typing import Callable, Optional
 
 ROOT = Path(__file__).resolve().parents[1]
+#: The app's name as people see it (DISPLAY_NAME in app/__init__.py).
+NAME = re.search(
+    r'^DISPLAY_NAME = "([^"]+)"', (ROOT / "app" / "__init__.py").read_text(encoding="utf-8"), re.MULTILINE
+).group(1)
 UNRELEASED = "Unreleased"
 #: The first version whose release carries the notices files.
 NOTICES_SINCE = (1, 0, 0)
@@ -114,12 +118,12 @@ def notes(version: str, repo: str, latest: Optional[str] = None) -> str:
     pre_release = "-" in version
     if pre_release:
         parts.append(
-            "> **This is a pre-release, for testing.** Installed copies of DoubleClick Fixer don't update to it."
+            f"> **This is a pre-release, for testing.** Installed copies of {NAME} don't update to it."
         )
     if pre_release:
         updates = ""
     else:
-        updates = "Already using DoubleClick Fixer? It updates itself; there is nothing to download."
+        updates = f"Already using {NAME}? It updates itself; there is nothing to download."
     if not pre_release and version_tuple(version) >= SIGNED_SINCE:
         checksums = "The files are listed in `SHA256SUMS.txt`, signed in `SHA256SUMS.txt.minisig`; "
     else:
@@ -145,7 +149,7 @@ def notes(version: str, repo: str, latest: Optional[str] = None) -> str:
 
 def newer_banner(latest: str, repo: str) -> str:
     return (
-        f"> **A newer version is available:** [DoubleClick Fixer {latest}]"
+        f"> **A newer version is available:** [{NAME} {latest}]"
         f"(https://github.com/{repo}/releases/latest). Download that one instead."
     )
 

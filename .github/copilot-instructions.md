@@ -2,6 +2,12 @@
 
 - Cross-platform Python desktop utility: Qt (PySide6) interface, native mouse
   hooks underneath (a macOS event tap, a Windows low-level mouse hook).
+- The app is Mouse Double-Click Fixer (DoubleClick Fixer before 1.0). Text
+  people see names it through `DISPLAY_NAME` in `app/__init__.py`, never a
+  literal. Identifiers installed copies depend on keep the old spelling: the
+  bundle id `com.doubleclickfixer.app`, the `DoubleClickFixer` executable,
+  the settings folders, the login item, the release file names and the
+  repository's `doubleclick-fixer.spec`.
 - Keep click classification and calibration platform-neutral in `app/core.py`.
 - Keep OS-specific capture in `app/platform.py`, startup integration in
   `app/startup.py`, and permission checks in `app/permissions.py`. The UI must

@@ -5,23 +5,30 @@
 [Setup]
 ; Fixed forever: this is how an update finds and replaces the installed copy.
 AppId={{6B0E2F4C-3D7A-4E51-9A0B-DC1F1C5E7A21}
-AppName=DoubleClick Fixer
+AppName=Mouse Double-Click Fixer
 AppVersion={#AppVersion}
-DefaultDirName={autopf}\DoubleClick Fixer
-DefaultGroupName=DoubleClick Fixer
+; New installs only. An update goes where the installed copy is
+; (UsePreviousAppDir, on by default), which before 1.0 was
+; {autopf}\DoubleClick Fixer; the app, its updater and the uninstaller find
+; that folder from the running exe or the uninstall entry, never by name.
+DefaultDirName={autopf}\Mouse Double-Click Fixer
+DefaultGroupName=Mouse Double-Click Fixer
+; Updates move the Start menu entry to the new name too ([InstallDelete]
+; removes the one from before 1.0) instead of reusing the old folder.
+UsePreviousGroup=no
 OutputBaseFilename=DoubleClickFixer-Setup
 ; The app is a 64-bit build, and Qt 6 needs Windows 10 1809 or later: say so
 ; up front rather than install something that can't start.
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0.17763
-AppPublisher=DoubleClick Fixer
-AppSupportURL=https://github.com/arnav-goel10/doubleclick-fixer
+AppPublisher=Mouse Double-Click Fixer
+AppSupportURL=https://github.com/arnav-goel10/mouse-double-click-fixer
 UninstallDisplayIcon={app}\DoubleClickFixer.exe
 VersionInfoVersion={#AppVersion}
-AppVerName=DoubleClick Fixer {#AppVersion}
-AppPublisherURL=https://github.com/arnav-goel10/doubleclick-fixer
-AppUpdatesURL=https://github.com/arnav-goel10/doubleclick-fixer/releases/latest
+AppVerName=Mouse Double-Click Fixer {#AppVersion}
+AppPublisherURL=https://github.com/arnav-goel10/mouse-double-click-fixer
+AppUpdatesURL=https://github.com/arnav-goel10/mouse-double-click-fixer/releases/latest
 WizardStyle=modern
 SetupIconFile=assets\icon.ico
 PrivilegesRequired=lowest
@@ -32,6 +39,11 @@ CloseApplications=yes
 ; The runtime beside the exe is replaced whole, so an update that moves to a
 ; newer Qt or Python leaves none of the old one behind.
 Type: filesandordirs; Name: "{app}\_internal"
+; The shortcuts from before 1.0, when the app was called DoubleClick Fixer.
+; The desktop one goes only when the new one replaces it.
+Type: files; Name: "{autoprograms}\DoubleClick Fixer\DoubleClick Fixer.lnk"
+Type: dirifempty; Name: "{autoprograms}\DoubleClick Fixer"
+Type: files; Name: "{autodesktop}\DoubleClick Fixer.lnk"; Tasks: desktopicon
 
 [Files]
 ; A folder, not the portable one-file exe: launching it (and every sign-in)
@@ -43,17 +55,17 @@ Source: "..\dist\onedir\DoubleClickFixer\*"; DestDir: "{app}"; Flags: ignorevers
 Source: "..\build\notices\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\DoubleClick Fixer"; Filename: "{app}\DoubleClickFixer.exe"
-Name: "{autodesktop}\DoubleClick Fixer"; Filename: "{app}\DoubleClickFixer.exe"; Tasks: desktopicon
+Name: "{group}\Mouse Double-Click Fixer"; Filename: "{app}\DoubleClickFixer.exe"
+Name: "{autodesktop}\Mouse Double-Click Fixer"; Filename: "{app}\DoubleClickFixer.exe"; Tasks: desktopicon
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
 ; Offered on the first install only: afterwards "Open at login" in the app
 ; owns the setting, and an update must not switch it back on.
-Name: "startup"; Description: "Start DoubleClick Fixer when I sign in"; Flags: unchecked; Check: not IsUpgrade
+Name: "startup"; Description: "Start Mouse Double-Click Fixer when I sign in"; Flags: unchecked; Check: not IsUpgrade
 
 [Run]
-Filename: "{app}\DoubleClickFixer.exe"; Description: "Open DoubleClick Fixer"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\DoubleClickFixer.exe"; Description: "Open Mouse Double-Click Fixer"; Flags: nowait postinstall skipifsilent
 ; The in-app updater installs silently and asks for the app to come back.
 Filename: "{app}\DoubleClickFixer.exe"; Parameters: "--updated {code:RelaunchArguments}"; Flags: nowait runasoriginaluser; Check: RelaunchRequested
 

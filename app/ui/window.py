@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import __version__, diagnostics, notices, permissions, startup
+from .. import DISPLAY_NAME, __version__, diagnostics, notices, permissions, startup
 from ..controller import AppController
 from ..core import (
     BOUNCE_CANDIDATE_MS,
@@ -91,7 +91,7 @@ def label(text: str) -> str:
     if IS_MAC:
         return text
     first, *rest = text.split(" ")
-    keep = {"DoubleClick", "Fixer", "Accessibility"}
+    keep = {*DISPLAY_NAME.split(" "), "Accessibility"}
     return " ".join([first, *(word if word in keep else word.lower() for word in rest)])
 
 
@@ -201,7 +201,7 @@ class FilterPage(Page):
         self.permission_row = self.permission.add(
             Row(
                 "Permission required",
-                f"Allow DoubleClick Fixer in Privacy & Security › {permissions.pane_name()}.",
+                f"Allow {DISPLAY_NAME} in Privacy & Security › {permissions.pane_name()}.",
                 self.permission_button,
                 SymbolView("warning", 22, "symbol"),
             )
@@ -694,7 +694,7 @@ class GeneralPage(Page):
         self.update_button = _button("Check Now")
         self.update_button.clicked.connect(self._on_update_button)
         self.update_row = self.update_section.add(
-            Row(f"DoubleClick Fixer {__version__}", "", self.update_button, card_icon("sync"))
+            Row(f"{DISPLAY_NAME} {__version__}", "", self.update_button, card_icon("sync"))
         )
         supported = updater is not None and updater.supported
         self.update_header.setVisible(supported)
@@ -729,7 +729,7 @@ class GeneralPage(Page):
         )
 
         self.body.addStretch(1)
-        version = TextLabel(f"DoubleClick Fixer {__version__}", "caption", "tertiary")
+        version = TextLabel(f"{DISPLAY_NAME} {__version__}", "caption", "tertiary")
         version.setAlignment(Qt.AlignmentFlag.AlignHCenter)
         version.setContentsMargins(0, 24, 0, 0)
         self.body.addWidget(version)
@@ -772,7 +772,7 @@ class GeneralPage(Page):
                 "Restart Now",
                 True,
             ),
-            updater.INSTALLING: ("Installing. DoubleClick Fixer will reopen.", "Update Now", False),
+            updater.INSTALLING: (f"Installing. {DISPLAY_NAME} will reopen.", "Update Now", False),
             updater.FAILED: (updater.message, "Try Again", True),
         }
         detail, text, enabled = states.get(updater.state, ("", "Check Now", True))
@@ -842,9 +842,9 @@ class GeneralPage(Page):
         QMessageBox.information(
             self,
             "Acknowledgements",
-            f"The licences of the software DoubleClick Fixer is built on are in:\n\n{path}"
+            f"The licences of the software {DISPLAY_NAME} is built on are in:\n\n{path}"
             if path is not None
-            else f"This copy has no {notices.NOTICES_FILE}. It is in DoubleClick Fixer's source on GitHub.",
+            else f"This copy has no {notices.NOTICES_FILE}. It is in {DISPLAY_NAME}'s source on GitHub.",
         )
 
     def _confirm_reset(self) -> None:
@@ -871,7 +871,7 @@ class MainWindow(QWidget):
         self.controller = controller
         self.updater = updater
         set_look(current_look())
-        self.setWindowTitle("DoubleClick Fixer")
+        self.setWindowTitle(DISPLAY_NAME)
         self.setWindowIcon(icons.app_icon())
         self.translucent = native.prepare(self)
         self._material = False

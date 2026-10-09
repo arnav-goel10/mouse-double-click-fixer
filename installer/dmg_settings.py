@@ -1,13 +1,13 @@
 # Layout of the disk image window, read by dmgbuild:
 #
-#     dmgbuild -s installer/dmg_settings.py -D app="dist/DoubleClick Fixer.app" \
-#         "DoubleClick Fixer" dist/DoubleClickFixer.dmg
+#     dmgbuild -s installer/dmg_settings.py -D app="dist/Mouse Double-Click Fixer.app" \
+#         "Mouse Double-Click Fixer" dist/DoubleClickFixer.dmg
 #
 # The icon positions line up with the arrow drawn in the background
 # (installer/make_icons.py), so change both together.
 import os.path
 
-app = defines.get("app", "dist/DoubleClick Fixer.app")  # noqa: F821 - provided by dmgbuild
+app = defines.get("app", "dist/Mouse Double-Click Fixer.app")  # noqa: F821 - provided by dmgbuild
 app_name = os.path.basename(app)
 
 format = "UDZO"

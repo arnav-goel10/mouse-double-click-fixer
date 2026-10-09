@@ -8,7 +8,9 @@ tools/sign_release.py makes it); a release that fails this is never offered.
 Installing it downloads the file for this platform, checks it against the
 signed checksums, and installs it:
 
-* macOS: a zipped app bundle. It must carry a valid code signature whose
+* macOS: a zipped app bundle, installed in the running copy's folder under
+  the name the release gives it (a copy from before 1.0 is renamed from
+  "DoubleClick Fixer.app"). It must carry a valid code signature whose
   designated requirement matches the running app's. That is what macOS keys
   the Accessibility grant on, so an update that passes this check keeps the
   permission. A release that moves to a new signing identity says so in its
@@ -44,12 +46,12 @@ from typing import Optional
 from PySide6.QtCore import QObject, QTimer, QUrl, Signal
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 
-from . import __version__, build_flags, tls
+from . import DISPLAY_NAME, __version__, build_flags, tls
 from .update_signature import PublicKey, ReleaseClaim, SignatureError, parse_claim, parse_public_key, verify
 
 log = logging.getLogger(__name__)
 
-REPOSITORY = "arnav-goel10/doubleclick-fixer"
+REPOSITORY = "arnav-goel10/mouse-double-click-fixer"
 LATEST_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
 #: Points the updater at another server; used by the end-to-end test.
 URL_OVERRIDE_ENV = "DCF_UPDATE_URL"
@@ -98,7 +100,7 @@ GIVE_UP_AFTER = 2
 SMALL_FILE_LIMIT = 64 * 1024
 
 UNSIGNED = "This update isn’t signed, so it can’t be installed."
-MOVE_TO_APPLICATIONS = "Move DoubleClick Fixer to Applications to update it."
+MOVE_TO_APPLICATIONS = f"Move {DISPLAY_NAME} to Applications to update it."
 CHECK_FAILED = "Couldn’t check for updates."
 INSTALL_FAILED = "The update didn’t install. Try again."
 
@@ -108,7 +110,7 @@ def no_secure_connection(platform: str = sys.platform) -> str:
     use (app/tls.py). On Windows that means Qt's Schannel plugin is missing
     from the app's folder, which installing the app again puts back."""
     if platform == "win32":
-        return "Couldn’t check for updates: the app can’t make a secure connection. Reinstall DoubleClick Fixer."
+        return f"Couldn’t check for updates: the app can’t make a secure connection. Reinstall {DISPLAY_NAME}."
     return "Couldn’t check for updates: the app can’t make a secure connection here."
 
 
@@ -345,6 +347,46 @@ def requirement_accepted(installed: str, incoming: str, signed: str) -> bool:
     return incoming == signed and requirement_is_stable(incoming)
 
 
+#: The macOS bundle identifier. It never changes: macOS keys the Accessibility
+#: permission and the login item on it.
+BUNDLE_ID = "com.doubleclickfixer.app"
+
+
+def is_this_app(path: Path) -> bool:
+    """Whether `path` is a copy of this app (a bundle, not a link to one)."""
+    if path.is_symlink() or not path.is_dir():
+        return False
+    try:
+        with open(path / "Contents" / "Info.plist", "rb") as handle:
+            info = plistlib.load(handle)
+    except (OSError, ValueError):  # plistlib.InvalidFileException is a ValueError
+        return False
+    return isinstance(info, dict) and info.get("CFBundleIdentifier") == BUNDLE_ID
+
+
+def update_destination(current: Path, shipped: str) -> Path:
+    """Where an update goes: the running copy's folder, under the name the
+    release ships the app with (`shipped`, the bundle's name in the zip).
+
+    A copy from before 1.0 is "DoubleClick Fixer.app" and comes back under
+    the new name, its old bundle removed. Another copy of this app already
+    under the new name is replaced with it. The update stays under the
+    current name if the shipped name is not a plain bundle name, or if
+    something else, not a copy of this app, has that name in the folder."""
+    if not shipped.endswith(".app") or shipped.startswith(".") or "/" in shipped or shipped == current.name:
+        return current
+    target = current.with_name(shipped)
+    if os.path.lexists(target):
+        try:
+            if os.path.samefile(target, current):  # the same name on a case-insensitive disk
+                return current
+        except OSError:
+            return current
+        if not is_this_app(target):
+            return current
+    return target
+
+
 def mac_swap_script(
     pid: int,
     current: Path,
@@ -352,14 +394,21 @@ def mac_swap_script(
     relaunch_args: list[str],
     opener: str = "/usr/bin/open",
     workdir: Optional[Path] = None,
+    target: Optional[Path] = None,
 ) -> str:
     """Wait for the app to exit, move the new bundle into place, reopen it.
 
-    The old bundle is kept until the new one is in place, and restored if the
-    move fails, so a failed update never leaves the user without the app.
+    The new bundle goes to `target` (by default where the running copy is).
+    When that is another name in the same folder, the running copy is
+    removed once the new one is in place, and so is any other copy of the app
+    under the new name (update_destination decides which paths those are).
+    Every bundle that is moved aside is kept until the new one is in place,
+    and put back if a move fails, so a failed update never leaves the user
+    without the app; the copy that was running is then reopened.
     """
     quoted = lambda value: "'" + str(value).replace("'", "'\\''") + "'"  # noqa: E731
     args = " ".join(quoted(argument) for argument in relaunch_args)
+    target = current if target is None else target
     backup = current.with_name(current.name + ".previous")
     # Only ever delete the updater's own download folder, never whatever
     # folder the script happens to sit in.
@@ -367,16 +416,34 @@ def mac_swap_script(
         cleanup = f"/bin/rm -rf {quoted(workdir)}"
     else:
         cleanup = '/bin/rm -f "$0"'
+    if target == current:
+        clear = move = remove = restore = ""
+    else:
+        # Another copy under the new name is moved aside like the running
+        # one; the final move is refused rather than made into a folder that
+        # appeared meanwhile.
+        other = target.with_name(target.name + ".previous")
+        clear = f"/bin/rm -rf {quoted(other)}\n"
+        move = (
+            f"{{ [ ! -e {quoted(target)} ] || /bin/mv {quoted(target)} {quoted(other)}; }} && "
+            f"[ ! -e {quoted(target)} ] && "
+        )
+        remove = f" {quoted(other)}"
+        restore = (
+            f"  [ -e {quoted(target)} ] || [ ! -d {quoted(other)} ] || /bin/mv {quoted(other)} {quoted(target)}\n"
+        )
     return f"""#!/bin/bash
 for _ in $(/usr/bin/seq 1 150); do kill -0 {pid} 2>/dev/null || break; /bin/sleep 0.2; done
 /bin/rm -rf {quoted(backup)}
-if /bin/mv {quoted(current)} {quoted(backup)} && /bin/mv {quoted(staged)} {quoted(current)}; then
-  /bin/rm -rf {quoted(backup)}
+{clear}if /bin/mv {quoted(current)} {quoted(backup)} && {move}/bin/mv {quoted(staged)} {quoted(target)}; then
+  /bin/rm -rf {quoted(backup)}{remove}
+  app={quoted(target)}
 else
-  [ -d {quoted(current)} ] || /bin/mv {quoted(backup)} {quoted(current)}
+{restore}  [ -d {quoted(current)} ] || /bin/mv {quoted(backup)} {quoted(current)}
+  app={quoted(current)}
 fi
-/usr/bin/xattr -dr com.apple.quarantine {quoted(current)} 2>/dev/null
-{opener} {quoted(current)} --args {args}
+/usr/bin/xattr -dr com.apple.quarantine "$app" 2>/dev/null
+{opener} "$app" --args {args}
 {cleanup}
 """
 
@@ -812,7 +879,10 @@ class Updater(QObject):
             raise UpdateError(f"No permission to replace the app in {current.parent}.")
         script = archive.parent / "apply-update.sh"
         script.write_text(
-            mac_swap_script(os.getpid(), current, staged, self._relaunch_args(), workdir=self._workdir)
+            mac_swap_script(
+                os.getpid(), current, staged, self._relaunch_args(), workdir=self._workdir,
+                target=update_destination(current, new_app.name),
+            )
         )
         subprocess.Popen(["/bin/bash", "-p", str(script)], start_new_session=True,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

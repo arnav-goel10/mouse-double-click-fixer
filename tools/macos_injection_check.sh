@@ -1,5 +1,5 @@
 #!/bin/bash
-# Check that a built "DoubleClick Fixer.app" loads no code named in its
+# Check that a built "Mouse Double-Click Fixer.app" loads no code named in its
 # environment. macOS grants the Accessibility permission to whatever runs as
 # the app, so code that gets itself loaded there inherits the grant.
 #
@@ -30,7 +30,7 @@
 # tools/sign_release.py runs the whole check, with --require-sip, on the
 # release's own app before publishing it.
 #
-# Usage: tools/macos_injection_check.sh [path/to/DoubleClick Fixer.app] [--require-sip] [--expect-injection]
+# Usage: tools/macos_injection_check.sh [path/to/Mouse Double-Click Fixer.app] [--require-sip] [--expect-injection]
 # --require-sip runs every leg, and fails unless SIP is reported enabled.
 # --expect-injection turns the check around, for a control build without the
 # hardening (and without the runtime hook): every canary must fire, which
@@ -38,7 +38,7 @@
 # Needs clang (Xcode Command Line Tools).
 set -euo pipefail
 
-app="dist/DoubleClick Fixer.app"
+app="dist/Mouse Double-Click Fixer.app"
 expect_injection=0
 require_sip=0
 for argument in "$@"; do

@@ -9,7 +9,7 @@ from typing import Optional
 
 from PySide6.QtCore import QObject, Signal
 
-from . import permissions
+from . import DISPLAY_NAME, permissions
 from . import settings as settings_store
 from . import startup
 from .core import Button, ClickEvent, clamp_threshold
@@ -307,9 +307,9 @@ class AppController(QObject):
         """The status line as a tooltip for the menu bar or tray icon, so a
         paused or waiting filter never reads as plain "off"."""
         if self.active:
-            return f"DoubleClick Fixer: on, {self.threshold_ms} ms"
+            return f"{DISPLAY_NAME}: on, {self.threshold_ms} ms"
         status = self.status_text()
-        return f"DoubleClick Fixer: {status[0].lower()}{status[1:]}"
+        return f"{DISPLAY_NAME}: {status[0].lower()}{status[1:]}"
 
     def resume(self) -> None:
         if self._suspended:
@@ -372,7 +372,7 @@ class AppController(QObject):
         """Returns an error message, or an empty string on success."""
         if enabled and startup.running_from_temporary_location():
             return (
-                "DoubleClick Fixer is running from the disk image or a temporary copy, "
+                f"{DISPLAY_NAME} is running from the disk image or a temporary copy, "
                 "which won’t be there at your next login. Move it to Applications, open "
                 "it from there, and turn this on again."
             )

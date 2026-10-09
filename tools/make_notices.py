@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Write THIRD_PARTY_NOTICES.md: the software DoubleClick Fixer ships that
-others wrote, with exact versions, licences, copyright lines, where to get
+"""Write THIRD_PARTY_NOTICES.md: the software Mouse Double-Click Fixer ships
+that others wrote, with exact versions, licences, copyright lines, where to get
 the source, and the licence texts.
 
 What it lists is read from the files a build ships. Qt and Python carry
@@ -172,6 +172,11 @@ def _read(relative: str) -> str:
 
 def app_version() -> str:
     return re.search(r'__version__ = "([^"]+)"', _read("app/__init__.py")).group(1)
+
+
+def app_name() -> str:
+    """DISPLAY_NAME: the app's name as people see it."""
+    return re.search(r'^DISPLAY_NAME = "([^"]+)"', _read("app/__init__.py"), re.MULTILINE).group(1)
 
 
 def repository_url() -> str:
@@ -908,6 +913,7 @@ def render(build: Optional[Build] = None) -> str:
     windows_left_out(build)
     version = app_version()
     repository = repository_url()
+    name = app_name()
     qt = qt_version()
     series = ".".join(qt.split(".")[:2])
     pyside = installed("PySide6-Essentials") or installed("PySide6")
@@ -975,7 +981,7 @@ def render(build: Optional[Build] = None) -> str:
     out = [
         "# Third-party notices",
         "",
-        f"DoubleClick Fixer {version} is copyright (c) 2026 Arnav Goel and is released under the MIT License "
+        f"{name} {version} is copyright (c) 2026 Arnav Goel and is released under the MIT License "
         f"(the LICENSE file, and its source at <{repository}>). It is built on the software below, each under its "
         "own licence. This file lists the exact versions in this build, where to get their source, and the full "
         "licence texts.",
@@ -989,7 +995,7 @@ def render(build: Optional[Build] = None) -> str:
         "",
         "## Qt and Qt for Python (LGPL-3.0)",
         "",
-        f"DoubleClick Fixer uses Qt {qt} and Qt for Python (PySide6 {pyside} and Shiboken6 {shiboken}) under the "
+        f"{name} uses Qt {qt} and Qt for Python (PySide6 {pyside} and Shiboken6 {shiboken}) under the "
         f"{use('LGPL-3.0')}. The LGPL is a set of additional permissions on top of the {use('GPL-3.0')}, so both "
         "texts are included below. Qt and Qt for Python are also available under the GPL-2.0, the GPL-3.0 and "
         "commercial licences from The Qt Company.",
@@ -999,9 +1005,9 @@ def render(build: Optional[Build] = None) -> str:
         "They are unmodified, and the app loads them as separate libraries, which you may replace with your own "
         "build of the same or a compatible version:",
         "",
-        "- macOS: in `DoubleClick Fixer.app/Contents/Frameworks`, the Qt frameworks are in `PySide6/Qt/lib`, "
+        f"- macOS: in `{name}.app/Contents/Frameworks`, the Qt frameworks are in `PySide6/Qt/lib`, "
         "and `libpyside6` and `libshiboken6` in `PySide6` and `shiboken6`. After replacing one, sign the app "
-        "again (for example `codesign --force --deep --sign - \"DoubleClick Fixer.app\"`); macOS then treats "
+        f"again (for example `codesign --force --deep --sign - \"{name}.app\"`); macOS then treats "
         "it as a different app, so allow it again in Privacy & Security.",
         "- Windows, installed with DoubleClickFixer-Setup.exe: they are the `Qt6*.dll`, `pyside6*.dll` and "
         "`shiboken6*.dll` files in the `_internal` folder of the program folder. Replace them there.",

@@ -1,6 +1,6 @@
 """Render every pane in light and dark, offscreen, for review and the docs.
 
-    python tools/screenshots.py OUTPUT_DIR [--as-windows | --live] [--docs]
+    python tools/screenshots.py OUTPUT_DIR [--as-windows | --live] [--docs | --social]
 
 `--as-windows` previews the Windows layout on another platform (fonts and
 icons fall back, so use it for layout only). `--live` opens a real window and
@@ -11,6 +11,11 @@ so this never touches a real configuration.
 `--docs` captures only the Bounce Filter pane for the README, in the same state
 and at the same window size as docs/images/macos.png (filter on, 46 ms,
 calibrated, the same counts), so the two screenshots match side by side.
+
+`--social` draws docs/images/social-preview.png, the 1280 x 640 card GitHub
+shows for links to the repository (upload it under Settings › General ›
+Social preview): the app icon, its name and what it does. It draws into an
+image, offscreen, with the system font (SF Pro on a Mac).
 """
 
 from __future__ import annotations
@@ -45,10 +50,79 @@ def wait(app, milliseconds: int) -> None:
     loop.exec()
 
 
+def social_preview():
+    """The repository's social preview card, as a QImage."""
+    from PySide6.QtCore import QPointF, QRectF, Qt
+    from PySide6.QtGui import QColor, QFont, QFontDatabase, QFontMetricsF, QImage, QLinearGradient, QPainter
+
+    from app import DISPLAY_NAME
+    from app.ui.icons import render_app_icon
+
+    width, height = 1280, 640
+    image = QImage(width, height, QImage.Format.Format_ARGB32)
+    painter = QPainter(image)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+    painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+    background = QLinearGradient(0, 0, width, height)
+    background.setColorAt(0.0, QColor("#f5f7ff"))
+    background.setColorAt(1.0, QColor("#e3e9ff"))
+    painter.fillRect(QRectF(0, 0, width, height), background)
+
+    # The icon's 824-unit tile is 450 px across, 50 px clear of the text.
+    size = round(450 * 1024 / 824)
+    painter.drawImage(QPointF(350 - size / 2, 320 - size / 2), render_app_icon(size))
+
+    family = QFontDatabase.systemFont(QFontDatabase.SystemFont.GeneralFont).family()
+
+    def font(pixels: float, weight: QFont.Weight) -> QFont:
+        face = QFont(family)
+        face.setPixelSize(round(pixels))
+        face.setWeight(weight)
+        return face
+
+    left, right = 624.0, width - 52.0
+    # The name on two lines, the second the longer, as large as fits.
+    first, _, second = DISPLAY_NAME.partition(" ")
+    lines = [first, second] if second else [first]
+    title = font(76, QFont.Weight.Bold)
+    widest = max(QFontMetricsF(title).horizontalAdvance(line) for line in lines)
+    if widest > right - left:
+        title = font(76 * (right - left) / widest, QFont.Weight.Bold)
+    subtitle = font(32, QFont.Weight.Normal)
+    note = font(24, QFont.Weight.DemiBold)
+    blocks = [
+        (title, QColor("#141a33"), lines, 1.08),
+        (subtitle, QColor("#3a4466"), ["Fix a mouse that double-clicks when you", "click once."], 1.25),
+        (note, QColor("#2f57e0"), ["Free for macOS and Windows"], 1.0),
+    ]
+    gaps = [30.0, 40.0]
+    heights = [QFontMetricsF(face).height() * spacing * len(text) for face, _colour, text, spacing in blocks]
+    y = (height - sum(heights) - sum(gaps)) / 2
+    for index, (face, colour, text, spacing) in enumerate(blocks):
+        metrics = QFontMetricsF(face)
+        painter.setFont(face)
+        painter.setPen(colour)
+        for line in text:
+            painter.drawText(QPointF(left, y + metrics.ascent()), line)
+            y += metrics.height() * spacing
+        if index < len(gaps):
+            y += gaps[index]
+    painter.end()
+    return image
+
+
 def main() -> None:
     positional = [argument for argument in sys.argv[1:] if not argument.startswith("--")]
     out = Path(positional[0] if positional else "screenshots")
     out.mkdir(parents=True, exist_ok=True)
+    if "--social" in sys.argv:
+        from PySide6.QtGui import QGuiApplication
+
+        _app = QGuiApplication([])
+        social_preview().save(str(out / "social-preview.png"))
+        print(f"Wrote {out / 'social-preview.png'}")
+        return
     as_windows = "--as-windows" in sys.argv
     docs = "--docs" in sys.argv
 

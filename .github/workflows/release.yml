@@ -196,7 +196,7 @@ jobs:
       - name: Confirm the app reports the release's version
         run: |
           version="$(python -c 'import app; print(app.__version__)')"
-          bundled="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' 'dist/DoubleClick Fixer.app/Contents/Info.plist')"
+          bundled="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' 'dist/Mouse Double-Click Fixer.app/Contents/Info.plist')"
           [ "$bundled" = "$version" ] || { echo "::error::app bundle says $bundled, expected $version"; exit 1; }
       - name: Confirm the app keeps the designated requirement installed copies have
         # The requirement is what macOS keys the Accessibility permission on;
@@ -204,14 +204,14 @@ jobs:
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         run: |
           expected='identifier "com.doubleclickfixer.app" and certificate root = H"81a512665a945aebb386f04541f5c41f341a6c31"'
-          found="$(codesign -d -r- "dist/DoubleClick Fixer.app" 2>&1 | sed -n 's/^designated => //p')"
+          found="$(codesign -d -r- "dist/Mouse Double-Click Fixer.app" 2>&1 | sed -n 's/^designated => //p')"
           echo "designated => $found"
           [ "$found" = "$expected" ] || { echo "::error::the app's designated requirement changed"; exit 1; }
       - name: Collect the release files
         run: |
           mkdir release
           cp dist/DoubleClickFixer.dmg dist/DoubleClickFixer-macos.zip release/
-          cp "dist/DoubleClick Fixer.app/Contents/Resources/THIRD_PARTY_NOTICES.md" release/THIRD_PARTY_NOTICES-macos.md
+          cp "dist/Mouse Double-Click Fixer.app/Contents/Resources/THIRD_PARTY_NOTICES.md" release/THIRD_PARTY_NOTICES-macos.md
           shasum -a 256 release/*
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -265,7 +265,7 @@ jobs:
           if [[ "$GITHUB_REF_NAME" == *-* ]]; then prerelease=(--prerelease); fi
           # A draft is never the latest release; publishing decides that.
           gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
-            "${prerelease[@]}" --latest=false --title "DoubleClick Fixer ${GITHUB_REF_NAME#v}" \
+            "${prerelease[@]}" --latest=false --title "Mouse Double-Click Fixer ${GITHUB_REF_NAME#v}" \
             --notes-file release-notes.md release/*
           {
             echo "### Draft ready"

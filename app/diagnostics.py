@@ -24,6 +24,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+from . import DISPLAY_NAME, FORMER_DISPLAY_NAME
+
 LOG_NAME = "DoubleClickFixer.log"
 CRASH_NAME = "crash.log"
 #: Two files of this size are kept, plus the one being written.
@@ -32,7 +34,10 @@ BACKUPS = 2
 #: crash.log is cut back to about this much, its newest end, at each launch.
 CRASH_MAX_BYTES = 256 * 1024
 #: Starts the line crash.log gets at each launch.
-CRASH_HEADER = "--- DoubleClick Fixer"
+CRASH_HEADER = f"--- {DISPLAY_NAME}"
+#: What those lines started with before 1.0; a crash.log carried over from
+#: then still has them.
+CRASH_HEADERS = (CRASH_HEADER, f"--- {FORMER_DISPLAY_NAME}")
 #: How much of the log "Copy Diagnostics" includes.
 REPORT_LINES = 200
 FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -114,7 +119,7 @@ def setup(version: str) -> None:
 
     _install_hooks()
     _enable_crash_log(version)
-    log.info("DoubleClick Fixer %s on %s", version, os_description())
+    log.info("%s %s on %s", DISPLAY_NAME, version, os_description())
 
 
 def shutdown() -> None:
@@ -254,7 +259,7 @@ def report(version: str, state: dict[str, Any], settings: dict[str, Any]) -> str
 
     shown = {key: value for key, value in settings.items() if key != "window_geometry"}
     lines = [
-        f"DoubleClick Fixer {version}",
+        f"{DISPLAY_NAME} {version}",
         f"OS: {os_description()}",
         f"Qt {qVersion()}, PySide6 {pyside_version}, Python {platform.python_version()}",
         f"Running from: {_private(sys.executable)}{' (built app)' if getattr(sys, 'frozen', False) else ''}",
@@ -270,6 +275,6 @@ def report(version: str, state: dict[str, Any], settings: dict[str, Any]) -> str
     ]
     crash = _tail(crash_path(), 60)
     # Launch lines alone mean nothing went wrong.
-    if any(line.strip() and not line.startswith(CRASH_HEADER) for line in crash):
+    if any(line.strip() and not line.startswith(CRASH_HEADERS) for line in crash):
         lines += ["", "crash.log, last lines:", *(_private(line) for line in crash)]
     return "\n".join(lines) + "\n"

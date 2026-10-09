@@ -1,4 +1,4 @@
-"""Launch DoubleClick Fixer.
+"""Launch Mouse Double-Click Fixer.
 
 `--minimized` starts it hidden in the menu bar / notification area, which is
 what the start-at-login entry uses. `--self-test` checks the build and exits

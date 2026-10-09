@@ -2,8 +2,8 @@
 
 ## 1. See the fault
 
-Open DoubleClick Fixer and choose **Test** in the sidebar. Click the pad the
-way you normally would, with any button. Each bar is the pause between
+Open Mouse Double-Click Fixer and choose **Test** in the sidebar. Click the
+pad the way you normally would, with any button. Each bar is the pause between
 releasing a button and pressing it again. A worn switch produces occasional
 tiny red bars: presses you never made.
 

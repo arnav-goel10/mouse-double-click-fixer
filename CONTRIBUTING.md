@@ -4,7 +4,7 @@ Thanks for helping. Bug reports, fixes and improvements are all welcome.
 
 ## Reporting bugs
 
-[Open an issue](https://github.com/arnav-goel10/doubleclick-fixer/issues/new/choose)
+[Open an issue](https://github.com/arnav-goel10/mouse-double-click-fixer/issues/new/choose)
 using the bug template, and paste what **General › Troubleshooting › Copy
 Diagnostics** (Windows: **Copy diagnostics**) gives you: it has the app
 version, OS, the filter's state, the settings and the app's recent log. Your
@@ -69,7 +69,7 @@ Some tests touch the system on purpose, and only in CI:
   `DCF_E2E=1` where it can't run, it fails instead of skipping.
 - `tools/windows_install_e2e.ps1` installs, upgrades, updates and uninstalls
   the app for real. CI runs it; never run it on a PC whose copy of
-  DoubleClick Fixer you care about.
+  Mouse Double-Click Fixer you care about.
 
 On a Mac where the Python running the tests is allowed to filter input, two
 unit tests start the real event tap and stop it again. While the first one

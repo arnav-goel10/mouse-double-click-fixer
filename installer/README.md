@@ -13,9 +13,9 @@ version 1809 or later or Windows 11. Both minimums come from Qt 6.11.
 bash installer/build_macos.sh
 ```
 
-Builds `dist/DoubleClick Fixer.app` (Apple silicon), the DMG and the zip the
-in-app updater downloads. It signs with the hardened runtime and the one
-entitlement in `entitlements.plist`, using the project's self-signed
+Builds `dist/Mouse Double-Click Fixer.app` (Apple silicon), the DMG and the
+zip the in-app updater downloads. It signs with the hardened runtime and the
+one entitlement in `entitlements.plist`, using the project's self-signed
 certificate from `~/.doubleclick-fixer-signing` when that exists, and ad-hoc
 otherwise. It fails unless the signature carries the runtime flag. Before
 packaging it runs the signed app's `--self-test` offscreen and again with the

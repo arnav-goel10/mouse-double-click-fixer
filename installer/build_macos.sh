@@ -1,6 +1,6 @@
 #!/bin/bash
-# Build "DoubleClick Fixer.app", the DMG people install from, and the zip the
-# in-app updater downloads.
+# Build "Mouse Double-Click Fixer.app", the DMG people install from, and the
+# zip the in-app updater downloads.
 #
 # Signing: macOS remembers the Accessibility permission against the app's
 # signing certificate. Releases must therefore always be signed with the same
@@ -10,7 +10,12 @@
 # is ad-hoc signed, which is fine for trying things out but not for releases.
 set -euo pipefail
 
-APP="dist/DoubleClick Fixer.app"
+# The name people see, from app/__init__.py (DISPLAY_NAME). The release files
+# keep their names (DoubleClickFixer.dmg and so on): installed copies and
+# download links look for them.
+NAME="$(sed -n 's/^DISPLAY_NAME = "\(.*\)"$/\1/p' app/__init__.py)"
+[[ -n "$NAME" ]] || { printf 'error: no DISPLAY_NAME in app/__init__.py\n' >&2; exit 1; }
+APP="dist/$NAME.app"
 LOCAL_SIGNING="$HOME/.doubleclick-fixer-signing"
 
 # Build with exactly the pinned packages and build tools, each file checked
@@ -40,7 +45,7 @@ test -d "$APP"
 # and codesign refuses a bundle that carries them.
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
-signed="$work/DoubleClick Fixer.app"
+signed="$work/$NAME.app"
 ditto --norsrc --noextattr "$APP" "$signed"
 xattr -cr "$signed"
 
@@ -107,13 +112,16 @@ python3 tools/make_notices.py --bundle "$signed" --check --output "$signed/Conte
 
 # The disk image opens to a designed window: the app, an arrow and the
 # Applications folder, so installing is one drag. dmgbuild writes Finder's
-# layout file directly, so this needs no Finder scripting or permissions.
+# layout file directly, so this needs no Finder scripting or permissions. The
+# volume, and so the window, is named after the app.
 rm -f dist/DoubleClickFixer.dmg dist/DoubleClickFixer-macos.zip
 python3 -m dmgbuild -s installer/dmg_settings.py -D app="$signed" \
-  "DoubleClick Fixer" dist/DoubleClickFixer.dmg
+  "$NAME" dist/DoubleClickFixer.dmg
 
 # What the in-app updater downloads: the signed bundle, zipped with ditto so
-# the signature and symlinks survive.
+# the signature and symlinks survive. Copies of 0.5.3 and earlier install the
+# one app they find in it under their own bundle's name; later ones install it
+# under this name and remove the old one (app/updater.py).
 ditto -c -k --norsrc --noextattr --keepParent "$signed" dist/DoubleClickFixer-macos.zip
 
 # Keep a copy of the signed app in dist for trying it out locally.

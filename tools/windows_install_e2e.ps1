@@ -1,6 +1,6 @@
 # End-to-end check of the Windows install, quit and update paths, on a real
 # Windows machine (CI). It installs, launches and replaces the app for real, so
-# never run it on a machine whose copy of DoubleClick Fixer you care about.
+# never run it on a machine whose copy of Mouse Double-Click Fixer you care about.
 #
 #   tools\windows_install_e2e.ps1 -OldSetup old\0.2.6\DoubleClickFixer-Setup.exe,old\0.5.3\DoubleClickFixer-Setup.exe -NewSetup installer\Output\DoubleClickFixer-Setup.exe
 #
@@ -59,6 +59,11 @@ function Expect-Quit($Lines, [string[]] $Wanted, [string[]] $Unwanted = @()) {
     }
 }
 $version = (python -c "import app; print(app.__version__)").Trim()
+# Every old installer here is from before 1.0, when the app was DoubleClick
+# Fixer: the Start menu entry it made, in the user's Programs folder.
+$Programs = [Environment]::GetFolderPath("Programs")
+$OldShortcut = Join-Path $Programs "DoubleClick Fixer\DoubleClick Fixer.lnk"
+$NewShortcut = Join-Path $Programs "Mouse Double-Click Fixer\Mouse Double-Click Fixer.lnk"
 # The new build is installed whole: the folder build (not the portable
 # one-file exe), its runtime, and the notices beside it. Nothing it replaced
 # was in use.
@@ -78,6 +83,8 @@ function Assert-NewBuild($Log) {
         Fail "the installed THIRD_PARTY_NOTICES.md is not the one this build wrote"
     }
     $fileVersion = (Get-Item $app).VersionInfo.ProductVersion
+    $described = (Get-Item $app).VersionInfo.FileDescription
+    if ($described -ne "Mouse Double-Click Fixer") { Fail "the exe describes itself as '$described'" }
     $listed = (Get-ItemProperty $UninstallKey).DisplayVersion
     if ($fileVersion -ne $version) { Fail "the exe says version '$fileVersion', expected $version" }
     if ($listed -ne $version) { Fail "Installed apps lists version '$listed', expected $version" }
@@ -113,6 +120,7 @@ foreach ($old in $OldSetup) {
     Install $old "$env:TEMP\dcf-old-$leg.log"
     $oldVersion = (Get-ItemProperty $UninstallKey).DisplayVersion
     $app = App-Path
+    if (-not (Test-Path $OldShortcut)) { Fail "$oldVersion made no $OldShortcut" }
     Start-Process $app -ArgumentList "--minimized"
     Wait-For { (Get-Running).Count -gt 0 } 30 "the old copy to start"
     Start-Sleep -Seconds 5
@@ -125,6 +133,14 @@ foreach ($old in $OldSetup) {
     $still = Get-Running | Where-Object { $oldIds -contains $_.ProcessId }
     if ($still) { Fail "the old copy is still running after the upgrade" }
     Assert-NewBuild $log
+    # The new name: the update stays in the folder the old copy was in, and
+    # its Start menu entry and Installed apps name are the new ones.
+    if ((App-Path) -ne $app) { Fail "the upgrade moved the app from $app to $(App-Path)" }
+    if (Test-Path $OldShortcut) { Fail "the Start menu still has $OldShortcut" }
+    if (Test-Path (Split-Path $OldShortcut)) { Fail "the old Start menu folder is still there" }
+    if (-not (Test-Path $NewShortcut)) { Fail "the Start menu has no $NewShortcut" }
+    $listed = (Get-ItemProperty $UninstallKey).DisplayName
+    if ($listed -notlike "Mouse Double-Click Fixer*") { Fail "Installed apps lists the app as '$listed'" }
     $quit = Quit-Lines $log
     $quit | Write-Host
     if ($oldVersion -and [version] $oldVersion -ge [version] "0.2.7") {

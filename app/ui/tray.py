@@ -8,6 +8,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon, QWidget
 
+from .. import DISPLAY_NAME
 from ..controller import AppController
 from . import icons
 from .theme import IS_MAC
@@ -57,7 +58,7 @@ class Tray(QSystemTrayIcon):
         menu.addAction(self.toggle_action)
         menu.addSeparator()
 
-        open_action = QAction("Open DoubleClick Fixer", menu)
+        open_action = QAction(f"Open {DISPLAY_NAME}", menu)
         # Windows wording: sentence case (the macOS menu has its own module).
         open_action.triggered.connect(lambda: on_open())
         menu.addAction(open_action)
@@ -74,7 +75,7 @@ class Tray(QSystemTrayIcon):
             updater.changed.connect(self.refresh)
         menu.addSeparator()
 
-        quit_action = QAction("Quit DoubleClick Fixer" if IS_MAC else "Exit", menu)
+        quit_action = QAction(f"Quit {DISPLAY_NAME}" if IS_MAC else "Exit", menu)
         quit_action.triggered.connect(lambda: on_quit())
         menu.addAction(quit_action)
 

@@ -14,7 +14,7 @@ from PySide6.QtGui import QAction, QFont, QKeySequence
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QMenuBar, QMessageBox, QSystemTrayIcon
 
-from . import __version__, diagnostics
+from . import DISPLAY_NAME, __version__, diagnostics
 from .controller import AppController
 from .updater import Updater
 from .ui import dock, icons
@@ -246,9 +246,10 @@ def _hand_over_to_running_instance(request: bytes = b"show") -> bool:
 class Application:
     def __init__(self, argv: list[str]) -> None:
         self.qt = QApplication(argv)
-        self.qt.setApplicationName("DoubleClick Fixer")
+        self.qt.setApplicationName(DISPLAY_NAME)
+        self.qt.setApplicationDisplayName(DISPLAY_NAME)
         self.qt.setApplicationVersion(__version__)
-        self.qt.setOrganizationName("DoubleClick Fixer")
+        self.qt.setOrganizationName(DISPLAY_NAME)
         self.qt.setWindowIcon(icons.app_icon())
         if platform.system() == "Windows":
             # Windows 11's own UI font and body size (14 px).
@@ -326,8 +327,8 @@ class Application:
         if platform.system() != "Darwin":
             return None
         bar = QMenuBar()
-        menu = bar.addMenu("DoubleClick Fixer")
-        about = QAction("About DoubleClick Fixer", menu)
+        menu = bar.addMenu(DISPLAY_NAME)
+        about = QAction(f"About {DISPLAY_NAME}", menu)
         about.setMenuRole(QAction.MenuRole.AboutRole)
         about.triggered.connect(self._about)
         updates = QAction("Check for Updates…", menu)
@@ -338,7 +339,7 @@ class Application:
         settings.setMenuRole(QAction.MenuRole.PreferencesRole)
         settings.setShortcut(QKeySequence.StandardKey.Preferences)
         settings.triggered.connect(lambda: (self.show_window(), self.window.show_page("general")))
-        quit_action = QAction("Quit DoubleClick Fixer", menu)
+        quit_action = QAction(f"Quit {DISPLAY_NAME}", menu)
         quit_action.setMenuRole(QAction.MenuRole.QuitRole)
         quit_action.triggered.connect(self.quit)
         menu.addActions([about, updates, settings, quit_action])
@@ -383,8 +384,8 @@ class Application:
     def _about(self) -> None:
         QMessageBox.about(
             self.window,
-            "About DoubleClick Fixer",
-            f"DoubleClick Fixer {__version__}",
+            f"About {DISPLAY_NAME}",
+            f"{DISPLAY_NAME} {__version__}",
         )
 
     # -- window ------------------------------------------------------------
@@ -413,7 +414,7 @@ class Application:
             return
         self.controller.note_tray_hint_shown()
         self.tray.showMessage(
-            "DoubleClick Fixer is still running",
+            f"{DISPLAY_NAME} is still running",
             "It keeps filtering from the notification area."
             if self.controller.active
             else "Bounce Filter is off. Turn it on from the icon in the notification area.",

@@ -204,14 +204,14 @@ class InstallLocationTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.root, True)
 
     def test_mac_copy_in_a_writable_folder(self) -> None:
-        app = self.root / "DoubleClick Fixer.app"
+        app = self.root / "Mouse Double-Click Fixer.app"
         app.mkdir()
         with mock.patch.object(updater, "bundle_path", return_value=app):
             self.assertEqual(updater.install_location_problem("mac"), "")
 
     @unittest.skipIf(sys.platform == "win32" or os.geteuid() == 0, "POSIX permissions, not root")
     def test_mac_copy_that_cant_be_replaced_says_move_it(self) -> None:
-        app = self.root / "image" / "DoubleClick Fixer.app"
+        app = self.root / "image" / "Mouse Double-Click Fixer.app"
         app.mkdir(parents=True)
         app.parent.chmod(0o555)  # like the read-only disk image
         self.addCleanup(app.parent.chmod, 0o755)
@@ -219,7 +219,7 @@ class InstallLocationTests(unittest.TestCase):
             self.assertEqual(updater.install_location_problem("mac"), updater.MOVE_TO_APPLICATIONS)
 
     def test_mac_copy_in_applications_without_permission_needs_an_administrator(self) -> None:
-        with mock.patch.object(updater, "bundle_path", return_value=Path("/Applications/DoubleClick Fixer.app")), \
+        with mock.patch.object(updater, "bundle_path", return_value=Path("/Applications/Mouse Double-Click Fixer.app")), \
                 mock.patch.object(updater.os, "access", return_value=False):
             self.assertIn("administrator", updater.install_location_problem("mac"))
         with mock.patch.object(updater, "bundle_path", return_value=None):
@@ -228,7 +228,7 @@ class InstallLocationTests(unittest.TestCase):
     def test_mac_copy_in_the_users_own_applications_folder(self) -> None:
         # Their own folder: no administrator to ask, and nowhere to move it.
         own = Path.home() / "Applications"
-        with mock.patch.object(updater, "bundle_path", return_value=own / "DoubleClick Fixer.app"), \
+        with mock.patch.object(updater, "bundle_path", return_value=own / "Mouse Double-Click Fixer.app"), \
                 mock.patch.object(updater.os, "access", return_value=False):
             self.assertEqual(updater.install_location_problem("mac"), f"No permission to replace the app in {own}.")
 
@@ -247,19 +247,23 @@ class MacInstallTests(unittest.TestCase):
     OLD = 'identifier "com.doubleclickfixer.app" and certificate root = H"81a5"'
     NEW = 'anchor apple generic and identifier "com.doubleclickfixer.app" and certificate leaf[subject.OU] = X'
 
-    def install(self, bundled_version="9.9.9", incoming=OLD, claim=updater.ReleaseClaim("9.9.9")):
+    def install(
+        self, bundled_version="9.9.9", incoming=OLD, claim=updater.ReleaseClaim("9.9.9"),
+        installed="Mouse Double-Click Fixer.app", shipped="Mouse Double-Click Fixer.app",
+    ):
         from app.updater import Release, Updater
 
         root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, root, True)
-        current = root / "Applications" / "DoubleClick Fixer.app"
+        current = root / "Applications" / installed
         current.mkdir(parents=True)
         workdir = root / (updater.WORKDIR_PREFIX + "1")
         workdir.mkdir()
+        self.current, self.script = current, workdir / "apply-update.sh"
 
         def run(command, **_kwargs):
             if command[:3] == ["/usr/bin/ditto", "-x", "-k"]:  # unpack the zip
-                contents = Path(command[4]) / "DoubleClick Fixer.app" / "Contents"
+                contents = Path(command[4]) / shipped / "Contents"
                 contents.mkdir(parents=True)
                 info = {"CFBundleShortVersionString": bundled_version}
                 (contents / "Info.plist").write_bytes(plistlib.dumps(info))
@@ -304,13 +308,69 @@ class MacInstallTests(unittest.TestCase):
             self.install(incoming=self.NEW)
         self.install(incoming=self.NEW, claim=updater.ReleaseClaim("9.9.9", self.NEW)).assert_called_once()
 
+    def test_an_update_stays_under_the_name_it_has(self) -> None:
+        self.install()
+        script = self.script.read_text()
+        staged = self.current.with_name(".Mouse Double-Click Fixer update.app")
+        self.assertIn(f"/bin/mv '{staged}' '{self.current}'; then", script)
+        # Only the running copy is moved aside.
+        self.assertEqual(set(re.findall(r"'([^']*\.previous)'", script)), {f"{self.current}.previous"})
+
+    def test_a_copy_from_before_1_0_comes_back_under_the_new_name(self) -> None:
+        self.install(installed="DoubleClick Fixer.app")
+        script = self.script.read_text()
+        target = self.current.with_name("Mouse Double-Click Fixer.app")
+        self.assertIn(f"/bin/mv '{self.current.with_name('.DoubleClick Fixer update.app')}' '{target}'; then", script)
+        self.assertIn(f"  app='{target}'", script)
+
+
+class UpdateDestinationTests(unittest.TestCase):
+    """Where an update goes (update_destination)."""
+
+    def setUp(self) -> None:
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.current = self.make_app("DoubleClick Fixer.app")
+
+    def make_app(self, name: str, bundle_id: str = updater.BUNDLE_ID) -> Path:
+        app = self.root / name
+        (app / "Contents").mkdir(parents=True)
+        (app / "Contents" / "Info.plist").write_bytes(plistlib.dumps({"CFBundleIdentifier": bundle_id}))
+        return app
+
+    def test_the_shipped_name_in_the_same_folder(self) -> None:
+        self.assertEqual(
+            updater.update_destination(self.current, "Mouse Double-Click Fixer.app"),
+            self.root / "Mouse Double-Click Fixer.app",
+        )
+
+    def test_the_same_name_is_an_update_in_place(self) -> None:
+        self.assertEqual(updater.update_destination(self.current, "DoubleClick Fixer.app"), self.current)
+
+    def test_another_copy_of_the_app_under_the_new_name_is_replaced(self) -> None:
+        other = self.make_app("Mouse Double-Click Fixer.app")
+        self.assertEqual(updater.update_destination(self.current, other.name), other)
+
+    def test_something_else_under_the_new_name_is_left_alone(self) -> None:
+        self.make_app("Mouse Double-Click Fixer.app", bundle_id="com.example.other")
+        self.assertEqual(updater.update_destination(self.current, "Mouse Double-Click Fixer.app"), self.current)
+        (self.root / "Plain.app").write_text("a file")
+        self.assertEqual(updater.update_destination(self.current, "Plain.app"), self.current)
+        (self.root / "Link.app").symlink_to(self.make_app("Elsewhere.app"))
+        self.assertEqual(updater.update_destination(self.current, "Link.app"), self.current)
+
+    def test_only_a_plain_bundle_name_is_taken(self) -> None:
+        for shipped in (".Hidden.app", "Mouse Double-Click Fixer", "a/b.app", ""):
+            with self.subTest(shipped=shipped):
+                self.assertEqual(updater.update_destination(self.current, shipped), self.current)
+
 
 @unittest.skipUnless(sys.platform != "win32", "bash script")
 class SwapScriptTests(unittest.TestCase):
     def test_script_replaces_the_bundle_and_relaunches(self) -> None:
         root = Path(tempfile.mkdtemp())
-        current = root / "It's DoubleClick Fixer.app"  # spaces and a quote
-        staged = root / ".It's DoubleClick Fixer update.app"
+        current = root / "It's Mouse Double-Click Fixer.app"  # spaces and a quote
+        staged = root / ".It's Mouse Double-Click Fixer update.app"
         (current / "Contents").mkdir(parents=True)
         (current / "Contents" / "version").write_text("old")
         (staged / "Contents").mkdir(parents=True)
@@ -329,6 +389,52 @@ class SwapScriptTests(unittest.TestCase):
         self.assertFalse(current.with_name(current.name + ".previous").exists())
         self.assertTrue(marker.exists(), "the app is reopened")
 
+    def rename(self, other: bool = False, staged_missing: bool = False) -> tuple[Path, Path, Path, str]:
+        """Run the swap from "It's DoubleClick Fixer.app" (a copy from before
+        1.0) to "Mouse Double-Click Fixer.app": the running copy, the new
+        name, the opener's log, and what the script printed."""
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        current = root / "It's DoubleClick Fixer.app"
+        target = root / "Mouse Double-Click Fixer.app"
+        staged = root / ".It's DoubleClick Fixer update.app"
+        for bundle, version in ((current, "old"), (staged, "new")) + (((target, "other"),) if other else ()):
+            (bundle / "Contents").mkdir(parents=True)
+            (bundle / "Contents" / "version").write_text(version)
+        if staged_missing:
+            shutil.rmtree(staged)
+        opened = root / "opened"
+        opener = root / "opener"
+        opener.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{opened}'\n")
+        opener.chmod(0o755)
+        finished = subprocess.Popen(["true"])
+        finished.wait()
+        script = root / "apply.sh"
+        script.write_text(mac_swap_script(finished.pid, current, staged, ["--updated"], opener=str(opener), target=target))
+        result = subprocess.run(["/bin/bash", "-p", str(script)], capture_output=True, text=True, check=True)
+        return current, target, opened, result.stderr
+
+    def test_a_copy_from_before_1_0_is_renamed(self) -> None:
+        current, target, opened, _ = self.rename()
+        self.assertEqual((target / "Contents" / "version").read_text(), "new")
+        self.assertFalse(current.exists(), "the old name is gone")
+        self.assertEqual(sorted(path.name for path in current.parent.glob("*.app*")), [target.name])
+        self.assertEqual(opened.read_text(), f"{target}\n", "the new name is opened")
+
+    def test_another_copy_under_the_new_name_is_replaced(self) -> None:
+        current, target, opened, _ = self.rename(other=True)
+        self.assertEqual((target / "Contents" / "version").read_text(), "new")
+        self.assertFalse(current.exists())
+        self.assertEqual(sorted(path.name for path in current.parent.glob("*.app*")), [target.name])
+        self.assertEqual(opened.read_text(), f"{target}\n")
+
+    def test_a_failed_rename_puts_everything_back_and_reopens_the_old_copy(self) -> None:
+        current, target, opened, _ = self.rename(other=True, staged_missing=True)
+        self.assertEqual((current / "Contents" / "version").read_text(), "old")
+        self.assertEqual((target / "Contents" / "version").read_text(), "other")
+        self.assertEqual(sorted(path.name for path in current.parent.glob("*.app*")), sorted([current.name, target.name]))
+        self.assertEqual(opened.read_text(), f"{current}\n")
+
     def test_script_runs_nothing_from_the_callers_environment(self) -> None:
         """A program earlier on PATH, BASH_ENV and an exported function all
         try to run instead of the script's own commands; none may."""
@@ -342,16 +448,6 @@ class SwapScriptTests(unittest.TestCase):
             (fake_bin / name).chmod(0o755)
         startup = root / "startup.sh"
         startup.write_text(f"echo BASH_ENV >> '{canary}'\n")
-        current = root / "App.app"
-        staged = root / ".App update.app"
-        (current / "Contents").mkdir(parents=True)
-        (current / "Contents" / "version").write_text("old")
-        (staged / "Contents").mkdir(parents=True)
-        (staged / "Contents" / "version").write_text("new")
-        finished = subprocess.Popen(["true"])
-        finished.wait()
-        script = root / "apply.sh"
-        script.write_text(mac_swap_script(finished.pid, current, staged, [], opener="/usr/bin/true"))
         environment = {
             "PATH": str(fake_bin),
             "BASH_ENV": str(startup),
@@ -359,10 +455,28 @@ class SwapScriptTests(unittest.TestCase):
             "BASH_FUNC_sleep%%": f"() {{ echo function >> '{canary}'; }}",
             "BASH_FUNC_mv%%": f"() {{ echo function >> '{canary}'; }}",
         }
-        subprocess.run(["/bin/bash", "-p", str(script)], check=True, env=environment)
-        self.assertFalse(canary.exists(), canary.read_text() if canary.exists() else "")
-        self.assertEqual((current / "Contents" / "version").read_text(), "new")
-        self.assertFalse(script.exists(), "the script still removes itself")
+        # In place, and renaming a copy from before 1.0 over another copy.
+        for renamed in (False, True):
+            with self.subTest(renamed=renamed):
+                folder = root / str(renamed)
+                current = folder / "App.app"
+                staged = folder / ".App update.app"
+                target = folder / "New App.app" if renamed else current
+                for bundle, version in ((current, "old"), (staged, "new"), (target, "other")):
+                    if not bundle.exists():
+                        (bundle / "Contents").mkdir(parents=True)
+                        (bundle / "Contents" / "version").write_text(version)
+                finished = subprocess.Popen(["true"])
+                finished.wait()
+                script = folder / "apply.sh"
+                script.write_text(
+                    mac_swap_script(finished.pid, current, staged, [], opener="/usr/bin/true", target=target)
+                )
+                subprocess.run(["/bin/bash", "-p", str(script)], check=True, env=environment)
+                self.assertFalse(canary.exists(), canary.read_text() if canary.exists() else "")
+                self.assertEqual((target / "Contents" / "version").read_text(), "new")
+                self.assertEqual(current.exists(), not renamed)
+                self.assertFalse(script.exists(), "the script still removes itself")
 
     def test_script_removes_only_the_updaters_own_folder(self) -> None:
         root = Path(tempfile.mkdtemp())
@@ -545,7 +659,7 @@ class NetworkTests(unittest.TestCase):
 
     def test_the_message_without_a_tls_backend_says_what_to_do_on_windows(self) -> None:
         # There it means Qt's Schannel plugin is gone from the app's folder.
-        self.assertTrue(updater.no_secure_connection("win32").endswith("Reinstall DoubleClick Fixer."))
+        self.assertTrue(updater.no_secure_connection("win32").endswith("Reinstall Mouse Double-Click Fixer."))
         self.assertNotIn("Reinstall", updater.no_secure_connection("darwin"))
 
     def test_a_check_after_one_without_a_tls_backend_can_succeed(self) -> None:
@@ -716,7 +830,7 @@ class NetworkTests(unittest.TestCase):
         self.location_problem.return_value = updater.MOVE_TO_APPLICATIONS
         instance.install(unattended=True)
         self.assertEqual(instance.state, instance.FAILED)
-        self.assertEqual(instance.message, "Move DoubleClick Fixer to Applications to update it.")
+        self.assertEqual(instance.message, "Move Mouse Double-Click Fixer to Applications to update it.")
         self.settle()
         self.assertEqual(self.requested, ["latest", CHECKSUM_ASSET, SIGNATURE_ASSET], "only the check's files")
 
@@ -1021,7 +1135,7 @@ class WindowsScriptTests(unittest.TestCase):
     def test_paths_go_through_the_environment(self) -> None:
         folder = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, folder, True)
-        app = Path(r"C:\Users\Łukasz 张伟\AppData\Local\Programs\DoubleClick Fixer\DoubleClickFixer.exe")
+        app = Path(r"C:\Users\Łukasz 张伟\AppData\Local\Programs\Mouse Double-Click Fixer\DoubleClickFixer.exe")
         setup = Path(r"C:\Users\Łukasz 张伟\AppData\Local\Temp\dcf-update-1\DoubleClickFixer-Setup.exe")
         script = folder / "apply-update.cmd"
         with mock.patch.object(updater.subprocess, "Popen") as popen, mock.patch.dict(
@@ -1068,7 +1182,7 @@ class WindowsPortableSwapTests(unittest.TestCase):
     def swap(self, root: Path) -> None:
         marker = root / "relaunched.txt"
         # The "app" is a batch file that notes how it was started.
-        app = root / "DoubleClick Fixer.cmd"
+        app = root / "Mouse Double-Click Fixer.cmd"
         app.write_text('echo old> "%~dp0relaunched.txt"\nexit\n', encoding="ascii")
         downloaded = root / "dcf-update-1" / "new.cmd"
         downloaded.parent.mkdir()

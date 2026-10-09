@@ -1,27 +1,27 @@
 <div align="center">
 
-<img src="docs/images/icon.png" width="128" height="128" alt="DoubleClick Fixer icon">
+<img src="docs/images/icon.png" width="128" height="128" alt="Mouse Double-Click Fixer icon">
 
-# DoubleClick Fixer
+# Mouse Double-Click Fixer
 
 **Fix a mouse that double-clicks when you click once.**<br>
 A free, open-source app for Windows and macOS that stops mouse double-clicking caused by a worn switch. It filters the extra clicks (switch bounce, or "chatter") and leaves your real double-clicks alone.
 
-[![Latest release](https://img.shields.io/github/v/release/arnav-goel10/doubleclick-fixer?label=release&color=3055ee)](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/arnav-goel10/doubleclick-fixer/total?color=3055ee)](https://github.com/arnav-goel10/doubleclick-fixer/releases)
-[![CI](https://github.com/arnav-goel10/doubleclick-fixer/actions/workflows/ci.yml/badge.svg)](https://github.com/arnav-goel10/doubleclick-fixer/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/arnav-goel10/mouse-double-click-fixer?label=release&color=3055ee)](https://github.com/arnav-goel10/mouse-double-click-fixer/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/arnav-goel10/mouse-double-click-fixer/total?color=3055ee)](https://github.com/arnav-goel10/mouse-double-click-fixer/releases)
+[![CI](https://github.com/arnav-goel10/mouse-double-click-fixer/actions/workflows/ci.yml/badge.svg)](https://github.com/arnav-goel10/mouse-double-click-fixer/actions/workflows/ci.yml)
 [![Platforms](https://img.shields.io/badge/platform-macOS%2013%2B%20(Apple%20silicon)%20%7C%20Windows%2010%2F11%20(x64)-lightgrey)](#download)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-**[Download for Mac](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest/download/DoubleClickFixer.dmg)** &nbsp;·&nbsp;
-**[Download for Windows](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest/download/DoubleClickFixer-Setup.exe)** &nbsp;·&nbsp;
-[All releases](https://github.com/arnav-goel10/doubleclick-fixer/releases)
+**[Download for Mac](https://github.com/arnav-goel10/mouse-double-click-fixer/releases/latest/download/DoubleClickFixer.dmg)** &nbsp;·&nbsp;
+**[Download for Windows](https://github.com/arnav-goel10/mouse-double-click-fixer/releases/latest/download/DoubleClickFixer-Setup.exe)** &nbsp;·&nbsp;
+[All releases](https://github.com/arnav-goel10/mouse-double-click-fixer/releases)
 
 </div>
 
 <p align="center">
-  <img src="docs/images/macos.png" width="49%" alt="DoubleClick Fixer on macOS: the Bounce Filter settings, with the filter on at 46 ms">
-  <img src="docs/images/windows.png" width="49%" alt="DoubleClick Fixer on Windows 11: the Bounce Filter settings, with the filter on at 46 ms">
+  <img src="docs/images/macos.png" width="49%" alt="Mouse Double-Click Fixer on macOS: the Bounce Filter settings, with the filter on at 46 ms">
+  <img src="docs/images/windows.png" width="49%" alt="Mouse Double-Click Fixer on Windows 11: the Bounce Filter settings, with the filter on at 46 ms">
 </p>
 <p align="center"><sub>macOS &nbsp;·&nbsp; Windows 11</sub></p>
 
@@ -33,7 +33,7 @@ Mouse buttons wear out. The metal contact inside starts to bounce, so a single c
 - **drag and drop lets go** halfway, or text selection keeps restarting;
 - a **held button seems to release on its own** while you drag a window or a file.
 
-It happens to every brand sooner or later, Logitech, Razer, SteelSeries, Microsoft and others, and it's especially common on gaming mice. Replacing the switch fixes it for good. If your mouse's own software has a debounce setting, try raising that first; otherwise DoubleClick Fixer fixes it in software, on Windows 10, Windows 11 and macOS.
+It happens to every brand sooner or later, Logitech, Razer, SteelSeries, Microsoft and others, and it's especially common on gaming mice. Replacing the switch fixes it for good. If your mouse's own software has a debounce setting, try raising that first; otherwise Mouse Double-Click Fixer fixes it in software, on Windows 10, Windows 11 and macOS.
 
 ## How it works
 
@@ -62,20 +62,20 @@ The filter sits in the system's own input path, an event tap on macOS and a low-
 
 | Platform | Get it | Notes |
 | --- | --- | --- |
-| **macOS 13 or later** (Apple silicon) | [DoubleClickFixer.dmg](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest/download/DoubleClickFixer.dmg) | Open it and drag DoubleClick Fixer onto Applications. |
-| **Windows 10** (version 1809 or later) **or 11**, 64-bit | [DoubleClickFixer-Setup.exe](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest/download/DoubleClickFixer-Setup.exe) | Or the [portable exe](https://github.com/arnav-goel10/doubleclick-fixer/releases/latest/download/DoubleClickFixer.exe), no installation needed. |
+| **macOS 13 or later** (Apple silicon) | [DoubleClickFixer.dmg](https://github.com/arnav-goel10/mouse-double-click-fixer/releases/latest/download/DoubleClickFixer.dmg) | Open it and drag Mouse Double-Click Fixer onto Applications. |
+| **Windows 10** (version 1809 or later) **or 11**, 64-bit | [DoubleClickFixer-Setup.exe](https://github.com/arnav-goel10/mouse-double-click-fixer/releases/latest/download/DoubleClickFixer-Setup.exe) | Or the [portable exe](https://github.com/arnav-goel10/mouse-double-click-fixer/releases/latest/download/DoubleClickFixer.exe), no installation needed. |
 
 The apps are not yet signed with an Apple or Microsoft developer certificate, so the first launch takes an extra step:
 
-- **macOS 15 and later:** open the app; macOS says it can't verify it. Choose **Done**, go to **System Settings › Privacy & Security**, scroll to the message about DoubleClick Fixer, choose **Open Anyway** (it is there for about an hour after you tried) and confirm with your password. On macOS 13 and 14, Control-click the app in Applications and choose **Open** instead.
-- **Permission on macOS:** turn on **Bounce Filter**, and allow DoubleClick Fixer when macOS asks, under **Privacy & Security › Device Control and Data Access** (**Accessibility** on macOS 26 and earlier). macOS only lets apps you approve filter input.
+- **macOS 15 and later:** open the app; macOS says it can't verify it. Choose **Done**, go to **System Settings › Privacy & Security**, scroll to the message about Mouse Double-Click Fixer, choose **Open Anyway** (it is there for about an hour after you tried) and confirm with your password. On macOS 13 and 14, Control-click the app in Applications and choose **Open** instead.
+- **Permission on macOS:** turn on **Bounce Filter**, and allow Mouse Double-Click Fixer when macOS asks, under **Privacy & Security › Device Control and Data Access** (**Accessibility** on macOS 26 and earlier). macOS only lets apps you approve filter input.
 - **Windows:** if SmartScreen appears, choose **More info › Run anyway**. If Smart App Control blocks the app, Windows offers no way to run it anyway; see [Installation](docs/INSTALLATION.md#smart-app-control).
 
 Full instructions, including uninstalling: [docs/INSTALLATION.md](docs/INSTALLATION.md).
 
 ## Getting started
 
-1. Open DoubleClick Fixer and choose **Calibrate** in the sidebar.
+1. Open Mouse Double-Click Fixer and choose **Calibrate** in the sidebar.
 2. Click the pad once at a time until it has counted twelve clicks, then double-click five times at your usual speed.
 3. Apply the recommendation, and turn on **Bounce Filter**.
 
@@ -142,8 +142,8 @@ The app never invents a click, but it does re-send some input: a release it held
 Python 3.11 or newer.
 
 ```bash
-git clone https://github.com/arnav-goel10/doubleclick-fixer
-cd doubleclick-fixer
+git clone https://github.com/arnav-goel10/mouse-double-click-fixer
+cd mouse-double-click-fixer
 python3 -m venv .venv && source .venv/bin/activate   # Windows: .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 python run.py
@@ -157,11 +157,11 @@ Bug reports and pull requests are welcome; start with [CONTRIBUTING.md](CONTRIBU
 
 ## Support the project
 
-DoubleClick Fixer is free. If it saved you from buying a new mouse, star the repository.
+Mouse Double-Click Fixer is free. If it saved you from buying a new mouse, star the repository.
 
 ## Star history
 
-[![Star History Chart](https://api.star-history.com/svg?repos=arnav-goel10/doubleclick-fixer&type=Date)](https://star-history.com/#arnav-goel10/doubleclick-fixer&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=arnav-goel10/mouse-double-click-fixer&type=Date)](https://star-history.com/#arnav-goel10/mouse-double-click-fixer&Date)
 
 ## License
 

@@ -1203,7 +1203,7 @@ class MenuToggleTests(unittest.TestCase):
     def controller(self, active=False, wanted=False):
         controller = mock.Mock(active=active, wanted=wanted, threshold_ms=60)
         controller.status_text.return_value = "Waiting for Accessibility permission"
-        controller.tooltip_text.return_value = "DoubleClick Fixer: waiting for Accessibility permission"
+        controller.tooltip_text.return_value = "Mouse Double-Click Fixer: waiting for Accessibility permission"
         return controller
 
     def test_tray_toggle_cancels_a_wait_for_permission(self) -> None:
@@ -1216,7 +1216,7 @@ class MenuToggleTests(unittest.TestCase):
         self.assertTrue(tray.toggle_action.isChecked(), "waiting reads as on")
         tray.toggle_action.trigger()
         toggle.assert_called_once_with(False)
-        self.assertEqual(tray.toolTip(), "DoubleClick Fixer: waiting for Accessibility permission")
+        self.assertEqual(tray.toolTip(), "Mouse Double-Click Fixer: waiting for Accessibility permission")
 
     def test_tray_toggle_turns_on_when_off(self) -> None:
         from app.ui.tray import Tray
@@ -1273,7 +1273,7 @@ class MenuToggleTests(unittest.TestCase):
         item._toggle_item.setState_.assert_called_with(1)
         item._target.actions["toggle"]()
         toggle.assert_called_once_with(False)
-        item._item.button().setToolTip_.assert_called_with("DoubleClick Fixer: waiting for Accessibility permission")
+        item._item.button().setToolTip_.assert_called_with("Mouse Double-Click Fixer: waiting for Accessibility permission")
 
 
 class ControllerFixTests(unittest.TestCase):
@@ -1496,7 +1496,7 @@ class SmallFixTests(LiveWindowTests):
         install = mock.Mock()
         controller = mock.Mock(active=False, wanted=False, threshold_ms=60)
         controller.status_text.return_value = "Off"
-        controller.tooltip_text.return_value = "DoubleClick Fixer: off"
+        controller.tooltip_text.return_value = "Mouse Double-Click Fixer: off"
         tray = Tray(controller, on_open=mock.Mock(), on_calibrate=mock.Mock(), on_quit=mock.Mock(),
                     updater=updater, on_check_updates=mock.Mock(), on_install_update=install)
         self.addCleanup(tray.deleteLater)

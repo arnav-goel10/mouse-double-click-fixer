@@ -2,9 +2,9 @@
 
 ## What the app can see
 
-DoubleClick Fixer puts a filter in the system's input path so it can drop
-bounced clicks before other apps see them: an event tap on macOS, a low-level
-mouse hook on Windows.
+Mouse Double-Click Fixer puts a filter in the system's input path so it can
+drop bounced clicks before other apps see them: an event tap on macOS, a
+low-level mouse hook on Windows.
 
 - **macOS:** the event tap asks for mouse button events and pointer movement,
   through one tap so they stay in order. It never asks for keystrokes. macOS
@@ -132,6 +132,6 @@ stay on it.
 ## Reporting a vulnerability
 
 Please report vulnerabilities privately through
-[GitHub's private vulnerability reporting](https://github.com/arnav-goel10/doubleclick-fixer/security/advisories/new),
+[GitHub's private vulnerability reporting](https://github.com/arnav-goel10/mouse-double-click-fixer/security/advisories/new),
 not as a public issue. Include the platform, app version, steps to reproduce
 and the impact. You can expect an acknowledgement within a few days.

@@ -981,10 +981,10 @@ class GlobalClickFilter:
             None,
         )
         if tap is None:
-            from . import permissions
+            from . import DISPLAY_NAME, permissions
 
             self._startup_error = HookError(
-                "macOS refused the event tap. Allow DoubleClick Fixer in System Settings \u203a "
+                f"macOS refused the event tap. Allow {DISPLAY_NAME} in System Settings \u203a "
                 f"Privacy & Security \u203a {permissions.pane_name()}, then try again."
             )
             self._ready.set()
@@ -1594,6 +1594,8 @@ class SessionWindow:
         import ctypes
         from ctypes import wintypes
 
+        from . import DISPLAY_NAME
+
         self.hwnd = None
         self._api = api
         self._wts = None
@@ -1664,7 +1666,7 @@ class SessionWindow:
             return
         WS_POPUP = 0x80000000
         self.hwnd = user32.CreateWindowExW(
-            0, self._class_name, "DoubleClick Fixer", WS_POPUP, 0, 0, 0, 0, None, None, self._instance, None
+            0, self._class_name, DISPLAY_NAME, WS_POPUP, 0, 0, 0, 0, None, None, self._instance, None
         )
         if not self.hwnd:
             log.warning("Couldn't create the hook's session window (error %d)", ctypes.get_last_error())

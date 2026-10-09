@@ -1,7 +1,7 @@
 """The macOS Dock icon, shown only while the window is open, and the other
 app-wide events AppKit delivers: reopen, wake, and session switches.
 
-DoubleClick Fixer is a menu bar app: the bundle is marked as an agent
+Mouse Double-Click Fixer is a menu bar app: the bundle is marked as an agent
 (LSUIElement), so it launches with no Dock icon and lives in the menu bar.
 While the window is open it switches to a regular app, so it gets a Dock
 icon, an app menu, ⌘Tab and ⌘Q like any other window; closing the window

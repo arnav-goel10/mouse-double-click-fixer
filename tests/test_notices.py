@@ -451,7 +451,7 @@ class ResolverTests(unittest.TestCase):
 
     def test_a_built_app_finds_its_own_copy(self) -> None:
         with tempfile.TemporaryDirectory() as folder:
-            contents = Path(folder) / "DoubleClick Fixer.app" / "Contents"
+            contents = Path(folder) / "Mouse Double-Click Fixer.app" / "Contents"
             frameworks = contents / "Frameworks"
             resources = contents / "Resources"
             frameworks.mkdir(parents=True)

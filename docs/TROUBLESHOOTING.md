@@ -36,24 +36,25 @@ and the app then puts it back where your hand has taken it.
 ## macOS: the filter won't turn on
 
 macOS only lets an approved app block input. Turn on **Bounce Filter**, choose
-**Open System Settings** when asked, and switch **DoubleClick Fixer** on under
-**Privacy & Security › Device Control and Data Access** (on macOS 26 and
-earlier, **Privacy & Security › Accessibility**). The app notices within a
+**Open System Settings** when asked, and switch **Mouse Double-Click Fixer**
+on under **Privacy & Security › Device Control and Data Access** (on macOS 26
+and earlier, **Privacy & Security › Accessibility**). The app notices within a
 second. Until then the menu bar menu says "Waiting for … permission".
 
 ### The switch in System Settings is on, but the app still asks
 
 The entry belongs to a different copy of the app, for example one built from
 source or installed before 0.2.0, which was signed differently. Select every
-**DoubleClick Fixer** entry in the list and remove it with **−**, then choose
+**Mouse Double-Click Fixer** entry in the list, and any **DoubleClick Fixer**
+one (the app's name before 1.0), and remove it with **−**, then choose
 **Open Settings…** in the app so macOS lists the copy you are running, and
 switch it on. Releases from 0.2.0 on are signed with the same certificate, so
 this only needs doing once.
 
 ## macOS: the permission was turned off
 
-If you remove DoubleClick Fixer from the list, or turn its switch off, while
-it is filtering, the filter stops within a second and clicks go through
+If you remove Mouse Double-Click Fixer from the list, or turn its switch off,
+while it is filtering, the filter stops within a second and clicks go through
 untouched. Your choice to filter is kept: the menu says it is waiting for
 permission, and filtering starts again by itself once you allow the app.
 
@@ -84,7 +85,7 @@ administrator (Task Manager, an admin terminal, some installers). Over those
 windows the app can't hold a release back and send it later, so drag
 protection is off there and a release goes straight through rather than leave
 the button looking stuck. Bounce is still filtered. If drags over such a
-window still let go, run DoubleClick Fixer as administrator as well.
+window still let go, run Mouse Double-Click Fixer as administrator as well.
 
 ## Games
 
@@ -115,9 +116,9 @@ disk image can't open at login; move it to Applications first.
 
 Closing the window hides it; the filter keeps running. Open it from the menu
 bar icon (macOS) or the notification area icon (Windows), or open the app
-again from Spotlight, Applications or the Start menu. **Quit DoubleClick
-Fixer** (macOS) or **Exit** (Windows) in that menu stops the filter and closes
-the app.
+again from Spotlight, Applications or the Start menu. **Quit Mouse
+Double-Click Fixer** (macOS) or **Exit** (Windows) in that menu stops the
+filter and closes the app.
 
 ## Updates
 
@@ -134,9 +135,9 @@ What the messages in **General › Software update** mean:
 - **This update isn't signed, so it can't be installed.** (or its signature
   isn't valid, or is for another version.) The release doesn't carry a valid
   signature from the project's keys, so the app won't download it.
-- **Move DoubleClick Fixer to Applications to update it.** The app is running
-  from the disk image or from where macOS put a downloaded copy it hasn't
-  moved. Drag it to Applications and open it from there.
+- **Move Mouse Double-Click Fixer to Applications to update it.** The app is
+  running from the disk image or from where macOS put a downloaded copy it
+  hasn't moved. Drag it to Applications and open it from there.
 - **Your account can't change apps in Applications.** Ask an administrator to
   update the app.
 - **No permission to replace the app in …** The folder the app runs from
@@ -164,7 +165,7 @@ On macOS, system crash reports are in
 
 ## Reporting a bug
 
-[Open an issue](https://github.com/arnav-goel10/doubleclick-fixer/issues/new/choose)
+[Open an issue](https://github.com/arnav-goel10/mouse-double-click-fixer/issues/new/choose)
 and paste what **Copy Diagnostics** gives you. Add your mouse model, what you
 did and what happened, and what the **Test** pane shows if it is about
 filtering.

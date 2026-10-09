@@ -35,7 +35,7 @@ from tools.sign_release import (
 )
 
 
-def app_zip(version: str, apps: tuple = ("DoubleClick Fixer.app",)) -> bytes:
+def app_zip(version: str, apps: tuple = ("Mouse Double-Click Fixer.app",)) -> bytes:
     """A stand-in for DoubleClickFixer-macos.zip whose apps are `version`."""
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
@@ -185,7 +185,7 @@ class ReleaseFolderTests(unittest.TestCase):
         # The updater refuses any other number, so the release would never install.
         for apps, message in (
             ((), "There's no app in DoubleClickFixer-macos.zip"),
-            (("DoubleClick Fixer.app", "Other.app"), "There are 2 apps in DoubleClickFixer-macos.zip"),
+            (("Mouse Double-Click Fixer.app", "Other.app"), "There are 2 apps in DoubleClickFixer-macos.zip"),
         ):
             self.add("DoubleClickFixer-macos.zip", app_zip("1.0.1", apps))
             self.write_checksums()
@@ -196,7 +196,7 @@ class ReleaseFolderTests(unittest.TestCase):
     def test_an_app_without_a_version_or_a_broken_zip_is_refused(self) -> None:
         buffer = io.BytesIO()
         with zipfile.ZipFile(buffer, "w") as archive:
-            archive.writestr("DoubleClick Fixer.app/Contents/MacOS/DoubleClickFixer", b"binary")
+            archive.writestr("Mouse Double-Click Fixer.app/Contents/MacOS/DoubleClickFixer", b"binary")
         self.add("DoubleClickFixer-macos.zip", buffer.getvalue())
         self.write_checksums()
         with self.assertRaisesRegex(ReleaseError, r"is version \(none\), not 1.0.1"):

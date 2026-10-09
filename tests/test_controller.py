@@ -158,11 +158,11 @@ class ControllerStateTests(unittest.TestCase):
         self.assertTrue(self.controller.active)
 
     def test_tooltip_uses_the_status_line(self) -> None:
-        self.assertEqual(self.controller.tooltip_text(), "DoubleClick Fixer: off")
+        self.assertEqual(self.controller.tooltip_text(), "Mouse Double-Click Fixer: off")
         self.controller.enable_after_calibration()
-        self.assertEqual(self.controller.tooltip_text(), "DoubleClick Fixer: paused for calibration")
+        self.assertEqual(self.controller.tooltip_text(), "Mouse Double-Click Fixer: paused for calibration")
         self.controller.resume()
-        self.assertEqual(self.controller.tooltip_text(), f"DoubleClick Fixer: on, {self.controller.threshold_ms} ms")
+        self.assertEqual(self.controller.tooltip_text(), f"Mouse Double-Click Fixer: on, {self.controller.threshold_ms} ms")
 
     def test_nothing_starts_a_hook_after_quitting(self) -> None:
         # Quitting mid-calibration: the window's hide event resumes the

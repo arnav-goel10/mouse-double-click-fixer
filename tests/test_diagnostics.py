@@ -52,7 +52,7 @@ class DiagnosticsTests(unittest.TestCase):
     def test_start_up_is_logged(self) -> None:
         self.flush()
         text = self.log_text()
-        self.assertIn("DoubleClick Fixer 9.9.9", text)
+        self.assertIn("Mouse Double-Click Fixer 9.9.9", text)
         self.assertIn(diagnostics.os_description(), text)
 
     def test_the_file_is_written_by_its_own_thread(self) -> None:
@@ -140,6 +140,14 @@ class DiagnosticsTests(unittest.TestCase):
         self.assertIn("crash.log, last lines:", text)
         self.assertIn("Segmentation fault", text)
 
+    def test_launch_lines_from_before_1_0_still_count_as_nothing_wrong(self) -> None:
+        self.flush()
+        path = self.directory / diagnostics.CRASH_NAME
+        old = "--- DoubleClick Fixer 0.5.3 started 2026-10-08T10:00:00+08:00 ---\n"
+        path.write_text(old + path.read_text(encoding="utf-8"), encoding="utf-8")
+        self.assertNotIn("crash.log", diagnostics.report("9.9.9", {}, {}))
+        self.assertTrue(path.read_text(encoding="utf-8").splitlines()[-1].startswith("--- Mouse Double-Click Fixer 9.9.9"))
+
     def test_shutdown_puts_the_hooks_back(self) -> None:
         diagnostics.shutdown()
         self.assertEqual((sys.excepthook, threading.excepthook, sys.unraisablehook), self.hooks)
@@ -161,7 +169,7 @@ class DiagnosticsTests(unittest.TestCase):
             {"filter running": True, "tap resets": 2},
             {"threshold_ms": 45, "window_geometry": "AdnQywADAAAAAA==", "buttons": ["left"]},
         )
-        self.assertIn("DoubleClick Fixer 9.9.9", text)
+        self.assertIn("Mouse Double-Click Fixer 9.9.9", text)
         self.assertIn(diagnostics.os_description(), text)
         self.assertIn("filter running: True", text)
         self.assertIn('"threshold_ms": 45', text)
@@ -200,7 +208,7 @@ class CopyDiagnosticsTests(unittest.TestCase):
         self.addCleanup(page.deleteLater)
         page.diagnostics_button.click()
         text = application.clipboard().text()
-        self.assertIn(f"DoubleClick Fixer {__version__}", text)
+        self.assertIn(f"Mouse Double-Click Fixer {__version__}", text)
         self.assertIn("filter running: False", text)
         self.assertIn("Settings:", text)
         self.assertIn("Copied", page.diagnostics_row.detail.text())

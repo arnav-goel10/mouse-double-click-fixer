@@ -37,7 +37,7 @@ class SelfTestTests(unittest.TestCase):
     def test_every_check_passes_or_skips_here(self) -> None:
         code, lines = run_self_test()
         self.assertEqual(code, 0, "\n".join(lines))
-        self.assertTrue(lines[0].startswith("DoubleClick Fixer "))
+        self.assertTrue(lines[0].startswith("Mouse Double-Click Fixer "))
         self.assertTrue(lines[-1].startswith("self-test passed"))
         for name, _check in selftest.CHECKS:
             matching = [line for line in lines if line.startswith(f"{name}: ")]

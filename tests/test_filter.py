@@ -1426,7 +1426,7 @@ class MacTapTests(unittest.TestCase):
                 GlobalClickFilter(60, [Button.LEFT]).start()
         self.assertEqual(
             str(raised.exception),
-            "macOS refused the event tap. Allow DoubleClick Fixer in System Settings › Privacy & Security "
+            "macOS refused the event tap. Allow Mouse Double-Click Fixer in System Settings › Privacy & Security "
             "› Device Control and Data Access, then try again.",
         )
 

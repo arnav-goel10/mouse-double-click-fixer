@@ -1,6 +1,7 @@
-# Build DoubleClick Fixer for Windows: the portable dist\DoubleClickFixer.exe
-# (one file) and dist\onedir\DoubleClickFixer\ (the folder the installer
-# ships). Then compile installer\windows.iss with Inno Setup for the installer.
+# Build Mouse Double-Click Fixer for Windows: the portable
+# dist\DoubleClickFixer.exe (one file) and dist\onedir\DoubleClickFixer\ (the
+# folder the installer ships). Then compile installer\windows.iss with Inno
+# Setup for the installer.
 $ErrorActionPreference = "Stop"
 # Build with exactly the pinned packages and build tools, each file checked
 # against its hash (requirements-build.txt; see requirements-build.in).

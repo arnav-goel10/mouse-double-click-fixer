@@ -15,6 +15,7 @@ from typing import Callable, Optional
 
 from PySide6.QtCore import QBuffer, QIODevice
 
+from .. import DISPLAY_NAME
 from ..controller import AppController
 from . import icons
 
@@ -75,7 +76,7 @@ def _status_image(active: bool, size: int = 18):
     from AppKit import NSFontWeightMedium, NSImage, NSImageSymbolConfiguration
 
     name = SYMBOL_ON if active else SYMBOL_OFF
-    image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, "DoubleClick Fixer")
+    image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, DISPLAY_NAME)
     if image is not None:
         configured = image.imageWithSymbolConfiguration_(
             NSImageSymbolConfiguration.configurationWithPointSize_weight_(SYMBOL_POINT_SIZE, NSFontWeightMedium)
@@ -155,7 +156,7 @@ class MacMenuBarItem:
         menu.addItem_(NSMenuItem.separatorItem())
 
         open_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Open DoubleClick Fixer", b"open:", ""
+            f"Open {DISPLAY_NAME}", b"open:", ""
         )
         open_item.setTarget_(self._target)
         menu.addItem_(open_item)
@@ -175,7 +176,7 @@ class MacMenuBarItem:
 
         menu.addItem_(NSMenuItem.separatorItem())
         quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Quit DoubleClick Fixer", b"quit:", "q"
+            f"Quit {DISPLAY_NAME}", b"quit:", "q"
         )
         quit_item.setTarget_(self._target)
         menu.addItem_(quit_item)

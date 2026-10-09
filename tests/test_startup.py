@@ -147,10 +147,10 @@ class MacLoginItemTests(unittest.TestCase):
 class TemporaryLocationTests(unittest.TestCase):
     def test_disk_images_and_translocated_copies_are_temporary(self) -> None:
         for path, temporary in (
-            ("/Volumes/DoubleClick Fixer/DoubleClick Fixer.app/Contents/MacOS/DoubleClickFixer", True),
-            ("/private/var/folders/x/T/AppTranslocation/1234/d/DoubleClick Fixer.app/Contents/MacOS/DoubleClickFixer", True),
-            ("/Applications/DoubleClick Fixer.app/Contents/MacOS/DoubleClickFixer", False),
-            (r"C:\Users\me\AppData\Local\Programs\DoubleClick Fixer\DoubleClickFixer.exe", False),
+            ("/Volumes/Mouse Double-Click Fixer/Mouse Double-Click Fixer.app/Contents/MacOS/DoubleClickFixer", True),
+            ("/private/var/folders/x/T/AppTranslocation/1234/d/Mouse Double-Click Fixer.app/Contents/MacOS/DoubleClickFixer", True),
+            ("/Applications/Mouse Double-Click Fixer.app/Contents/MacOS/DoubleClickFixer", False),
+            (r"C:\Users\me\AppData\Local\Programs\Mouse Double-Click Fixer\DoubleClickFixer.exe", False),
         ):
             with mock.patch.object(startup.sys, "executable", path):
                 self.assertEqual(startup.running_from_temporary_location(), temporary, path)
@@ -180,23 +180,23 @@ class ControllerLoginItemTests(unittest.TestCase):
             return AppController()
 
     def test_the_installed_copy_rewrites_its_login_item(self) -> None:
-        controller = self.controller(startup.ON, "/Applications/DoubleClick Fixer.app/Contents/MacOS/DoubleClickFixer")
+        controller = self.controller(startup.ON, "/Applications/Mouse Double-Click Fixer.app/Contents/MacOS/DoubleClickFixer")
         self.set_enabled.assert_called_once_with(True)
         self.assertTrue(controller.settings["start_at_login"])
 
     def test_a_copy_on_the_disk_image_never_rewrites_it(self) -> None:
-        self.controller(startup.ON, "/Volumes/DoubleClick Fixer/DoubleClick Fixer.app/Contents/MacOS/DoubleClickFixer")
+        self.controller(startup.ON, "/Volumes/Mouse Double-Click Fixer/Mouse Double-Click Fixer.app/Contents/MacOS/DoubleClickFixer")
         self.set_enabled.assert_not_called()
 
     def test_a_blocked_login_item_reads_as_off_and_is_left_alone(self) -> None:
-        controller = self.controller(startup.BLOCKED, "/Applications/DoubleClick Fixer.app/Contents/MacOS/DoubleClickFixer")
+        controller = self.controller(startup.BLOCKED, "/Applications/Mouse Double-Click Fixer.app/Contents/MacOS/DoubleClickFixer")
         self.set_enabled.assert_not_called()
         self.assertFalse(controller.settings["start_at_login"])
         self.assertEqual(controller.login_item_state, startup.BLOCKED)
 
     def test_turning_it_on_from_the_disk_image_explains_instead(self) -> None:
         controller = self.controller(startup.OFF, "/Applications/x")
-        with mock.patch.object(startup.sys, "executable", "/Volumes/DoubleClick Fixer/x"):
+        with mock.patch.object(startup.sys, "executable", "/Volumes/Mouse Double-Click Fixer/x"):
             error = controller.set_start_at_login(True)
         self.assertIn("Applications", error)
         self.set_enabled.assert_not_called()

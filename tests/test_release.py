@@ -49,7 +49,7 @@ from tools.sign_release import (
 )
 
 ROOT = Path(__file__).resolve().parents[1]
-REPOSITORY = "owner/doubleclick-fixer"
+REPOSITORY = "owner/mouse-double-click-fixer"
 REF = os.environ.get("GITHUB_REF", "")
 TAG = REF[len("refs/tags/") :] if REF.startswith("refs/tags/") else ""
 
@@ -121,8 +121,8 @@ class ReleaseNotesTests(unittest.TestCase):
         self.assertIn("releases/download/v1.0.0/DoubleClickFixer.dmg", page)
         self.assertIn("- **One point oh.** It wraps.", page)
         self.assertIn("compare/v0.5.3...v1.0.0", page)
-        self.assertIn("[THIRD_PARTY_NOTICES-macos.md](https://github.com/owner/doubleclick-fixer/releases/download/v1.0.0/THIRD_PARTY_NOTICES-macos.md) (macOS)", page)
-        self.assertIn("[THIRD_PARTY_NOTICES-windows.md](https://github.com/owner/doubleclick-fixer/releases/download/v1.0.0/THIRD_PARTY_NOTICES-windows.md) (Windows)", page)
+        self.assertIn("[THIRD_PARTY_NOTICES-macos.md](https://github.com/owner/mouse-double-click-fixer/releases/download/v1.0.0/THIRD_PARTY_NOTICES-macos.md) (macOS)", page)
+        self.assertIn("[THIRD_PARTY_NOTICES-windows.md](https://github.com/owner/mouse-double-click-fixer/releases/download/v1.0.0/THIRD_PARTY_NOTICES-windows.md) (Windows)", page)
         self.assertEqual(
             {name for _label, name in release_notes.NOTICES}, {MAC_NOTICES, WINDOWS_NOTICES}, "the files a release carries"
         )
@@ -134,7 +134,7 @@ class ReleaseNotesTests(unittest.TestCase):
 
     def test_an_older_page_points_at_the_latest(self) -> None:
         page = release_notes.notes("0.5.3", REPOSITORY, latest="1.0.0")
-        self.assertTrue(page.startswith("> **A newer version is available:** [DoubleClick Fixer 1.0.0]"))
+        self.assertTrue(page.startswith("> **A newer version is available:** [Mouse Double-Click Fixer 1.0.0]"))
 
     def test_a_pre_release_uses_its_own_entry_then_its_versions_then_unreleased(self) -> None:
         page = release_notes.notes("1.0.0-rc.1", REPOSITORY)
@@ -162,7 +162,7 @@ class ReleaseNotesTests(unittest.TestCase):
                 return bodies.get(arguments[2], f"## Download\n\nThe {arguments[2]} page as published.\n") + "\n"
             if arguments[:2] == ("release", "edit"):
                 page = Path(arguments[arguments.index("--notes-file") + 1]).read_text(encoding="utf-8")
-                self.assertIn(f"[DoubleClick Fixer {latest[1:]}]", page)
+                self.assertIn(f"[Mouse Double-Click Fixer {latest[1:]}]", page)
                 bodies[arguments[2]] = page
                 return ""
             raise AssertionError(f"unexpected gh {arguments}")
@@ -191,7 +191,7 @@ class ReleaseNotesTests(unittest.TestCase):
         self.assertEqual(edited, older)
         self.assertTrue(any(line.startswith("v1.1.0-beta.2: left alone") for line in said))
         for tag in older:
-            self.assertTrue(bodies[tag].startswith("> **A newer version is available:** [DoubleClick Fixer 1.0.0]"))
+            self.assertTrue(bodies[tag].startswith("> **A newer version is available:** [Mouse Double-Click Fixer 1.0.0]"))
             self.assertIn(f"The {tag} page as published.", bodies[tag], "the rest of the page is kept")
         gh, calls = self.gh(releases, bodies=bodies)
         self.assertEqual(release_notes.point_older(REPOSITORY, apply=True, gh=gh, say=said.append), [], "a second run changes nothing")
@@ -200,8 +200,12 @@ class ReleaseNotesTests(unittest.TestCase):
         published = release_notes.notes("0.5.3", REPOSITORY, latest="0.5.4")
         page = release_notes.point_at(published, "1.0.0", REPOSITORY)
         self.assertEqual(page.count("A newer version is available"), 1)
-        self.assertIn("[DoubleClick Fixer 1.0.0]", page)
-        self.assertNotIn("[DoubleClick Fixer 0.5.4]", page)
+        self.assertIn("[Mouse Double-Click Fixer 1.0.0]", page)
+        self.assertNotIn("[Mouse Double-Click Fixer 0.5.4]", page)
+        # A line put there before the app was renamed is replaced the same way.
+        renamed = published.replace("[Mouse Double-Click Fixer 0.5.4]", "[DoubleClick Fixer 0.5.4]", 1)
+        self.assertNotEqual(renamed, published)
+        self.assertEqual(release_notes.point_at(renamed, "1.0.0", REPOSITORY), page)
         self.assertEqual(
             page.split("\n", 2)[2].lstrip("\n"), published.split("\n", 2)[2].lstrip("\n"), "everything below the line is kept"
         )
@@ -378,7 +382,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('Source: "..\\build\\notices\\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"',
                       (ROOT / "installer" / "windows.iss").read_text(encoding="utf-8"))
         self.assertIn(
-            'cp "dist/DoubleClick Fixer.app/Contents/Resources/THIRD_PARTY_NOTICES.md" release/THIRD_PARTY_NOTICES-macos.md',
+            'cp "dist/Mouse Double-Click Fixer.app/Contents/Resources/THIRD_PARTY_NOTICES.md" release/THIRD_PARTY_NOTICES-macos.md',
             step(job(release, "macos"), "Collect the release files"),
         )
         self.assertEqual(ARTIFACTS["DoubleClickFixer-windows"][-1], WINDOWS_NOTICES)
@@ -529,7 +533,7 @@ exec /usr/bin/env "$@"
         for name, body in programs.items():
             (self.fakes / name).write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
             (self.fakes / name).chmod(0o755)
-        self.app = self.root / "DoubleClick Fixer.app"
+        self.app = self.root / "Mouse Double-Click Fixer.app"
         binary = self.app / "Contents" / "MacOS" / "DoubleClickFixer"
         binary.parent.mkdir(parents=True)
         binary.write_text(self.APP, encoding="utf-8")
@@ -606,9 +610,9 @@ MAC_NOTICES_TEXT = b"# Notices for the Mac app\n"
 def app_zip(version: str, notices: bytes = MAC_NOTICES_TEXT) -> bytes:
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
-        archive.writestr("DoubleClick Fixer.app/Contents/Info.plist", plistlib.dumps({"CFBundleShortVersionString": version}))
-        archive.writestr("DoubleClick Fixer.app/Contents/MacOS/DoubleClickFixer", b"binary " + version.encode())
-        archive.writestr("DoubleClick Fixer.app/Contents/Resources/THIRD_PARTY_NOTICES.md", notices)
+        archive.writestr("Mouse Double-Click Fixer.app/Contents/Info.plist", plistlib.dumps({"CFBundleShortVersionString": version}))
+        archive.writestr("Mouse Double-Click Fixer.app/Contents/MacOS/DoubleClickFixer", b"binary " + version.encode())
+        archive.writestr("Mouse Double-Click Fixer.app/Contents/Resources/THIRD_PARTY_NOTICES.md", notices)
     return buffer.getvalue()
 
 
@@ -692,7 +696,7 @@ class FakeGitHub:
                 if not self.codesign_ok:
                     raise ReleaseError("`codesign --verify` failed: invalid signature")
                 return ""
-            return "Executable=/x/DoubleClick Fixer.app/Contents/MacOS/DoubleClickFixer\n" + (
+            return "Executable=/x/Mouse Double-Click Fixer.app/Contents/MacOS/DoubleClickFixer\n" + (
                 f"designated => {self.requirement}\n" if self.requirement else ""
             )
         assert program == "gh", command
@@ -790,7 +794,7 @@ class PublishTests(unittest.TestCase):
         self.assertEqual(len(self.github.calls_of("gh", "release", "view")), 2, "the draft wasn't re-read before publishing")
         # The injection check ran, every leg, on the draft's own app, before anything was signed.
         (check,) = self.github.calls_of("bash")
-        self.assertEqual(check[1:], (str(INJECTION_CHECK), str(self.root / "work1" / "unpacked" / "DoubleClick Fixer.app"), "--require-sip"))
+        self.assertEqual(check[1:], (str(INJECTION_CHECK), str(self.root / "work1" / "unpacked" / "Mouse Double-Click Fixer.app"), "--require-sip"))
         self.assertLess(calls.index(check), upload)
         self.assertGreater(calls.index(check), calls.index(self.github.calls_of("codesign", "-d", "-r-")[0]))
 
@@ -967,7 +971,7 @@ class PublishTests(unittest.TestCase):
             self.publish()
 
     def test_the_repository_defaults_to_the_one_copies_update_from(self) -> None:
-        self.assertEqual(sign_release.default_repository(), "arnav-goel10/doubleclick-fixer")
+        self.assertEqual(sign_release.default_repository(), "arnav-goel10/mouse-double-click-fixer")
 
     def test_command_line(self) -> None:
         output, errors = io.StringIO(), io.StringIO()
@@ -997,7 +1001,7 @@ class PublishTests(unittest.TestCase):
                 '"## 1.0.1 — YYYY-MM-DD"',
                 "GITHUB_REF=refs/tags/v1.0.1 python3 -m unittest tests.test_release",
                 "git push origin main",
-                'git tag -a v1.0.1 -m "DoubleClick Fixer 1.0.1"',
+                'git tag -a v1.0.1 -m "Mouse Double-Click Fixer 1.0.1"',
                 "git push origin v1.0.1",
                 "until run=\"$(gh run list --workflow release.yml --branch v1.0.1 --event push --limit 1 "
                 "--json databaseId --jq '.[].databaseId')\" && [ -n \"$run\" ]; do sleep 5; done",
