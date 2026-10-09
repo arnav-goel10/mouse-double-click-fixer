@@ -15,7 +15,7 @@ from types import SimpleNamespace
 from typing import Optional
 from unittest import mock
 
-from app.core import PEAK_WINDOW_S, Button, ClickEvent
+from app.core import Button, ClickEvent
 from app.platform import (
     DEFAULT_DOUBLE_CLICK_S,
     DOUBLE_CLICK_KEY,
@@ -1136,6 +1136,51 @@ class CrossButtonOrderTests(unittest.TestCase):
         rig.run_until(100.150)
         self.assertTrue(rig.handle(Button.RIGHT, True, 100.095, "rdown", late_ms=60).accepted)
 
+    def test_once_a_release_is_back_another_buttons_press_goes_straight_through(self) -> None:
+        rig = Pipeline(self, buttons=(Button.LEFT, Button.RIGHT))     # re-sent events come back in 2 ms
+        rig.handle(Button.LEFT, True, 100.000, "ldown")
+        rig.handle(Button.LEFT, False, 100.100, "lup")
+        rig.run_until(100.300)                                        # lup re-sent and back
+        self.assertEqual(rig.sent, [(Button.LEFT, False, "lup")])
+        for second in range(3):
+            stamp = 101.000 + second
+            self.assertTrue(rig.handle(Button.RIGHT, True, stamp, ("rdown", second)).accepted)
+            rig.handle(Button.RIGHT, False, stamp + 0.050, ("rup", second))
+            rig.run_until(stamp + 0.500)
+
+    def test_a_release_given_up_on_holds_no_press_back(self) -> None:
+        # macOS re-armed its tap: lup, posted while it was off, went past it
+        # and never comes back (see _give_up_all).
+        rig = Pipeline(self, buttons=(Button.LEFT, Button.RIGHT))
+        rig.round_trip = None
+        rig.handle(Button.LEFT, True, 100.000, "ldown")
+        rig.handle(Button.LEFT, False, 100.100, "lup")
+        rig.run_until(100.150)                                        # lup re-sent
+        rig.filter._give_up_all()
+        self.assertTrue(rig.handle(Button.RIGHT, True, 100.160, "rdown").accepted)
+
+    def test_a_press_follows_another_buttons_release_waiting_behind_its_press(self) -> None:
+        # rup2 waits behind rdown2, a press on its way: no right release is
+        # on its way, but one happened before ldown and has not reached apps.
+        rig = Pipeline(self, buttons=(Button.LEFT, Button.RIGHT))
+        rig.round_trip = None
+        rig.handle(Button.RIGHT, True, 100.000, "rdown1")
+        rig.handle(Button.RIGHT, False, 100.050, "rup1")
+        rig.run_until(100.100)                                        # rup1 re-sent
+        self.assertTrue(rig.handle(Button.RIGHT, True, 100.110, "rdown2").deferred)
+        come_back(rig.filter, Button.RIGHT)                           # rdown2 re-sent
+        self.assertFalse(rig.move(100.120, "m1", (0, 0)))             # waits behind rdown2
+        self.assertTrue(rig.handle(Button.RIGHT, False, 100.130, "rup2").held)
+        self.assertFalse(rig.move(100.175, "m2", (50, 0)))            # settles rup2, which waits there too
+        self.assertTrue(rig.handle(Button.LEFT, True, 100.180, "ldown").deferred)
+        come_back(rig.filter, Button.RIGHT)
+        self.assertEqual(rig.sent[2:], [
+            (Button.RIGHT, None, "m1"),
+            (Button.RIGHT, False, "rup2"),
+            (Button.RIGHT, None, "m2"),
+            (Button.LEFT, True, "ldown"),
+        ])
+
     def test_a_timer_settled_release_follows_another_buttons_queued_release(self) -> None:
         rig = Pipeline(self, buttons=(Button.LEFT, Button.RIGHT))
         rig.round_trip = None
@@ -1182,9 +1227,9 @@ class InFlightTimeoutTests(unittest.TestCase):
         rig = Pipeline(self)
         rig.handle(Button.MIDDLE, True, 97.500, "stalled", late_ms=400)
         self.assertAlmostEqual(rig.filter._in_flight_timeout(), IN_FLIGHT_MAX_TIMEOUT_S, places=9)
-        rig.run_until(97.899 + PEAK_WINDOW_S)
+        rig.run_until(99.899)
         self.assertAlmostEqual(rig.filter._in_flight_timeout(), IN_FLIGHT_MAX_TIMEOUT_S, places=9)
-        rig.run_until(97.901 + PEAK_WINDOW_S)
+        rig.run_until(99.901)
         self.assertAlmostEqual(rig.filter._in_flight_timeout(), IN_FLIGHT_TIMEOUT_S, places=9)
 
     def test_a_wait_a_late_event_lengthened_shortens_when_it_stops_counting(self) -> None:
@@ -1202,6 +1247,18 @@ class InFlightTimeoutTests(unittest.TestCase):
         self.assertEqual(rig.sent, [(Button.LEFT, False, "up1")])
         rig.run_until(sent_at + IN_FLIGHT_TIMEOUT_S + IN_FLIGHT_CHECK_SLACK_S)
         self.assertEqual(rig.sent[1:], [(Button.LEFT, True, "down2")])
+
+    def test_an_events_own_lateness_counts_before_it_gives_anything_up(self) -> None:
+        # down2 reaches the hook 200 ms late, stamped just after up1 went out
+        # (as Windows' coarse stamps can put an event made just before it):
+        # up1 may be as late, so it is not given up on yet.
+        rig = Pipeline(self)
+        rig.round_trip = None
+        rig.handle(Button.LEFT, True, 100.000, "down1", late_ms=0)
+        rig.handle(Button.LEFT, False, 100.100, "up1", late_ms=0)
+        rig.run_until(100.150)                                        # up1 re-sent at 100.145
+        self.assertTrue(rig.handle(Button.LEFT, True, 100.150, "down2", late_ms=200).deferred)
+        self.assertEqual(rig.sent, [(Button.LEFT, False, "up1")])
 
 
 def quantized_tick(ms: float) -> int:
