@@ -259,6 +259,23 @@ class AppController(QObject):
         self._stop_filter()
         self.flush_stats()
 
+    def diagnostic_state(self) -> dict:
+        """The filter's state for a bug report. Counts only, never clicks."""
+        current = self._filter
+        return {
+            "filter running": self.active,
+            "user has it on": self.wanted,
+            "saved choice": "on" if self.settings["fix_enabled"] else "off",
+            "paused for calibration": self._suspended,
+            "waiting for permission": self.waiting_for_permission,
+            "failure": f"{self.failure}: {self.failure_detail}" if self.failure else "none",
+            "tap alive": self.tap_alive(),
+            "tap resets": getattr(current, "tap_resets", "-"),
+            "hook re-arms": getattr(current, "hook_rearms", "-"),
+            "blocked this session": self.session_filtered,
+            "login item": self.login_item_state,
+        }
+
     # -- settings ----------------------------------------------------------
     def set_threshold(self, value: int) -> None:
         threshold = clamp_threshold(value)

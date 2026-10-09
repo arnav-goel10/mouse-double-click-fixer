@@ -8,6 +8,7 @@ from typing import Optional
 from PySide6.QtCore import QByteArray, QEvent, QRect, QTimer, Qt, Signal
 from PySide6.QtGui import QGuiApplication, QPainter
 from PySide6.QtWidgets import (
+    QApplication,
     QFrame,
     QHBoxLayout,
     QMessageBox,
@@ -22,7 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .. import __version__, permissions, startup
+from .. import __version__, diagnostics, permissions, startup
 from ..controller import AppController
 from ..core import (
     BOUNCE_CANDIDATE_MS,
@@ -69,6 +70,8 @@ HEALTH_CHECK_MS = 5000
 COLUMN_MAX = 640 if IS_MAC else 1000
 #: The narrowest the content column may get before the window stops shrinking.
 COLUMN_MIN = 440
+
+DIAGNOSTICS_DETAIL = "Version, settings and the recent log, for a bug report. Never your clicks."
 
 PAGES = [
     ("filter", "Bounce Filter"),
@@ -698,6 +701,18 @@ class GeneralPage(Page):
         reset.clicked.connect(self._confirm_reset)
         self.stats_row = stats.add(Row("Blocked bounces", "", reset, card_icon("chart")))
 
+        self.header("Troubleshooting")
+        troubleshooting = self.section()
+        self.diagnostics_button = _button("Copy Diagnostics")
+        self.diagnostics_button.clicked.connect(self._copy_diagnostics)
+        self.diagnostics_row = troubleshooting.add(
+            Row("Diagnostics", DIAGNOSTICS_DETAIL, self.diagnostics_button, card_icon("copy"))
+        )
+        self._diagnostics_timer = QTimer(self)
+        self._diagnostics_timer.setSingleShot(True)
+        self._diagnostics_timer.setInterval(4000)
+        self._diagnostics_timer.timeout.connect(lambda: self.diagnostics_row.set_detail(DIAGNOSTICS_DETAIL))
+
         self.body.addStretch(1)
         version = TextLabel(f"DoubleClick Fixer {__version__}", "caption", "tertiary")
         version.setAlignment(Qt.AlignmentFlag.AlignHCenter)
@@ -708,7 +723,7 @@ class GeneralPage(Page):
     def _login_detail(state: str) -> str:
         if state == startup.BLOCKED:
             if IS_MAC:
-                return "Turned off in System Settings › General › Login Items."
+                return "Turned off in System Settings."
             return "Turned off in Task Manager › Startup apps. Turn it on here to allow it again."
         return f"Starts in the {'menu bar' if IS_MAC else 'notification area'}."
 
@@ -778,6 +793,20 @@ class GeneralPage(Page):
             return
         # Still off if macOS keeps it switched off in Login Items; say so.
         self.refresh_login()
+
+    def _copy_diagnostics(self) -> None:
+        """Put a bug report's worth of detail on the clipboard: versions,
+        state, settings and the end of the log."""
+        window = self.window()
+        state = self.controller.diagnostic_state()
+        if permissions.needs_accessibility():
+            state[f"{permissions.pane_name()} permission"] = getattr(window, "_permission_granted", "?")
+        if self.updater is not None and self.updater.supported:
+            state["update"] = f"{self.updater.state} {self.updater.message}".strip()
+        text = diagnostics.report(__version__, state, self.controller.settings)
+        QApplication.clipboard().setText(text)
+        self.diagnostics_row.set_detail("Copied. Paste it into your bug report.")
+        self._diagnostics_timer.start()
 
     def _confirm_reset(self) -> None:
         answer = QMessageBox.question(

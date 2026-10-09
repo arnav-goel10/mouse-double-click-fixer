@@ -13,7 +13,7 @@ from PySide6.QtGui import QAction, QFont, QKeySequence
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QMenuBar, QMessageBox, QSystemTrayIcon
 
-from . import __version__
+from . import __version__, diagnostics
 from .controller import AppController
 from .updater import Updater
 from .ui import dock, icons
@@ -192,8 +192,10 @@ class Application:
         hints = self.qt.styleHints()
         if hasattr(hints, "colorSchemeChanged"):
             hints.colorSchemeChanged.connect(lambda _scheme: self._on_theme_changed())
-        # Quitting from anywhere (Dock, app menu, logout) stops the hook cleanly.
+        # Quitting from anywhere (Dock, app menu, logout) stops the hook cleanly,
+        # then the log writes out what is left.
         self.qt.aboutToQuit.connect(self.controller.shutdown)
+        self.qt.aboutToQuit.connect(diagnostics.shutdown)
         self.menu_bar = self._build_menu_bar()
         # Opening the app again (Launchpad, Spotlight, Finder, Dock) while it
         # runs from the menu bar shows the window. Installed once the event
@@ -341,6 +343,7 @@ class Application:
         )
 
     def quit(self) -> None:
+        diagnostics.log.info("Quitting")
         if self.window.isVisible():
             self.window.save_geometry()
         self.controller.shutdown()
@@ -376,6 +379,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         lock.unlock()
         return 0
 
+    # Only the copy that runs logs: a second launch that hands over, or
+    # --quit, would otherwise write to the same file at the same time.
+    diagnostics.setup(__version__)
     application = Application(arguments)
     application.instance_lock = lock  # held for as long as the app runs
     return application.start(minimized)
