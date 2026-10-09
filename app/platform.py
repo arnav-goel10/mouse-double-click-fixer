@@ -1047,7 +1047,13 @@ class GlobalClickFilter:
                 self._injected_passed(INJECTED_MOTION_MARKS[mark])
                 return event  # re-sent by this app; already decided
             location = Quartz.CGEventGetLocation(event)
-            timestamp = to_seconds(Quartz.CGEventGetTimestamp(event))
+            # Only the hardware's own stream comes in the order it happened.
+            # Another app's motion is stamped when it was posted and can
+            # overtake hardware events still on their way, a comeback press
+            # among them, so its time settles nothing.
+            source = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventSourceStateID)
+            hardware = filter_injected or source == Quartz.kCGEventSourceStateHIDSystemState
+            timestamp = to_seconds(Quartz.CGEventGetTimestamp(event)) if hardware else None
             copy = Quartz.CGEventCreateCopy(event)
             return event if self._motion(copy, (location.x, location.y), timestamp) else None
 

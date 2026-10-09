@@ -1374,11 +1374,14 @@ class MacTapTests(unittest.TestCase):
             self.Q.kCGMouseEventClickState: state,
         })
 
-    def move(self, at, mark=0, kind=FakeQuartz.kCGEventMouseMoved, offset=None) -> FakeCGEvent:
+    def move(self, at, mark=0, kind=FakeQuartz.kCGEventMouseMoved, offset=None, hardware=True) -> FakeCGEvent:
         """Pointer motion, stamped `offset` (by default 1 ms after the
-        latest button event)."""
+        latest button event); from the mouse, or else posted by an app."""
         offset = self.clock + 0.001 if offset is None else offset
-        return FakeCGEvent(kind, *at, timestamp=self.ticks(offset), fields={self.Q.kCGEventSourceUserData: mark})
+        fields = {self.Q.kCGEventSourceUserData: mark}
+        if hardware:
+            fields[self.Q.kCGEventSourceStateID] = self.Q.kCGEventSourceStateHIDSystemState
+        return FakeCGEvent(kind, *at, timestamp=self.ticks(offset), fields=fields)
 
     def button(self, kind, at, offset, state=1, ns=False):
         """Feed one hardware button event to the tap."""
@@ -1511,6 +1514,19 @@ class MacTapTests(unittest.TestCase):
             timer.fire()
         self.assertEqual(len(self.quartz.posted), 3, "the timer must not resend the release")
         self.assertFalse(self.filter._motion_wanted)
+
+    def test_another_apps_motion_never_settles_a_release_by_its_time(self) -> None:
+        # Stamped when it was posted, it can overtake the hardware's own
+        # events, the press that would have cancelled the release among them.
+        self.button(self.Q.kCGEventLeftMouseDown, (0, 0), 0.0)
+        self.assertIsNone(self.button(self.Q.kCGEventLeftMouseUp, (50, 0), 0.5))
+        posted = self.move((300, 0), offset=0.6, hardware=False)
+        self.assertIs(self.tap.callback(None, posted.kind, posted, None), posted)
+        self.assertEqual(self.quartz.posted, [])
+        self.assertTrue(self.filter._filters[Button.LEFT].holding_release)
+        self.assertIsNone(self.button(self.Q.kCGEventLeftMouseDown, (50, 0), 0.52), "the contact came back")
+        self.assertTrue(self.events[-1].cancels_held)
+        self.assertEqual(self.quartz.posted, [], "the drag carries on")
 
     def test_a_drag_let_go_while_moving_puts_the_pointer_back(self) -> None:
         self.assertIsNotNone(self.button(self.Q.kCGEventLeftMouseDown, (0, 0), 0.0))
