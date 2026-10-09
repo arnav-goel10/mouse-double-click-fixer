@@ -34,6 +34,7 @@ jobs:
   windows-hook:
     name: Windows hook end-to-end
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -62,6 +63,7 @@ jobs:
   windows-install:
     name: Windows install, quit and update end-to-end
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7

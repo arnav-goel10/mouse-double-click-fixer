@@ -8,9 +8,11 @@ first, so anything the filter suppresses never reaches it, the same thing an
 application would see. Every system setting a test changes is put back.
 """
 
+import faulthandler
 import os
 import platform
 import statistics
+import sys
 import threading
 import time
 import unittest
@@ -423,12 +425,19 @@ class RealWindows(unittest.TestCase):
         self.observed: list = []
         self._observer = None
         self.filter = None
+        # A hook that stops answering would hang the job: show every thread's
+        # stack and end the run instead.
+        faulthandler.dump_traceback_later(120, exit=True)
+        self.addCleanup(faulthandler.cancel_dump_traceback_later)
 
     def tearDown(self) -> None:
         if self.filter is not None:
             self.filter.stop()
         if self._observer is not None:
             self._stop_observer()
+
+    def report(self, text: str) -> None:
+        print(f"\n{text}", file=sys.stderr, flush=True)
 
     # -- the observer hook -------------------------------------------------
     def start_observer(self) -> None:
@@ -518,7 +527,7 @@ class RealWindows(unittest.TestCase):
         mouse would."""
         from app.platform import WindowsApi
 
-        print(f"\n[runner] pointer showing: {self.api.cursor_showing()}, remote: {self.api.remote_session()}")
+        self.report(f"[runner] pointer showing: {self.api.cursor_showing()}, remote: {self.api.remote_session()}")
         if not self.api.relocation_allowed():
             patch = mock.patch.object(WindowsApi, "relocation_allowed", return_value=True)
             patch.start()
@@ -565,7 +574,7 @@ class WindowsPointerTests(RealWindows):
     def test_absolute_moves_land_on_the_exact_pixel(self) -> None:
         # (b) Every 7th pixel and both edges, along each axis.
         left, top, width, height = self.api.virtual_screen()
-        print(f"\n[runner] virtual screen {left},{top} {width}x{height}")
+        self.report(f"[runner] virtual screen {left},{top} {width}x{height}")
         mid_x, mid_y = left + width // 2, top + height // 2
         xs = sorted(set(range(left, left + width, 7)) | {left, left + width - 1})
         ys = sorted(set(range(top, top + height, 7)) | {top, top + height - 1})
@@ -573,7 +582,7 @@ class WindowsPointerTests(RealWindows):
         with self.api.physical_pixels():
             for target in [(x, mid_y) for x in xs] + [(mid_x, y) for y in ys]:
                 self.send(self.api.move_input(target[0], target[1], 0))
-                landed = self.wait_for_cursor(target, 0.5)
+                landed = self.wait_for_cursor(target, 0.2)
                 if landed != target:
                     misses.append((target, landed))
         self.assertEqual(misses, [])
@@ -678,9 +687,9 @@ class WindowsHookTests(RealWindows):
             # the clicks around it show the tick.
             ticks = [entry[3] for entry in self.observed_buttons()]
             tick_gaps.append([later - earlier for earlier, later in zip(ticks, ticks[1:])])
-        print(f"\n[timing] sent gaps ms {[round(gap, 1) for gap in sent_gaps]}")
-        print(f"[timing] filter gaps ms {[round(gap, 1) for gap in measured_gaps]}")
-        print(f"[timing] info.time steps between the clicks' events ms {tick_gaps}")
+        self.report(f"[timing] sent gaps ms {[round(gap, 1) for gap in sent_gaps]}")
+        self.report(f"[timing] filter gaps ms {[round(gap, 1) for gap in measured_gaps]}")
+        self.report(f"[timing] info.time steps between the clicks' events ms {tick_gaps}")
         for sent, measured in zip(sent_gaps, measured_gaps):
             self.assertAlmostEqual(measured, sent, delta=4.0)
 
@@ -762,7 +771,7 @@ class WindowsMotionTests(RealWindows):
         self.move_by(40, 0)                                           # motion re-sends the up
         time.sleep(0.3)
         messages = [entry[0] for entry in self.observed_buttons()]
-        print(f"\n[swapped] {[hex(message) for message in messages]}")
+        self.report(f"[swapped] {[hex(message) for message in messages]}")
         self.assertEqual(len(messages), 4, messages)
         self.assertEqual(messages[0::2], [messages[0]] * 2)
         self.assertEqual(messages[1::2], [messages[0] + 1] * 2, "each re-sent release matches its press")
@@ -795,8 +804,8 @@ class WindowsMotionTests(RealWindows):
         def p99(values: list) -> float:
             return values[int(len(values) * 0.99) - 1]
 
-        print(
-            f"\n[cost] unwatched n={len(unwatched)} median={statistics.median(unwatched):.4f} ms "
+        self.report(
+            f"[cost] unwatched n={len(unwatched)} median={statistics.median(unwatched):.4f} ms "
             f"p99={p99(unwatched):.4f} ms max={unwatched[-1]:.3f} ms; watched n={len(watched)} "
             f"median={statistics.median(watched):.4f} ms p99={p99(watched):.4f} ms max={watched[-1]:.3f} ms"
         )
