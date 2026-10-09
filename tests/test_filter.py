@@ -15,6 +15,7 @@ from app.platform import (
     INJECTED_MARK,
     MOTION_MARK_FOR,
     RESTORE_MARK,
+    TAP_DISABLE_LIMIT,
     TAP_DISABLED_MESSAGE,
     ClickCountRepair,
     GlobalClickFilter,
@@ -852,6 +853,8 @@ class FakeQuartz:
     def __init__(self) -> None:
         self.taps = []
         self.posted = []
+        # Whether each tap was enabled as each event was posted.
+        self.taps_enabled_at_post = []
         self.pointer = (0.0, 0.0)
         self.pointer_error = None  # raised when the pointer is read, if set
         self._wake = threading.Event()
@@ -915,6 +918,7 @@ class FakeQuartz:
 
     def CGEventPost(self, where, event):
         self.posted.append(event.copy())
+        self.taps_enabled_at_post.append([tap.enabled for tap in self.taps])
 
     def CGEventCreate(self, source):
         if self.pointer_error is not None:
@@ -945,7 +949,18 @@ class MacTapTests(unittest.TestCase):
             self.addCleanup(patch.stop)
         self.events = []
         self.errors = []
-        self.filter = GlobalClickFilter(60, [Button.LEFT], on_event=self.events.append, on_error=self.errors.append)
+        self.permitted = True
+        # Per call of on_permission_lost: its thread, and how many events
+        # had been posted by then.
+        self.lost = []
+        self.filter = GlobalClickFilter(
+            60,
+            [Button.LEFT],
+            on_event=self.events.append,
+            on_error=self.errors.append,
+            permission_ok=lambda: self.permitted,
+            on_permission_lost=lambda: self.lost.append((threading.current_thread().name, len(self.quartz.posted))),
+        )
         self.filter.start()
         self.addCleanup(self.filter.stop)  # runs before the patches are undone
         self.main_tap, self.motion_tap = self.quartz.taps
@@ -1095,10 +1110,88 @@ class MacTapTests(unittest.TestCase):
         self.filter._thread.join(2)
         self.assertFalse(self.filter.running)
         self.assertEqual(self.errors, [TAP_DISABLED_MESSAGE])
-        self.assertFalse(self.main_tap.enabled, "not re-armed a third time")
+        self.assertEqual(self.filter.tap_resets, 2, "not re-armed a third time")
         self.assertTrue(self.main_tap.invalidated and self.motion_tap.invalidated)
         released = [event for event in self.quartz.posted if event.kind == self.Q.kCGEventLeftMouseUp]
         self.assertEqual(len(released), 1, "the held release still reaches apps")
+        self.assertEqual(self.lost, [])
+
+    def test_motion_tap_disables_do_not_count_toward_giving_up(self) -> None:
+        # One system event can disable both taps; only the main tap counts.
+        self.button(self.Q.kCGEventLeftMouseDown, (0, 0), 0.0)
+        self.button(self.Q.kCGEventLeftMouseUp, (0, 0), 0.1)            # held in place: motion tap on
+        for _ in range(TAP_DISABLE_LIMIT):
+            self.disable(self.motion_tap)
+        self.assertTrue(self.motion_tap.enabled, "re-armed each time")
+        self.disable(self.main_tap)
+        self.assertTrue(self.filter.running)
+        self.assertEqual(self.filter.tap_resets, TAP_DISABLE_LIMIT + 1)
+        self.assertEqual(self.errors, [])
+
+    def test_a_motion_tap_disable_while_it_is_meant_to_be_off_is_ignored(self) -> None:
+        asked = []
+        self.filter._permission_ok = lambda: asked.append(True) or True
+        self.assertFalse(self.motion_tap.enabled)
+        self.disable(self.motion_tap)
+        self.assertFalse(self.motion_tap.enabled, "not switched on by a re-arm")
+        self.assertEqual((self.filter.tap_resets, asked), (0, []))
+
+    def test_a_motion_tap_switched_off_during_its_rearm_stays_off(self) -> None:
+        self.button(self.Q.kCGEventLeftMouseDown, (0, 0), 0.0)
+        self.button(self.Q.kCGEventLeftMouseUp, (0, 0), 0.1)            # held in place: motion tap on
+
+        def release_settles_meanwhile() -> bool:
+            # While the motion tap is being re-armed, the hold's timer (on
+            # another thread) re-sends the release, it comes back, and with
+            # nothing left to watch the tap is switched off.
+            self.timers[-1].fire()
+            self.pass_back(self.quartz.posted[0])
+            self.assertFalse(self.motion_tap.enabled)
+            return True
+
+        self.filter._permission_ok = release_settles_meanwhile
+        self.disable(self.motion_tap)
+        self.assertEqual(len(self.quartz.posted), 1, "the release went out")
+        self.assertFalse(self.motion_tap.enabled, "left on while nothing needs it")
+        self.assertEqual(self.filter.tap_resets, 0)
+
+    def lose_permission_then_disable(self, tap) -> None:
+        self.button(self.Q.kCGEventLeftMouseDown, (0, 0), 0.0)
+        self.button(self.Q.kCGEventLeftMouseUp, (0, 0), 0.1)            # held in place: motion tap on
+        self.assertTrue(self.motion_tap.enabled)
+        self.permitted = False
+        with self.assertLogs("app.platform", "INFO") as self.logged:
+            self.disable(tap)
+            self.filter._thread.join(2)
+
+    def assert_failed_open_for_permission(self) -> None:
+        self.assertFalse(self.filter.running, "the hook ends")
+        self.assertEqual(self.errors, [], "not reported as an error")
+        self.assertEqual(self.lost, [("dcf-hook", 1)], "told once, from the hook thread, after the release went out")
+        released = [event for event in self.quartz.posted if event.kind == self.Q.kCGEventLeftMouseUp]
+        self.assertEqual(len(released), 1, "the held release still reaches apps")
+        self.assertEqual(self.quartz.taps_enabled_at_post, [[False, False]], "posted once both taps were off")
+        self.assertTrue(self.main_tap.invalidated and self.motion_tap.invalidated)
+        self.assertEqual((self.filter.tap_resets, self.filter._tap_disables), (0, []))
+        self.assertIn("permission gone", "\n".join(self.logged.output))
+
+    def test_a_main_tap_disabled_after_the_permission_is_gone_fails_open(self) -> None:
+        self.lose_permission_then_disable(self.main_tap)
+        self.assert_failed_open_for_permission()
+
+    def test_a_motion_tap_disabled_after_the_permission_is_gone_fails_open(self) -> None:
+        self.lose_permission_then_disable(self.motion_tap)
+        self.assert_failed_open_for_permission()
+
+    def test_a_failing_permission_check_still_rearms(self) -> None:
+        def broken() -> bool:
+            raise OSError("no answer")
+
+        self.filter._permission_ok = broken
+        with fresh_error_log(), self.assertLogs("app.platform", "WARNING"):
+            self.disable(self.main_tap)
+        self.assertTrue(self.main_tap.enabled)
+        self.assertEqual(self.filter.tap_resets, 1)
 
     def test_the_hook_logs_its_rearms_when_it_ends(self) -> None:
         self.disable(self.main_tap)
