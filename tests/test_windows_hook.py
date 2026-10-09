@@ -285,14 +285,17 @@ class WindowsHookLogicTests(unittest.TestCase):
                 self.assertEqual(self.win.moves_between("down", "up"), [])
                 self.assertEqual(self.win.cursor, (410, 320))
 
-    def test_small_motion_passes_and_the_timer_puts_the_up_back_on_the_click(self) -> None:
+    def test_small_motion_passes_and_the_up_goes_out_where_the_pointer_is(self) -> None:
         self.click()
         self.win.move(2, 0)                                           # inside the drag rectangle
         self.win.run()
         self.assertEqual(self.win.cursor, (202, 200), "a hand resting on the mouse isn't held back")
         self.fire_timers()
-        self.assertEqual(self.win.buttons()[1][:3], ("up", Button.LEFT, (200, 200)))
+        # Still the same spot to apps (inside the drag rectangle): a plain up
+        # there, with no jump to the click and back.
+        self.assertEqual(self.win.buttons()[1][:3], ("up", Button.LEFT, (202, 200)))
         self.assertEqual(self.win.buttons()[1][3], int(self.win.now_ms), "stamped now: motion came first")
+        self.assertEqual([entry[1:] for entry in self.win.seen if entry[0] == "move"], [((202, 200), 0)])
         self.assertEqual(self.win.cursor, (202, 200))
         self.assertFalse(self.win.hook.watch[0])
 
@@ -301,8 +304,29 @@ class WindowsHookLogicTests(unittest.TestCase):
         self.win.move(2, 0)
         self.win.move(10, 0)
         self.win.run()
-        self.assertEqual(self.win.buttons()[1][:3], ("up", Button.LEFT, (200, 200)))
+        self.assertEqual(self.win.buttons()[1][:3], ("up", Button.LEFT, (202, 200)))
+        self.assertNotIn(TELEPORT_MARK, [entry[2] for entry in self.win.seen if entry[0] == "move"])
         self.assertEqual(self.win.cursor, (212, 200))
+
+    def test_a_drop_still_inside_the_drag_rectangle_goes_out_where_the_pointer_is(self) -> None:
+        # The drag rectangle is 4 px each way here: 3 px off is the same spot
+        # (a plain up), 4 px off is not (taken back to where it came up).
+        for step, up_at, marks in ((3, (303, 200), []), (4, (300, 200), [TELEPORT_MARK])):
+            with self.subTest(step=step):
+                self.setUp()
+                self.win.press()
+                self.win.wait(50)
+                self.win.move(100, 0)
+                self.win.wait(50)
+                self.win.release()
+                self.win.wait(1)
+                self.win.move(step, 0)
+                self.win.run()
+                self.fire_timers()
+                self.assertEqual(self.win.buttons()[1][:3], ("up", Button.LEFT, up_at))
+                self.assertEqual(self.win.cursor, (300 + step, 200))
+                moves = [entry[2] for entry in self.win.seen if entry[0] == "move"]
+                self.assertEqual([mark for mark in moves if mark == TELEPORT_MARK], marks)
 
     def drag_and_let_go_while_moving(self) -> None:
         self.win.press()
@@ -873,6 +897,20 @@ class WindowsMotionTests(RealWindows):
         up = self.first(WM_LBUTTONUP)
         self.assertEqual(self.observed[up][1], (200, 200), f"the click ended off its spot: {self.observed}")
         self.assertEqual(self.cursor(), (600, 400))
+
+    def test_a_small_move_after_a_click_releases_in_place(self) -> None:
+        # Inside the drag rectangle it is still the same spot: a plain up
+        # where the pointer is, no jump to the click and back.
+        self.start_filter()
+        self.click_at_200()
+        time.sleep(0.005)
+        self.move_by(2, 0)
+        time.sleep(0.3)
+        up = self.first(WM_LBUTTONUP)
+        self.assertEqual(self.observed[up][1], (202, 200), f"{self.observed}")
+        self.assertEqual(self.observed[up][2], INJECTED_MARK, "the up was held and re-sent")
+        self.assertNotIn(TELEPORT_MARK, [entry[2] for entry in self.observed if entry[0] == WM_MOUSEMOVE])
+        self.assertEqual(self.cursor(), (202, 200))
 
     def test_the_hook_stays_cheap(self) -> None:
         # (g) Every move reaches this Python callback; while nothing is held

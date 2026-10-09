@@ -1130,7 +1130,8 @@ class WindowsHook:
     the move follows it. A release that can't be delivered that way (the
     hand moved on before the timer delivered it, as when a drag ends while
     moving) is re-sent in one batch with motion that takes the pointer to
-    where the button came up and back again.
+    where the button came up and back again; while the pointer is still
+    inside the drag rectangle there, it goes out where the pointer is.
 
     A move held back leaves the pointer where it was, so Windows works out
     the next move from that stale spot. While motion is watched, `basis` is
@@ -1297,11 +1298,20 @@ class WindowsHook:
         # Message times must not run backwards: once later motion has
         # reached apps, a release goes out stamped now.
         when = 0 if moved and not pressed else int(tick) & 0xFFFFFFFF
-        if pressed or not moved or not relocate or not api.relocation_allowed():
+        if (
+            pressed
+            or not moved
+            or not relocate
+            or not api.relocation_allowed()
+            or self._owner._is_near((x, y), here)
+        ):
             # A press goes where the pointer is: it is re-sent right after the
             # events that came before it, motion included. So does a release
-            # where the pointer still is, one made where the pointer's place
-            # means nothing (see button), and one whose way back isn't known.
+            # where the pointer still is, or still inside the drag rectangle
+            # around where the button came up (apps take that as the same
+            # spot, so the pointer needn't jump), one made where the
+            # pointer's place means nothing (see button), and one whose way
+            # back isn't known.
             return [(api.button_input(flags, when), button)]
         # The pointer has moved on: take it to where the button came up,
         # release it there and take it back, in one batch so the three arrive
@@ -1546,7 +1556,8 @@ class WindowsApi:
     def within_drag_rect(self, point: Optional[tuple], location: Optional[tuple]) -> bool:
         """Whether `location` is still on the spot `point`: inside the
         rectangle Windows itself uses to tell a click from a drag (DragDetect
-        starts a drag once the pointer leaves it). Runs on the hook thread."""
+        starts a drag once the pointer leaves it). Runs on the hook thread,
+        or inside physical_pixels() (a re-send deciding where to go)."""
         if point is None or location is None:
             return False
         try:
