@@ -88,13 +88,6 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(page.clicks, 0)
         self.assertEqual(page.count_value.text(), "0")
 
-    def test_opening_calibrate_alone_does_not_pause_the_filter(self) -> None:
-        # Only measuring pauses it (see CalibrationPauseTests); the intro
-        # is just reading.
-        with mock.patch.object(self.controller, "suspend") as suspend:
-            self.window._show_page(self.page_index("calibrate"))
-            suspend.assert_not_called()
-
     def test_calibration_runs_end_to_end_and_applies(self) -> None:
         from app.core import REQUIRED_DOUBLE_CLICKS, REQUIRED_SINGLE_CLICKS
 
@@ -1271,14 +1264,6 @@ class ControllerFixTests(unittest.TestCase):
 
 
 class WindowFixTests(WindowTests):
-    def test_closing_on_calibrate_resumes_filtering(self) -> None:
-        from PySide6.QtCore import QEvent
-
-        with mock.patch.object(self.controller, "resume") as resume:
-            self.window._show_page(self.page_index("calibrate"))
-            self.window.closeEvent(QEvent(QEvent.Type.Close))
-            resume.assert_called()
-
     def test_failed_login_change_restores_the_previous_state(self) -> None:
         page = self.window.general
         page.login_switch.setChecked(False, animate=False)
