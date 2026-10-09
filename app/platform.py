@@ -253,19 +253,26 @@ class GlobalClickFilter:
         # back in the order sent, so once one does, those before it came
         # back or never will (see _injected_passed).
         self._in_flight: dict[Button, deque] = {button: deque() for button in Button}
+        # Per button: the releases among them, as (number, when the release
+        # happened): another button's later events must not overtake them
+        # (see _follow_earlier_releases).
+        self._releases_in_flight: dict[Button, deque] = {button: deque() for button in Button}
         # Per button: the number its last re-send was given (see _resend).
         self._last_seq: dict[Button, int] = {button: 0 for button in Button}
         # Per button: real events waiting to be re-sent until its re-sent
         # events have come back. An entry is (order, pressed, template, sent
-        # as): order counts entries across every queue, pressed is None for
-        # motion, and "sent as" is the button the event is re-sent and counted
-        # in flight for, its own. Another button's event waits in this queue
-        # only behind a release it settled, and that button's later events
-        # then follow it here (see _handle and _queue_for).
+        # as, stamp): order counts entries across every queue, pressed is
+        # None for motion, "sent as" is the button the event is re-sent and
+        # counted in flight for, its own, and stamp is when it happened.
+        # Another button's event waits in this queue behind a release that
+        # came before it, and that button's later events then follow it here
+        # (see _handle and _queue_for).
         self._queued: dict[Button, list[tuple]] = {button: [] for button in Button}
         self._queue_order = itertools.count()
         # Per button: the other button's queue its events wait in, if they do.
         self._parked: dict[Button, Button] = {}
+        # Per button: when the first of its releases waiting in a queue happened.
+        self._queued_release_at: dict[Button, float] = {}
         # Per button: the one check that gives up on its re-sent events
         # should they never come back, as (timer, token) (see _arm_check).
         self._checks: dict[Button, tuple] = {}
@@ -315,8 +322,10 @@ class GlobalClickFilter:
         self._tap_disables.clear()
         for button in Button:
             self._in_flight[button].clear()
+            self._releases_in_flight[button].clear()
             self._queued[button].clear()
         self._parked.clear()
+        self._queued_release_at.clear()
         self._outbox.clear()
         self._motion_wanted = False
         self._thread = threading.Thread(target=self._run, name="dcf-hook", daemon=True)
@@ -411,7 +420,9 @@ class GlobalClickFilter:
 
         First, every held release this event's timestamp shows was real is
         settled, its own button's among them (see _settle_due); this event,
-        if it is to reach apps, then goes out behind them."""
+        if it is to reach apps, then goes out behind them, and behind its own
+        button's earlier events and other buttons' earlier releases that
+        have not reached apps yet."""
         arrived = monotonic()
         timestamp = self._normalise_time(timestamp)
         with self._lock:
@@ -421,6 +432,7 @@ class GlobalClickFilter:
             settled, behind = self._settle_due(timestamp)
             click_filter = self._filters[button]
             click_filter.enabled = button in self._active
+            held_at = click_filter.held_at
             event = click_filter.press(timestamp) if pressed else click_filter.release(timestamp, allow_hold)
             if event.is_bounce:
                 self.filtered_count += 1
@@ -448,33 +460,36 @@ class GlobalClickFilter:
                 # filtered): deliver it, behind whatever came before it, then
                 # this. (A press past the window has already settled it,
                 # above, and comes back deferred.)
-                queue = self._send_or_queue(button, self._held_templates.pop(button, None), behind)
+                queue = self._send_or_queue(button, self._held_templates.pop(button, None), held_at, behind)
                 self._forget_held(button)
                 if queue is None:
                     self._resend(button, True, template)
                 else:
-                    self._enqueue(queue, True, template, button)
+                    self._enqueue(queue, True, template, button, timestamp)
             if event.accepted:
                 # It must reach apps after the events of its button still
-                # waiting to be re-sent, and after the releases it settled,
-                # which happened first: it waits where they wait, or is
-                # re-sent right behind them.
+                # waiting to be re-sent, after the releases it settled, which
+                # happened first, and after another button's release that
+                # happened first and has not reached apps yet: it waits where
+                # they wait, or is re-sent right behind them.
                 queue = self._queue_for(button)
                 resend = False
                 if queue is None and allow_hold:
-                    queue = behind
-                    resend = bool(settled)
+                    earlier, on_way = self._follow_earlier_releases(button, timestamp)
+                    queue = behind if behind is not None else earlier
+                    resend = bool(settled) or (on_way and not self._in_flight[button])
                 if queue is None and not resend and self._in_flight[button]:
                     # Events of this button re-sent a moment ago may still be
                     # on their way. Letting this one through now could overtake
                     # them (apps would see down, down, up, up), so it goes out
-                    # after.
+                    # after them, and so after any release of another button
+                    # it follows that is on its way too.
                     queue = button
                 if queue is not None:
-                    self._enqueue(queue, pressed, template, button)
+                    self._enqueue(queue, pressed, template, button, timestamp)
                     event = replace(event, accepted=False, deferred=True)
                 elif resend:
-                    self._resend(button, pressed, template)
+                    self._resend(button, pressed, template, timestamp)
                     event = replace(event, accepted=False, deferred=True)
             if pressed and not event.is_bounce:
                 # Where apps saw the button go down. A press they never see (a
@@ -515,10 +530,11 @@ class GlobalClickFilter:
         them waits there, or else is re-sent right behind them."""
         behind = None
         for button in sorted(buttons, key=lambda each: self._filters[each].held_at):
+            released_at = self._filters[button].held_at
             self._filters[button].commit_held()
             template = self._held_templates.pop(button, None)
             self._forget_held(button)
-            behind = self._send_or_queue(button, template, behind)
+            behind = self._send_or_queue(button, template, released_at, behind)
         return buttons, behind
 
     def _fallback_delay(self, threshold_ms: float, released_at: float, arrived: float) -> float:
@@ -542,28 +558,58 @@ class GlobalClickFilter:
         """The threshold passed with no press: the held release was real.
         A timer passes the release it was started for."""
         with self._lock:
-            if self._filters[button].commit_held(expected):
+            click_filter = self._filters[button]
+            released_at = click_filter.held_at
+            if click_filter.commit_held(expected):
                 template = self._held_templates.pop(button, None)
                 self._forget_held(button)
-                self._send_or_queue(button, template)
+                self._send_or_queue(button, template, released_at)
         self._send_outbox()
         self._update_motion_tap()
 
-    def _send_or_queue(self, button: Button, template: object, behind: Optional[Button] = None) -> Optional[Button]:
-        """With the lock held: a held release is now to be delivered. It joins
-        the events of its button already waiting to be re-sent (see
-        _queue_for), since it came after them (sent first, apps could see
-        this release before its own press), or else `behind`, where an older
-        release settled with it waits. Returns the queue it joined, or None
-        when nothing had to wait and it is re-sent now."""
+    def _send_or_queue(
+        self, button: Button, template: object, released_at: float, behind: Optional[Button] = None
+    ) -> Optional[Button]:
+        """With the lock held: a held release, made at `released_at`, is now
+        to be delivered. It joins the events of its button already waiting to
+        be re-sent (see _queue_for), since it came after them (sent first,
+        apps could see this release before its own press), or else `behind`,
+        where an older release settled with it waits, or else the queue where
+        another button's earlier release waits (see
+        _follow_earlier_releases). Returns the queue it joined, or None when
+        nothing had to wait and it is re-sent now."""
         queue = self._queue_for(button)
         if queue is None:
             queue = behind
         if queue is None:
-            self._resend(button, False, template)
+            queue, _on_way = self._follow_earlier_releases(button, released_at)
+        if queue is None:
+            self._resend(button, False, template, released_at)
         else:
-            self._enqueue(queue, False, template, button)
+            self._enqueue(queue, False, template, button, released_at)
         return queue
+
+    def _follow_earlier_releases(self, button: Button, stamp: float) -> tuple[Optional[Button], bool]:
+        """With the lock held: whether an event of `button` that happened at
+        `stamp` has to follow another button's release that happened before
+        it and has not reached apps yet; going first, it would show apps the
+        two buttons down together when they never were. Returns the queue to
+        wait in, when that button has events waiting in one (the release
+        among them, or ahead of them), and whether such a release is on its
+        way: then the event is to be re-sent, which puts it right behind."""
+        on_way = False
+        for other in Button:
+            if other is button:
+                continue
+            releases = self._releases_in_flight[other]
+            queued_at = self._queued_release_at.get(other)
+            if not ((releases and releases[0][1] < stamp) or (queued_at is not None and queued_at < stamp)):
+                continue
+            queue = self._queue_for(other)
+            if queue is not None:
+                return queue, False
+            on_way = True
+        return None, on_way
 
     def _forget_held(self, button: Button) -> None:
         """With the lock held: the held release is settled one way or another."""
@@ -673,33 +719,44 @@ class GlobalClickFilter:
         """With the lock held: the queue an event of `button` joins to reach
         apps after everything of that button still waiting to be re-sent, or
         None when nothing waits. That is its own queue, unless its events
-        wait in another button's queue behind a release they settled (see
-        _handle): its later events follow them there, or they would overtake
-        them."""
+        wait in another button's queue behind a release that came before
+        them (see _handle): its later events follow them there, or they would
+        overtake them."""
         parked = self._parked.get(button)
         if parked is not None:
             return parked
         return button if self._queued[button] else None
 
     def _enqueue(
-        self, button: Button, pressed: Optional[bool], template: object, send_as: Optional[Button] = None
+        self,
+        button: Button,
+        pressed: Optional[bool],
+        template: object,
+        send_as: Optional[Button] = None,
+        stamp: Optional[float] = None,
     ) -> None:
         """With the lock held: queue an event behind `button`'s re-sent ones.
-        `send_as` is the event's own button, if not `button`."""
+        `send_as` is the event's own button, if not `button`, and `stamp` when
+        it happened."""
         send_as = button if send_as is None else send_as
         self._motion_wanted = True
-        self._queued[button].append((next(self._queue_order), pressed, template, send_as))
+        self._queued[button].append((next(self._queue_order), pressed, template, send_as, stamp))
         if send_as is not button:
             self._parked[send_as] = button
+        if pressed is False and stamp is not None:
+            self._queued_release_at.setdefault(send_as, stamp)
         self._arm_check(button)
 
-    def _resend(self, button: Button, pressed: Optional[bool], template: object) -> None:
+    def _resend(self, button: Button, pressed: Optional[bool], template: object, stamp: Optional[float] = None) -> None:
         """With the lock held: re-send an event as `button`, in turn. It gets
         the next number in that button's sequence, which its mark carries, and
-        counts in flight until the hook sees it come back."""
+        counts in flight until the hook sees it come back. `stamp` is when it
+        happened, for a release."""
         self._last_seq[button] += 1
         seq = self._last_seq[button]
         self._in_flight[button].append((seq, monotonic()))
+        if pressed is False and stamp is not None:
+            self._releases_in_flight[button].append((seq, stamp))
         self._outbox.append((button, pressed, template, seq))
         self._motion_wanted = True
 
@@ -765,6 +822,11 @@ class GlobalClickFilter:
                 if in_flight[index][0] == seq:
                     del in_flight[index]
                     break
+            releases = self._releases_in_flight[button]
+            for index in range(len(releases) - 1, -1, -1):
+                if releases[index][0] == seq:
+                    del releases[index]
+                    break
             if not in_flight:
                 self._take_queue(button)
         self._send_outbox()
@@ -776,6 +838,9 @@ class GlobalClickFilter:
         in_flight = self._in_flight[button]
         while in_flight and in_flight[0][0] <= number:
             in_flight.popleft()
+        releases = self._releases_in_flight[button]
+        while releases and releases[0][0] <= number:
+            releases.popleft()
         if not in_flight:
             self._take_queue(button)
 
@@ -786,11 +851,12 @@ class GlobalClickFilter:
 
     def _resend_queued(self, queued: list) -> None:
         """With the lock held: re-send these queue entries, in order."""
-        for _order, pressed, template, send_as in queued:
+        for _order, pressed, template, send_as, stamp in queued:
             if pressed is not None:
                 # A button's waiting events all wait in one queue: this one.
                 self._parked.pop(send_as, None)
-            self._resend(send_as, pressed, template)
+                self._queued_release_at.pop(send_as, None)
+            self._resend(send_as, pressed, template, stamp)
 
     # -- giving up on re-sent events ------------------------------------------
     def _in_flight_timeout(self) -> float:
@@ -858,6 +924,7 @@ class GlobalClickFilter:
             waiting = sorted((entry for button in Button for entry in self._queued[button]), key=lambda entry: entry[0])
             for button in Button:
                 self._in_flight[button].clear()
+                self._releases_in_flight[button].clear()
                 self._queued[button] = []
             self._resend_queued(waiting)
         self._send_outbox()

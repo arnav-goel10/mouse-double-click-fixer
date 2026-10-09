@@ -451,7 +451,8 @@ class EventTimeTests(unittest.TestCase):
         self.handle(Button.LEFT, False, 100.100, "up1")
         self.timers[-1].fire()                                        # up1 re-sent, still on its way
         self.assertTrue(self.handle(Button.LEFT, True, 100.150, "down2").deferred)
-        self.assertTrue(self.handle(Button.RIGHT, True, 100.160, "rdown").accepted)
+        # It came after up1, which has not reached apps: it waits with down2.
+        self.assertTrue(self.handle(Button.RIGHT, True, 100.160, "rdown").deferred)
         self.assertTrue(self.handle(Button.LEFT, False, 100.200, "up2").held)
         self.assertTrue(self.handle(Button.RIGHT, False, 100.210, "rup").held)
         # A right press past both windows: up2, the older, must wait behind
@@ -462,6 +463,7 @@ class EventTimeTests(unittest.TestCase):
         self.assertEqual(self.sent, [
             (Button.LEFT, False, "up1"),
             (Button.LEFT, True, "down2"),
+            (Button.RIGHT, True, "rdown"),
             (Button.LEFT, False, "up2"),
             (Button.RIGHT, False, "rup"),
             (Button.RIGHT, True, "rdown2"),
@@ -679,7 +681,8 @@ class EventTimeTests(unittest.TestCase):
         check = self.timers[-1]
         self.assertAlmostEqual(self.check_due(), 100.200 + 0.150 + IN_FLIGHT_CHECK_SLACK_S, places=9)
         # A click reaches the hook 180 ms late: up1 may be that late too.
-        self.assertTrue(self.handle(Button.RIGHT, True, 100.215, "rdown", late_ms=180).accepted)
+        # (It happened after up1, so it waits behind it.)
+        self.assertTrue(self.handle(Button.RIGHT, True, 100.215, "rdown", late_ms=180).deferred)
         self.clock[0] = 100.410
         check.fire()
         self.assertEqual(self.sent, [(Button.LEFT, False, "up1")], "not overdue any more")
@@ -688,7 +691,9 @@ class EventTimeTests(unittest.TestCase):
         self.assertAlmostEqual(self.check_due(), 100.200 + 0.360 + IN_FLIGHT_CHECK_SLACK_S, places=9)
         self.clock[0] = 100.566
         recheck.fire()
-        self.assertEqual(self.sent, [(Button.LEFT, False, "up1"), (Button.LEFT, True, "down2")])
+        self.assertEqual(
+            self.sent, [(Button.LEFT, False, "up1"), (Button.LEFT, True, "down2"), (Button.RIGHT, True, "rdown")]
+        )
 
     def test_a_real_race_between_the_timer_and_an_event_delivers_once(self) -> None:
         for _round in range(300):
@@ -1013,6 +1018,51 @@ class SendOrderTests(unittest.TestCase):
             go.set()
             timer.join(5)
         self.assertEqual(sent, ["lup1", "rup", "ldown2"])
+
+
+class CrossButtonOrderTests(unittest.TestCase):
+    """An event never reaches apps before another button's release that
+    happened first: they would see both buttons down when they never were."""
+
+    def test_a_press_after_another_buttons_release_on_its_way_follows_it(self) -> None:
+        rig = Pipeline(self, buttons=(Button.LEFT, Button.RIGHT))
+        rig.round_trip = None
+        rig.handle(Button.LEFT, True, 100.000, "ldown")
+        rig.handle(Button.LEFT, False, 100.100, "lup")
+        rig.run_until(100.150)                                        # lup re-sent
+        rdown = rig.handle(Button.RIGHT, True, 100.160, "rdown")
+        self.assertTrue(rdown.deferred)
+        self.assertFalse(rdown.is_bounce)
+        self.assertEqual(rig.sent, [(Button.LEFT, False, "lup"), (Button.RIGHT, True, "rdown")], "right behind it")
+
+    def test_a_press_from_before_another_buttons_release_goes_straight_through(self) -> None:
+        rig = Pipeline(self, buttons=(Button.LEFT, Button.RIGHT))
+        rig.round_trip = None
+        rig.handle(Button.LEFT, True, 100.000, "ldown")
+        rig.handle(Button.LEFT, False, 100.100, "lup")
+        rig.run_until(100.150)
+        self.assertTrue(rig.handle(Button.RIGHT, True, 100.095, "rdown", late_ms=60).accepted)
+
+    def test_a_timer_settled_release_follows_another_buttons_queued_release(self) -> None:
+        rig = Pipeline(self, buttons=(Button.LEFT, Button.RIGHT))
+        rig.round_trip = None
+        rig.handle(Button.RIGHT, True, 100.000, "rdown1")
+        rig.handle(Button.LEFT, True, 100.050, "ldown")
+        rig.handle(Button.RIGHT, False, 100.100, "rup1")
+        rig.run_until(100.150)                                        # rup1 re-sent
+        self.assertTrue(rig.handle(Button.RIGHT, True, 100.160, "rdown2").deferred)
+        self.assertTrue(rig.handle(Button.RIGHT, False, 100.200, "rup2").held)
+        self.assertTrue(rig.handle(Button.LEFT, False, 100.210, "lup").held)
+        self.assertFalse(rig.move(100.241, "m", (0, 0)))              # settles rup2: it queues behind rdown2
+        rig.run_until(100.290)                                        # the left timer settles lup
+        self.assertEqual(rig.sent, [(Button.RIGHT, False, "rup1")], "lup waits behind rup2")
+        come_back(rig.filter, Button.RIGHT)
+        self.assertEqual(rig.sent[1:], [
+            (Button.RIGHT, True, "rdown2"),
+            (Button.RIGHT, False, "rup2"),
+            (Button.RIGHT, None, "m"),
+            (Button.LEFT, False, "lup"),
+        ])
 
 
 class InFlightTimeoutTests(unittest.TestCase):
