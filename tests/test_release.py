@@ -437,23 +437,32 @@ class CiUpdateKeyGuardTests(unittest.TestCase):
 
 @unittest.skipIf(sys.platform == "win32" or shutil.which("bash") is None, "a bash script")
 class InjectionCheckScriptTests(unittest.TestCase):
-    """tools/macos_injection_check.sh with csrutil, clang, codesign and the
-    app's self-test faked: which legs run with System Integrity Protection on
-    and off, and what fails."""
+    """tools/macos_injection_check.sh with csrutil, clang, codesign, env and
+    the app's self-test faked: which legs run with System Integrity Protection
+    on and off, and what fails."""
 
     #: Stands in for the app's --self-test. FAKE_LOADS names the canaries that
     #: get in: dyld only does when SIP is off (or the app isn't hardened).
-    #: macOS drops DYLD_* variables when it starts /bin/sh, which SIP protects
-    #: (and a real loader would load the fake canary), so the dyld leg is told
-    #: apart as the one that sets neither of the other legs' variables.
     APP = """#!/bin/sh -p
-leg=dyld
-[ -n "$OPENSSL_CONF" ] && leg=openssl
-[ -n "$BASH_ENV" ] && leg=path
-case " $FAKE_LOADS " in
-  *" $leg "*) echo loaded > "$DCF_CANARY_DIR/dcf-canary-$leg" ;;
-esac
+for canary in $FAKE_LOADS; do
+  case "$canary" in
+    dyld) [ -n "$FAKE_DYLD_INSERT_LIBRARIES" ] && echo loaded > "$DCF_CANARY_DIR/dcf-canary-dyld" ;;
+    openssl) [ -n "$OPENSSL_CONF" ] && echo loaded > "$DCF_CANARY_DIR/dcf-canary-openssl" ;;
+  esac
+done
 exit 0
+"""
+    #: Runs the app as env does, with each DYLD_* variable renamed FAKE_DYLD_*:
+    #: a real loader would otherwise act on the fake canary (SIP off) or drop
+    #: the variable (SIP on, when it starts /bin/sh) before the app could look.
+    ENV = """for argument do
+  shift
+  case "$argument" in
+    DYLD_*=*) set -- "$@" "FAKE_$argument" ;;
+    *) set -- "$@" "$argument" ;;
+  esac
+done
+exec /usr/bin/env "$@"
 """
 
     def setUp(self) -> None:
@@ -465,6 +474,7 @@ exit 0
             "csrutil": 'echo "System Integrity Protection status: $FAKE_SIP."',
             "clang": 'while [ $# -gt 0 ]; do [ "$1" = -o ] && : > "$2"; shift; done',
             "codesign": "exit 0",
+            "env": self.ENV,
         }
         for name, body in programs.items():
             (self.fakes / name).write_text(f"#!/bin/sh\n{body}\n", encoding="utf-8")
