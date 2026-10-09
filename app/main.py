@@ -199,6 +199,14 @@ class Application:
         # runs from the menu bar shows the window. Installed once the event
         # loop runs, after AppKit has registered its own handler.
         QTimer.singleShot(0, lambda: dock.on_reopen(self.show_window))
+        # Sleep and session switches can leave the event taps dead or in the
+        # way; the window rebuilds or stops the filter on them.
+        dock.observe_system(
+            on_wake=self.window.system_woke,
+            on_session_active=self.window.session_activated,
+            on_session_inactive=self.window.session_resigned,
+            on_permission_change=self.window.check_permission_soon,
+        )
 
     def _build_menu_bar(self) -> Optional[QMenuBar]:
         """macOS app menu: About, Settings… (⌘,) and Quit, where users expect them."""
@@ -311,8 +319,9 @@ class Application:
 
         if self.controller.settings["fix_enabled"] and self.controller.supported():
             # Restore the filter after the UI is up, so any failure has a
-            # window to be reported in.
-            QTimer.singleShot(0, lambda: self.window.request_filter(True, prompt=not minimized))
+            # window to be reported in, or, in the background, the menu's
+            # status line and a few more tries.
+            QTimer.singleShot(0, lambda: self.window.restore_filter(background=minimized))
         elif not self.controller.supported():
             QTimer.singleShot(0, self._warn_unsupported)
 

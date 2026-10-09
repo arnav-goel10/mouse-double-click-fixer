@@ -8,6 +8,12 @@ from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import logging
+
+# The app logs failures on purpose; keep them out of the test output.
+logging.getLogger("app").addHandler(logging.NullHandler())
+logging.getLogger("app").propagate = False
+
 from run import _unhide_qt_plugins
 
 _unhide_qt_plugins()
@@ -151,7 +157,7 @@ class WindowTests(unittest.TestCase):
 
         with mock.patch("app.permissions.needs_accessibility", return_value=True), mock.patch(
             "app.permissions.has_accessibility", return_value=True
-        ):
+        ), mock.patch("app.permissions.event_tap_allowed", return_value=True):
             self.window._check_permission()
             self.assertTrue(notice.isHidden(), "the notice must go once permission is granted")
 
@@ -169,7 +175,8 @@ class WindowTests(unittest.TestCase):
 
         with mock.patch("app.permissions.needs_accessibility", return_value=True), mock.patch(
             "app.permissions.has_accessibility", return_value=True
-        ), mock.patch.object(self.controller, "set_active", return_value=True) as started:
+        ), mock.patch("app.permissions.event_tap_allowed", return_value=True), \
+                mock.patch.object(self.controller, "set_active", return_value=True) as started:
             self.window._check_permission()
             started.assert_called_once_with(True)
 
@@ -392,6 +399,158 @@ class CalibrationPauseTests(LiveWindowTests):
         self.assertFalse(self.controller.settings["fix_enabled"])
         self.window.calibrate._finish()
         self.assertFalse(self.controller.active, "stays off after calibration")
+
+
+class KeepFilterAliveTests(LiveWindowTests):
+    """Fail open, and never lose the user's on (plan item 6)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        warning = mock.patch("app.ui.window.QMessageBox.warning")
+        self.dialog = warning.start()
+        self.addCleanup(warning.stop)
+
+    def fire_retry(self) -> None:
+        """What the single-shot retry timer does when it runs out."""
+        self.window._retry_timer.stop()
+        self.window._retry_start()
+
+    def test_revoked_access_is_caught_even_when_ax_still_says_yes(self) -> None:
+        self.controller.set_active(True)
+        with mock.patch("app.permissions.needs_accessibility", return_value=True), \
+                mock.patch("app.permissions.has_accessibility", return_value=True), \
+                mock.patch("app.permissions.event_tap_allowed", return_value=False) as probe:
+            self.window._permission_granted = True
+            self.window._check_permission()
+            probe.assert_called()
+            self.assertFalse(self.controller.active, "no filtering tap on a dead grant")
+            self.assertTrue(self.controller.settings["fix_enabled"])
+            self.assertTrue(self.controller.waiting_for_permission)
+            self.window._check_permission()  # still refused: no restart attempt
+            self.assertFalse(self.controller.active)
+        with mock.patch("app.permissions.needs_accessibility", return_value=True), \
+                mock.patch("app.permissions.has_accessibility", return_value=True), \
+                mock.patch("app.permissions.event_tap_allowed", return_value=True):
+            self.window._check_permission()
+            self.assertTrue(self.controller.active, "back on once access returns")
+
+    def test_the_probe_only_runs_while_it_matters(self) -> None:
+        with mock.patch("app.permissions.needs_accessibility", return_value=True), \
+                mock.patch("app.permissions.has_accessibility", return_value=True), \
+                mock.patch("app.permissions.event_tap_allowed") as probe:
+            self.window._permission_granted = True
+            self.window._check_permission()
+            probe.assert_not_called()
+
+    def test_a_dead_hook_keeps_the_choice_and_stays_quiet_when_hidden(self) -> None:
+        self.controller.set_active(True)
+        self.window._on_hook_failed("The hook stopped.")
+        self.assertTrue(self.controller.settings["fix_enabled"])
+        self.assertEqual(self.controller.status_text(), "The filter stopped")
+        self.dialog.assert_not_called()
+
+    def test_failures_show_a_dialog_only_when_the_window_is_up(self) -> None:
+        self.controller._store(fix_enabled=True)
+        FakeFilter.fail_with = "macOS refused the event tap."
+        self.window.request_filter(True)
+        self.dialog.assert_not_called()
+        self.assertEqual(self.controller.status_text(), "Couldn't start the filter")
+        self.window.show()
+        self.assertIn("refused", self.window.filter_page.status_row.detail.text())
+        self.window.request_filter(True)
+        self.dialog.assert_called_once()
+
+    def test_a_background_start_retries_on_schedule(self) -> None:
+        from app.ui.window import RETRY_AT_S
+
+        self.controller._store(fix_enabled=True)
+        FakeFilter.fail_with = "macOS refused the event tap."
+        self.window.restore_filter(background=True)
+        self.assertTrue(self.window._retry_timer.isActive())
+        waits = [self.window._retry_timer.interval()]
+        for _ in range(len(RETRY_AT_S) - 1):
+            self.fire_retry()
+            waits.append(self.window._retry_timer.interval())
+        self.fire_retry()  # the last try
+        self.assertFalse(self.window._retry_timer.isActive(), "then it is left to the user")
+        marks = [sum(waits[: index + 1]) / 1000 for index in range(len(waits))]
+        self.assertEqual(tuple(marks), RETRY_AT_S)
+        self.assertTrue(self.controller.settings["fix_enabled"], "still on for the next login")
+        self.dialog.assert_not_called()
+
+    def test_a_retry_that_works_ends_the_retries(self) -> None:
+        self.controller._store(fix_enabled=True)
+        FakeFilter.fail_with = "busy"
+        self.window.restore_filter(background=True)
+        FakeFilter.fail_with = None
+        self.fire_retry()
+        self.assertTrue(self.controller.active)
+        self.assertFalse(self.window._retry_timer.isActive())
+        self.assertEqual(self.controller.failure, "")
+
+    def test_turning_off_ends_the_retries(self) -> None:
+        self.controller._store(fix_enabled=True)
+        FakeFilter.fail_with = "busy"
+        self.window.restore_filter(background=True)
+        self.window.request_filter(False)
+        self.assertFalse(self.window._retry_timer.isActive())
+
+    def test_an_opened_window_does_not_retry_by_itself(self) -> None:
+        self.controller._store(fix_enabled=True)
+        FakeFilter.fail_with = "busy"
+        self.window.show()
+        self.window.restore_filter(background=False)
+        self.assertFalse(self.window._retry_timer.isActive())
+        self.dialog.assert_called_once()
+
+    def test_a_dead_tap_is_rebuilt(self) -> None:
+        self.controller.set_active(True)
+        old = self.controller._filter
+        self.assertTrue(self.window._health_timer.isActive(), "watched while filtering")
+        old.tap_alive = lambda: False
+        self.window._check_health()
+        self.assertTrue(old.stopped)
+        self.assertIsNot(self.controller._filter, old)
+        self.assertTrue(self.controller.active)
+        self.controller.set_active(False)
+        self.assertFalse(self.window._health_timer.isActive())
+
+    def test_a_live_tap_is_left_alone(self) -> None:
+        self.controller.set_active(True)
+        current = self.controller._filter
+        current.tap_alive = lambda: True
+        self.window._check_health()
+        self.assertIs(self.controller._filter, current)
+
+    def test_wake_rebuilds_a_filter_that_is_on(self) -> None:
+        self.controller.set_active(True)
+        old = self.controller._filter
+        self.window.system_woke()
+        self.assertTrue(old.stopped)
+        self.assertTrue(self.controller.active)
+
+    def test_wake_leaves_an_off_filter_off(self) -> None:
+        self.window.system_woke()
+        self.assertFalse(self.controller.active)
+
+    def test_switching_sessions_stops_and_restarts(self) -> None:
+        self.controller.set_active(True)
+        self.window.session_resigned()
+        self.assertFalse(self.controller.active, "no tap in a session nobody is using")
+        self.assertTrue(self.controller.settings["fix_enabled"])
+        self.window.system_woke()  # nothing starts while away
+        self.assertFalse(self.controller.active)
+        self.window.session_activated()
+        self.assertTrue(self.controller.active)
+
+    def test_wake_does_not_end_a_calibration_pause(self) -> None:
+        self.controller.set_active(True)
+        self.window.show()
+        self.window._show_page(self.page_index("calibrate"))
+        self.window.calibrate._advance()
+        self.window.system_woke()
+        self.assertFalse(self.controller.active)
+        self.assertTrue(self.controller.suspended)
 
 
 class MenuBarItemTests(unittest.TestCase):

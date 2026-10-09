@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from PySide6.QtCore import QByteArray, QEvent, QRect, QTimer, Qt, Signal
@@ -49,8 +50,17 @@ from .widgets import (
     set_look,
 )
 
+log = logging.getLogger(__name__)
+
 #: A pause longer than this starts a new pair while calibrating double-clicks.
 PAIR_WINDOW_MS = 600.0
+
+#: A background launch whose filter fails to start tries again this many
+#: seconds later: at login the window server or the permission database can
+#: answer a moment late.
+RETRY_AT_S = (1, 3, 8, 20)
+#: How often a running filter is checked for a tap that stopped working.
+HEALTH_CHECK_MS = 5000
 
 #: Content never stretches wider than this; extra window width becomes margin,
 #: so a label always stays within reach of its control.
@@ -803,8 +813,9 @@ class MainWindow(QWidget):
         self._save_timer.timeout.connect(controller.flush_stats)
         self._save_timer.start()
 
-        # macOS sends no notification when Accessibility is granted or revoked,
-        # so poll it. The check is a cheap local query.
+        # macOS sends no reliable notification when Accessibility is granted
+        # or revoked, so poll it every second (see _check_permission). While
+        # filtering, that poll is also the guard against a revoked grant.
         self._permission_granted = permissions.has_accessibility()
         self._enable_when_granted = False
         self._permission_timer = QTimer(self)
@@ -812,6 +823,22 @@ class MainWindow(QWidget):
         self._permission_timer.timeout.connect(self._check_permission)
         if permissions.needs_accessibility():
             self._permission_timer.start()
+
+        # A tap macOS disabled and couldn't re-arm lets every click through;
+        # look now and then, and rebuild it.
+        self._health_timer = QTimer(self)
+        self._health_timer.setInterval(HEALTH_CHECK_MS)
+        self._health_timer.timeout.connect(self._check_health)
+
+        # Retries for a filter that failed to start in the background.
+        self._retry_timer = QTimer(self)
+        self._retry_timer.setSingleShot(True)
+        self._retry_timer.timeout.connect(self._retry_start)
+        self._retry_waits: list[int] = []
+
+        # False while the user is in another login session (macOS fast user
+        # switching), where a tap left running would stall that session.
+        self._session_active = True
 
         self._show_page(0)
         self._restore_geometry()
@@ -942,10 +969,24 @@ class MainWindow(QWidget):
         self.test_page.refresh()
         self.general.refresh(granted)
 
+    def _read_permission(self) -> bool:
+        if not permissions.has_accessibility():
+            return False
+        if self.controller.active or self._enable_when_granted:
+            # AXIsProcessTrusted can stay true after the app is removed from
+            # the list, and a filtering tap left on a dead grant can stall
+            # input everywhere. A throwaway tap tells the truth. Only asked
+            # while it matters: filtering, or about to start.
+            return permissions.event_tap_allowed()
+        return True
+
     def _check_permission(self) -> None:
-        granted = permissions.has_accessibility()
+        if not self._session_active:
+            return  # nothing runs in another user's session; check on return
+        granted = self._read_permission()
         if granted == self._permission_granted:
             return
+        log.info("Permission %s", "granted" if granted else "withdrawn")
         self._permission_granted = granted
         if granted and self._enable_when_granted:
             # The user already asked for the filter; finish the job (after
@@ -959,6 +1000,11 @@ class MainWindow(QWidget):
             self.controller.stop_for_permission()
             self._enable_when_granted = True
         self.refresh()
+
+    def check_permission_soon(self) -> None:
+        """The Accessibility list just changed. macOS posts that a moment
+        before the new answer can be read, so look shortly after."""
+        QTimer.singleShot(300, self._check_permission)
 
     def request_filter(self, checked: bool, prompt: bool = True) -> None:
         """Turn the filter on or off from anywhere: the switch, the menu, launch.
@@ -990,6 +1036,13 @@ class MainWindow(QWidget):
         self.refresh()
 
     def _on_filter_state(self, _active: bool, error: str) -> None:
+        if self.controller.active:
+            self._health_timer.start()
+        else:
+            self._health_timer.stop()
+        if self.controller.active or not self.controller.settings["fix_enabled"]:
+            self._retry_waits.clear()
+            self._retry_timer.stop()
         self.refresh()
         if error and self._on_screen():
             QMessageBox.warning(self, "The filter couldn’t start", error)
@@ -1001,6 +1054,74 @@ class MainWindow(QWidget):
         self.refresh()
         if self._on_screen():
             QMessageBox.warning(self, "The filter stopped", message)
+
+    # -- keeping the filter alive ------------------------------------------------
+    def restore_filter(self, background: bool) -> None:
+        """Turn the saved "on" back on at launch.
+
+        A background launch (at login) shows nothing if the tap is refused:
+        the menu's status line says so, and it tries again at each of
+        RETRY_AT_S before leaving it to the user.
+        """
+        self.request_filter(True, prompt=not background)
+        if background and self._start_failed():
+            marks = (0, *RETRY_AT_S)
+            self._retry_waits = [int((later - earlier) * 1000) for earlier, later in zip(marks, marks[1:])]
+            self._retry_timer.start(self._retry_waits.pop(0))
+
+    def _start_failed(self) -> bool:
+        controller = self.controller
+        return (
+            bool(controller.failure)
+            and controller.settings["fix_enabled"]
+            and not controller.active
+            and not controller.suspended
+            and not controller.waiting_for_permission
+        )
+
+    def _retry_start(self) -> None:
+        if not self._start_failed():
+            self._retry_waits.clear()
+            return
+        log.info("Trying the filter again")
+        self.request_filter(True, prompt=False)
+        if self._start_failed() and self._retry_waits:
+            self._retry_timer.start(self._retry_waits.pop(0))
+
+    def restart_filter(self) -> None:
+        """Start the filter afresh if the user has it on: after sleep, on
+        coming back to this login session, or when its tap stopped working.
+        Taps made before sleep or a session switch can be left dead."""
+        controller = self.controller
+        if not self._session_active or controller.suspended or self._enable_when_granted:
+            return
+        if not controller.settings["fix_enabled"]:
+            return
+        controller.stop_keeping_choice()
+        self.request_filter(True, prompt=False)
+
+    def _check_health(self) -> None:
+        if self.controller.active and not self.controller.tap_alive():
+            log.warning("The event tap stopped receiving events; rebuilding it")
+            self.restart_filter()
+
+    def system_woke(self) -> None:
+        log.info("Woke from sleep")
+        self.restart_filter()
+
+    def session_resigned(self) -> None:
+        """The user switched to another login session. A tap left running in
+        an inactive session can stall the active one, so stop it; stop()
+        sends any release it was holding first."""
+        log.info("Session switched away")
+        self._session_active = False
+        if self.controller.active:
+            self.controller.stop_keeping_choice()
+
+    def session_activated(self) -> None:
+        log.info("Session active again")
+        self._session_active = True
+        self.restart_filter()
 
     def _on_screen(self) -> bool:
         """Whether a failure can be shown in a dialog. With the window closed
