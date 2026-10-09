@@ -33,9 +33,18 @@ jobs:
         run: python -m unittest discover -s tests -v
         env:
           QT_QPA_PLATFORM: offscreen
-      - name: Build portable Windows executable
+      - name: Refuse CI's throwaway update key
+        # CI's end-to-end build trusts a key made for that run; a release must
+        # trust the release keys only (see tools/ci_update_key.py).
+        shell: pwsh
+        run: |
+          if ($env:DCF_CI_UPDATE_KEY) { throw "DCF_CI_UPDATE_KEY is set: a release must never trust CI's update key" }
+      - name: Build the portable executable and the installed folder
         shell: pwsh
         run: .\installer\build_windows.ps1
+      - name: Confirm no build carries CI's update key
+        shell: pwsh
+        run: python tools/ci_update_key.py check dist\DoubleClickFixer.exe dist\onedir
       - name: Build Windows installer
         shell: pwsh
         run: |

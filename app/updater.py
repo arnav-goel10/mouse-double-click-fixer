@@ -72,6 +72,11 @@ RELEASE_KEYS = (
 #: copy running from source reads it: a packaged app never takes a key from its
 #: environment, which whatever starts the app controls.
 TEST_KEY_ENV = "DCF_UPDATE_TEST_KEY"
+#: CI's end-to-end build of the Windows app carries one more key, made for that
+#: run and thrown away after it, as a file beside the app's own (see
+#: tools/ci_update_key.py). release.yml refuses to build with it, so no release
+#: has the file; and anyone able to put it there could replace the app itself.
+CI_KEY_FILE = "dcf-ci-update-key.pub"
 
 #: The Windows update scripts find the running app and the download through
 #: these. cmd reads a batch file in the OEM code page, which can't spell every
@@ -188,9 +193,30 @@ def release_from_json(data: dict, kind: str) -> Optional[Release]:
     )
 
 
+def _ci_key() -> Optional[PublicKey]:
+    """CI's throwaway key, in a packaged app built by CI's end-to-end job."""
+    bundled = getattr(sys, "_MEIPASS", None)
+    if not getattr(sys, "frozen", False) or not bundled:
+        return None
+    path = Path(bundled) / CI_KEY_FILE
+    if not path.is_file():
+        return None
+    try:
+        key = parse_public_key(path.read_text(encoding="ascii"))
+    except (OSError, ValueError) as error:  # SignatureError is a ValueError
+        log.warning("Ignored an unreadable %s: %s", CI_KEY_FILE, error)
+        return None
+    log.warning("This build trusts CI's throwaway update key %s", key.key_id_text)
+    return key
+
+
 def trusted_keys() -> list[PublicKey]:
-    """The release keys, plus the test key when running from source."""
+    """The release keys, plus the test key when running from source, or CI's
+    throwaway key in a build made for CI's end-to-end test."""
     keys = [parse_public_key(text) for text in RELEASE_KEYS]
+    ci_key = _ci_key()
+    if ci_key is not None:
+        keys.append(ci_key)
     test_key = os.environ.get(TEST_KEY_ENV, "")
     if test_key and not getattr(sys, "frozen", False):
         keys.append(parse_public_key(test_key))

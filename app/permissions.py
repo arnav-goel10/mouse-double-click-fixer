@@ -59,7 +59,7 @@ def macos_major() -> int:
         return major
     try:
         darwin = int(os.uname().release.split(".")[0])
-    except ValueError:
+    except (ValueError, AttributeError):  # AttributeError: no uname (Windows, under tests)
         return major
     if darwin >= 26:
         return max(darwin, 27)

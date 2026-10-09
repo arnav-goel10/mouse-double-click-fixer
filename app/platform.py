@@ -2,20 +2,23 @@
 
 Both backends run on a dedicated thread, feed a per-button :class:`BounceFilter`
 and drop the events the filter rejects before any other application sees them.
-Timestamps come from the operating system's own event records rather than from
-when Python happened to wake up, so a busy machine cannot inflate a gap and let
-bounce through.
+Timestamps come from the operating system's own event records, or on Windows,
+whose records are only as fine as its 15.6 ms tick, from a precise clock read
+as the event arrives with any lateness the tick shows taken off, so a busy
+machine cannot inflate a gap and let bounce through.
 """
 
 from __future__ import annotations
 
+import itertools
 import logging
 import math
 import os
 import platform
 import threading
+from contextlib import contextmanager
 from time import monotonic, perf_counter
-from typing import Callable, Iterable, Optional
+from typing import Callable, Iterable, NamedTuple, Optional
 
 from dataclasses import replace
 
@@ -39,6 +42,26 @@ MOTION_MARK_FOR = {button: mark for mark, button in INJECTED_MOTION_MARKS.items(
 #: Marks the pointer motion this app posts to put the pointer back after a
 #: re-sent release pulled it to where the button came up (see _run_macos).
 RESTORE_MARK = max(INJECTED_MOTION_MARKS) + 1
+
+#: Marks the pointer motion that takes the pointer to where a held release
+#: happened, just before the release is re-sent there (Windows; see
+#: WindowsHook). The move back after it carries the button's motion mark.
+TELEPORT_MARK = RESTORE_MARK + 1
+
+#: Windows tags mouse messages it makes from pen and touch input with this
+#: signature in dwExtraInfo (the low byte varies). They are absolute
+#: positions, not hand motion, so they are never held back or re-based.
+PEN_SIGNATURE_MASK = 0xFFFFFF00
+PEN_SIGNATURE = 0xFF515700
+
+#: GetTickCount, which stamps Windows input, advances in ticks of 15.6 ms. An
+#: event whose stamp is this much older than the tick count when the hook
+#: sees it may still have come at once.
+TICK_MS = 16
+
+#: Windows silently removes a low-level hook it judges too slow, and says
+#: nothing. The hook is re-installed this often in case that happened unseen.
+WINDOWS_REARM_INTERVAL_MS = 15_000
 
 #: A release this close to where apps saw its press counts as a click made in
 #: place (not the end of a drag). Motion that takes the pointer this far from
@@ -146,6 +169,8 @@ class GlobalClickFilter:
         self._thread_id: Optional[int] = None
         self._tap = None
         self._run_loop = None
+        # The Windows hook's hidden window (see SessionWindow), while it runs.
+        self._hook_window = None
         self._use_os_time: Optional[bool] = None
         self._started = False
         # Why the hook last ended, for the log.
@@ -159,6 +184,13 @@ class GlobalClickFilter:
         self._held_points: dict[Button, Optional[tuple[float, float]]] = {}
         # Per button: where the last press that reached apps landed.
         self._press_points: dict[Button, Optional[tuple[float, float]]] = {}
+        # Whether two pointer positions count as one spot: a release there is
+        # a click made in place, and motion that stays there leaves it held.
+        # Windows replaces it with its own drag rectangle (see _run_windows).
+        self._is_near: Callable[[Optional[tuple], Optional[tuple]], bool] = _near
+        # When set to a list, the Windows hook appends (message, watched,
+        # seconds) for every callback; the end-to-end test reads its cost.
+        self._callback_timings: Optional[list] = None
         # When macOS disabled a tap lately (see _tap_disabled).
         self._tap_disables: list[float] = []
         self.tap_resets = 0  # times macOS disabled the tap and it was re-armed
@@ -315,7 +347,7 @@ class GlobalClickFilter:
                 # A release that came while the contact was still closing is
                 # never a click ending, however still the pointer: it waits for
                 # its press to come back, and motion must not settle it.
-                self._held_stationary[button] = event.hold_reason == "lift" and _near(
+                self._held_stationary[button] = event.hold_reason == "lift" and self._is_near(
                     self._press_points.get(button), location
                 )
                 timer = threading.Timer(
@@ -435,7 +467,7 @@ class GlobalClickFilter:
                 click_filter = self._filters[button]
                 if click_filter.held_id is None or not self._held_stationary.get(button):
                     continue
-                if location is not None and _near(self._held_points.get(button), location):
+                if location is not None and self._is_near(self._held_points.get(button), location):
                     continue
                 if click_filter.commit_held():
                     held_template = self._held_templates.pop(button, None)
@@ -533,12 +565,12 @@ class GlobalClickFilter:
         """Use the operating system's event time only if it shares our clock.
 
         Event records are stamped when the driver produced the event, which is
-        what a gap should be measured from. Both platforms happen to count from
-        boot like `monotonic()` does, but synthetic events can carry a zero or
-        otherwise unusable stamp, so on Windows the first event decides once
-        whether these numbers are trustworthy. Mixing two clocks would corrupt
-        every gap. macOS checks each stamp on its own instead (see
-        _mach_timebase) and settles this check up front.
+        what a gap should be measured from, but a stamp can be zero or
+        otherwise unusable, so the first one decides once whether these
+        numbers are trustworthy. Mixing two clocks would corrupt every gap.
+        Both platform hooks settle this up front instead: macOS checks each
+        stamp on its own (see _mach_timebase), and Windows times events on
+        the precise clock as they arrive (see windows_event_time).
         """
         now = monotonic()
         if timestamp is None:
@@ -578,12 +610,15 @@ class GlobalClickFilter:
         import ctypes
         from ctypes import wintypes
 
-        user32 = ctypes.WinDLL("user32", use_last_error=True)
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        api = WindowsApi()
+        user32, kernel32 = api.user32, api.kernel32
+        # This thread works in the same physical pixels as the hook's event
+        # records (the app's own threads are per-monitor aware through Qt).
+        api.use_physical_pixels()
 
         WH_MOUSE_LL = 14
         WM_QUIT = 0x0012
-        LLMHF_INJECTED = 0x00000001
+        WM_MOUSEMOVE = 0x0200
         BUTTONS = {
             0x0201: (Button.LEFT, True),
             0x0202: (Button.LEFT, False),
@@ -592,37 +627,7 @@ class GlobalClickFilter:
             0x0207: (Button.MIDDLE, True),
             0x0208: (Button.MIDDLE, False),
         }
-
-        class MSLLHOOKSTRUCT(ctypes.Structure):
-            _fields_ = [
-                ("pt", wintypes.POINT),
-                ("mouseData", wintypes.DWORD),
-                ("flags", wintypes.DWORD),
-                ("time", wintypes.DWORD),
-                ("dwExtraInfo", ctypes.c_size_t),  # ULONG_PTR
-            ]
-
-        class MOUSEINPUT(ctypes.Structure):
-            _fields_ = [
-                ("dx", wintypes.LONG),
-                ("dy", wintypes.LONG),
-                ("mouseData", wintypes.DWORD),
-                ("dwFlags", wintypes.DWORD),
-                ("time", wintypes.DWORD),
-                ("dwExtraInfo", ctypes.c_size_t),
-            ]
-
-        class INPUT(ctypes.Structure):
-            # Only the mouse member of the union is used; it is the largest.
-            _fields_ = [("type", wintypes.DWORD), ("mi", MOUSEINPUT)]
-
-        INPUT_MOUSE = 0
-        SEND_FLAGS = {
-            (Button.LEFT, True): 0x0002, (Button.LEFT, False): 0x0004,
-            (Button.RIGHT, True): 0x0008, (Button.RIGHT, False): 0x0010,
-            (Button.MIDDLE, True): 0x0020, (Button.MIDDLE, False): 0x0040,
-        }
-
+        PMSLLHOOKSTRUCT = ctypes.POINTER(api.MSLLHOOKSTRUCT)
         LRESULT = ctypes.c_ssize_t
         HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
 
@@ -635,101 +640,135 @@ class GlobalClickFilter:
         user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), ctypes.c_void_p, wintypes.UINT, wintypes.UINT]
         user32.GetMessageW.restype = ctypes.c_int
         user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
-        kernel32.GetCurrentThreadId.restype = wintypes.DWORD
-        user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
-        user32.SendInput.restype = wintypes.UINT
-
-        def inject(button: Button, pressed: Optional[bool], template: object) -> bool:
-            if pressed is None:
-                return False  # re-sending pointer motion is not supported here
-            # Re-post a suppressed press or release at the current pointer
-            # position, tagged so this hook lets it through. `template` is the
-            # event's own tick time: apps then see when it really happened, not
-            # when it was let through.
-            when = int(template) & 0xFFFFFFFF if isinstance(template, int) else 0
-            event = INPUT(INPUT_MOUSE, MOUSEINPUT(0, 0, 0, SEND_FLAGS[(button, pressed)], when, INJECTED_MARK))
-            return user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(INPUT)) == 1
-
-        self._inject = inject
-
-        self._thread_id = kernel32.GetCurrentThreadId()
-        filter_injected = _filter_injected()
-        kernel32.GetTickCount.restype = wintypes.DWORD
-        ticks = TickClock(kernel32.GetTickCount)
-        targets = InjectableWindows(user32, kernel32)
-        # Windows silently removes a low-level hook whose callback runs past
-        # LowLevelHooksTimeout, and says nothing: the thread lives on and no
-        # click is filtered again. So a slow callback re-installs the hook,
-        # and so does a timer once a minute, in case a stall went unseen.
-        WM_REARM = 0x8000 + 0x44  # WM_APP + n
-        WM_TIMER = 0x0113
-        SLOW_CALLBACK_S = 0.2
-        REARM_INTERVAL_MS = 60_000
-        thread_id = kernel32.GetCurrentThreadId()
-
-        @HOOKPROC
-        def callback(code: int, message: int, data: int) -> int:
-            started = perf_counter()
-            try:
-                return decide(code, message, data)
-            finally:
-                if perf_counter() - started > SLOW_CALLBACK_S:
-                    user32.PostThreadMessageW(thread_id, WM_REARM, 0, 0)
-
-        def decide(code: int, message: int, data: int) -> int:
-            if code >= 0:
-                entry = BUTTONS.get(int(message))
-                if entry is not None:
-                    info = ctypes.cast(data, ctypes.POINTER(MSLLHOOKSTRUCT)).contents
-                    injected = bool(info.flags & LLMHF_INJECTED)
-                    ours = info.dwExtraInfo == INJECTED_MARK
-                    if ours:
-                        self._injected_passed(entry[0])
-                    elif not injected or filter_injected:
-                        button, pressed = entry
-                        # A release is only held back if it can be re-sent to
-                        # the window that will receive it.
-                        allow_hold = pressed or targets.accepts_injection(info.pt)
-                        # `time` is the tick count, in milliseconds, recorded
-                        # when the driver produced the event.
-                        event = self._handle(
-                            button, pressed, ticks.seconds(info.time), int(info.time), allow_hold=allow_hold
-                        )
-                        if not event.accepted:
-                            return 1
-            return user32.CallNextHookEx(None, code, message, data)
-
         user32.SetTimer.argtypes = [wintypes.HWND, ctypes.c_size_t, wintypes.UINT, ctypes.c_void_p]
         user32.SetTimer.restype = ctypes.c_size_t
         user32.KillTimer.argtypes = [wintypes.HWND, ctypes.c_size_t]
+        kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+        kernel32.GetTickCount.restype = wintypes.DWORD
+        get_tick_count = kernel32.GetTickCount
+        call_next = user32.CallNextHookEx
+
+        targets = InjectableWindows(user32, kernel32)
+        sender = InputSender(api, self._injected_passed)
+        hook_logic = WindowsHook(
+            self,
+            api,
+            accepts_injection=lambda x, y: targets.accepts_injection(wintypes.POINT(x, y)),
+            filter_injected=_filter_injected(),
+            send=sender.submit,
+        )
+        watch = hook_logic.watch
+        self._inject = hook_logic.inject
+        self._is_near = api.within_drag_rect
+        with self._motion_tap_lock:
+            self._set_motion_tap = hook_logic.set_watch
+        # Every stamp is on monotonic()'s clock (see WindowsHook.button), so
+        # the once-per-run check in _normalise_time must not second-guess it.
+        self._use_os_time = True
+        self._thread_id = kernel32.GetCurrentThreadId()
+
+        # Windows silently removes a low-level hook whose callback runs past
+        # LowLevelHooksTimeout, and says nothing: the thread lives on and no
+        # click is filtered again. So a slow callback re-installs the hook, so
+        # does a timer every 15 s in case a stall went unseen, and so do
+        # unlocking the session, reconnecting to it and waking from sleep,
+        # when hooks are most often lost.
+        WM_REARM = 0x8000 + 0x44  # WM_APP + n
+        REARM_SLOW, REARM_SESSION = 1, 2
+        WM_TIMER = 0x0113
+        SLOW_CALLBACK_S = 0.2
+        thread_id = kernel32.GetCurrentThreadId()
+        rearm_interval_ms = WINDOWS_REARM_INTERVAL_MS
+        # Arrival times come from the precise clock, moved onto monotonic()'s.
+        clock_offset = monotonic() - perf_counter()
+
+        @HOOKPROC
+        def callback(code: int, message: int, data: int) -> int:
+            arrival = perf_counter()
+            timings = self._callback_timings
+            watched = watch[0]
+            try:
+                return decide(code, message, data, arrival)
+            except Exception:  # noqa: BLE001 - never drop input on a bug
+                _log_ignored("the mouse hook")
+                return call_next(None, code, message, data)
+            finally:
+                elapsed = perf_counter() - arrival
+                if elapsed > SLOW_CALLBACK_S:
+                    user32.PostThreadMessageW(thread_id, WM_REARM, REARM_SLOW, 0)
+                if timings is not None:
+                    timings.append((int(message), watched, elapsed))
+
+        def decide(code: int, message: int, data: int, arrival: float) -> int:
+            if code >= 0:
+                if message == WM_MOUSEMOVE:
+                    # The hot path: every move comes here, and is only looked
+                    # at while it matters (see WindowsHook.set_watch).
+                    if watch[0]:
+                        info = ctypes.cast(data, PMSLLHOOKSTRUCT).contents
+                        if hook_logic.motion(info.pt.x, info.pt.y, info.flags, info.dwExtraInfo):
+                            return 1
+                else:
+                    entry = BUTTONS.get(int(message))
+                    if entry is not None:
+                        info = ctypes.cast(data, PMSLLHOOKSTRUCT).contents
+                        if hook_logic.button(
+                            entry[0], entry[1], info.pt.x, info.pt.y, info.flags, info.time,
+                            info.dwExtraInfo, arrival + clock_offset, get_tick_count(),
+                        ):
+                            return 1
+            return call_next(None, code, message, data)
 
         hook = user32.SetWindowsHookExW(WH_MOUSE_LL, callback, None, 0)
         if not hook:
+            sender.close()
             self._startup_error = ctypes.WinError(ctypes.get_last_error())
             self._ready.set()
             return
+        try:
+            window = SessionWindow(api, lambda: user32.PostThreadMessageW(thread_id, WM_REARM, REARM_SESSION, 0))
+        except Exception:  # noqa: BLE001 - the periodic re-arm still covers it
+            _log_ignored("creating the session window")
+            window = None
+        self._hook_window = window.hwnd if window is not None else None
         self._started = True
         self._ready.set()
-        timer = user32.SetTimer(None, 0, REARM_INTERVAL_MS, None)
+        timer = user32.SetTimer(None, 0, rearm_interval_ms, None)
         message = wintypes.MSG()
         try:
             while not self._stop_event.is_set():
                 result = user32.GetMessageW(ctypes.byref(message), None, 0, 0)
                 if result in (0, -1) or message.message == WM_QUIT:
                     break
-                if message.message in (WM_REARM, WM_TIMER):
+                if message.message in (WM_REARM, WM_TIMER) and not message.hWnd:
                     fresh = user32.SetWindowsHookExW(WH_MOUSE_LL, callback, None, 0)
                     if fresh:
                         user32.UnhookWindowsHookEx(hook)
                         hook = fresh
                         self.hook_rearms += 1
+                        if message.message == WM_REARM:
+                            log.info(
+                                "Re-installed the mouse hook: %s",
+                                "it ran slowly" if message.wParam == REARM_SLOW
+                                else "the session was unlocked or reconnected, or the computer woke",
+                            )
                     continue
                 user32.TranslateMessage(ctypes.byref(message))
                 user32.DispatchMessageW(ctypes.byref(message))
         finally:
             if timer:
                 user32.KillTimer(None, timer)
+            if window is not None:
+                window.close()
+            self._hook_window = None
             user32.UnhookWindowsHookEx(hook)
+            with self._motion_tap_lock:
+                self._set_motion_tap = lambda _wanted: None
+                watch[0] = False
+            # What stop() handed over (held releases, queued events) goes out
+            # now, with no hook of ours left for SendInput to wait on. A timer
+            # that fires later sends directly.
+            sender.close()
 
     # -- macOS -------------------------------------------------------------
     def _run_macos(self) -> None:
@@ -1032,39 +1071,650 @@ class GlobalClickFilter:
             raise HookError(TAP_DISABLED_MESSAGE)
 
 
-class TickClock:
-    """Windows event times as seconds that never jump backwards.
+class WindowsTemplate(NamedTuple):
+    """What the Windows hook keeps of a press or release it may re-send: the
+    tick it was stamped with (re-sent with it, so apps see when it happened),
+    where it happened, and whether it may be re-sent there (see
+    WindowsHook.button)."""
 
-    Event records carry GetTickCount(): milliseconds since boot in 32 bits,
-    which wrap to zero every 49.7 days. Measured naively, the first click
-    after a wrap would be a huge negative gap, read as zero, and dropped as
-    bounce. Differences taken modulo 2**32 stay correct across the wrap.
+    tick: int
+    x: int
+    y: int
+    relocate: bool = True
+
+
+def windows_event_time(arrival: float, tick_now: int, event_tick: int) -> float:
+    """When a Windows input event happened, in seconds on `arrival`'s clock.
+
+    `arrival` is when the hook saw the event, on a precise clock; `event_tick`
+    the GetTickCount value Windows stamped it with, and `tick_now` the same
+    clock read in the hook. Ticks come in 15.6 ms steps, so a stamp up to one
+    tick old says nothing; anything older is how late the hook ran (its thread
+    was busy), and is taken off the arrival time. The difference is taken
+    modulo 2**32, so the tick count wrapping every 49.7 days changes nothing,
+    and no state is kept between events, so neither does a long idle.
+    """
+    late_ms = (int(tick_now) - int(event_tick)) & 0xFFFFFFFF
+    if late_ms >= 0x80000000:
+        late_ms = 0  # stamped after the hook's own reading: not late at all
+    late_s = max(0, late_ms - TICK_MS) / 1000.0
+    return arrival - min(late_s, CLOCK_TOLERANCE_S)
+
+
+def normalized_absolute(x: int, y: int, left: int, top: int, width: int, height: int) -> tuple[int, int]:
+    """SendInput's absolute coordinates (0-65535 across the virtual desktop)
+    that put the pointer on pixel (x, y) exactly.
+
+    Windows maps a coordinate back to the pixel floor(value * width / 65536),
+    so this takes the smallest value that maps to the pixel: the ceiling of
+    pixel * 65536 / width, never 0 (an absolute 0 stopped working in Windows
+    10 1709). Positions are first kept on the desktop, whose top-left corner
+    (left, top) can be negative with monitors left of or above the main one.
+    """
+    width, height = max(1, int(width)), max(1, int(height))
+    x = min(max(int(x), left), left + width - 1)
+    y = min(max(int(y), top), top + height - 1)
+    return max(1, -(-(x - left) * 65536 // width)), max(1, -(-(y - top) * 65536 // height))
+
+
+class WindowsHook:
+    """What the Windows hook decides, apart from its ctypes plumbing (see
+    _run_windows), so it can be tested against a stand-in for Windows.
+
+    Windows has no location on a button event: an event goes wherever the
+    pointer is when Windows processes it. So a release held while the hand
+    moves on would land off the click, and apps would see the pointer leave
+    with the button still down and start a drag. The hook therefore watches
+    motion while a release is held in place: the first move that leaves the
+    spot is held back, the release goes out where the pointer still is, and
+    the move follows it. A release that can't be delivered that way (the
+    hand moved on before the timer delivered it, as when a drag ends while
+    moving) is re-sent in one batch with motion that takes the pointer to
+    where the button came up and back again.
+
+    A move held back leaves the pointer where it was, so Windows works out
+    the next move from that stale spot. While motion is watched, `basis` is
+    where the last move that went through left the pointer (this app's own
+    included), and `virtual` where the hand has really taken it: the target
+    of the last move held back. Each real move keeps its own step, already
+    shaped by pointer acceleration, on top of `virtual`. Moves held back are
+    re-sent as the exact pixel they were headed for.
     """
 
-    def __init__(self, current_tick: Optional[Callable[[], int]] = None) -> None:
-        # GetTickCount, to place the first event on this process's own clock.
-        self._current_tick = current_tick
-        self._last_tick: Optional[int] = None
-        self._seconds = 0.0
+    LLMHF_INJECTED = 0x00000001
 
-    def seconds(self, tick: int) -> Optional[float]:
-        tick = int(tick) & 0xFFFFFFFF
-        if tick == 0:
-            return None  # synthetic input with no timestamp
-        if self._last_tick is None:
-            # Start on `monotonic()`, whichever clock Python uses for it, so
-            # these times and the app's own agree.
-            age = 0.0
-            if self._current_tick is not None:
-                age = ((int(self._current_tick()) - tick) & 0xFFFFFFFF) / 1000.0
-            self._seconds = monotonic() - (age if age < 10 else 0.0)
-        else:
-            delta = (tick - self._last_tick) & 0xFFFFFFFF
-            if delta >= 0x80000000:
-                delta -= 0x100000000  # a slightly older event, not a wrap
-            self._seconds += delta / 1000.0
-        self._last_tick = tick
-        return self._seconds
+    def __init__(
+        self,
+        owner: "GlobalClickFilter",
+        api: "WindowsApi",
+        accepts_injection: Callable[[int, int], bool],
+        filter_injected: bool = False,
+        send: Optional[Callable[[list], object]] = None,
+    ) -> None:
+        self._owner = owner
+        self._api = api
+        self._accepts_injection = accepts_injection
+        self._filter_injected = filter_injected
+        # Sends a batch of (input, button it counts for or None), in order.
+        # The hook runs with an InputSender (see there); by default, at once.
+        self._send = send or (lambda batch: send_batch(api, batch, owner._injected_passed))
+        # Whether motion is being watched: read on every move, without a lock.
+        self.watch = [False]
+        self.basis = (0, 0)
+        self.virtual = (0, 0)
+        # False when Windows couldn't say where the pointer was as watching
+        # began (another desktop had the input); the next real move sets both.
+        self.known = False
+
+    # -- watching motion ----------------------------------------------------
+    def set_watch(self, wanted: bool) -> None:
+        """The filter's motion switch (GlobalClickFilter._set_motion_tap),
+        called with its _motion_tap_lock held. As watching begins, the
+        pointer is where Windows says it is."""
+        if wanted and not self.watch[0]:
+            here = self._api.cursor_pos()
+            self.known = here is not None
+            if here is not None:
+                self.basis = self.virtual = here
+        self.watch[0] = wanted
+
+    def _watch_now(self) -> Optional[tuple[int, int]]:
+        """Watch motion before anything is sent: a real move processed while
+        SendInput runs (other hooks make it interleave) must queue behind
+        what is being sent, not overtake it. Returns where the pointer will
+        be once everything sent before has arrived, if known."""
+        with self._owner._motion_tap_lock:
+            self.set_watch(True)
+            return self.virtual if self.known else None
+
+    def _where(self, x: int, y: int) -> tuple[int, int]:
+        """Where an event at (x, y) really happened: while motion is held
+        back the pointer lags behind the hand by the moves held."""
+        if not self.watch[0] or not self.known:
+            return (x, y)
+        return (self.virtual[0] + x - self.basis[0], self.virtual[1] + y - self.basis[1])
+
+    # -- events the hook sees -------------------------------------------------
+    def button(
+        self,
+        button: Button,
+        pressed: bool,
+        x: int,
+        y: int,
+        flags: int,
+        tick: int,
+        extra: int,
+        arrival: float,
+        tick_now: int,
+    ) -> bool:
+        """A press or release at (x, y), stamped `tick` by Windows, seen by
+        the hook at `arrival` (on monotonic()'s clock) while GetTickCount
+        read `tick_now`. Returns True when the hook must drop it."""
+        owner = self._owner
+        if extra == INJECTED_MARK:
+            owner._injected_passed(button)  # re-sent by this app; already decided
+            return False
+        if flags & self.LLMHF_INJECTED and not self._filter_injected:
+            return False  # synthetic input from another app; leave it alone
+        # The tick is far coarser than the 12 ms and 30 ms rules and the
+        # thresholds near them, so the event is timed by its arrival on the
+        # precise clock, less any lateness the tick shows (a stall here).
+        stamp = windows_event_time(arrival, tick_now, tick)
+        # A release is only held back if it can be re-sent to the window that
+        # will receive it.
+        allow_hold = pressed or self._accepts_injection(x, y)
+        # A release is re-sent where it happened, and motion that leaves the
+        # spot delivers it, unless the pointer's place means nothing: pen and
+        # touch (absolute positions), a hidden pointer (a game's mouse-look)
+        # or a remote session.
+        relocate = (extra & PEN_SIGNATURE_MASK) != PEN_SIGNATURE and (
+            pressed or self._api.relocation_allowed()
+        )
+        at = self._where(x, y)
+        event = owner._handle(
+            button,
+            pressed,
+            stamp,
+            WindowsTemplate(int(tick), at[0], at[1], relocate),
+            allow_hold=allow_hold,
+            location=at if relocate else None,
+        )
+        return not event.accepted
+
+    def motion(self, x: int, y: int, flags: int, extra: int) -> bool:
+        """A move to (x, y), seen while motion is watched. Returns True when
+        the hook must drop it (it was queued to be re-sent)."""
+        if extra in INJECTED_MOTION_MARKS:
+            self.basis = (x, y)
+            self._owner._injected_passed(INJECTED_MOTION_MARKS[extra])
+            return False
+        if extra == TELEPORT_MARK:
+            self.basis = (x, y)
+            return False
+        if (flags & self.LLMHF_INJECTED and not self._filter_injected) or (
+            extra & PEN_SIGNATURE_MASK
+        ) == PEN_SIGNATURE:
+            return False  # another program's motion, or pen and touch: left alone
+        if not self.known:
+            self.basis = self.virtual = (x, y)
+            self.known = True
+        target = (self.virtual[0] + x - self.basis[0], self.virtual[1] + y - self.basis[1])
+        if not self._owner._motion(target, target):
+            self.virtual = target
+            return True
+        self.basis = self.virtual = (x, y)
+        return False
+
+    # -- sending ----------------------------------------------------------------
+    def inject(self, button: Button, pressed: Optional[bool], template: object) -> bool:
+        """The filter's re-send (GlobalClickFilter._inject). `template` is a
+        WindowsTemplate, or for motion the (x, y) it was headed for. What to
+        send is decided here, at once; the sending itself is handed on."""
+        api = self._api
+        with api.physical_pixels():
+            batch = self._batch(api, button, pressed, template)
+        self._send(batch)
+        return True  # anything that doesn't go in is settled by send_batch
+
+    def _batch(self, api: "WindowsApi", button: Button, pressed: Optional[bool], template: object) -> list:
+        if pressed is None:
+            x, y = template
+            self._watch_now()
+            return [(api.move_input(x, y, MOTION_MARK_FOR[button]), button)]
+        tick, x, y, relocate = template
+        flags = api.button_flags(button, pressed)
+        here = self._watch_now()
+        moved = here is not None and here != (x, y)
+        # Message times must not run backwards: once later motion has
+        # reached apps, a release goes out stamped now.
+        when = 0 if moved and not pressed else int(tick) & 0xFFFFFFFF
+        if pressed or not moved or not relocate or not api.relocation_allowed():
+            # A press goes where the pointer is: it is re-sent right after the
+            # events that came before it, motion included. So does a release
+            # where the pointer still is, one made where the pointer's place
+            # means nothing (see button), and one whose way back isn't known.
+            return [(api.button_input(flags, when), button)]
+        # The pointer has moved on: take it to where the button came up,
+        # release it there and take it back, in one batch so the three arrive
+        # in order. The way back counts as re-sent motion, so a real move that
+        # comes between the release and it queues behind it rather than being
+        # undone by it.
+        with self._owner._lock:
+            self._owner._track(button, 1)
+        return [
+            (api.move_input(x, y, TELEPORT_MARK), None),
+            (api.button_input(flags, when), button),
+            (api.move_input(here[0], here[1], MOTION_MARK_FOR[button]), button),
+        ]
+
+
+def send_batch(api, batch: list, lost: Callable[[Button], object]) -> int:
+    """SendInput one batch of (input, button it counts for or None). An input
+    that didn't go in never comes back through the hook, so it is settled
+    with `lost` rather than waited for. Returns how many went in."""
+    try:
+        with api.physical_pixels():
+            sent = api.send([item for item, _button in batch])
+    except Exception:  # noqa: BLE001 - never break the event stream
+        _log_ignored("sending input")
+        sent = 0
+    for _item, button in batch[sent:]:
+        if button is not None:
+            lost(button)
+    return sent
+
+
+class InputSender:
+    """Sends the Windows hook's input, in order, from a thread of its own.
+
+    While a low-level hook is installed, SendInput waits until every hook has
+    seen the input. On the hook's own thread, inside its callback, that means
+    the callback runs again within SendInput, and a send from there waits for
+    ever: all input on the machine stops. So the hook decides what to send
+    and hands it here, and timers and stop() do the same, so one queue keeps
+    every batch in the order it was decided.
+    """
+
+    def __init__(self, api: "WindowsApi", lost: Callable[[Button], object]) -> None:
+        import queue
+
+        self._api = api
+        self._lost = lost
+        self._queue: "queue.SimpleQueue" = queue.SimpleQueue()
+        self._closed = False
+        self._lock = threading.Lock()
+        self._thread = threading.Thread(target=self._run, name="dcf-send", daemon=True)
+        self._thread.start()
+
+    def submit(self, batch: list) -> None:
+        with self._lock:
+            if not self._closed:
+                self._queue.put(batch)
+                return
+        send_batch(self._api, batch, self._lost)  # the hook is gone: nothing to wait on
+
+    def close(self, timeout: float = 2.0) -> None:
+        """Send what is queued, then stop; later batches are sent directly."""
+        with self._lock:
+            self._closed = True
+            self._queue.put(None)
+        self._thread.join(timeout)
+
+    def _run(self) -> None:
+        while True:
+            batch = self._queue.get()
+            if batch is None:
+                return
+            send_batch(self._api, batch, self._lost)
+
+
+class WindowsApi:
+    """The Win32 calls the Windows hook makes, set up once per hook thread.
+
+    Coordinates are physical pixels, as in the hook's event records: callers
+    that may run on another thread (re-sends from timers, or stop() from the
+    UI) wrap their work in `physical_pixels()`.
+    """
+
+    SM_SWAPBUTTON = 23
+    SM_CXDRAG, SM_CYDRAG = 68, 69
+    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN = 76, 77, 78, 79
+    SM_REMOTESESSION = 0x1000
+    CURSOR_SHOWING = 0x1
+    MONITOR_DEFAULTTONEAREST = 2
+    #: DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, as Qt makes the app.
+    PER_MONITOR_AWARE_V2 = -4
+    INPUT_MOUSE = 0
+    MOVE_ABSOLUTE = 0x0001 | 0x8000 | 0x4000  # MOVE | ABSOLUTE | VIRTUALDESK
+    BUTTON_FLAGS = {
+        (Button.LEFT, True): 0x0002, (Button.LEFT, False): 0x0004,
+        (Button.RIGHT, True): 0x0008, (Button.RIGHT, False): 0x0010,
+        (Button.MIDDLE, True): 0x0020, (Button.MIDDLE, False): 0x0040,
+    }
+
+    def __init__(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        self._ctypes = ctypes
+        self._wintypes = wintypes
+        self.user32 = user32 = ctypes.WinDLL("user32", use_last_error=True)
+        self.kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class MSLLHOOKSTRUCT(ctypes.Structure):
+            _fields_ = [
+                ("pt", wintypes.POINT),
+                ("mouseData", wintypes.DWORD),
+                ("flags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.c_size_t),  # ULONG_PTR
+            ]
+
+        class MOUSEINPUT(ctypes.Structure):
+            _fields_ = [
+                ("dx", wintypes.LONG),
+                ("dy", wintypes.LONG),
+                ("mouseData", wintypes.DWORD),
+                ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.c_size_t),
+            ]
+
+        class INPUT(ctypes.Structure):
+            # Only the mouse member of the union is used; it is the largest.
+            _fields_ = [("type", wintypes.DWORD), ("mi", MOUSEINPUT)]
+
+        class CURSORINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("flags", wintypes.DWORD),
+                ("hCursor", wintypes.HANDLE),
+                ("ptScreenPos", wintypes.POINT),
+            ]
+
+        self.MSLLHOOKSTRUCT, self.MOUSEINPUT, self.INPUT, self.CURSORINFO = (
+            MSLLHOOKSTRUCT, MOUSEINPUT, INPUT, CURSORINFO
+        )
+        user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+        user32.SendInput.restype = wintypes.UINT
+        user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+        user32.GetSystemMetrics.restype = ctypes.c_int
+        user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+        user32.GetCursorPos.restype = wintypes.BOOL
+        user32.GetCursorInfo.argtypes = [ctypes.POINTER(CURSORINFO)]
+        user32.GetCursorInfo.restype = wintypes.BOOL
+        user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+        user32.MonitorFromPoint.restype = wintypes.HANDLE
+        # Windows 10 1607 and later; without them the system-wide values do.
+        self._metric_for_dpi = getattr(user32, "GetSystemMetricsForDpi", None)
+        if self._metric_for_dpi is not None:
+            self._metric_for_dpi.argtypes = [ctypes.c_int, wintypes.UINT]
+            self._metric_for_dpi.restype = ctypes.c_int
+        self._set_dpi_context = getattr(user32, "SetThreadDpiAwarenessContext", None)
+        if self._set_dpi_context is not None:
+            self._set_dpi_context.argtypes = [ctypes.c_void_p]
+            self._set_dpi_context.restype = ctypes.c_void_p
+        try:
+            self._dpi_for_monitor = ctypes.WinDLL("shcore").GetDpiForMonitor
+            self._dpi_for_monitor.argtypes = [
+                wintypes.HANDLE, ctypes.c_int, ctypes.POINTER(wintypes.UINT), ctypes.POINTER(wintypes.UINT)
+            ]
+            self._dpi_for_monitor.restype = ctypes.c_long
+        except (OSError, AttributeError):
+            self._dpi_for_monitor = None
+
+    # -- DPI ---------------------------------------------------------------
+    def use_physical_pixels(self) -> None:
+        """Make this thread per-monitor aware for good (the hook's own thread)."""
+        if self._set_dpi_context is not None:
+            self._set_dpi_context(self.PER_MONITOR_AWARE_V2)
+
+    @contextmanager
+    def physical_pixels(self):
+        """Work in physical pixels on this thread for a moment. The app's
+        threads already do (Qt makes the process per-monitor aware), but a
+        process without Qt, such as the tests, would get scaled coordinates."""
+        previous = None
+        if self._set_dpi_context is not None:
+            previous = self._set_dpi_context(self.PER_MONITOR_AWARE_V2)
+        try:
+            yield
+        finally:
+            if previous:
+                self._set_dpi_context(previous)
+
+    # -- the pointer -------------------------------------------------------
+    def metric(self, index: int) -> int:
+        return int(self.user32.GetSystemMetrics(index))
+
+    def cursor_pos(self) -> Optional[tuple[int, int]]:
+        point = self._wintypes.POINT()
+        with self.physical_pixels():
+            if not self.user32.GetCursorPos(self._ctypes.byref(point)):
+                return None  # another desktop has the input (a UAC prompt, the lock screen)
+        return (point.x, point.y)
+
+    def cursor_showing(self) -> bool:
+        info = self.CURSORINFO()
+        info.cbSize = self._ctypes.sizeof(info)
+        if not self.user32.GetCursorInfo(self._ctypes.byref(info)):
+            return True  # unsure: treat it as an ordinary pointer
+        return bool(info.flags & self.CURSOR_SHOWING)
+
+    def remote_session(self) -> bool:
+        return bool(self.metric(self.SM_REMOTESESSION))
+
+    def relocation_allowed(self) -> bool:
+        """Whether a release may be held for the pointer leaving its spot,
+        and re-sent where it happened. Not while the pointer is hidden (a
+        game's mouse-look, where absolute moves would show up as camera
+        jumps) or in a remote session (the client positions the pointer)."""
+        return self.cursor_showing() and not self.remote_session()
+
+    def drag_size(self, point: tuple) -> tuple[int, int]:
+        """How far the pointer may move from `point` before Windows calls it a
+        drag, in pixels, at the DPI of the monitor there (SM_CXDRAG/SM_CYDRAG)."""
+        dpi = self.dpi_at(point)
+        if dpi and self._metric_for_dpi is not None:
+            return (
+                max(1, self._metric_for_dpi(self.SM_CXDRAG, dpi)),
+                max(1, self._metric_for_dpi(self.SM_CYDRAG, dpi)),
+            )
+        return max(1, self.metric(self.SM_CXDRAG)), max(1, self.metric(self.SM_CYDRAG))
+
+    def dpi_at(self, point: tuple) -> int:
+        if self._dpi_for_monitor is None:
+            return 0
+        wintypes = self._wintypes
+        monitor = self.user32.MonitorFromPoint(
+            wintypes.POINT(int(point[0]), int(point[1])), self.MONITOR_DEFAULTTONEAREST
+        )
+        x_dpi, y_dpi = wintypes.UINT(), wintypes.UINT()
+        if not monitor or self._dpi_for_monitor(monitor, 0, self._ctypes.byref(x_dpi), self._ctypes.byref(y_dpi)):
+            return 0  # MDT_EFFECTIVE_DPI = 0; any non-zero HRESULT is a failure
+        return int(x_dpi.value)
+
+    def within_drag_rect(self, point: Optional[tuple], location: Optional[tuple]) -> bool:
+        """Whether `location` is still on the spot `point`: inside the
+        rectangle Windows itself uses to tell a click from a drag (DragDetect
+        starts a drag once the pointer leaves it). Runs on the hook thread."""
+        if point is None or location is None:
+            return False
+        try:
+            width, height = self.drag_size(point)
+        except Exception:  # noqa: BLE001 - fall back to the shared test
+            _log_ignored("reading the drag rectangle")
+            return _near(point, location)
+        return abs(location[0] - point[0]) < width and abs(location[1] - point[1]) < height
+
+    # -- sending input -------------------------------------------------------
+    def buttons_swapped(self) -> bool:
+        return bool(self.metric(self.SM_SWAPBUTTON))
+
+    def button_flags(self, button: Button, pressed: bool) -> int:
+        """SendInput's flags for this app's button. Those name the physical
+        button, which Windows then swaps for a left-handed user, while the
+        hook sees the swapped (logical) one."""
+        if button is not Button.MIDDLE and self.buttons_swapped():
+            button = Button.RIGHT if button is Button.LEFT else Button.LEFT
+        return self.BUTTON_FLAGS[(button, pressed)]
+
+    def button_input(self, flags: int, when: int) -> object:
+        return self.INPUT(self.INPUT_MOUSE, self.MOUSEINPUT(0, 0, 0, flags, when, INJECTED_MARK))
+
+    def virtual_screen(self) -> tuple[int, int, int, int]:
+        """The rectangle around every monitor: left, top, width, height. Read
+        on every send, so a display change needs no notification."""
+        return (
+            self.metric(self.SM_XVIRTUALSCREEN),
+            self.metric(self.SM_YVIRTUALSCREEN),
+            self.metric(self.SM_CXVIRTUALSCREEN),
+            self.metric(self.SM_CYVIRTUALSCREEN),
+        )
+
+    def move_input(self, x: int, y: int, mark: int) -> object:
+        """Pointer motion to pixel (x, y) exactly. Absolute, so pointer
+        acceleration (already in the hand's motion) isn't applied twice."""
+        dx, dy = normalized_absolute(x, y, *self.virtual_screen())
+        return self.INPUT(self.INPUT_MOUSE, self.MOUSEINPUT(dx, dy, 0, self.MOVE_ABSOLUTE, 0, mark))
+
+    def send(self, inputs: list) -> int:
+        """SendInput, in one batch; returns how many went in."""
+        batch = (self.INPUT * len(inputs))(*inputs)
+        return int(self.user32.SendInput(len(inputs), batch, self._ctypes.sizeof(self.INPUT)))
+
+
+class SessionWindow:
+    """A hidden window on the hook's thread that hears the session being
+    unlocked or reconnected and the computer waking, the moments a low-level
+    hook is most often lost, and calls `on_change` (on that thread).
+
+    A top-level window, not a message-only one: those miss broadcasts such as
+    WM_POWERBROADCAST. Nothing here is essential; the periodic re-arm covers
+    whatever fails to register.
+    """
+
+    WM_WTSSESSION_CHANGE = 0x02B1
+    WM_POWERBROADCAST = 0x0218
+    #: WTS_CONSOLE_CONNECT, WTS_REMOTE_CONNECT, WTS_SESSION_UNLOCK.
+    SESSION_EVENTS = (0x1, 0x3, 0x8)
+    #: PBT_APMRESUMESUSPEND, PBT_APMRESUMEAUTOMATIC.
+    RESUME_EVENTS = (0x7, 0x12)
+    _names = itertools.count(1)
+
+    def __init__(self, api: WindowsApi, on_change: Callable[[], object]) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        self.hwnd = None
+        self._api = api
+        self._wts = None
+        self._power = None
+        user32, kernel32 = api.user32, api.kernel32
+        LRESULT = ctypes.c_ssize_t
+        WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+
+        class WNDCLASSW(ctypes.Structure):
+            _fields_ = [
+                ("style", wintypes.UINT),
+                ("lpfnWndProc", WNDPROC),
+                ("cbClsExtra", ctypes.c_int),
+                ("cbWndExtra", ctypes.c_int),
+                ("hInstance", wintypes.HINSTANCE),
+                ("hIcon", wintypes.HICON),
+                ("hCursor", wintypes.HANDLE),
+                ("hbrBackground", wintypes.HBRUSH),
+                ("lpszMenuName", wintypes.LPCWSTR),
+                ("lpszClassName", wintypes.LPCWSTR),
+            ]
+
+        user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.DefWindowProcW.restype = LRESULT
+        user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+        user32.RegisterClassW.restype = wintypes.ATOM
+        user32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
+        user32.CreateWindowExW.argtypes = [
+            wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD,
+            ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+            wintypes.HWND, wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID,
+        ]
+        user32.CreateWindowExW.restype = wintypes.HWND
+        user32.DestroyWindow.argtypes = [wintypes.HWND]
+        kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        kernel32.GetModuleHandleW.restype = wintypes.HMODULE
+
+        session_events, resume_events = self.SESSION_EVENTS, self.RESUME_EVENTS
+        session_change, power = self.WM_WTSSESSION_CHANGE, self.WM_POWERBROADCAST
+
+        @WNDPROC
+        def window_proc(hwnd, message, wparam, lparam):
+            try:
+                if (message == session_change and wparam in session_events) or (
+                    message == power and wparam in resume_events
+                ):
+                    on_change()
+            except Exception:  # noqa: BLE001 - never break the hook's thread
+                _log_ignored("the session window")
+            return user32.DefWindowProcW(hwnd, message, wparam, lparam)
+
+        self._proc = window_proc  # keep it alive as long as the window
+        self._instance = kernel32.GetModuleHandleW(None)
+        self._class_name = f"DoubleClickFixerHook-{os.getpid()}-{next(self._names)}"
+        window_class = WNDCLASSW()
+        window_class.lpfnWndProc = window_proc
+        window_class.hInstance = self._instance
+        window_class.lpszClassName = self._class_name
+        if not user32.RegisterClassW(ctypes.byref(window_class)):
+            log.warning("Couldn't register the hook's session window (error %d)", ctypes.get_last_error())
+            self._class_name = None
+            return
+        WS_POPUP = 0x80000000
+        self.hwnd = user32.CreateWindowExW(
+            0, self._class_name, "DoubleClick Fixer", WS_POPUP, 0, 0, 0, 0, None, None, self._instance, None
+        )
+        if not self.hwnd:
+            log.warning("Couldn't create the hook's session window (error %d)", ctypes.get_last_error())
+            self.close()
+            return
+        try:
+            wts = ctypes.WinDLL("wtsapi32", use_last_error=True)
+            wts.WTSRegisterSessionNotification.argtypes = [wintypes.HWND, wintypes.DWORD]
+            wts.WTSRegisterSessionNotification.restype = wintypes.BOOL
+            wts.WTSUnRegisterSessionNotification.argtypes = [wintypes.HWND]
+            if wts.WTSRegisterSessionNotification(self.hwnd, 0):  # NOTIFY_FOR_THIS_SESSION
+                self._wts = wts
+            else:
+                log.info("Session notifications are unavailable (error %d)", ctypes.get_last_error())
+        except (OSError, AttributeError):
+            _log_ignored("registering for session notifications")
+        try:
+            # Windows 8 and later: wake-up notices sent to this window itself,
+            # however Windows decides to broadcast them.
+            register = user32.RegisterSuspendResumeNotification
+            register.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            register.restype = ctypes.c_void_p
+            user32.UnregisterSuspendResumeNotification.argtypes = [ctypes.c_void_p]
+            self._power = register(self.hwnd, 0) or None  # DEVICE_NOTIFY_WINDOW_HANDLE
+        except AttributeError:
+            pass
+
+    def close(self) -> None:
+        user32 = self._api.user32
+        try:
+            if self._power is not None:
+                user32.UnregisterSuspendResumeNotification(self._power)
+                self._power = None
+            if self._wts is not None and self.hwnd:
+                self._wts.WTSUnRegisterSessionNotification(self.hwnd)
+                self._wts = None
+            if self.hwnd:
+                user32.DestroyWindow(self.hwnd)
+                self.hwnd = None
+            if self._class_name is not None:
+                user32.UnregisterClassW(self._class_name, self._instance)
+                self._class_name = None
+        except Exception:  # noqa: BLE001 - the hook is ending either way
+            _log_ignored("closing the session window")
 
 
 class InjectableWindows:
@@ -1148,6 +1798,7 @@ class InjectableWindows:
                 windows.append(info.hwndCapture)
             return all(self._window_ok(hwnd) for hwnd in windows if hwnd)
         except Exception:  # noqa: BLE001 - unsure: deliver at once, as before holding existed
+            _log_ignored("checking whether a window accepts re-sent input")
             return False
 
     def _window_ok(self, hwnd) -> bool:
