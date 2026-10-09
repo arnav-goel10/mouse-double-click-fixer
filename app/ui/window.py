@@ -1,4 +1,4 @@
-"""The main window: a sidebar and four panes, in the platform's own idiom."""
+"""The main window: a sidebar and its panes, in the platform's own idiom."""
 
 from __future__ import annotations
 
@@ -9,14 +9,14 @@ from PySide6.QtCore import QByteArray, QEvent, QRect, QTimer, Qt, Signal
 from PySide6.QtGui import QGuiApplication, QPainter
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QMessageBox,
     QProgressBar,
     QPushButton,
     QScrollArea,
-    QSizePolicy,
-    QSlider,
+    QSpinBox,
     QStackedWidget,
     QSystemTrayIcon,
     QVBoxLayout,
@@ -24,6 +24,8 @@ from PySide6.QtWidgets import (
 )
 
 from .. import DISPLAY_NAME, __version__, diagnostics, notices, permissions, startup
+from .. import settings as settings_store
+from ..contracts import SIDE_BUTTONS, Button, as_button, button_name
 from ..controller import AppController
 from ..core import (
     BOUNCE_CANDIDATE_MS,
@@ -31,18 +33,30 @@ from ..core import (
     MIN_THRESHOLD_MS,
     REQUIRED_DOUBLE_CLICKS,
     REQUIRED_SINGLE_CLICKS,
-    Button,
     Calibrator,
     ClickEvent,
 )
 from . import icons, native
+from .base import (
+    COLUMN_MAX,
+    COLUMN_MIN,
+    Page,
+    card_icon,
+    centred_column,
+    controls,
+    label,
+    link,
+    make_button,
+    make_link_label,
+    set_primary,
+)
+from .panes import AppsPage, DevicesPage, HistoryPage
 from .theme import IS_MAC, current_look
 from .widgets import (
     AppIconView,
     ClickPad,
     GapTimeline,
     Row,
-    Section,
     Sidebar,
     Switch,
     SymbolView,
@@ -51,6 +65,9 @@ from .widgets import (
     look,
     set_look,
 )
+
+# Older name, kept for callers.
+_button = make_button
 
 log = logging.getLogger(__name__)
 
@@ -66,11 +83,6 @@ RETRY_AT_S = (1, 3, 8, 20)
 #: How often a running filter is checked for a tap that stopped working.
 HEALTH_CHECK_MS = 5000
 
-#: Content never stretches wider than this; extra window width becomes margin,
-#: so a label always stays within reach of its control.
-COLUMN_MAX = 640 if IS_MAC else 1000
-#: The narrowest the content column may get before the window stops shrinking.
-COLUMN_MIN = 440
 #: Room left around a first-launch window for its frame and title bar.
 FRAME_ALLOWANCE = (16, 48)
 
@@ -81,113 +93,39 @@ PAGES = [
     ("filter", "Bounce Filter"),
     ("test", "Test"),
     ("calibrate", "Calibrate"),
+    ("history", "History"),
+    ("apps", "Apps"),
+    ("devices", "Devices"),
     ("general", "General"),
 ]
 
 
-def label(text: str) -> str:
-    """Button and menu wording in the platform's own case: Title Case on
-    macOS ("Check Now"), sentence case on Windows ("Check now")."""
-    if IS_MAC:
-        return text
-    first, *rest = text.split(" ")
-    keep = {*DISPLAY_NAME.split(" "), "Accessibility"}
-    return " ".join([first, *(word if word in keep else word.lower() for word in rest)])
-
-
-def _button(text: str, default: bool = False) -> QPushButton:
-    button = QPushButton(label(text))
-    set_primary(button, default)
-    return button
-
-
-def set_primary(button: QPushButton, primary: bool) -> None:
-    """Make `button` the default one. Windows 11 fills it with the accent
-    colour (WinUI's AccentButton); macOS draws its own default button."""
-    button.setDefault(primary)
-    button.setAutoDefault(primary)
-    if IS_MAC:
-        return
-    if not primary:
-        button.setStyleSheet("")
-        return
-    lk = look()
-    accent = lk.accent
-    text = "#000000" if lk.dark else "#ffffff"
-    hover = accent.lighter(110) if lk.dark else accent.darker(110)
-    button.setStyleSheet(
-        "QPushButton {"
-        f" background: {accent.name()}; color: {text};"
-        " border: 1px solid rgba(0, 0, 0, 20); border-radius: 4px;"
-        " padding: 5px 16px; min-height: 20px; }"
-        f"QPushButton:hover {{ background: {hover.name()}; }}"
-        f"QPushButton:pressed {{ background: {accent.name()}; color: rgba({'0,0,0' if lk.dark else '255,255,255'},180); }}"
-        "QPushButton:disabled { background: rgba(128,128,128,70); color: rgba(128,128,128,200); border: none; }"
-    )
-
-
-def card_icon(name: str) -> Optional[SymbolView]:
-    """Windows 11 Settings leads every card with a Fluent icon; macOS rows
-    inside a grouped box carry none."""
-    return None if IS_MAC else SymbolView(name, 20, "text")
-
-
-def centred_column(parent: QWidget, maximum: int = COLUMN_MAX) -> QWidget:
-    """Give `parent` a column capped at `maximum` wide, centred in any extra space."""
-    outer = QHBoxLayout(parent)
-    outer.setContentsMargins(0, 0, 0, 0)
-    outer.setSpacing(0)
-    column = QWidget()
-    column.setMaximumWidth(maximum)
-    outer.addStretch(1)
-    outer.addWidget(column, 100)
-    outer.addStretch(1)
-    return column
-
-
-class Page(QWidget):
-    """A pane: stacked sections with headers and footnotes."""
-
-    def __init__(self, title: str, parent: Optional[QWidget] = None) -> None:
-        super().__init__(parent)
-        self.page_title = title
-        self.column = centred_column(self)
-        self.body = QVBoxLayout(self.column)
-        self.body.setSpacing(0)
-        if IS_MAC:
-            self.body.setContentsMargins(20, 4, 20, 20)
-        else:
-            self.body.setContentsMargins(36, 0, 36, 28)
-            heading = TextLabel(title, "title")
-            heading.setContentsMargins(0, 24, 0, 20)
-            self.body.addWidget(heading)
-
-    def header(self, text: str) -> TextLabel:
-        label = TextLabel(text, "headline")
-        label.setContentsMargins(2 if IS_MAC else 0, 18, 0, 6 if IS_MAC else 8)
-        self.body.addWidget(label)
-        return label
-
-    def section(self) -> Section:
-        section = Section()
-        self.body.addWidget(section)
-        return section
-
-    def footnote(self, text: str) -> TextLabel:
-        label = TextLabel(text, "caption", "secondary")
-        label.setWordWrap(True)
-        label.setContentsMargins(2 if IS_MAC else 0, 6, 0, 0)
-        self.body.addWidget(label)
-        return label
-
-    def gap(self, height: int = 20) -> None:
-        self.body.addSpacing(height)
-
-
 # -- panes -----------------------------------------------------------------------
 
+#: Under the button rows.
+WINDOW_NOTE = (
+    "The window is how soon after a release a press counts as bounce. Most worn switches "
+    "bounce within 30 ms. Back and forward presses are never held back: a repeat within "
+    "the window is dropped."
+)
+WHEEL_DETAIL = "Drops a notch that jumps the wrong way. Trackpads and smooth scrolling are never touched."
+
+
+def window_box(low: int, high: int, accessible_name: str) -> QSpinBox:
+    """A number of milliseconds, as a native spin box."""
+    box = QSpinBox()
+    box.setRange(low, high)
+    box.setSuffix(" ms")
+    # Typing "120" would otherwise apply 1, 12 and 120 in turn.
+    box.setKeyboardTracking(False)
+    box.setAccessibleName(accessible_name)
+    box.setMinimumWidth(78)
+    return box
+
+
 class FilterPage(Page):
-    calibrate_requested = Signal()
+    #: The user asked to calibrate a button (carries the Button).
+    calibrate_requested = Signal(object)
 
     def __init__(self, controller: AppController, parent: Optional[QWidget] = None) -> None:
         super().__init__("Bounce Filter", parent)
@@ -214,37 +152,38 @@ class FilterPage(Page):
         self.switch = Switch(accessible_name="Bounce filter")
         self.status_row = main.add(Row("Bounce Filter", "", self.switch, AppIconView(34 if IS_MAC else 32)))
 
-        self.header("Filter window")
-        window = self.section()
-        slider_box = QWidget()
-        slider_layout = QHBoxLayout(slider_box)
-        slider_layout.setContentsMargins(0, 0, 0, 0)
-        slider_layout.setSpacing(10)
-        self.slider = QSlider(Qt.Orientation.Horizontal)
-        self.slider.setRange(MIN_THRESHOLD_MS, MAX_THRESHOLD_MS)
-        self.slider.setPageStep(5)
-        # Flexes with the window instead of forcing it wider.
-        self.slider.setMinimumWidth(110)
-        self.slider.setMaximumWidth(240)
-        self.slider.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.slider.setAccessibleName("Filter window in milliseconds")
-        self.value = ValueLabel()
-        self.value.setMinimumWidth(52)
-        slider_layout.addWidget(self.slider)
-        slider_layout.addWidget(self.value)
-        window.add(Row("Ignore presses within", "", slider_box, card_icon("stopwatch")))
-        self.window_note = self.footnote("")
-        self.window_note.setTextFormat(Qt.TextFormat.RichText)
-        self.window_note.linkActivated.connect(lambda _link: self.calibrate_requested.emit())
-
+        # One row per button: its window, a Calibrate link and its switch.
         self.header("Buttons")
         buttons = self.section()
         self.button_switches: dict[Button, Switch] = {}
+        self.window_boxes: dict[Button, QSpinBox] = {}
+        self.button_rows: dict[Button, Row] = {}
         for button in Button:
-            switch = Switch(accessible_name=f"Filter the {button.label.lower()} button")
+            name = button_name(button)
+            box = window_box(MIN_THRESHOLD_MS, MAX_THRESHOLD_MS, f"{name} button window in milliseconds")
+            box.valueChanged.connect(lambda value, which=button: self._on_window(which, value))
+            switch = Switch(accessible_name=f"Filter the {name.lower()} button")
             switch.clicked.connect(self._on_buttons)
+            row = Row(f"{name} button", " ", controls(box, switch), card_icon("mouse"))
+            make_link_label(row.detail)
+            row.detail.linkActivated.connect(lambda _href, which=button: self.calibrate_requested.emit(which))
+            buttons.add(row)
             self.button_switches[button] = switch
-            buttons.add(Row(f"{button.label} button", "", switch, card_icon("mouse")))
+            self.window_boxes[button] = box
+            self.button_rows[button] = row
+        self.window_note = self.footnote(WINDOW_NOTE)
+
+        self.header("Scroll wheel")
+        wheel = self.section()
+        self.wheel_box = window_box(
+            settings_store.WHEEL_MIN_MS, settings_store.WHEEL_MAX_MS, "Wheel reversal window in milliseconds"
+        )
+        self.wheel_box.valueChanged.connect(self._on_wheel_window)
+        self.wheel_switch = Switch(accessible_name="Fix scroll-wheel reversals")
+        self.wheel_switch.clicked.connect(self._on_wheel)
+        self.wheel_row = wheel.add(
+            Row("Fix wheel reversals", WHEEL_DETAIL, controls(self.wheel_box, self.wheel_switch), card_icon("wheel"))
+        )
 
         self.header("Activity")
         activity = self.section()
@@ -254,14 +193,15 @@ class FilterPage(Page):
         activity.add(Row("Blocked since launch", "", self.session_value, card_icon("chart")))
         self.body.addStretch(1)
 
-        self.slider.valueChanged.connect(self._on_slider)
-        # While dragging, only the label follows; the value is saved on release.
-        self.slider.sliderReleased.connect(lambda: self._on_slider(self.slider.value()))
-
     def refresh(self, granted: bool, waiting_for_permission: bool = False) -> None:
         self._loading = True
+        try:
+            self._refresh(granted, waiting_for_permission)
+        finally:
+            self._loading = False
+
+    def _refresh(self, granted: bool, waiting_for_permission: bool) -> None:
         controller = self.controller
-        threshold = controller.threshold_ms
         # The user's choice, as the menus show it: on while it waits for
         # permission or calibration has it paused.
         self.switch.setChecked(controller.wanted, animate=self.isVisible())
@@ -275,34 +215,33 @@ class FilterPage(Page):
             self.status_row.set_detail(f"{controller.failure}. {controller.failure_detail}".strip())
         else:
             self.status_row.set_detail("Ignores the extra click a worn switch adds.")
-        self.slider.setValue(threshold)
-        self.value.setText(f"{threshold} ms")
-        if self.controller.calibrated:
-            self.window_note.setText("Most worn switches bounce within 30 ms.")
-        else:
-            accent = look().accent.name()
-            self.window_note.setText(
-                f'Not calibrated yet. <a href="calibrate" style="color:{accent}; text-decoration:none">'
-                f"{label('Calibrate')}</a> measures your mouse and sets this for you."
-            )
-        for button, switch in self.button_switches.items():
-            switch.setChecked(button in self.controller.buttons, animate=False)
-        self.total_value.setText(f"{self.controller.filtered_total:,}")
-        self.session_value.setText(f"{self.controller.session_filtered:,}")
+        filtered = set(controller.buttons)
+        for button in Button:
+            on = button in filtered
+            self.button_switches[button].setChecked(on, animate=False)
+            box = self.window_boxes[button]
+            box.setValue(controller.threshold_for(button))
+            # A window only means something for a button being filtered.
+            box.setEnabled(on)
+            state = "Calibrated." if controller.is_calibrated(button) else "Not calibrated."
+            self.button_rows[button].set_detail(f"{state} {link(label('Calibrate'), 'calibrate')}")
+        self.wheel_switch.setChecked(controller.wheel_fix, animate=False)
+        self.wheel_box.setValue(controller.wheel_window_ms)
+        self.wheel_box.setEnabled(controller.wheel_fix)
+        self.total_value.setText(f"{controller.filtered_total:,}")
+        self.session_value.setText(f"{controller.session_filtered:,}")
         show = permissions.needs_accessibility() and not granted
         self.permission.setVisible(show)
         self.permission_gap.setVisible(show)
-        self._loading = False
 
     def note_global_event(self, event: ClickEvent) -> None:
         if event.is_bounce:
             self.total_value.setText(f"{self.controller.filtered_total:,}")
             self.session_value.setText(f"{self.controller.session_filtered:,}")
 
-    def _on_slider(self, value: int) -> None:
-        self.value.setText(f"{value} ms")
-        if not self._loading and not self.slider.isSliderDown():
-            self.controller.set_threshold(value)
+    def _on_window(self, button: Button, value: int) -> None:
+        if not self._loading:
+            self.controller.set_threshold(button, value)
 
     def _on_buttons(self, _checked: bool) -> None:
         if self._loading:
@@ -313,6 +252,14 @@ class FilterPage(Page):
             self.button_switches[Button.LEFT].setChecked(True)
             selected = [Button.LEFT]
         self.controller.set_buttons(selected)
+
+    def _on_wheel(self, checked: bool) -> None:
+        if not self._loading:
+            self.controller.set_wheel_fix(checked)
+
+    def _on_wheel_window(self, value: int) -> None:
+        if not self._loading:
+            self.controller.set_wheel_fix(self.controller.wheel_fix, value)
 
 
 class TestPage(Page):
@@ -392,10 +339,10 @@ class TestPage(Page):
         if gap_ms is None:
             self.pad.flash(False)
             return
-        bounce = gap_ms <= self.controller.threshold_ms
+        bounce = gap_ms <= self.controller.threshold_for(button)
         self.timeline.add(gap_ms, bounce)
         # Each button is timed against its own release; say which one.
-        which = "" if button is Button.LEFT else f" ({button.label.lower()})"
+        which = "" if as_button(button) is Button.LEFT else f" ({button_name(button).lower()})"
         self.last_value.setText(f"{gap_ms:.0f} ms{which}")
         if self.shortest_gap is None or gap_ms < self.shortest_gap:
             self.shortest_gap = gap_ms
@@ -404,9 +351,10 @@ class TestPage(Page):
 
 
 class CalibratePage(Page):
-    """Two measured phases, then a recommendation."""
+    """Two measured phases for one button, then a recommendation."""
 
-    threshold_chosen = Signal(int)
+    #: Apply: (Button, window in ms).
+    threshold_chosen = Signal(object, int)
     #: The phase moved: "intro", "single", "double" or "done". Filtering
     #: pauses only while a measuring phase is on screen.
     phase_changed = Signal(str)
@@ -420,6 +368,18 @@ class CalibratePage(Page):
         # The button whose first press of a double-click is waiting for its
         # second, or None.
         self._pair_button: Optional[Button] = None
+        # The button being measured. Presses of the others are ignored.
+        self.button: Button = Button.LEFT
+
+        picker = self.section()
+        self.button_picker = QComboBox()
+        for button in Button:
+            self.button_picker.addItem(button_name(button), button.value)
+        self.button_picker.setAccessibleName("Button to calibrate")
+        # activated, not currentIndexChanged: only the user's own choice.
+        self.button_picker.activated.connect(lambda index: self.set_button(list(Button)[index]))
+        self.picker_row = picker.add(Row("Button", "", self.button_picker, card_icon("mouse")))
+        self.gap(12)
 
         # The step and its progress bar are one row, so they share one box
         # (macOS) or one card (Windows).
@@ -454,7 +414,7 @@ class CalibratePage(Page):
         self.double_value = ValueLabel()
         self.result.add(Row("Recommended window", "", self.recommended_value))
         self.result.add(Row("Longest bounce", "", self.bounce_value))
-        self.result.add(Row("Fastest double-click", "", self.double_value))
+        self.double_row = self.result.add(Row("Fastest double-click", "", self.double_value))
         self.summary = self.footnote("")
 
         actions = QHBoxLayout()
@@ -483,6 +443,23 @@ class CalibratePage(Page):
             self.phase = phase
             self.phase_changed.emit(phase)
 
+    def set_button(self, button: object) -> None:
+        """Measure `button` from now on, starting afresh if it is another."""
+        button = as_button(button)
+        self.button_picker.setCurrentIndex(list(Button).index(button))
+        if button is not self.button:
+            self.button = button
+            self.restart()
+
+    @property
+    def _side(self) -> bool:
+        return self.button in SIDE_BUTTONS
+
+    @property
+    def _pair(self) -> str:
+        """What a quick second press is called for this button."""
+        return "repeat" if self._side else "double-click"
+
     def restart(self) -> None:
         self.calibrator = Calibrator()
         self.suggestion = None
@@ -502,8 +479,9 @@ class CalibratePage(Page):
             return
         elif self.phase == "done":
             if self.suggestion is not None:
-                self.threshold_chosen.emit(self.suggestion.threshold_ms)
-                self.controller.set_calibrated(True)
+                button = self.button
+                self.threshold_chosen.emit(button, self.suggestion.threshold_ms)
+                self.controller.set_calibrated(button, True)
             return
         self.pad.reset()
         self._render()
@@ -525,6 +503,15 @@ class CalibratePage(Page):
         self, gap_ms: Optional[float], _interval_ms: Optional[float], button: Button = Button.LEFT
     ) -> None:
         note = ""
+        button = as_button(button)
+        if button is not self.button:
+            if self.phase != "done":
+                self._render(
+                    f"That was the {button_name(button).lower()} button. To measure it, "
+                    "choose it above; this measures the "
+                    f"{button_name(self.button).lower()} button."
+                )
+            return
         if self.phase == "intro":
             # Clicking the pad is as good as Begin, and counts as the first
             # single click. Its gap means nothing: it is the first.
@@ -569,6 +556,8 @@ class CalibratePage(Page):
         # Only the start of a pair: no "counted" flash.
         self.pad.flash(False, neutral=True)
         if too_slow:
+            if self._side:
+                return "Too slow for a repeat, so it wasn’t counted. Press a little faster."
             return "Too slow for a double-click, so it wasn’t counted. Double-click a little faster."
         return ""
 
@@ -583,12 +572,22 @@ class CalibratePage(Page):
         self.progress_row.setVisible(self.phase in ("single", "double"))
         self.pad.setVisible(not done)
         self.primary_button.setVisible(True)
+        # The button can change before measuring starts and once it is over.
+        self.button_picker.setEnabled(not self.measuring)
+        name = button_name(self.button).lower()
+        side = self._side
+        self.double_row.title.setText("Fastest repeat" if side else "Fastest double-click")
 
         if self.phase == "intro":
-            self.step_row.title.setText("Calibrate your mouse")
+            self.step_row.title.setText(f"Calibrate the {name} button")
             self.step_row.set_detail(
-                "Click once at a time, then double-click. Filtering pauses while you do, "
-                "so the pad sees your mouse as it is."
+                note
+                or (
+                    f"Press the {name} button once at a time, then twice quickly. "
+                    if side
+                    else f"Click the {name} button once at a time, then double-click it. "
+                )
+                + "Filtering pauses while you do, so the pad sees your mouse as it is."
             )
             self.count_label.setText("")
             self.pad.set_text(label("Ready"), "")
@@ -596,20 +595,22 @@ class CalibratePage(Page):
             self.primary_button.setEnabled(True)
         elif self.phase == "single":
             count = self.calibrator.single_clicks
-            self.step_row.title.setText("Single clicks")
-            self.step_row.set_detail(note or "Click once, then pause.")
+            self.step_row.title.setText("Single presses" if side else "Single clicks")
+            self.step_row.set_detail(note or ("Press once, then pause." if side else "Click once, then pause."))
             self.count_label.setText(f"{count} of {REQUIRED_SINGLE_CLICKS}")
             self.progress.setValue(int(self.calibrator.single_progress * 100))
-            self.pad.set_text(label("Click Once"), "")
+            self.pad.set_text(label("Press Once" if side else "Click Once"), "")
             self.primary_button.setText(label("Skip"))
             self.primary_button.setEnabled(True)
         elif self.phase == "double":
             count = self.calibrator.double_clicks
-            self.step_row.title.setText("Double-clicks")
-            self.step_row.set_detail(note or "Double-click at your usual speed.")
+            self.step_row.title.setText("Repeats" if side else "Double-clicks")
+            self.step_row.set_detail(
+                note or ("Press twice quickly, as when going back two pages." if side else "Double-click at your usual speed.")
+            )
             self.count_label.setText(f"{count} of {REQUIRED_DOUBLE_CLICKS}")
             self.progress.setValue(int(self.calibrator.double_progress * 100))
-            self.pad.set_text(label("Double-Click"), "")
+            self.pad.set_text(label("Press Twice" if side else "Double-Click"), "")
             # It finishes by itself at the last double-click; a Finish button
             # here could only lead to "not enough double-clicks".
             self.primary_button.setVisible(False)
@@ -617,13 +618,20 @@ class CalibratePage(Page):
             suggestion = self.suggestion
             self.count_label.setText("")
             if suggestion is None:
-                self.step_row.title.setText("Not enough double-clicks")
-                self.step_row.set_detail(f"Start over and double-click at least {REQUIRED_DOUBLE_CLICKS} times.")
+                if side:
+                    self.step_row.title.setText("Not enough repeats")
+                    self.step_row.set_detail(f"Start over and press twice quickly at least {REQUIRED_DOUBLE_CLICKS} times.")
+                else:
+                    self.step_row.title.setText("Not enough double-clicks")
+                    self.step_row.set_detail(f"Start over and double-click at least {REQUIRED_DOUBLE_CLICKS} times.")
                 self.primary_button.setText(label("Apply"))
                 self.primary_button.setEnabled(False)
                 return
             self.step_row.title.setText("Calibration complete")
-            self.step_row.set_detail("")
+            filtered = self.button in self.controller.buttons
+            self.step_row.set_detail(
+                f"Apply sets the {name} button’s window" + (".", " and starts filtering it.")[not filtered]
+            )
             self.recommended_value.setText(f"{suggestion.threshold_ms} ms")
             self.bounce_value.setText(
                 "None detected" if suggestion.worst_bounce_ms is None else f"{suggestion.worst_bounce_ms:.0f} ms"
@@ -827,7 +835,7 @@ class GeneralPage(Page):
             state[f"{permissions.pane_name()} permission"] = getattr(window, "_permission_granted", "?")
         if self.updater is not None and self.updater.supported:
             state["update"] = f"{self.updater.state} {self.updater.message}".strip()
-        text = diagnostics.report(__version__, state, self.controller.settings)
+        text = diagnostics.report(__version__, state, self.controller.diagnostic_settings())
         QApplication.clipboard().setText(text)
         self.diagnostics_row.set_detail("Copied. Paste it into your bug report.")
         self._diagnostics_timer.start()
@@ -862,7 +870,7 @@ class GeneralPage(Page):
 # -- window ----------------------------------------------------------------------
 
 class MainWindow(QWidget):
-    """Sidebar navigation over four panes."""
+    """Sidebar navigation over the panes (PAGES)."""
 
     closed_to_tray = Signal()
 
@@ -912,8 +920,20 @@ class MainWindow(QWidget):
         self.filter_page = FilterPage(controller)
         self.test_page = TestPage(controller)
         self.calibrate = CalibratePage(controller)
+        self.history = HistoryPage(controller)
+        self.apps = AppsPage(controller)
+        self.devices = DevicesPage(controller)
         self.general = GeneralPage(controller, updater)
-        self.pages = [self.filter_page, self.test_page, self.calibrate, self.general]
+        by_key = {
+            "filter": self.filter_page,
+            "test": self.test_page,
+            "calibrate": self.calibrate,
+            "history": self.history,
+            "apps": self.apps,
+            "devices": self.devices,
+            "general": self.general,
+        }
+        self.pages = [by_key[key] for key, _title in PAGES]
         self.stack = QStackedWidget()
         for page in self.pages:
             area = QScrollArea()
@@ -948,6 +968,8 @@ class MainWindow(QWidget):
         controller.settings_changed.connect(self.refresh)
         controller.global_event.connect(self.filter_page.note_global_event)
         controller.global_event.connect(self.test_page.note_global_event)
+        # From the hook's thread.
+        controller.device_seen.connect(self.devices.refresh, Qt.ConnectionType.QueuedConnection)
         self.filter_page.calibrate_requested.connect(self.show_calibration)
         controller.hook_failed.connect(self._on_hook_failed)
         # Reported from the hook's thread; handled here, on the UI thread.
@@ -1104,7 +1126,10 @@ class MainWindow(QWidget):
             if name == key:
                 self._show_page(index)
 
-    def show_calibration(self) -> None:
+    def show_calibration(self, button: object = None) -> None:
+        """Open Calibrate, measuring `button` if one is named."""
+        if button is not None:
+            self.calibrate.set_button(button)
         self.show_page("calibrate")
 
     # -- calibration pause -------------------------------------------------------
@@ -1134,6 +1159,9 @@ class MainWindow(QWidget):
         self.controller.set_waiting_for_permission(waiting)
         self.filter_page.refresh(granted, waiting)
         self.test_page.refresh()
+        self.history.refresh()
+        self.apps.refresh()
+        self.devices.refresh()
         self.general.refresh(granted)
 
     def _read_permission(self) -> bool:
@@ -1346,8 +1374,11 @@ class MainWindow(QWidget):
         nobody asked for would open over whatever the user is doing."""
         return self.isVisible() and not self.isMinimized()
 
-    def _apply_calibration(self, threshold_ms: int) -> None:
-        self.controller.set_threshold(threshold_ms)
+    def _apply_calibration(self, button: object, threshold_ms: int) -> None:
+        """Calibration's Apply: the button's window, and filtering it, since
+        it was worth measuring."""
+        self.controller.set_threshold(button, threshold_ms)
+        self.controller.set_button_filtered(button, True)
         self.calibrate.restart()
         self._show_page(0)
 

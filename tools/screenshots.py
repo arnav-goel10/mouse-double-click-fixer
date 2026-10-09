@@ -112,6 +112,47 @@ def social_preview():
     return image
 
 
+def sample_state(controller) -> None:
+    """Something to show on every pane: a few buttons with their own windows,
+    the wheel fix, an excluded app, the devices a Mac usually has, and a
+    month of wear on a switch that is getting worse."""
+    import time
+
+    from app.contracts import Button, DeviceInfo
+    from app.core import ClickEvent
+
+    controller.set_buttons([Button.LEFT, Button.RIGHT, Button.BACK])
+    controller.set_threshold(Button.LEFT, 46)
+    controller.set_calibrated(Button.LEFT)
+    controller.set_threshold(Button.BACK, 30)
+    controller.set_wheel_fix(True)
+    controller.add_excluded_app("com.valvesoftware.steam", "Steam")
+    controller.add_excluded_app("cs2.exe", "Counter-Strike 2")
+    controller.set_device_ignored("usb:046D:C08B:0F3A1B", "Logitech G502 HERO", True)
+    now = time.time()
+    controller._devices = {
+        "usb:03F0:1F4A:HP": DeviceInfo("usb:03F0:1F4A:HP", "HP 2.4G Wireless and BT Mouse", "mouse", True, now - 30),
+        "bt:05AC:0269:A1": DeviceInfo("bt:05AC:0269:A1", "Magic Mouse", "mouse", True, now - 900),
+        "usb:05AC:0342:T": DeviceInfo("usb:05AC:0342:T", "Apple Internal Keyboard / Trackpad", "trackpad", False, now),
+    }
+    wear = controller.wear
+    clock = wear._clock
+    gaps = [7, 9, 11, 8, 12, 10, 14, 9, 6, 17, 10, 13, 8, 22, 11, 9, 15, 12, 26, 10]
+    for day in range(30):
+        wear._clock = lambda day=day: now - (29 - day) * 86400
+        clicks = 900 + (day * 137) % 700
+        bounces = 3 + day // 3 + day % 4
+        for _ in range(clicks):
+            wear.note_event(ClickEvent(Button.LEFT, True, True, 400.0, None), 46)
+        for index in range(bounces):
+            wear.note_event(ClickEvent(Button.LEFT, True, False, float(gaps[(index + day) % len(gaps)]), None), 46)
+        if day % 5 == 0:
+            wear.note_event(ClickEvent(Button.LEFT, True, False, 5.0, None, cancels_held=True), 46)
+        for index in range(400):
+            wear.note_wheel(1, index % 97 == 0)
+    wear._clock = clock
+
+
 def main() -> None:
     positional = [argument for argument in sys.argv[1:] if not argument.startswith("--")]
     out = Path(positional[0] if positional else "screenshots")
@@ -146,7 +187,9 @@ def main() -> None:
     from app.ui.theme import current_look
 
     if as_windows:
-        for module in (widgets, window_module):
+        from app.ui import base, panes
+
+        for module in (widgets, window_module, base, panes):
             module.IS_MAC = False
         permissions.needs_accessibility = lambda: False  # type: ignore[assignment]
         from app.ui import symbols
@@ -158,10 +201,12 @@ def main() -> None:
         AppController.active = property(lambda self: True)  # type: ignore[assignment]
     controller = AppController()
     if docs:
-        controller._store(threshold_ms=46, calibrated=True, fix_enabled=True)
+        controller._store(thresholds={**controller.settings["thresholds"], "left": 46},
+                          calibrated_buttons=["left"], fix_enabled=True)
         controller.settings["filtered_total"] = 8324
         controller.session_filtered = 945
     else:
+        sample_state(controller)
         controller.settings["filtered_total"] = 1284
         controller.session_filtered = 37
     main_window = window_module.MainWindow(controller)
@@ -228,6 +273,14 @@ def main() -> None:
                 )
             else:
                 main_window.grab().save(str(out / name))
+                # The whole pane, however long, for review.
+                size = main_window.size()
+                page = main_window.pages[index]
+                main_window.resize(size.width(), max(size.height(), page.sizeHint().height() + 40))
+                app.processEvents()
+                main_window.grab().save(str(out / name.replace(".png", "-full.png")))
+                main_window.resize(size)
+                app.processEvents()
     if LIVE:
         # The narrowest the window can get, to check nothing is clipped.
         main_window._show_page(0)

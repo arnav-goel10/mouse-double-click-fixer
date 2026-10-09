@@ -36,7 +36,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..core import Button
+from ..contracts import Button
 from . import symbols
 from .theme import IS_MAC, IS_WINDOWS, Look, current_look, font, with_alpha
 
@@ -257,6 +257,15 @@ class Section(QWidget):
         self.rows.append(row)
         self._layout.addWidget(row)
         return row
+
+    def clear(self) -> None:
+        """Remove every row, for a list that is built again."""
+        for row in self.rows:
+            self._layout.removeWidget(row)
+            row.hide()
+            row.deleteLater()
+        self.rows = []
+        self.update()
 
     def paintEvent(self, _event) -> None:  # noqa: N802
         lk = look()
@@ -566,6 +575,9 @@ PAD_BUTTONS = {
     Qt.MouseButton.LeftButton: Button.LEFT,
     Qt.MouseButton.RightButton: Button.RIGHT,
     Qt.MouseButton.MiddleButton: Button.MIDDLE,
+    # Qt's names for the side buttons (X1 and X2; buttons 3 and 4 on macOS).
+    Qt.MouseButton.BackButton: Button.BACK,
+    Qt.MouseButton.ForwardButton: Button.FORWARD,
 }
 
 
@@ -573,8 +585,8 @@ class ClickPad(QWidget):
     """A surface that measures the user's own clicks.
 
     It reports the release-to-press gap, the same measurement the system-wide
-    filter uses, for the left, right and middle buttons, each timed against
-    its own last release.
+    filter uses, for every button the filter knows (left, right, middle, back
+    and forward), each timed against its own last release.
     """
 
     pressed_with_gap = Signal(object, object, object)  # gap_ms, interval_ms, Button

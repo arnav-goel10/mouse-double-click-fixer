@@ -22,6 +22,9 @@ SYMBOLS = {
     "test": ("hand.tap.fill", "", "#30b158"),
     "calibrate": ("slider.horizontal.3", "", "#ff9500"),
     "general": ("gearshape.fill", "", "#8e8e93"),
+    "history": ("chart.xyaxis.line", "\ue81c", "#ff2d55"),
+    "apps": ("square.grid.2x2.fill", "\ue71d", "#af52de"),
+    "devices": ("computermouse.fill", "\ue772", "#5ac8fa"),
     "warning": ("exclamationmark.triangle.fill", "", "#ff9f0a"),
     "ok": ("checkmark.circle.fill", "", "#30b158"),
     # Card icons, used on Windows only (Windows 11 Settings gives every card one).
@@ -32,6 +35,7 @@ SYMBOLS = {
     "sync": ("arrow.triangle.2.circlepath", "", "#8e8e93"),
     "copy": ("doc.on.clipboard", "", "#8e8e93"),
     "info": ("info.circle", "\ue946", "#8e8e93"),
+    "wheel": ("scroll", "\uec8f", "#8e8e93"),
 }
 
 

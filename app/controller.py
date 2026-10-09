@@ -2,23 +2,48 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import sys
 import threading
-from typing import Optional
+from typing import Any, Optional
 
 from PySide6.QtCore import QObject, Signal
 
 from . import DISPLAY_NAME, permissions
 from . import settings as settings_store
 from . import startup
-from .core import Button, ClickEvent, clamp_threshold
-from .platform import GlobalClickFilter, HookError, is_supported
+from .contracts import (
+    SIDE_BUTTONS,
+    TOUCH_KINDS,
+    Button,
+    DeviceInfo,
+    FilterConfig,
+    GlobalClickFilter,
+    as_button,
+    button_name,
+)
+from .core import ClickEvent, clamp_threshold
+from .platform import HookError, is_supported
+from .wear import WearHistory
 
 log = logging.getLogger(__name__)
 
 #: The settings the updater keeps, through store_update_state().
 UPDATE_STATE_KEYS = frozenset({"auto_check", "update_attempt_version", "update_attempt_count"})
+
+
+def config_from_settings(values: dict[str, Any]) -> FilterConfig:
+    """The filter's configuration from the saved settings. The one place a
+    FilterConfig is built (see app/contracts.py)."""
+    return FilterConfig(
+        thresholds=settings_store.thresholds_from(values),
+        buttons=frozenset(settings_store.buttons_from(values)),
+        wheel_fix=bool(values["wheel_fix"]),
+        wheel_window_ms=int(values["wheel_window_ms"]),
+        excluded_apps=frozenset(entry["key"] for entry in values["excluded_apps"]),
+        ignored_devices=frozenset(entry["key"] for entry in values["ignored_devices"]),
+    )
 
 
 class AppController(QObject):
@@ -37,6 +62,9 @@ class AppController(QObject):
     #: A running filter found its access withdrawn and stopped. Carries that
     #: filter, so a late signal from one since replaced can be ignored.
     permission_lost = Signal(object)
+    #: The filter saw a device for the first time this run. Emitted from the
+    #: hook's thread; connect with a queued connection.
+    device_seen = Signal()
 
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
@@ -83,15 +111,44 @@ class AppController(QObject):
         self._count_lock = threading.Lock()
         self._pending_filtered = 0
         self.session_filtered = 0
+        # Daily wear counts, from the hook's thread (see _on_global_event).
+        self.wear = WearHistory()
+        try:
+            self.wear.load()
+        except OSError as error:
+            log.warning("Couldn't read the wear history: %s", error)
+        # What the hook thread reads for wear counting: the filtered buttons
+        # and their windows. Replaced whole, never changed in place.
+        self._watched: dict[Button, int] = {}
+        # Devices seen this run, by key; the filter's own list goes when it
+        # stops, and the Devices pane keeps showing them.
+        self._device_lock = threading.Lock()
+        self._devices: dict[str, DeviceInfo] = {}
+        # Keys of devices whose clicks the filter passes untouched (touch
+        # kinds and ignored mice), read by the hook thread: their presses
+        # are not the switch's, so they don't count towards its wear.
+        self._passthrough: frozenset[str] = frozenset()
+        self._sync_watched()
 
     # -- state -------------------------------------------------------------
     @property
     def threshold_ms(self) -> int:
-        return int(self.settings["threshold_ms"])
+        """The left button's window (see threshold_for)."""
+        return self.threshold_for(Button.LEFT)
+
+    def threshold_for(self, button: Any) -> int:
+        return int(self.settings["thresholds"][as_button(button).value])
+
+    @property
+    def thresholds(self) -> dict[Button, int]:
+        return settings_store.thresholds_from(self.settings)
 
     @property
     def buttons(self) -> list[Button]:
         return settings_store.buttons_from(self.settings)
+
+    def filter_config(self) -> FilterConfig:
+        return config_from_settings(self.settings)
 
     @property
     def active(self) -> bool:
@@ -99,7 +156,27 @@ class AppController(QObject):
 
     @property
     def calibrated(self) -> bool:
-        return bool(self.settings["calibrated"])
+        """Whether the left button's window came from calibration."""
+        return self.is_calibrated(Button.LEFT)
+
+    def is_calibrated(self, button: Any) -> bool:
+        return as_button(button).value in self.settings["calibrated_buttons"]
+
+    @property
+    def wheel_fix(self) -> bool:
+        return bool(self.settings["wheel_fix"])
+
+    @property
+    def wheel_window_ms(self) -> int:
+        return int(self.settings["wheel_window_ms"])
+
+    @property
+    def excluded_apps(self) -> list[dict[str, str]]:
+        return [dict(entry) for entry in self.settings["excluded_apps"]]
+
+    @property
+    def ignored_devices(self) -> list[dict[str, str]]:
+        return [dict(entry) for entry in self.settings["ignored_devices"]]
 
     @property
     def filtered_total(self) -> int:
@@ -151,14 +228,15 @@ class AppController(QObject):
         try:
             reporter: list = []
             self._filter = GlobalClickFilter(
-                self.threshold_ms,
-                self.buttons,
+                self.filter_config(),
                 on_event=self._on_global_event,
                 on_error=self.hook_failed.emit,
                 # macOS re-arms a tap it disabled only while access is still
                 # there; without it the filter lets clicks through and stops.
                 permission_ok=permissions.event_tap_allowed if permissions.needs_accessibility() else None,
                 on_permission_lost=lambda: self.permission_lost.emit(reporter[0] if reporter else None),
+                on_device=self._on_device,
+                on_wheel=self._on_wheel,
             )
             reporter.append(self._filter)
             self._filter.start()
@@ -169,7 +247,7 @@ class AppController(QObject):
             self.filter_state_changed.emit(False, str(error))
             return False
         self.failure = self.failure_detail = ""
-        log.info("Filter on: %d ms, buttons %s", self.threshold_ms, ", ".join(self.settings["buttons"]))
+        log.info("Filter on: %s%s", self._windows_text(), ", wheel fix" if self.wheel_fix else "")
         self._store(fix_enabled=True)
         self.filter_state_changed.emit(True, "")
         return True
@@ -196,6 +274,7 @@ class AppController(QObject):
             current, self._unstopped = self._unstopped, None
         if current is None:
             return
+        self._keep_devices(current)
         current.stop()
         if current.running:
             # Its hook thread didn't end in time. Dropping the handle to a
@@ -307,7 +386,10 @@ class AppController(QObject):
         """The status line as a tooltip for the menu bar or tray icon, so a
         paused or waiting filter never reads as plain "off"."""
         if self.active:
-            return f"{DISPLAY_NAME}: on, {self.threshold_ms} ms"
+            windows = {self.threshold_for(button) for button in self.buttons}
+            if len(windows) == 1:
+                return f"{DISPLAY_NAME}: on, {windows.pop()} ms"
+            return f"{DISPLAY_NAME}: on"
         status = self.status_text()
         return f"{DISPLAY_NAME}: {status[0].lower()}{status[1:]}"
 
@@ -325,6 +407,7 @@ class AppController(QObject):
         self._shut_down = True
         self._stop_filter()
         self.flush_stats()
+        self.wear.save()
 
     def diagnostic_state(self) -> dict:
         """The filter's state for a bug report. Counts only, never clicks."""
@@ -342,31 +425,149 @@ class AppController(QObject):
             "hook re-arms": getattr(current, "hook_rearms", "-"),
             "blocked this session": self.session_filtered,
             "login item": self.login_item_state,
+            "windows": self._windows_text(every=True),
+            "side buttons": ", ".join(
+                f"{button_name(button).lower()} {'on' if button in self.buttons else 'off'}"
+                for button in Button
+                if button in SIDE_BUTTONS
+            ),
+            "wheel fix": f"on, {self.wheel_window_ms} ms" if self.wheel_fix else "off",
+            "excluded apps": len(self.settings["excluded_apps"]),
+            "ignored devices": ", ".join(entry["name"] for entry in self.settings["ignored_devices"]) or "none",
+            "seen devices": ", ".join(f"{device.name} ({device.kind})" for device in self.seen_devices()) or "none",
         }
 
+    def diagnostic_settings(self) -> dict:
+        """The settings for a bug report: the excluded apps only as a count
+        and the ignored devices by name (their keys carry serial numbers)."""
+        shown = dict(self.settings)
+        shown["excluded_apps"] = len(self.settings["excluded_apps"])
+        shown["ignored_devices"] = [entry["name"] for entry in self.settings["ignored_devices"]]
+        return shown
+
+    def _windows_text(self, every: bool = False) -> str:
+        """"left 46 ms, right 30 ms": the filtered buttons' windows, or
+        every button's with `every`."""
+        chosen = list(Button) if every else self.buttons
+        return ", ".join(f"{button.value} {self.threshold_for(button)} ms" for button in chosen)
+
     # -- settings ----------------------------------------------------------
-    def set_threshold(self, value: int) -> None:
-        threshold = clamp_threshold(value)
-        if threshold == self.threshold_ms:
-            return
-        self._store(threshold_ms=threshold)
+    def _apply(self, **values: object) -> None:
+        """Save filter settings, hand the new configuration to a running
+        filter (it takes effect at once), and tell the UI."""
+        self._store(**values)
+        self._sync_watched()
         if self._filter is not None:
-            self._filter.update(threshold_ms=threshold)
+            self._filter.update(self.filter_config())
         self.settings_changed.emit()
+
+    def set_threshold(self, button: Any, value: int) -> None:
+        """Set one button's window."""
+        button = as_button(button)
+        threshold = clamp_threshold(value)
+        if threshold == self.threshold_for(button):
+            return
+        self._apply(thresholds={**self.settings["thresholds"], button.value: threshold})
 
     def set_buttons(self, buttons: list[Button]) -> None:
+        """Choose the buttons to filter, side buttons included. One always
+        stays: with none chosen, the left button is."""
         # A Qt signal delivers these as plain strings, since Button is a str
         # enum; accept either form.
-        names = [Button(button).value for button in buttons] or [Button.LEFT.value]
+        chosen = {as_button(button) for button in buttons}
+        names = [button.value for button in Button if button in chosen] or [Button.LEFT.value]
         if names == self.settings["buttons"]:
             return
-        self._store(buttons=names)
-        if self._filter is not None:
-            self._filter.update(buttons=self.buttons)
-        self.settings_changed.emit()
+        self._apply(buttons=names)
 
-    def set_calibrated(self, value: bool) -> None:
-        self._store(calibrated=bool(value))
+    def set_button_filtered(self, button: Any, filtered: bool) -> None:
+        button = as_button(button)
+        current = set(self.buttons)
+        self.set_buttons(sorted(current | {button} if filtered else current - {button}, key=list(Button).index))
+
+    def set_side_buttons(self, filtered: bool) -> None:
+        """Filter the back and forward buttons, or stop."""
+        current = set(self.buttons)
+        self.set_buttons(sorted(current | SIDE_BUTTONS if filtered else current - SIDE_BUTTONS, key=list(Button).index))
+
+    def set_calibrated(self, button: Any, value: bool = True) -> None:
+        name = as_button(button).value
+        names = [other for other in self.settings["calibrated_buttons"] if other != name]
+        if value:
+            names.append(name)
+        if sorted(names) != sorted(self.settings["calibrated_buttons"]):
+            self._store(calibrated_buttons=names)
+            self.settings_changed.emit()
+
+    def set_wheel_fix(self, enabled: bool, window_ms: Optional[int] = None) -> None:
+        values: dict[str, object] = {"wheel_fix": bool(enabled)}
+        if window_ms is not None:
+            values["wheel_window_ms"] = settings_store.milliseconds(
+                window_ms, self.wheel_window_ms, settings_store.WHEEL_MIN_MS, settings_store.WHEEL_MAX_MS
+            )
+        if all(self.settings.get(key) == value for key, value in values.items()):
+            return
+        self._apply(**values)
+
+    def add_excluded_app(self, key: str, name: str = "") -> None:
+        """Let everything through while this app is in front."""
+        if not key or any(entry["key"] == key for entry in self.settings["excluded_apps"]):
+            return
+        self._apply(excluded_apps=[*self.settings["excluded_apps"], {"key": key, "name": name or key}])
+
+    def remove_excluded_app(self, key: str) -> None:
+        kept = [entry for entry in self.settings["excluded_apps"] if entry["key"] != key]
+        if len(kept) != len(self.settings["excluded_apps"]):
+            self._apply(excluded_apps=kept)
+
+    def is_device_ignored(self, key: str) -> bool:
+        return any(entry["key"] == key for entry in self.settings["ignored_devices"])
+
+    def set_device_ignored(self, key: str, name: str, ignored: bool) -> None:
+        """Stop filtering a device (or start again). Touch devices are never
+        filtered whatever this says."""
+        if not key or ignored == self.is_device_ignored(key):
+            return
+        kept = [entry for entry in self.settings["ignored_devices"] if entry["key"] != key]
+        if ignored:
+            kept.append({"key": key, "name": name or key})
+        self._apply(ignored_devices=kept)
+
+    def seen_devices(self) -> list[DeviceInfo]:
+        """The devices the filter has seen this run, newest first, each
+        marked filtered or not by the settings as they are now."""
+        current = self._filter or self._unstopped
+        found: dict[str, DeviceInfo] = {}
+        with self._device_lock:
+            found.update(self._devices)
+        if current is not None:
+            try:
+                for device in current.seen_devices():
+                    found[device.key] = device
+            except Exception:  # noqa: BLE001 - a list for the UI; never break it
+                log.warning("Couldn't read the filter's devices", exc_info=True)
+        ignored = {entry["key"] for entry in self.settings["ignored_devices"]}
+        devices = [
+            dataclasses.replace(device, filtered=device.kind not in TOUCH_KINDS and device.key not in ignored)
+            for device in found.values()
+        ]
+        return sorted(devices, key=lambda device: device.last_seen, reverse=True)
+
+    def _keep_devices(self, current: object) -> None:
+        try:
+            devices = list(current.seen_devices())  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001 - a stand-in or a dying filter
+            return
+        with self._device_lock:
+            for device in devices:
+                self._devices[device.key] = device
+
+    def _sync_watched(self) -> None:
+        self._watched = {button: self.threshold_for(button) for button in self.buttons}
+        with self._device_lock:
+            self._passthrough = frozenset(entry["key"] for entry in self.settings["ignored_devices"]) | frozenset(
+                key for key, device in self._devices.items() if device.kind in TOUCH_KINDS
+            )
 
     def set_start_at_login(self, enabled: bool) -> str:
         """Returns an error message, or an empty string on success."""
@@ -441,6 +642,8 @@ class AppController(QObject):
         return "updated" if pending == current_version else "failed"
 
     def reset_statistics(self) -> None:
+        """Start the blocked count from zero. The wear history is kept: it is
+        what says whether the switch is getting worse."""
         with self._count_lock:
             self._pending_filtered = 0
             self.session_filtered = 0
@@ -459,20 +662,39 @@ class AppController(QObject):
             self.settings = settings_store.merge(values, self.settings)
 
     def flush_stats(self) -> None:
-        """Write the running count to disk. Called from the UI thread only."""
+        """Write the running count to disk, and the wear history when it is
+        due (every few minutes). Called from the UI thread only."""
         with self._count_lock:
             pending, self._pending_filtered = self._pending_filtered, 0
         if pending:
             self._store(filtered_total=int(self.settings["filtered_total"]) + pending)
+        self.wear.save_if_due()
 
     # -- events ------------------------------------------------------------
     def _on_global_event(self, event: ClickEvent) -> None:
         # Runs on the hook thread. Windows drops a low-level hook that takes
         # too long, so this does nothing but count and emit; the signal hops
         # to the UI thread, which owns all disk writes.
+        if event.pressed:
+            window = self._watched.get(as_button(event.button))
+            # Only the buttons being filtered, from devices being filtered.
+            if window is not None and getattr(event, "device", None) not in self._passthrough:
+                self.wear.note_event(event, window)
         if event.is_bounce:
             with self._count_lock:
                 self.session_filtered += 1
                 self._pending_filtered += 1
             # The UI only reacts to bounces, so only those cross threads.
             self.global_event.emit(event)
+
+    def _on_device(self, device: DeviceInfo) -> None:
+        # The hook thread: remember it, and let the UI know.
+        with self._device_lock:
+            self._devices[device.key] = device
+            if device.kind in TOUCH_KINDS:
+                self._passthrough = self._passthrough | {device.key}
+        self.device_seen.emit()
+
+    def _on_wheel(self, axis: int, dropped: bool) -> None:
+        # The hook thread.
+        self.wear.note_wheel(axis, dropped)

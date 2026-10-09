@@ -130,12 +130,12 @@ class WindowTests(unittest.TestCase):
         self.assertFalse(page.primary_button.isEnabled())
 
     def test_settings_changes_reach_the_controller(self) -> None:
-        from app.core import Button
+        from app.contracts import Button
 
         page = self.window.filter_page
-        page.slider.setValue(35)
-        self.assertEqual(self.controller.threshold_ms, 35)
-        self.assertEqual(page.value.text(), "35 ms")
+        page.window_boxes[Button.LEFT].setValue(35)
+        self.assertEqual(self.controller.threshold_for(Button.LEFT), 35)
+        self.assertEqual(self.controller.threshold_for(Button.RIGHT), 46, "each button has its own window")
 
         page.button_switches[Button.RIGHT].click()
         self.assertIn(Button.RIGHT, self.controller.buttons)
@@ -241,8 +241,13 @@ class FakeFilter:
 
     fail_with = None
 
-    def __init__(self, threshold_ms, buttons, on_event=None, on_error=None,
-                 permission_ok=None, on_permission_lost=None) -> None:
+    def __init__(self, config, on_event=None, on_error=None, permission_ok=None,
+                 on_permission_lost=None, on_device=None, on_wheel=None) -> None:
+        self.config = config
+        self.on_event = on_event
+        self.on_device = on_device
+        self.on_wheel = on_wheel
+        self.updates = []
         self.started = self.stopped = False
         self.on_permission_lost = on_permission_lost
 
@@ -260,8 +265,11 @@ class FakeFilter:
     def stop(self) -> None:
         self.stopped = True
 
-    def update(self, **_changes) -> None:
-        pass
+    def update(self, config) -> None:
+        self.updates.append(config)
+
+    def seen_devices(self) -> list:
+        return list(getattr(self, "devices", []))
 
 
 @unittest.skipIf(QApplication is None, "PySide6 is not installed")
@@ -862,8 +870,10 @@ class AccessibilityTests(LiveWindowTests):
         from PySide6.QtCore import Qt
         from PySide6.QtWidgets import QScrollArea
 
+        from app.ui.window import PAGES
+
         areas = self.window.findChildren(QScrollArea)
-        self.assertEqual(len(areas), 4)
+        self.assertEqual(len(areas), len(PAGES))
         for area in areas:
             self.assertEqual(area.focusPolicy(), Qt.FocusPolicy.NoFocus)
 
@@ -1043,14 +1053,15 @@ class CalibrationFlowTests(LiveWindowTests):
         self.assertIn("Too slow", page.step_row.detail.text())
         self.assertEqual(page.pad._flash_tone, "neutral", "not flashed as counted")
 
-    def test_a_pair_is_one_button(self) -> None:
-        from app.core import Button
+    def test_only_the_chosen_button_is_measured(self) -> None:
+        from app.contracts import Button
 
         page = self.to_double_phase()
         page._on_pad_press(1500.0, 1600.0, Button.LEFT)
-        page._on_pad_press(150.0, 220.0, Button.RIGHT)  # a different button opens its own pair
+        page._on_pad_press(150.0, 220.0, Button.RIGHT)  # another button: not measured at all
         self.assertEqual(page.calibrator.double_clicks, 0)
-        page._on_pad_press(150.0, 220.0, Button.RIGHT)
+        self.assertIn("right button", page.step_row.detail.text())
+        page._on_pad_press(150.0, 220.0, Button.LEFT)  # the pair is still open
         self.assertEqual(page.calibrator.double_clicks, 1)
 
     def test_the_pad_times_each_button_against_its_own_release(self) -> None:
@@ -1297,7 +1308,9 @@ class ControllerFixTests(unittest.TestCase):
     def test_settings_writes_keep_unflushed_bounces(self) -> None:
         for _ in range(40):
             self.bounce()
-        self.controller.set_threshold(70)            # an unrelated write
+        from app.contracts import Button
+
+        self.controller.set_threshold(Button.LEFT, 70)  # an unrelated write
         self.assertEqual(self.controller.filtered_total, 40)
         self.controller.flush_stats()
         from app import settings
@@ -1553,9 +1566,11 @@ class StateFixTests(unittest.TestCase):
         self.assertEqual(self.controller.status_text(), "Paused for calibration")
 
     def test_a_failed_settings_write_still_takes_effect(self) -> None:
+        from app.contracts import Button
+
         with mock.patch("app.settings.save", side_effect=OSError("disk full")):
-            self.controller.set_threshold(35)
-        self.assertEqual(self.controller.threshold_ms, 35)
+            self.controller.set_threshold(Button.RIGHT, 35)
+        self.assertEqual(self.controller.threshold_for(Button.RIGHT), 35)
 
     def test_infinite_threshold_in_settings_falls_back(self) -> None:
         from app.core import DEFAULT_THRESHOLD_MS, clamp_threshold
