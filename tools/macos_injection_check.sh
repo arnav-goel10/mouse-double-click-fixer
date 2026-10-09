@@ -4,15 +4,22 @@
 # the app, so code that gets itself loaded there inherits the grant.
 #
 # It builds a canary library that leaves a file behind if it is ever loaded,
-# then runs the app's --self-test (never the app itself) twice:
+# then runs the app's --self-test (never the app itself) three times:
 #   dyld     DYLD_INSERT_LIBRARIES=<canary>; the hardened runtime must ignore it
 #   openssl  OPENSSL_CONF=<a config whose provider module is the canary>; the
 #            runtime hook must remove it before hashlib starts OpenSSL
+#   path     PATH starting with a folder of canary programs (pgrep, bash,
+#            sleep, codesign, ditto, open and the rest), BASH_ENV and ENV
+#            naming a canary script, and an exported bash function for
+#            sleep. The self-test runs the app's own pgrep lookup and bash
+#            -p, which runs sleep by name; the app must run /usr/bin/pgrep,
+#            and the runtime hook must pin PATH and drop the rest.
 # Each canary file must stay absent, and the self-test must still pass.
 #
 # Usage: tools/macos_injection_check.sh [path/to/DoubleClick Fixer.app] [--expect-injection]
 # --expect-injection turns the check around, for a control build without the
-# hardening: both canaries must fire, which shows the check can fail at all.
+# hardening (and without the runtime hook): every canary must fire, which
+# shows the check can fail at all.
 # Needs clang (Xcode Command Line Tools).
 set -euo pipefail
 
@@ -82,6 +89,16 @@ activate = 1
 activate = 1
 CNF
 
+# Programs that would run instead of the system's, and bash start-up code.
+fake_bin="$work/bin"
+mkdir -p "$fake_bin"
+for program in pgrep bash sh sleep seq mv rm xattr open codesign ditto; do
+  printf '#!/bin/sh\necho "%s ran" >> "%s"\n' "$program" "$marks/dcf-canary-path" > "$fake_bin/$program"
+  chmod +x "$fake_bin/$program"
+done
+printf 'echo "BASH_ENV or ENV was read" >> "%s"\n' "$marks/dcf-canary-path" > "$work/startup.sh"
+rm -f "$marks/dcf-canary-path"
+
 failed=0
 run() {  # name, then the environment to run the self-test with
   local name="$1"
@@ -105,17 +122,19 @@ run() {  # name, then the environment to run the self-test with
 codesign -dv "$app" 2>&1 | grep -E '^CodeDirectory' || true
 run dyld DYLD_INSERT_LIBRARIES="$dyld_canary"
 run openssl OPENSSL_CONF="$work/openssl.cnf"
+run path PATH="$fake_bin:/usr/bin:/bin:/usr/sbin:/sbin" BASH_ENV="$work/startup.sh" ENV="$work/startup.sh" \
+  "BASH_FUNC_sleep%%=() { echo 'exported function ran' >> '$marks/dcf-canary-path'; }"
 
 if [[ $failed != 0 ]]; then
   if [[ $expect_injection == 1 ]]; then
-    echo "FAILED: a canary did not fire in a build expected to load it; the check proves nothing" >&2
+    echo "FAILED: a canary did not fire in a build expected to run it; the check proves nothing" >&2
   else
-    echo "FAILED: the app loaded code named in its environment, or its self-test failed" >&2
+    echo "FAILED: the app loaded or ran code named in its environment, or its self-test failed" >&2
   fi
   exit 1
 fi
 if [[ $expect_injection == 1 ]]; then
-  echo "OK: both canaries fired in this unhardened build, as expected"
+  echo "OK: every canary fired in this unhardened build, as expected"
 else
-  echo "OK: neither canary fired and the self-test passed"
+  echo "OK: no canary fired and the self-test passed"
 fi

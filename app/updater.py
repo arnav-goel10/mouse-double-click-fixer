@@ -194,9 +194,9 @@ def release_from_json(data: dict, kind: str) -> Optional[Release]:
 
 
 def _ci_key() -> Optional[PublicKey]:
-    """CI's throwaway key, in a packaged app built by CI's end-to-end job."""
+    """CI's throwaway key, in a packaged Windows app built by CI's end-to-end job."""
     bundled = getattr(sys, "_MEIPASS", None)
-    if not getattr(sys, "frozen", False) or not bundled:
+    if sys.platform != "win32" or not getattr(sys, "frozen", False) or not bundled:
         return None
     path = Path(bundled) / CI_KEY_FILE
     if not path.is_file():
@@ -302,7 +302,7 @@ def bundle_version(app: Path) -> str:
 def designated_requirement(app: Path) -> str:
     """The signature requirement macOS stores with privacy grants."""
     result = subprocess.run(
-        ["codesign", "-d", "-r-", str(app)], capture_output=True, text=True, check=False
+        ["/usr/bin/codesign", "-d", "-r-", str(app)], capture_output=True, text=True, check=False
     )
     for line in (result.stdout + result.stderr).splitlines():
         if line.startswith("designated =>"):
@@ -312,7 +312,7 @@ def designated_requirement(app: Path) -> str:
 
 def signature_is_valid(app: Path) -> bool:
     result = subprocess.run(
-        ["codesign", "--verify", "--deep", "--strict", str(app)], capture_output=True, check=False
+        ["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)], capture_output=True, check=False
     )
     return result.returncode == 0
 
@@ -342,7 +342,7 @@ def mac_swap_script(
     current: Path,
     staged: Path,
     relaunch_args: list[str],
-    opener: str = "open",
+    opener: str = "/usr/bin/open",
     workdir: Optional[Path] = None,
 ) -> str:
     """Wait for the app to exit, move the new bundle into place, reopen it.
@@ -356,18 +356,18 @@ def mac_swap_script(
     # Only ever delete the updater's own download folder, never whatever
     # folder the script happens to sit in.
     if workdir is not None and workdir.name.startswith(WORKDIR_PREFIX):
-        cleanup = f"rm -rf {quoted(workdir)}"
+        cleanup = f"/bin/rm -rf {quoted(workdir)}"
     else:
-        cleanup = 'rm -f "$0"'
+        cleanup = '/bin/rm -f "$0"'
     return f"""#!/bin/bash
-for _ in $(seq 1 150); do kill -0 {pid} 2>/dev/null || break; sleep 0.2; done
-rm -rf {quoted(backup)}
-if mv {quoted(current)} {quoted(backup)} && mv {quoted(staged)} {quoted(current)}; then
-  rm -rf {quoted(backup)}
+for _ in $(/usr/bin/seq 1 150); do kill -0 {pid} 2>/dev/null || break; /bin/sleep 0.2; done
+/bin/rm -rf {quoted(backup)}
+if /bin/mv {quoted(current)} {quoted(backup)} && /bin/mv {quoted(staged)} {quoted(current)}; then
+  /bin/rm -rf {quoted(backup)}
 else
-  [ -d {quoted(current)} ] || mv {quoted(backup)} {quoted(current)}
+  [ -d {quoted(current)} ] || /bin/mv {quoted(backup)} {quoted(current)}
 fi
-xattr -dr com.apple.quarantine {quoted(current)} 2>/dev/null
+/usr/bin/xattr -dr com.apple.quarantine {quoted(current)} 2>/dev/null
 {opener} {quoted(current)} --args {args}
 {cleanup}
 """
@@ -769,7 +769,7 @@ class Updater(QObject):
         if current is None:
             raise UpdateError("Couldn’t find the installed app.")
         unpacked = archive.parent / "unpacked"
-        result = subprocess.run(["ditto", "-x", "-k", str(archive), str(unpacked)], capture_output=True)
+        result = subprocess.run(["/usr/bin/ditto", "-x", "-k", str(archive), str(unpacked)], capture_output=True)
         if result.returncode != 0:
             raise UpdateError("Couldn’t unpack the update.")
         candidates = list(unpacked.glob("*.app"))
@@ -790,7 +790,7 @@ class Updater(QObject):
         # same volume and can't be left half done.
         staged = current.with_name("." + current.stem + " update.app")
         shutil.rmtree(staged, ignore_errors=True)
-        copied = subprocess.run(["ditto", str(new_app), str(staged)], capture_output=True)
+        copied = subprocess.run(["/usr/bin/ditto", str(new_app), str(staged)], capture_output=True)
         if copied.returncode != 0:
             shutil.rmtree(staged, ignore_errors=True)
             raise UpdateError(f"No permission to replace the app in {current.parent}.")
@@ -798,7 +798,7 @@ class Updater(QObject):
         script.write_text(
             mac_swap_script(os.getpid(), current, staged, self._relaunch_args(), workdir=self._workdir)
         )
-        subprocess.Popen(["/bin/bash", str(script)], start_new_session=True,
+        subprocess.Popen(["/bin/bash", "-p", str(script)], start_new_session=True,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
     def _install_windows_installer(self, installer: Path) -> None:

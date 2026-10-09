@@ -169,7 +169,7 @@ def _other_copies_running() -> bool:
             return False
         import subprocess
 
-        found = subprocess.run(["pgrep", "-x", os.path.basename(sys.executable)], capture_output=True, text=True)
+        found = subprocess.run(["/usr/bin/pgrep", "-x", os.path.basename(sys.executable)], capture_output=True, text=True)
         return any(int(pid) not in mine for pid in found.stdout.split())
     except Exception:  # noqa: BLE001 - unsure: behave as before
         return False

@@ -129,7 +129,7 @@ def open_login_items_settings() -> None:
             return
         except Exception:  # noqa: BLE001 - fall back to the pane's URL
             pass
-    subprocess.Popen(["open", LOGIN_ITEMS_PANE])
+    subprocess.Popen(["/usr/bin/open", LOGIN_ITEMS_PANE])
 
 
 def remove() -> None:

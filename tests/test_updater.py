@@ -257,7 +257,7 @@ class MacInstallTests(unittest.TestCase):
         workdir.mkdir()
 
         def run(command, **_kwargs):
-            if command[:3] == ["ditto", "-x", "-k"]:  # unpack the zip
+            if command[:3] == ["/usr/bin/ditto", "-x", "-k"]:  # unpack the zip
                 contents = Path(command[4]) / "DoubleClick Fixer.app" / "Contents"
                 contents.mkdir(parents=True)
                 info = {"CFBundleShortVersionString": bundled_version}
@@ -289,7 +289,10 @@ class MacInstallTests(unittest.TestCase):
         self.assertEqual(updater.bundle_version(app), "")
 
     def test_a_matching_update_is_staged_and_swapped(self) -> None:
-        self.install().assert_called_once()
+        popen = self.install()
+        popen.assert_called_once()
+        # bash -p: no BASH_ENV, ENV or exported functions from the environment.
+        self.assertEqual(popen.call_args.args[0][:2], ["/bin/bash", "-p"])
 
     def test_the_bundle_must_be_the_release_version(self) -> None:
         with self.assertRaisesRegex(updater.UpdateError, "isn’t the version it claims"):
@@ -325,6 +328,41 @@ class SwapScriptTests(unittest.TestCase):
         self.assertFalse(current.with_name(current.name + ".previous").exists())
         self.assertTrue(marker.exists(), "the app is reopened")
 
+    def test_script_runs_nothing_from_the_callers_environment(self) -> None:
+        """A program earlier on PATH, BASH_ENV and an exported function all
+        try to run instead of the script's own commands; none may."""
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        canary = root / "canary"
+        fake_bin = root / "bin"
+        fake_bin.mkdir()
+        for name in ("seq", "sleep", "mv", "rm", "xattr", "open", "kill"):
+            (fake_bin / name).write_text(f"#!/bin/sh\necho {name} >> '{canary}'\n")
+            (fake_bin / name).chmod(0o755)
+        startup = root / "startup.sh"
+        startup.write_text(f"echo BASH_ENV >> '{canary}'\n")
+        current = root / "App.app"
+        staged = root / ".App update.app"
+        (current / "Contents").mkdir(parents=True)
+        (current / "Contents" / "version").write_text("old")
+        (staged / "Contents").mkdir(parents=True)
+        (staged / "Contents" / "version").write_text("new")
+        finished = subprocess.Popen(["true"])
+        finished.wait()
+        script = root / "apply.sh"
+        script.write_text(mac_swap_script(finished.pid, current, staged, [], opener="/usr/bin/true"))
+        environment = {
+            "PATH": str(fake_bin),
+            "BASH_ENV": str(startup),
+            "ENV": str(startup),
+            "BASH_FUNC_sleep%%": f"() {{ echo function >> '{canary}'; }}",
+            "BASH_FUNC_mv%%": f"() {{ echo function >> '{canary}'; }}",
+        }
+        subprocess.run(["/bin/bash", "-p", str(script)], check=True, env=environment)
+        self.assertFalse(canary.exists(), canary.read_text() if canary.exists() else "")
+        self.assertEqual((current / "Contents" / "version").read_text(), "new")
+        self.assertFalse(script.exists(), "the script still removes itself")
+
     def test_script_removes_only_the_updaters_own_folder(self) -> None:
         root = Path(tempfile.mkdtemp())
         workdir = root / (updater.WORKDIR_PREFIX + "abc")
@@ -347,6 +385,7 @@ class SwapScriptTests(unittest.TestCase):
         other.mkdir()
         text = mac_swap_script(finished.pid, current, staged, [], opener="true", workdir=other)
         self.assertNotIn("rm -rf '" + str(other), text)
+        self.assertIn('/bin/rm -f "$0"', text)
 
 
 class _Server(http.server.ThreadingHTTPServer):

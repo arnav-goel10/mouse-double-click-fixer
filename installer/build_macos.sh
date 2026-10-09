@@ -78,8 +78,19 @@ fi
 
 # Launch the signed app's self-test: it catches a build that crashes at
 # launch, or that the hardened runtime breaks, before anything is packaged.
-# It never starts the app itself (see app/selftest.py).
+# It never starts the app itself (see app/selftest.py). The second run loads
+# the real Cocoa platform plugin, which must load under the hardened runtime
+# too (it still opens no window).
 "$signed/Contents/MacOS/DoubleClickFixer" --self-test
+QT_QPA_PLATFORM=cocoa "$signed/Contents/MacOS/DoubleClickFixer" --self-test
+
+# Nothing named in the app's environment may load into it or run as it:
+# libraries (DYLD_INSERT_LIBRARIES, OPENSSL_CONF), or programs and shell
+# start-up files (PATH, BASH_ENV, exported functions).
+bash tools/macos_injection_check.sh "$signed"
+
+# The notices it ships must be exactly what its own files call for.
+python3 tools/make_notices.py --bundle "$signed" --check --output "$signed/Contents/Resources/THIRD_PARTY_NOTICES.md"
 
 # The disk image opens to a designed window: the app, an arrow and the
 # Applications folder, so installing is one drag. dmgbuild writes Finder's
