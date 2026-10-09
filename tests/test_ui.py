@@ -1263,6 +1263,7 @@ class WindowFixTests(WindowTests):
         self.assertFalse(page.login_switch.isChecked(), "it won't open at login")
         self.assertIn("Turned off in", page.login_row.detail.text())
         self.assertEqual(not page.login_items_button.isHidden(), IS_MAC, "macOS can only fix it there")
+        self.assertEqual(page.login_switch.isEnabled(), not IS_MAC, "so the switch here can't")
         with mock.patch.object(startup, "open_login_items_settings") as open_settings:
             page.login_items_button.click()
         open_settings.assert_called_once_with()
@@ -1271,6 +1272,7 @@ class WindowFixTests(WindowTests):
             self.window._show_page(self.page_index("general"))
         self.assertTrue(page.login_switch.isChecked())
         self.assertTrue(page.login_items_button.isHidden())
+        self.assertTrue(page.login_switch.isEnabled())
 
     def test_general_open_settings_opens_the_pane_even_when_allowed(self) -> None:
         from app import permissions

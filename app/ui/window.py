@@ -728,7 +728,7 @@ class GeneralPage(Page):
     def _login_detail(state: str) -> str:
         if state == startup.BLOCKED:
             if IS_MAC:
-                return "Turned off in System Settings."
+                return "Turned off in System Settings. Turn it on again in Login Items."
             return "Turned off in Task Manager › Startup apps. Turn it on here to allow it again."
         return f"Starts in the {'menu bar' if IS_MAC else 'notification area'}."
 
@@ -793,7 +793,11 @@ class GeneralPage(Page):
         self.login_switch.setChecked(bool(self.controller.settings["start_at_login"]), animate=False)
         state = self.controller.login_item_state
         self.login_row.set_detail(self._login_detail(state))
-        self.login_items_button.setVisible(IS_MAC and state == startup.BLOCKED)
+        # On macOS only Login Items can switch it back on; the switch here
+        # would slide on and snap off again.
+        blocked_by_system = IS_MAC and state == startup.BLOCKED
+        self.login_items_button.setVisible(blocked_by_system)
+        self.login_switch.setEnabled(not blocked_by_system)
 
     def _on_login(self, checked: bool) -> None:
         error = self.controller.set_start_at_login(checked)
