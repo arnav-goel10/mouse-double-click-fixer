@@ -241,13 +241,19 @@ class FilterPage(Page):
 
     def refresh(self, granted: bool, waiting_for_permission: bool = False) -> None:
         self._loading = True
-        active = self.controller.active
-        threshold = self.controller.threshold_ms
-        self.switch.setChecked(active or waiting_for_permission, animate=self.isVisible())
-        if self.controller.suspended:
+        controller = self.controller
+        threshold = controller.threshold_ms
+        # The user's choice, as the menus show it: on while it waits for
+        # permission or calibration has it paused.
+        self.switch.setChecked(controller.wanted, animate=self.isVisible())
+        if controller.suspended and controller.settings["fix_enabled"]:
             self.status_row.set_detail("Paused during calibration.")
         elif waiting_for_permission:
             self.status_row.set_detail(f"Waiting for {permissions.pane_name()} permission.")
+        elif controller.failure and not controller.active and controller.settings["fix_enabled"]:
+            # Kept here too: the failure may have happened while the window
+            # was closed, with only the menu's status line to show it.
+            self.status_row.set_detail(f"{controller.failure}. {controller.failure_detail}".strip())
         else:
             self.status_row.set_detail("Ignores the extra click a worn switch adds.")
         self.slider.setValue(threshold)
@@ -949,13 +955,22 @@ class MainWindow(QWidget):
 
     def _on_filter_state(self, _active: bool, error: str) -> None:
         self.refresh()
-        if error:
+        if error and self._on_screen():
             QMessageBox.warning(self, "The filter couldn’t start", error)
 
     def _on_hook_failed(self, message: str) -> None:
-        self.controller.set_active(False)
+        # Not set_active(False): that is the user's "off", and would keep the
+        # filter off at every later login.
+        self.controller.stop_after_failure(message)
         self.refresh()
-        QMessageBox.warning(self, "The filter stopped", message)
+        if self._on_screen():
+            QMessageBox.warning(self, "The filter stopped", message)
+
+    def _on_screen(self) -> bool:
+        """Whether a failure can be shown in a dialog. With the window closed
+        or minimized the menu's status line carries it instead: a dialog
+        nobody asked for would open over whatever the user is doing."""
+        return self.isVisible() and not self.isMinimized()
 
     def _apply_calibration(self, threshold_ms: int) -> None:
         self.controller.set_threshold(threshold_ms)

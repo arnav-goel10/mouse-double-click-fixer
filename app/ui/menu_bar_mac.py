@@ -124,7 +124,9 @@ class MacMenuBarItem:
             {
                 "open": on_open,
                 "calibrate": on_calibrate,
-                "toggle": lambda: self._on_toggle(not controller.active),
+                # The user's choice, not the running state: choosing the
+                # item while waiting for permission or paused turns it off.
+                "toggle": lambda: self._on_toggle(not controller.wanted),
                 "updates": self._check_updates,
                 "quit": on_quit,
             }
@@ -199,14 +201,11 @@ class MacMenuBarItem:
             # Only two images exist; swap only when the state changes.
             self._shown_active = active
             button.setImage_(_status_image(active))
+        status = self.controller.status_text()
         if button is not None:
-            button.setToolTip_(
-                f"DoubleClick Fixer: on, {self.controller.threshold_ms} ms"
-                if active
-                else "DoubleClick Fixer: off"
-            )
-        self._status_item.setTitle_(self.controller.status_text())
-        self._toggle_item.setState_(NSControlStateValueOn if active else NSControlStateValueOff)
+            button.setToolTip_(self.controller.tooltip_text())
+        self._status_item.setTitle_(status)
+        self._toggle_item.setState_(NSControlStateValueOn if self.controller.wanted else NSControlStateValueOff)
         if self.updater is not None and self.updater.state in (self.updater.AVAILABLE, self.updater.READY) and self.updater.release:
             self._update_item.setTitle_(f"Update to {self.updater.release.version}")
         else:
@@ -214,7 +213,7 @@ class MacMenuBarItem:
 
     def _refresh_count(self) -> None:
         if self.controller.active:
-            self._status_item.setTitle_(f"On · {self.controller.filtered_total:,} blocked")
+            self._status_item.setTitle_(self.controller.status_text())
 
     # -- actions ---------------------------------------------------------------
     def _check_updates(self) -> None:

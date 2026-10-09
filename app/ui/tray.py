@@ -50,7 +50,9 @@ class Tray(QSystemTrayIcon):
 
         self.toggle_action = QAction("Bounce Filter", menu)
         self.toggle_action.setCheckable(True)
-        self.toggle_action.triggered.connect(lambda checked: self._on_toggle(checked))
+        # The user's choice, not the running state: choosing the item while
+        # waiting for permission or paused turns it off.
+        self.toggle_action.triggered.connect(lambda _checked: self._on_toggle(not self.controller.wanted))
         menu.addAction(self.toggle_action)
         menu.addSeparator()
 
@@ -116,10 +118,7 @@ class Tray(QSystemTrayIcon):
             # filter state or the taskbar theme.
             self._icon_state = state
             self.setIcon(icons.tray_icon(active))
-        self.toggle_action.setChecked(active)
+        self.toggle_action.setChecked(self.controller.wanted)
         status = self.controller.status_text()
         self.status_action.setText(status)
-        self.setToolTip(
-            f"DoubleClick Fixer: on, {self.controller.threshold_ms} ms" if active
-            else f"DoubleClick Fixer: {status[0].lower()}{status[1:]}"
-        )
+        self.setToolTip(self.controller.tooltip_text())

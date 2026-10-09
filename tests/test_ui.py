@@ -248,6 +248,81 @@ class MenuBarItemTests(unittest.TestCase):
             qt_tray.assert_called_once()
 
 
+class MenuToggleTests(unittest.TestCase):
+    """Both menus show and toggle the user's choice, not the running state."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.application = QApplication.instance() or QApplication([])
+
+    def controller(self, active=False, wanted=False):
+        controller = mock.Mock(active=active, wanted=wanted, threshold_ms=60)
+        controller.status_text.return_value = "Waiting for Accessibility permission"
+        controller.tooltip_text.return_value = "DoubleClick Fixer: waiting for Accessibility permission"
+        return controller
+
+    def test_tray_toggle_cancels_a_wait_for_permission(self) -> None:
+        from app.ui.tray import Tray
+
+        controller = self.controller(active=False, wanted=True)
+        toggle = mock.Mock()
+        tray = Tray(controller, on_open=mock.Mock(), on_calibrate=mock.Mock(), on_quit=mock.Mock(), on_toggle=toggle)
+        self.addCleanup(tray.deleteLater)
+        self.assertTrue(tray.toggle_action.isChecked(), "waiting reads as on")
+        tray.toggle_action.trigger()
+        toggle.assert_called_once_with(False)
+        self.assertEqual(tray.toolTip(), "DoubleClick Fixer: waiting for Accessibility permission")
+
+    def test_tray_toggle_turns_on_when_off(self) -> None:
+        from app.ui.tray import Tray
+
+        controller = self.controller(active=False, wanted=False)
+        toggle = mock.Mock()
+        tray = Tray(controller, on_open=mock.Mock(), on_calibrate=mock.Mock(), on_quit=mock.Mock(), on_toggle=toggle)
+        self.addCleanup(tray.deleteLater)
+        tray.toggle_action.trigger()
+        toggle.assert_called_once_with(True)
+
+    def mac_item(self, controller, toggle):
+        """The macOS item over stand-in AppKit objects (a real one would
+        appear in the developer's menu bar)."""
+        import sys
+
+        from app.ui import menu_bar_mac
+
+        class Target:
+            @classmethod
+            def alloc(cls):
+                return cls()
+
+            def initWithActions_(self, actions):  # noqa: N802
+                self.actions = actions
+                return self
+
+        appkit = mock.MagicMock(NSControlStateValueOn=1, NSControlStateValueOff=0)
+        patches = [
+            mock.patch.dict(sys.modules, {"AppKit": appkit}),
+            mock.patch.object(menu_bar_mac, "_handler_class", return_value=Target),
+            mock.patch.object(menu_bar_mac, "_status_image", return_value=None),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        item = menu_bar_mac.MacMenuBarItem(
+            controller, on_open=mock.Mock(), on_calibrate=mock.Mock(), on_quit=mock.Mock(), on_toggle=toggle
+        )
+        return item, appkit
+
+    def test_mac_menu_toggle_follows_the_users_choice(self) -> None:
+        controller = self.controller(active=False, wanted=True)
+        toggle = mock.Mock()
+        item, _appkit = self.mac_item(controller, toggle)
+        item._toggle_item.setState_.assert_called_with(1)
+        item._target.actions["toggle"]()
+        toggle.assert_called_once_with(False)
+        item._item.button().setToolTip_.assert_called_with("DoubleClick Fixer: waiting for Accessibility permission")
+
+
 class ControllerFixTests(unittest.TestCase):
     def setUp(self) -> None:
         from app import settings
