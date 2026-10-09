@@ -905,7 +905,7 @@ class GlobalClickFilter:
         with self._lock:
             check = self._checks.get(button)
             if check is None or check[1] is not token:
-                return  # stop() cancelled it
+                return  # cancelled (see _give_up_all)
             del self._checks[button]
             if not self._queued[button]:
                 # What it was set for came back, and what waited went out.
@@ -935,6 +935,9 @@ class GlobalClickFilter:
                 self._in_flight[button].clear()
                 self._releases_in_flight[button].clear()
                 self._queued[button] = []
+            for timer, _token in self._checks.values():
+                timer.cancel()  # nothing left to check
+            self._checks.clear()
             self._resend_queued(waiting)
         self._send_outbox()
         self._update_motion_tap()
@@ -948,9 +951,6 @@ class GlobalClickFilter:
             for timer in self._held_timers.values():
                 timer.cancel()
             self._held_timers.clear()
-            for timer, _token in self._checks.values():
-                timer.cancel()
-            self._checks.clear()
             self._settle([button for button, click_filter in self._filters.items() if click_filter.held_id is not None])
         self._give_up_all()
 

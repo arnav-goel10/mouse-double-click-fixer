@@ -928,6 +928,23 @@ class InFlightCheckTests(unittest.TestCase):
         self.assertEqual(rig.checks(), [new])
         self.assertEqual(rig.sent[-1], (Button.LEFT, False, "up2"), "down3 still waits for up2")
 
+    def test_stop_leaves_no_check_when_a_held_release_joins_a_queue(self) -> None:
+        rig = Pipeline(self)
+        rig.round_trip = None
+        rig.handle(Button.LEFT, True, 100.000, "down1")
+        rig.handle(Button.LEFT, False, 100.100, "up1")
+        rig.run_until(100.150)                                        # up1 re-sent, never back
+        self.assertTrue(rig.handle(Button.LEFT, True, 100.160, "down2").deferred)
+        self.assertTrue(rig.handle(Button.LEFT, False, 100.200, "up2").held)
+        rig.filter.stop()                                             # settled, up2 joins down2's queue
+        self.assertEqual(rig.checks(), [])
+        self.assertEqual(rig.filter._checks, {})
+        self.assertEqual(rig.sent, [
+            (Button.LEFT, False, "up1"),
+            (Button.LEFT, True, "down2"),
+            (Button.LEFT, False, "up2"),
+        ])
+
 
 class ResendNumberTests(unittest.TestCase):
     """Every re-sent event carries its number in its button's sequence; the
