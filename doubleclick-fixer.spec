@@ -96,6 +96,12 @@ for destination, source, *_rest in sorted(left_out):
     size = os.path.getsize(source) if source and os.path.isfile(source) else 0
     print(f"left out: {destination} ({size / 1e6:.1f} MB, from {source})")
 
+# Every library, extension and DLL left must come from Python itself or from
+# this environment's site-packages: one PyInstaller found anywhere else (on
+# Windows, through PATH) fails the build, named with where it came from.
+binary_sources = load_tool("binary_sources")
+print(binary_sources.check(analysis.binaries + analysis.datas))
+
 # Every build carries the licences of what it bundles (Qt's LGPL among them),
 # worked out from the very files it ships: Contents/Resources on macOS,
 # beside the program files on Windows (app/notices.py finds it).

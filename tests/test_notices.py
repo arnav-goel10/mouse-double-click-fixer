@@ -299,14 +299,20 @@ class BuildScanTests(unittest.TestCase):
                       "licence terms (Distributable Code) |", text)
         self.assertIn("`MSVCP140.dll`, `VCRUNTIME140.dll`, `VCRUNTIME140_1.dll`", text)
         self.assertIn("Windows 10 and later include the Universal C Runtime", text)
-        # Were the Universal C Runtime ever shipped again, it would be named too.
-        with_ucrt = self.build(files + [fake_binary(self.folder, "ucrtbase.dll", self.version_resource("10.0.26100.1")),
-                                        fake_binary(self.folder, "api-ms-win-crt-runtime-l1-1-0.dll")],
-                               platform="win32")
-        text = make_notices.render(with_ucrt)
-        self.assertIn("| Microsoft Universal C Runtime | 10.0.26100.1 |", text)
-        self.assertNotIn("Windows 10 and later include the Universal C Runtime", text)
         self.assertEqual(make_notices.microsoft_runtimes(self.build(files)), [])  # not on macOS
+
+    def test_a_windows_build_with_a_universal_c_runtime_copy_fails(self) -> None:
+        # Windows 10 and later always use their own; a copy that comes back
+        # (from a JDK on the build machine's PATH, say) fails the build.
+        files = self.python_openssl() + [fake_binary(self.folder, "VCRUNTIME140.dll", self.version_resource("14.44.35211.0"))]
+        for name in ("ucrtbase.dll", "api-ms-win-crt-runtime-l1-1-0.dll", "API-MS-WIN-CORE-FILE-L1-2-0.DLL"):
+            build = self.build(files + [fake_binary(self.folder, name, self.version_resource("10.0.26100.1"))],
+                               platform="win32")
+            with self.subTest(name=name), self.assertRaisesRegex(
+                    SystemExit, rf"Windows build ships {name}: a copy of the Universal C Runtime"):
+                make_notices.render(build)
+        # On macOS such a name means nothing.
+        make_notices.render(self.build(self.python_openssl() + [fake_binary(self.folder, "ucrtbase.dll")]))
 
     def test_python_notices_follow_the_modules_that_ship(self) -> None:
         select = fake_binary(self.folder, "select.cpython-314-darwin.so", b"kqueue")

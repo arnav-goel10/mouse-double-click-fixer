@@ -68,7 +68,7 @@ UNUSED_FILES = frozenset({"opengl32sw.dll"})
 #: them, PATH included, and PyInstaller collects such files from the PATH of
 #: the machine that builds: whichever other program put its copy there
 #: first. Neither the plugin nor those files ship on Windows, and a Windows
-#: build that ships either fails (windows_openssl_for_qt). Python's own
+#: build that ships either fails (windows_left_out). Python's own
 #: libssl-3.dll and libcrypto-3.dll, which its ssl and hashlib modules link
 #: to, stay.
 QT_OPENSSL_ON_WINDOWS = re.compile(r"qopensslbackend\.dll|lib(?:crypto|ssl)-\d+-(?:x64|arm64|arm)\.dll", re.IGNORECASE)
@@ -76,7 +76,8 @@ QT_OPENSSL_ON_WINDOWS = re.compile(r"qopensslbackend\.dll|lib(?:crypto|ssl)-\d+-
 QT_OPENSSL_BACKEND_MARKER = b"qt.tlsbackend.ossl"
 #: The Universal C Runtime, which PyInstaller collects on Windows: Windows 10
 #: and later (all that Qt 6 runs on) have it built in, and keep it updated, so
-#: a build leaves out its own copy rather than ship an older one beside it.
+#: a build leaves out its own copy rather than ship an older one beside it,
+#: and a Windows build that ships one fails (windows_left_out).
 UCRT_FILE = re.compile(r"ucrtbase\.dll|api-ms-win-[a-z0-9-]+\.dll", re.IGNORECASE)
 #: The Microsoft Visual C++ runtime, which Windows doesn't have built in;
 #: Python and Qt need it, and a build ships it.
@@ -620,10 +621,13 @@ def _freetype_version(build: Build) -> str:
     return version if re.fullmatch(r"\d+\.\d+\.\d+", version) else ""
 
 
-def windows_openssl_for_qt(build: Build) -> None:
-    """Fail a Windows build that ships Qt's OpenSSL backend or the OpenSSL
-    files it loads: Windows builds connect through Schannel (see
-    QT_OPENSSL_ON_WINDOWS)."""
+def windows_left_out(build: Build) -> None:
+    """Fail a Windows build that ships what Windows builds leave out by
+    name: Qt's OpenSSL backend or the OpenSSL files it loads (Windows builds
+    connect through Schannel, see QT_OPENSSL_ON_WINDOWS), or a copy of the
+    Universal C Runtime (Windows' own is used, see UCRT_FILE). The spec
+    leaves these out, and tools/binary_sources.py refuses any binary from
+    outside Python and its packages; this is the second check."""
     if build.platform != "win32":
         return
     files = sorted({name for name in build.files if QT_OPENSSL_ON_WINDOWS.fullmatch(name)}
@@ -632,6 +636,11 @@ def windows_openssl_for_qt(build: Build) -> None:
         raise SystemExit(f"This Windows build ships {', '.join(files)}: Qt's OpenSSL backend or the OpenSSL it "
                          "loads. Windows builds make their TLS connections through Schannel and leave these out "
                          "(app/tls.py, unused_qt_file in tools/make_notices.py)")
+    ucrt = sorted(name for name in build.files if UCRT_FILE.fullmatch(name))
+    if ucrt:
+        raise SystemExit(f"This Windows build ships {', '.join(ucrt)}: a copy of the Universal C Runtime. Windows "
+                         "10 and later have their own, which is always the one used, and builds leave these out "
+                         "(UCRT_FILE, unused_qt_file in tools/make_notices.py)")
 
 
 def inside_qt(build: Build) -> List[Inside]:
@@ -846,9 +855,9 @@ def file_version(data: bytes) -> str:
 
 #: Microsoft's runtime libraries: the name a build lists them under, the
 #: files that are part of each, and the terms Microsoft redistributes it under.
+#: (The Universal C Runtime never ships: windows_left_out.)
 MICROSOFT_RUNTIMES = (
     ("Microsoft Visual C++ runtime", MSVC_RUNTIME_FILE, "Microsoft Visual Studio licence terms (Distributable Code)"),
-    ("Microsoft Universal C Runtime", UCRT_FILE, "Windows SDK licence terms (Distributable Code)"),
 )
 
 
@@ -896,7 +905,7 @@ def _sentence(text: str) -> str:
 def render(build: Optional[Build] = None) -> str:
     """The whole file, for `build` (by default, what this environment would ship)."""
     build = build or Build.from_environment()
-    windows_openssl_for_qt(build)
+    windows_left_out(build)
     version = app_version()
     repository = repository_url()
     qt = qt_version()
@@ -1096,7 +1105,6 @@ def render(build: Optional[Build] = None) -> str:
             "",
         ]
     if runtimes:
-        ucrt = any(item.name == "Microsoft Universal C Runtime" for item, _files in runtimes)
         out += [
             "## Microsoft runtime libraries (Windows)",
             "",
@@ -1110,13 +1118,10 @@ def render(build: Optional[Build] = None) -> str:
             "runtime, Visual Studio's: <https://visualstudio.microsoft.com/license-terms/>), and publishes no "
             "source for them.",
             "",
+            "Windows 10 and later include the Universal C Runtime, which they also need, and keep it up to "
+            "date, so the app uses Windows' own and carries no copy.",
+            "",
         ]
-        if not ucrt:
-            out += [
-                "Windows 10 and later include the Universal C Runtime, which they also need, and keep it up to "
-                "date, so the app uses Windows' own and carries no copy.",
-                "",
-            ]
     out += [
         "## Windows installer",
         "",
