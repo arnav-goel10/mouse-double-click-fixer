@@ -323,6 +323,12 @@ class MacInstallTests(unittest.TestCase):
         self.assertIn(f"/bin/mv '{self.current.with_name('.DoubleClick Fixer update.app')}' '{target}'; then", script)
         self.assertIn(f"  app='{target}'", script)
 
+    def test_a_copy_someone_renamed_keeps_its_name(self) -> None:
+        self.install(installed="DCF.app")
+        script = self.script.read_text()
+        self.assertIn(f"/bin/mv '{self.current.with_name('.DCF update.app')}' '{self.current}'; then", script)
+        self.assertNotIn("Mouse Double-Click Fixer.app", script)
+
 
 class UpdateDestinationTests(unittest.TestCase):
     """Where an update goes (update_destination)."""
@@ -346,6 +352,18 @@ class UpdateDestinationTests(unittest.TestCase):
 
     def test_the_same_name_is_an_update_in_place(self) -> None:
         self.assertEqual(updater.update_destination(self.current, "DoubleClick Fixer.app"), self.current)
+
+    def test_only_a_copy_with_the_name_from_before_1_0_is_renamed(self) -> None:
+        """A name someone chose is kept, and the update is made in place,
+        even with another copy under the new name beside it."""
+        for name in ("DCF.app", "DoubleClick Fixer 2.app", "doubleclick fixer.app", "Mouse Double-Click Fixer.app"):
+            with self.subTest(name=name):
+                self.root = Path(tempfile.mkdtemp())
+                self.addCleanup(shutil.rmtree, self.root, True)
+                current = self.make_app(name)
+                if name != "Mouse Double-Click Fixer.app":
+                    self.make_app("Mouse Double-Click Fixer.app")  # left alone
+                self.assertEqual(updater.update_destination(current, "Mouse Double-Click Fixer.app"), current)
 
     def test_another_copy_of_the_app_under_the_new_name_is_replaced(self) -> None:
         other = self.make_app("Mouse Double-Click Fixer.app")
@@ -389,20 +407,27 @@ class SwapScriptTests(unittest.TestCase):
         self.assertFalse(current.with_name(current.name + ".previous").exists())
         self.assertTrue(marker.exists(), "the app is reopened")
 
-    def rename(self, other: bool = False, staged_missing: bool = False) -> tuple[Path, Path, Path, str]:
+    def rename(
+        self, other: bool = False, staged_missing: bool = False, prepare=None, target_name: str = "Mouse Double-Click Fixer.app",
+    ) -> tuple[Path, Path, Path, str]:
         """Run the swap from "It's DoubleClick Fixer.app" (a copy from before
         1.0) to "Mouse Double-Click Fixer.app": the running copy, the new
-        name, the opener's log, and what the script printed."""
+        name, the opener's log, and what the script printed. `prepare(root)`
+        runs just before the script."""
         root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, root, True)
+        if sys.platform == "darwin":  # runs first: lets rmtree delete what a test locked
+            self.addCleanup(subprocess.run, ["/usr/bin/chflags", "-R", "nouchg", str(root)], check=False)
         current = root / "It's DoubleClick Fixer.app"
-        target = root / "Mouse Double-Click Fixer.app"
+        target = root / target_name
         staged = root / ".It's DoubleClick Fixer update.app"
         for bundle, version in ((current, "old"), (staged, "new")) + (((target, "other"),) if other else ()):
             (bundle / "Contents").mkdir(parents=True)
             (bundle / "Contents" / "version").write_text(version)
         if staged_missing:
             shutil.rmtree(staged)
+        if prepare:
+            prepare(root)
         opened = root / "opened"
         opener = root / "opener"
         opener.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{opened}'\n")
@@ -433,6 +458,58 @@ class SwapScriptTests(unittest.TestCase):
         self.assertEqual((current / "Contents" / "version").read_text(), "old")
         self.assertEqual((target / "Contents" / "version").read_text(), "other")
         self.assertEqual(sorted(path.name for path in current.parent.glob("*.app*")), sorted([current.name, target.name]))
+        self.assertEqual(opened.read_text(), f"{current}\n")
+
+    def bundles(self, folder: Path) -> list[str]:
+        return sorted(path.name for path in folder.iterdir() if ".app" in path.name)
+
+    @unittest.skipUnless(sys.platform == "darwin", "chflags")
+    def test_a_copy_that_cant_be_moved_aside_stays_and_the_old_copy_is_reopened(self) -> None:
+        """The other copy under the new name is locked, so moving it aside
+        fails after the running copy was moved: the running copy comes back,
+        and the locked one is left as it was."""
+        lock = lambda root: subprocess.run(  # noqa: E731
+            ["/usr/bin/chflags", "uchg", str(root / "Mouse Double-Click Fixer.app")], check=True
+        )
+        current, target, opened, _ = self.rename(other=True, prepare=lock)
+        self.assertEqual((current / "Contents" / "version").read_text(), "old")
+        self.assertEqual((target / "Contents" / "version").read_text(), "other")
+        self.assertEqual(self.bundles(current.parent), sorted([current.name, target.name, ".It's DoubleClick Fixer update.app"]))
+        self.assertEqual(opened.read_text(), f"{current}\n")
+
+    @unittest.skipUnless(sys.platform == "darwin", "chflags")
+    def test_a_leftover_previous_folder_is_never_moved_into(self) -> None:
+        """A ".previous" folder from an earlier update that can't be deleted
+        (a locked file inside) stops the update before anything is moved, so
+        no bundle ends up nested inside it, and nothing is restored from it."""
+        for leftover in ("It's DoubleClick Fixer.app.previous", "Mouse Double-Click Fixer.app.previous"):
+            with self.subTest(leftover=leftover):
+                def plant(root: Path, leftover: str = leftover) -> None:
+                    (root / leftover / "Contents").mkdir(parents=True)
+                    (root / leftover / "Contents" / "version").write_text("leftover")
+                    subprocess.run(["/usr/bin/chflags", "uchg", str(root / leftover / "Contents" / "version")], check=True)
+
+                current, target, opened, _ = self.rename(other=True, prepare=plant)
+                self.assertEqual((current / "Contents" / "version").read_text(), "old")
+                self.assertEqual((target / "Contents" / "version").read_text(), "other")
+                self.assertEqual(sorted(path.name for path in (current.parent / leftover).iterdir()), ["Contents"])
+                self.assertEqual(opened.read_text(), f"{current}\n")
+
+    def test_a_leftover_previous_folder_under_the_new_name_is_not_restored(self) -> None:
+        """With nothing under the new name to move aside, a failed final move
+        doesn't put an old ".previous" folder in the new name's place."""
+        def plant(root: Path) -> None:
+            (root / "Mouse Double-Click Fixer.app.previous" / "Contents").mkdir(parents=True)
+            if sys.platform == "darwin":
+                (root / "Mouse Double-Click Fixer.app.previous" / "Contents" / "version").write_text("leftover")
+                subprocess.run(
+                    ["/usr/bin/chflags", "uchg", str(root / "Mouse Double-Click Fixer.app.previous" / "Contents" / "version")],
+                    check=True,
+                )
+
+        current, target, opened, _ = self.rename(staged_missing=True, prepare=plant)
+        self.assertEqual((current / "Contents" / "version").read_text(), "old")
+        self.assertFalse(target.exists())
         self.assertEqual(opened.read_text(), f"{current}\n")
 
     def test_script_runs_nothing_from_the_callers_environment(self) -> None:

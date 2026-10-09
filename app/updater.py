@@ -8,13 +8,14 @@ tools/sign_release.py makes it); a release that fails this is never offered.
 Installing it downloads the file for this platform, checks it against the
 signed checksums, and installs it:
 
-* macOS: a zipped app bundle, installed in the running copy's folder under
-  the name the release gives it (a copy from before 1.0 is renamed from
-  "DoubleClick Fixer.app"). It must carry a valid code signature whose
-  designated requirement matches the running app's. That is what macOS keys
-  the Accessibility grant on, so an update that passes this check keeps the
-  permission. A release that moves to a new signing identity says so in its
-  signed comment. The bundle must also say it is the release's version.
+* macOS: a zipped app bundle, installed where the running copy is (a copy
+  still called "DoubleClick Fixer.app", from before 1.0, comes back in the
+  same folder under the name the release gives it). It must carry a valid
+  code signature whose designated requirement matches the running app's.
+  That is what macOS keys the Accessibility grant on, so an update that
+  passes this check keeps the permission. A release that moves to a new
+  signing identity says so in its signed comment. The bundle must also say
+  it is the release's version.
 * Windows (installed): the Inno Setup installer, run silently; it upgrades in
   place and relaunches the app.
 * Windows (portable): the executable itself, swapped once the app has quit.
@@ -46,7 +47,7 @@ from typing import Optional
 from PySide6.QtCore import QObject, QTimer, QUrl, Signal
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 
-from . import DISPLAY_NAME, __version__, build_flags, tls
+from . import DISPLAY_NAME, FORMER_DISPLAY_NAME, __version__, build_flags, tls
 from .update_signature import PublicKey, ReleaseClaim, SignatureError, parse_claim, parse_public_key, verify
 
 log = logging.getLogger(__name__)
@@ -350,6 +351,9 @@ def requirement_accepted(installed: str, incoming: str, signed: str) -> bool:
 #: The macOS bundle identifier. It never changes: macOS keys the Accessibility
 #: permission and the login item on it.
 BUNDLE_ID = "com.doubleclickfixer.app"
+#: Bundle names releases shipped the app under before its current name. An
+#: update renames a copy that still has one of them (update_destination).
+FORMER_BUNDLE_NAMES = (f"{FORMER_DISPLAY_NAME}.app",)
 
 
 def is_this_app(path: Path) -> bool:
@@ -365,14 +369,22 @@ def is_this_app(path: Path) -> bool:
 
 
 def update_destination(current: Path, shipped: str) -> Path:
-    """Where an update goes: the running copy's folder, under the name the
-    release ships the app with (`shipped`, the bundle's name in the zip).
+    """Where an update goes. A copy that still has the name the app shipped
+    with before 1.0, "DoubleClick Fixer.app", comes back in the same folder
+    under the name the release ships the app with (`shipped`, the bundle's
+    name in the zip), and its old bundle is removed. Any other copy is
+    updated where it is, under its own name: a name someone gave their copy
+    (say "DCF.app") is theirs to keep.
 
-    A copy from before 1.0 is "DoubleClick Fixer.app" and comes back under
-    the new name, its old bundle removed. Another copy of this app already
-    under the new name is replaced with it. The update stays under the
-    current name if the shipped name is not a plain bundle name, or if
-    something else, not a copy of this app, has that name in the folder."""
+    When a copy from before 1.0 is renamed and its folder already holds
+    another copy of this app under the new name (one dragged in from the 1.0
+    disk image beside it, say), that copy is replaced, whatever version it
+    is, so one copy of the app is left rather than two. The rename is
+    skipped, and the update made in place, if the shipped name is not a
+    plain bundle name, or if something other than a copy of this app has
+    that name in the folder."""
+    if current.name not in FORMER_BUNDLE_NAMES:
+        return current
     if not shipped.endswith(".app") or shipped.startswith(".") or "/" in shipped or shipped == current.name:
         return current
     target = current.with_name(shipped)
@@ -404,7 +416,10 @@ def mac_swap_script(
     under the new name (update_destination decides which paths those are).
     Every bundle that is moved aside is kept until the new one is in place,
     and put back if a move fails, so a failed update never leaves the user
-    without the app; the copy that was running is then reopened.
+    without the app; the copy that was running is then reopened. A bundle is
+    only ever moved to a name that is free: BSD mv has no -T, so moving onto
+    a leftover ".previous" folder that couldn't be deleted would put the
+    bundle inside it.
     """
     quoted = lambda value: "'" + str(value).replace("'", "'\\''") + "'"  # noqa: E731
     args = " ".join(quoted(argument) for argument in relaunch_args)
@@ -416,26 +431,27 @@ def mac_swap_script(
         cleanup = f"/bin/rm -rf {quoted(workdir)}"
     else:
         cleanup = '/bin/rm -f "$0"'
+    free = lambda path: f"[ ! -e {quoted(path)} ] && [ ! -L {quoted(path)} ]"  # noqa: E731
     if target == current:
         clear = move = remove = restore = ""
     else:
         # Another copy under the new name is moved aside like the running
-        # one; the final move is refused rather than made into a folder that
-        # appeared meanwhile.
+        # one, and put back only if this run moved it; the final move is
+        # refused rather than made into a folder that appeared meanwhile.
         other = target.with_name(target.name + ".previous")
         clear = f"/bin/rm -rf {quoted(other)}\n"
         move = (
-            f"{{ [ ! -e {quoted(target)} ] || /bin/mv {quoted(target)} {quoted(other)}; }} && "
+            f"{{ [ ! -e {quoted(target)} ] || "
+            f"{{ {free(other)} && /bin/mv {quoted(target)} {quoted(other)} && aside=1; }}; }} && "
             f"[ ! -e {quoted(target)} ] && "
         )
         remove = f" {quoted(other)}"
-        restore = (
-            f"  [ -e {quoted(target)} ] || [ ! -d {quoted(other)} ] || /bin/mv {quoted(other)} {quoted(target)}\n"
-        )
+        restore = f'  [ -z "$aside" ] || [ -e {quoted(target)} ] || /bin/mv {quoted(other)} {quoted(target)}\n'
     return f"""#!/bin/bash
 for _ in $(/usr/bin/seq 1 150); do kill -0 {pid} 2>/dev/null || break; /bin/sleep 0.2; done
+aside=
 /bin/rm -rf {quoted(backup)}
-{clear}if /bin/mv {quoted(current)} {quoted(backup)} && {move}/bin/mv {quoted(staged)} {quoted(target)}; then
+{clear}if {free(backup)} && /bin/mv {quoted(current)} {quoted(backup)} && {move}/bin/mv {quoted(staged)} {quoted(target)}; then
   /bin/rm -rf {quoted(backup)}{remove}
   app={quoted(target)}
 else

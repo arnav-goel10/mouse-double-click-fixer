@@ -73,9 +73,11 @@ over.
 The app was called DoubleClick Fixer before 1.0. Updating keeps its
 settings, its permission on macOS and **Open at login**. On macOS, a copy that
 updates itself from 0.5.3 or earlier to 1.0 keeps its old name in
-Applications, and takes the new one with its next update. On Windows, an
-update stays in the folder the app was installed in, and moves its Start menu
-entry to the new name.
+Applications, and takes the new one with its next update; a copy you renamed
+yourself keeps your name. On Windows, an update stays in the folder the app
+was installed in and gives its Start menu shortcut the new name. The shortcut
+moves from the DoubleClick Fixer folder to a Mouse Double-Click Fixer one; a
+Start menu folder you chose yourself is kept.
 
 Every update must carry a signature from the project's release keys, which
 are built into the app; anything else is refused (see
