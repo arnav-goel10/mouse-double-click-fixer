@@ -22,7 +22,7 @@ from typing import Callable, Iterable, NamedTuple, Optional
 
 from dataclasses import replace
 
-from .core import BounceFilter, Button, ClickEvent, clamp_threshold
+from .core import BounceFilter, Button, ClickEvent, DeliveryDelay, clamp_threshold
 
 log = logging.getLogger(__name__)
 
@@ -196,12 +196,18 @@ class GlobalClickFilter:
         self.tap_resets = 0  # times macOS disabled the tap and it was re-armed
         self.hook_rearms = 0  # times the Windows hook was re-installed
         self._timers: list[threading.Timer] = []
+        # How late button events reach the hook here; sets how long the
+        # timer for a held release waits (see _fallback_delay).
+        self._lateness = DeliveryDelay()
         # Per button: events re-sent but not yet seen coming back through the
         # hook, since when, and the real events queued behind them.
         self._in_flight: dict[Button, int] = {button: 0 for button in Button}
         self._in_flight_since: dict[Button, float] = {}
-        # A queued entry is (pressed, template); pressed is None for motion.
-        self._queued: dict[Button, list[tuple[Optional[bool], object]]] = {button: [] for button in Button}
+        # A queued entry is (pressed, template, sent as): pressed is None for
+        # motion, and "sent as" is the button the event is re-sent and
+        # counted in flight for, its own (another button's event waits in
+        # this queue only behind a release it settled; see _handle).
+        self._queued: dict[Button, list[tuple[Optional[bool], object, Button]]] = {button: [] for button in Button}
         # Set by the platform runner: re-posts an event the hook suppressed.
         # `pressed` is None for pointer motion.
         self._inject: Callable[[Button, Optional[bool], object], object] = lambda _b, _p, _t: None
@@ -337,12 +343,22 @@ class GlobalClickFilter:
         `allow_hold=False` says a release could not be re-injected later.
         `location` is where the pointer was, as (x, y), if the platform knows:
         a release held where apps saw its press is a click made in place, and
-        pointer motion leaving that spot delivers it rather than the timer."""
+        pointer motion leaving that spot delivers it rather than the timer.
+
+        First, any held release this event's timestamp shows was real is
+        settled and re-sent (see _settle_due); this event, if it is to reach
+        apps, then goes out behind it."""
+        arrived = monotonic()
         timestamp = self._normalise_time(timestamp)
-        replay = []
-        overdue = []
+        # (button it is sent as, pressed, template) to re-send, in order.
+        resend: list = []
         with self._lock:
-            overdue = self._expire_in_flight(button)
+            self._lateness.add(arrived - timestamp)
+            resend += self._expire_in_flight(button)
+            # A press settles its own button's held release through the
+            # filter (flush_held, below), which re-sends the two together.
+            settled, waiting_on = self._settle_due(timestamp, skip=button if pressed else None)
+            resend += settled
             click_filter = self._filters[button]
             click_filter.enabled = button in self._active
             event = click_filter.press(timestamp) if pressed else click_filter.release(timestamp, allow_hold)
@@ -357,10 +373,13 @@ class GlobalClickFilter:
                 self._held_stationary[button] = event.hold_reason == "lift" and self._is_near(
                     self._press_points.get(button), location
                 )
-                if self._held_stationary[button]:
-                    self._motion_wanted = True
+                # Motion is judged while any release is held: motion stamped
+                # past the window settles it (see _motion).
+                self._motion_wanted = True
                 timer = threading.Timer(
-                    click_filter.threshold_ms / 1000.0, self._commit_held, (button, click_filter.held_id)
+                    self._fallback_delay(click_filter.threshold_ms, timestamp, arrived),
+                    self._commit_held,
+                    (button, click_filter.held_id),
                 )
                 timer.daemon = True
                 self._timers = [t for t in self._timers if t.is_alive()] + [timer]
@@ -370,29 +389,38 @@ class GlobalClickFilter:
                 self._forget_held(button)
             elif event.flush_held:
                 # The held release was real after all: deliver it, then this.
-                replay = [(False, self._held_templates.pop(button, None)), (True, template)]
+                replay = [(button, False, self._held_templates.pop(button, None)), (button, True, template)]
                 self._forget_held(button)
                 if self._queued[button]:
                     # Real events already wait behind a re-sent one, and these
                     # came after them.
-                    for entry in replay:
-                        self._enqueue(button, *entry)
-                    replay = []
+                    for _button, replay_pressed, replay_template in replay:
+                        self._enqueue(button, replay_pressed, replay_template)
                 else:
                     self._track(button, len(replay))
+                    resend += replay
             if event.accepted and (self._in_flight[button] or self._queued[button]):
                 # A release this app re-sent a moment ago may still be on its
                 # way. Letting this one through now could overtake it (apps
                 # would see down, down, up, up), so it goes out right after.
                 self._enqueue(button, pressed, template)
                 event = replace(event, accepted=False, deferred=True)
+            elif event.accepted and allow_hold and (settled or waiting_on is not None):
+                # This event settled another button's release, which happened
+                # first: apps must see that release before this.
+                if waiting_on is not None:
+                    self._enqueue(waiting_on, pressed, template, send_as=button)
+                else:
+                    self._track(button, 1)
+                    resend.append((button, pressed, template))
+                event = replace(event, accepted=False, deferred=True)
             if pressed and not event.is_bounce:
                 # Where apps saw the button go down. A press they never see (a
                 # bounce, or the contact coming back mid-drag) must not move
                 # it, or a drag would look like a click made in place.
                 self._press_points[button] = location
-        for replay_pressed, replay_template in overdue + replay:
-            self._safe_inject(button, replay_pressed, replay_template)
+        for send_as, resend_pressed, resend_template in resend:
+            self._safe_inject(send_as, resend_pressed, resend_template)
         self._update_motion_tap()
         try:
             self._on_event(event)
@@ -400,8 +428,51 @@ class GlobalClickFilter:
             _log_ignored("the click event callback")
         return event
 
-    def _enqueue(self, button: Button, pressed: Optional[bool], template: object) -> None:
-        """With the lock held: queue an event behind the re-sent ones."""
+    def _settle_due(self, timestamp: float, skip: Optional[Button] = None) -> tuple[list, Optional[Button]]:
+        """With the lock held: settle every held release that an event stamped
+        `timestamp` shows was real (see BounceFilter.due), the oldest first,
+        except `skip`'s. Returns the releases to re-send now, as (button,
+        False, template), and the last button whose release had to join real
+        events already queued behind a re-sent one instead, or None."""
+        due = sorted(
+            (click_filter.held_at, button)
+            for button, click_filter in self._filters.items()
+            if button is not skip and click_filter.due(timestamp)
+        )
+        send: list = []
+        waiting_on = None
+        for _held_at, button in due:
+            self._filters[button].commit_held()
+            template = self._held_templates.pop(button, None)
+            self._forget_held(button)
+            if self._send_or_queue(button, template):
+                send.append((button, False, template))
+            else:
+                waiting_on = button
+        return send, waiting_on
+
+    def _fallback_delay(self, threshold_ms: float, released_at: float, arrived: float) -> float:
+        """With the lock held: how long the timer for a release held just now
+        waits before settling it.
+
+        The timer is for silence, a release with nothing after it (a click
+        with the hand kept still): any later event settles it sooner, and
+        exactly (see _settle_due). It must not fire while a press made inside
+        the window may still be on its way, so it waits out the window from
+        when the release happened plus how late this machine delivers events
+        (see DeliveryDelay), and never less than the window from when the
+        release arrived: a release that came out of a backlog has its
+        comeback press right behind it in that backlog."""
+        window = threshold_ms / 1000.0
+        allowance = self._lateness.allowance_ms() / 1000.0
+        deadline = max(released_at + window + allowance, arrived + window)
+        return max(0.0, deadline - monotonic())
+
+    def _enqueue(
+        self, button: Button, pressed: Optional[bool], template: object, send_as: Optional[Button] = None
+    ) -> None:
+        """With the lock held: queue an event behind `button`'s re-sent ones.
+        `send_as` is the event's own button, if not `button`."""
         self._motion_wanted = True
         if not self._queued[button]:
             # Should the re-sent event never come back, don't keep this one
@@ -410,7 +481,7 @@ class GlobalClickFilter:
             timer.daemon = True
             self._timers = [t for t in self._timers if t.is_alive()] + [timer]
             timer.start()
-        self._queued[button].append((pressed, template))
+        self._queued[button].append((pressed, template, send_as or button))
 
     def _commit_held(self, button: Button, expected: Optional[float] = None) -> None:
         """The threshold passed with no press: the held release was real.
@@ -452,28 +523,41 @@ class GlobalClickFilter:
             self._tap_disables = recent + [now]
             return len(self._tap_disables) >= TAP_DISABLE_LIMIT
 
-    def _motion(self, template: object, location: Optional[tuple[float, float]] = None) -> bool:
-        """The pointer moved (`template` is a copy of the motion event, and
-        `location` where it took the pointer, if known).
+    def _motion(
+        self,
+        template: object,
+        location: Optional[tuple[float, float]] = None,
+        timestamp: Optional[float] = None,
+    ) -> bool:
+        """The pointer moved (`template` is a copy of the motion event,
+        `location` where it took the pointer, and `timestamp` when it
+        happened, if known).
 
-        A release held where its press landed is settled once the pointer
-        leaves the spot where the button came up: a click made in place ends
-        when the pointer moves off, and apps must see its release where it
-        happened, before the motion. Smaller motion goes through and the hold
-        stays: it is a hand resting on the mouse, or a drag only starting,
-        and the contact may yet come back. Motion arriving while re-sent
-        events are still on their way waits behind them, so apps never see
-        the pointer leave before the click is over.
+        Motion stamped past a held release's window settles that release
+        first (see _settle_due), as any event does. A release held where its
+        press landed is settled sooner, once the pointer leaves the spot
+        where the button came up: a click made in place ends when the
+        pointer moves off, and apps must see its release where it happened,
+        before the motion. Smaller motion goes through and the hold stays: it
+        is a hand resting on the mouse, or a drag only starting, and the
+        contact may yet come back. Motion arriving while re-sent events are
+        still on their way waits behind them, so apps never see the pointer
+        leave before the click is over.
 
         Returns True to let the event through unchanged, False when the
         platform must drop it because it was queued to be re-sent.
         """
-        flushed = []
-        overdue = []
+        if timestamp is not None:
+            timestamp = self._normalise_time(timestamp)
+        resend: list = []
         passes = True
         with self._lock:
             for button in Button:
-                overdue += [(button, entry) for entry in self._expire_in_flight(button)]
+                resend += self._expire_in_flight(button)
+            if timestamp is not None:
+                settled, _waiting_on = self._settle_due(timestamp)
+                resend += settled
+            for button in Button:
                 click_filter = self._filters[button]
                 if click_filter.held_id is None or not self._held_stationary.get(button):
                     continue
@@ -482,31 +566,30 @@ class GlobalClickFilter:
                 if click_filter.commit_held():
                     held_template = self._held_templates.pop(button, None)
                     if self._send_or_queue(button, held_template):
-                        flushed.append((button, held_template))
+                        resend.append((button, False, held_template))
                 self._forget_held(button)
             for button in Button:
                 if self._in_flight[button] or self._queued[button]:
                     self._enqueue(button, None, template)
                     passes = False
                     break
-        for button, (pressed, queued_template) in overdue:
-            self._safe_inject(button, pressed, queued_template)
-        for button, held_template in flushed:
-            self._safe_inject(button, False, held_template)
+        for send_as, resend_pressed, resend_template in resend:
+            self._safe_inject(send_as, resend_pressed, resend_template)
         self._update_motion_tap()
         return passes
 
     def _update_motion_tap(self) -> None:
-        """Judge pointer motion only while it matters: a release held in place
-        (motion settles it) or re-sent events still on their way (motion
-        must wait behind them). Otherwise the hook lets every move straight
-        through after one look at _motion_wanted. The flag is raised as soon
-        as something becomes pending (with the lock held); this lowers it
-        once nothing is. Call without the lock held."""
+        """Judge pointer motion only while it matters: a release is held
+        (motion stamped past its window settles it, and motion leaving a
+        click made in place settles that sooner) or re-sent events are still
+        on their way (motion must wait behind them). Otherwise the hook lets
+        every move straight through after one look at _motion_wanted. The
+        flag is raised as soon as something becomes pending (with the lock
+        held); this lowers it once nothing is. Call without the lock held."""
         with self._motion_tap_lock:
             with self._lock:
                 wanted = any(
-                    (self._filters[button].held_id is not None and self._held_stationary.get(button, False))
+                    self._filters[button].held_id is not None
                     or self._in_flight[button] > 0
                     or bool(self._queued[button])
                     for button in Button
@@ -532,15 +615,15 @@ class GlobalClickFilter:
             if self._in_flight[button]:
                 self._in_flight[button] -= 1
             queued = [] if self._in_flight[button] else self._take_queue(button)
-        for pressed, template in queued:
-            self._safe_inject(button, pressed, template)
+        for send_as, pressed, template in queued:
+            self._safe_inject(send_as, pressed, template)
         self._update_motion_tap()
 
     def _expire_check(self, button: Button) -> None:
         with self._lock:
             overdue = self._expire_in_flight(button)
-        for pressed, template in overdue:
-            self._safe_inject(button, pressed, template)
+        for send_as, pressed, template in overdue:
+            self._safe_inject(send_as, pressed, template)
         self._update_motion_tap()
 
     def _expire_in_flight(self, button: Button) -> list:
@@ -552,18 +635,20 @@ class GlobalClickFilter:
         return []
 
     def _take_queue(self, button: Button) -> list:
-        queued = self._queued[button][:]
+        """With the lock held: the queue to send now, as (button it is sent
+        as, pressed, template), each counted in flight for that button."""
+        queued = [(send_as, pressed, template) for pressed, template, send_as in self._queued[button]]
         self._queued[button].clear()
-        if queued:
-            self._track(button, len(queued))
+        for send_as, _pressed, _template in queued:
+            self._track(send_as, 1)
         return queued
 
     def _release_queue(self, button: Button) -> None:
         with self._lock:
             self._in_flight[button] = 0
             queued = self._take_queue(button)
-        for pressed, template in queued:
-            self._safe_inject(button, pressed, template)
+        for send_as, pressed, template in queued:
+            self._safe_inject(send_as, pressed, template)
         self._update_motion_tap()
 
     def _safe_inject(self, button: Button, pressed: Optional[bool], template: object) -> None:
@@ -721,7 +806,10 @@ class GlobalClickFilter:
                     # at while it matters (see WindowsHook.set_watch).
                     if watch[0]:
                         info = ctypes.cast(data, PMSLLHOOKSTRUCT).contents
-                        if hook_logic.motion(info.pt.x, info.pt.y, info.flags, info.dwExtraInfo):
+                        if hook_logic.motion(
+                            info.pt.x, info.pt.y, info.flags, info.dwExtraInfo,
+                            info.time, arrival + clock_offset, get_tick_count(),
+                        ):
                             return 1
                 else:
                     entry = BUTTONS.get(int(message))
@@ -950,8 +1038,8 @@ class GlobalClickFilter:
             return event if result.accepted else None
 
         def decide_motion(event: object) -> object:
-            # Motion while a release is held in place or re-sent events are
-            # on their way (see _update_motion_tap).
+            # Motion while a release is held or re-sent events are on their
+            # way (see _update_motion_tap).
             mark = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventSourceUserData)
             if mark == RESTORE_MARK:
                 return event  # puts the pointer back after a re-sent release
@@ -959,7 +1047,9 @@ class GlobalClickFilter:
                 self._injected_passed(INJECTED_MOTION_MARKS[mark])
                 return event  # re-sent by this app; already decided
             location = Quartz.CGEventGetLocation(event)
-            return event if self._motion(Quartz.CGEventCreateCopy(event), (location.x, location.y)) else None
+            timestamp = to_seconds(Quartz.CGEventGetTimestamp(event))
+            copy = Quartz.CGEventCreateCopy(event)
+            return event if self._motion(copy, (location.x, location.y), timestamp) else None
 
         # One tap sees clicks and pointer motion alike. WindowServer delivers
         # one tap's events to it strictly in order, and holds each until the
@@ -1206,9 +1296,19 @@ class WindowsHook:
         )
         return not event.accepted
 
-    def motion(self, x: int, y: int, flags: int, extra: int) -> bool:
-        """A move to (x, y), seen while motion is watched. Returns True when
-        the hook must drop it (it was queued to be re-sent)."""
+    def motion(
+        self,
+        x: int,
+        y: int,
+        flags: int,
+        extra: int,
+        tick: Optional[int] = None,
+        arrival: Optional[float] = None,
+        tick_now: Optional[int] = None,
+    ) -> bool:
+        """A move to (x, y), seen while motion is watched, timed as `button`
+        times a press when `tick`, `arrival` and `tick_now` are given.
+        Returns True when the hook must drop it (it was queued to be re-sent)."""
         if extra in INJECTED_MOTION_MARKS:
             self.basis = (x, y)
             self._owner._injected_passed(INJECTED_MOTION_MARKS[extra])
@@ -1224,7 +1324,10 @@ class WindowsHook:
             self.basis = self.virtual = (x, y)
             self.known = True
         target = (self.virtual[0] + x - self.basis[0], self.virtual[1] + y - self.basis[1])
-        if not self._owner._motion(target, target):
+        stamp = None
+        if tick is not None and arrival is not None and tick_now is not None:
+            stamp = windows_event_time(arrival, tick_now, tick)
+        if not self._owner._motion(target, target, stamp):
             self.virtual = target
             return True
         self.basis = self.virtual = (x, y)

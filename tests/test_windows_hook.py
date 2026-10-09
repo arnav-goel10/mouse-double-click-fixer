@@ -208,7 +208,9 @@ class FakeWindows:
             self._button(self._swap(button), pressed, self.INJECTED, mark, when or int(self.now_ms))
 
     def _move(self, point, flags, extra) -> None:
-        if self.hook.watch[0] and self.hook.motion(point[0], point[1], flags, extra):
+        if self.hook.watch[0] and self.hook.motion(
+            point[0], point[1], flags, extra, int(self.now_ms), self.now_ms / 1000, int(self.now_ms)
+        ):
             return  # held back: the pointer stays where it was
         self.cursor = point
         self.seen.append(("move", point, extra))
@@ -329,6 +331,27 @@ class WindowsHookLogicTests(unittest.TestCase):
         self.assertEqual(marks, [TELEPORT_MARK, MOTION_MARK_FOR[Button.LEFT]])
         self.assertFalse(self.win.hook.watch[0])
 
+    def test_motion_past_the_window_drops_a_drag_where_it_came_up(self) -> None:
+        # No timer: the first move stamped past the window settles the
+        # release, which goes out at its spot before that move.
+        self.win.press()
+        self.win.wait(50)
+        self.win.move(100, 0)
+        self.win.wait(50)
+        self.win.release()
+        self.win.wait(1)
+        self.win.move(10, 0)                                          # inside the window
+        self.win.wait(70)
+        self.win.move(10, 0)                                          # past it
+        self.win.run()
+        self.assertEqual(self.win.buttons()[1][:3], ("up", Button.LEFT, (300, 200)))
+        self.assertEqual(self.win.cursor, (320, 200))
+        marks = [entry[2] for entry in self.win.seen if entry[0] == "move"][-3:]
+        self.assertEqual(marks, [TELEPORT_MARK, MOTION_MARK_FOR[Button.LEFT], MOTION_MARK_FOR[Button.LEFT]])
+        self.assertFalse(self.win.hook.watch[0])
+        self.fire_timers()
+        self.assertEqual(len(self.win.buttons()), 2, "the timer must not send the up again")
+
     def test_a_move_inside_the_teleport_is_kept(self) -> None:
         for position in (1, 2):  # after the move there, after the release
             with self.subTest(position=position):
@@ -395,8 +418,18 @@ class WindowsHookLogicTests(unittest.TestCase):
         self.assertNotIn(TELEPORT_MARK, [entry[2] for entry in self.win.seen if entry[0] == "move"])
 
     def test_an_unknown_pointer_position_sends_the_release_where_it_is(self) -> None:
-        self.drag_and_let_go_while_moving()
+        # Windows couldn't say where the pointer was as watching began
+        # (another desktop had the input), and no move of the hand has come
+        # since to tell: only another program moved it.
+        self.win.press()
+        self.win.wait(50)
+        self.win.move(100, 0)
+        self.win.wait(50)
         self.win.cursor_known = False
+        self.win.release()
+        self.win.wait(1)
+        self.win.queue.append(("move", normalized_absolute(500, 200, *self.win.screen), 0))
+        self.win.run()
         self.fire_timers()
         self.assertEqual(self.win.buttons()[1][:3], ("up", Button.LEFT, (500, 200)))
 

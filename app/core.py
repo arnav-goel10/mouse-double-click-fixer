@@ -12,6 +12,8 @@ too.
 
 from __future__ import annotations
 
+import math
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from statistics import median
@@ -71,7 +73,8 @@ class ClickEvent:
     #: caller must deliver that release first, then this press.
     flush_held: bool = False
     #: Real, but held back by the hook so it reaches apps after an event the
-    #: app re-sent just before it (see GlobalClickFilter._defer).
+    #: app re-sent just before it, or after another button's held release
+    #: that its own timestamp settled (see GlobalClickFilter._handle).
     deferred: bool = False
     #: Why a release was held: "closing" when it came too soon after the
     #: contact closed to be a finger letting go (the contact is still
@@ -105,6 +108,12 @@ class BounceFilter:
       late by the caller (see `commit_held`). Worn switches drop contact as
       early as 60 ms into a drag, and bounce as they close, so no length of
       press is safe to skip.
+
+    "In time" is judged by the events' own timestamps, never by when they
+    reach the filter: events can arrive tens of milliseconds late, but they
+    arrive in the order they happened, so once any event stamped past the
+    window has been seen, no press inside it can still be on its way (see
+    `due`).
     """
 
     def __init__(
@@ -208,6 +217,23 @@ class BounceFilter:
         return ClickEvent(self.button, False, True, None, None)
 
     @property
+    def held_at(self) -> Optional[float]:
+        """When the release being held back happened, or None."""
+        return self._held_release_at
+
+    def due(self, timestamp: float) -> bool:
+        """Whether an event stamped `timestamp` settles the held release.
+
+        It does once it comes more than the threshold after the release:
+        events reach the filter in the order they happened, so a press that
+        would have cancelled the release, being earlier, would already have
+        been seen. That holds however late the events arrive, which a timer
+        started on arrival cannot promise.
+        """
+        held = self._held_release_at
+        return held is not None and (float(timestamp) - held) * 1000 > self.threshold_ms
+
+    @property
     def held_id(self) -> Optional[int]:
         """Identifies the release being held back, or None. A counter rather
         than its timestamp: Windows stamps events in ~16 ms ticks, so two
@@ -230,6 +256,51 @@ class BounceFilter:
         self._last_release_at = self._held_release_at
         self._held_release_at = None
         return True
+
+
+#: The delivery allowance is judged from this many of the latest events, and
+#: covers this share of them.
+LATENESS_SAMPLES = 64
+LATENESS_SHARE = 0.95
+#: The allowance stays within these bounds, and is this before any event has
+#: been measured.
+MIN_ALLOWANCE_MS = 5.0
+MAX_ALLOWANCE_MS = 150.0
+DEFAULT_ALLOWANCE_MS = 30.0
+#: A measured lateness beyond this is no delivery delay: the event's stamp
+#: came from another clock (see GlobalClickFilter._normalise_time).
+MAX_LATENESS_S = 2.0
+
+
+class DeliveryDelay:
+    """How late events reach the filter on this machine.
+
+    An event is stamped when the hardware made it and reaches the filter
+    later: a millisecond or two on an idle machine, tens of milliseconds and
+    now and then well over a hundred on a busy one. A held release that no
+    later event settles (see BounceFilter.due) is settled by a timer, and the
+    timer must wait out the window and then this lateness too, or a press
+    made inside the window but delivered late finds its release already
+    gone, and a drag breaks. The allowance is the 95th percentile of the
+    latest events' lateness, within MIN_ALLOWANCE_MS and MAX_ALLOWANCE_MS.
+    """
+
+    def __init__(self, size: int = LATENESS_SAMPLES) -> None:
+        self._samples: deque = deque(maxlen=size)
+
+    def add(self, seconds: float) -> None:
+        """Record one event: how long after its timestamp it arrived."""
+        if not math.isfinite(seconds) or abs(seconds) > MAX_LATENESS_S:
+            return
+        # A stamp a hair ahead of the clock read on arrival is on time.
+        self._samples.append(max(0.0, seconds * 1000))
+
+    def allowance_ms(self) -> float:
+        if not self._samples:
+            return DEFAULT_ALLOWANCE_MS
+        ordered = sorted(self._samples)
+        rank = max(0, math.ceil(LATENESS_SHARE * len(ordered)) - 1)
+        return min(MAX_ALLOWANCE_MS, max(MIN_ALLOWANCE_MS, ordered[rank]))
 
 
 def clamp_threshold(value: float) -> int:

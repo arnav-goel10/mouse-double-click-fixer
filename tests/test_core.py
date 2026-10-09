@@ -6,13 +6,18 @@ except ImportError:  # run as tests.<module> from the repository root
 import unittest
 
 from app.core import (
+    DEFAULT_ALLOWANCE_MS,
     DEFAULT_THRESHOLD_MS,
+    LATENESS_SAMPLES,
+    MAX_ALLOWANCE_MS,
     MAX_THRESHOLD_MS,
+    MIN_ALLOWANCE_MS,
     MIN_THRESHOLD_MS,
     REQUIRED_DOUBLE_CLICKS,
     BounceFilter,
     Button,
     Calibrator,
+    DeliveryDelay,
     clamp_threshold,
 )
 
@@ -278,3 +283,91 @@ class DragDropoutTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DueTests(unittest.TestCase):
+    """An event stamped past a held release's window settles it."""
+
+    def test_only_an_event_stamped_past_the_window_settles_the_release(self) -> None:
+        # 125 ms: a threshold whose edge is exact in binary.
+        click_filter = BounceFilter(125)
+        click_filter.press(timestamp=1.0)
+        self.assertFalse(click_filter.due(5.0), "nothing is held")
+        self.assertTrue(click_filter.release(timestamp=1.5).held)
+        self.assertEqual(click_filter.held_at, 1.5)
+        self.assertFalse(click_filter.due(1.6))
+        self.assertFalse(click_filter.due(1.625), "the edge is still inside, as for a press")
+        self.assertTrue(click_filter.due(1.626))
+
+    def test_due_and_a_press_draw_the_line_in_the_same_place(self) -> None:
+        for threshold in (30, 40, 46, 60):
+            for gap_ms in range(threshold - 3, threshold + 4):
+                with self.subTest(threshold=threshold, gap_ms=gap_ms):
+                    click_filter = BounceFilter(threshold)
+                    click_filter.press(timestamp=1.0)
+                    click_filter.release(timestamp=1.3)
+                    at = 1.3 + gap_ms / 1000
+                    settles = click_filter.due(at)
+                    event = click_filter.press(timestamp=at)
+                    self.assertEqual(event.flush_held, settles)
+                    self.assertEqual(event.cancels_held, not settles)
+
+    def test_the_threshold_in_force_decides(self) -> None:
+        click_filter = BounceFilter(40)
+        click_filter.press(timestamp=1.0)
+        click_filter.release(timestamp=1.5)
+        click_filter.threshold_ms = 80
+        self.assertFalse(click_filter.due(1.55))
+        self.assertTrue(click_filter.due(1.59))
+
+
+class DeliveryDelayTests(unittest.TestCase):
+    """The allowance the timer for a held release waits on top of the window."""
+
+    def test_before_any_event_it_is_the_default(self) -> None:
+        self.assertEqual(DeliveryDelay().allowance_ms(), DEFAULT_ALLOWANCE_MS)
+
+    def test_it_covers_ninety_five_percent_of_recent_events(self) -> None:
+        delay = DeliveryDelay()
+        for ms in range(1, 101):  # 1..100 ms; only the latest 64 count
+            delay.add(ms / 1000)
+        # 37..100 kept: the 61st of 64 is 97 ms.
+        self.assertAlmostEqual(delay.allowance_ms(), 97.0, places=6)
+
+    def test_it_is_clamped_both_ways(self) -> None:
+        quick, slow = DeliveryDelay(), DeliveryDelay()
+        for _ in range(LATENESS_SAMPLES):
+            quick.add(0.0002)
+            slow.add(0.400)
+        self.assertEqual(quick.allowance_ms(), MIN_ALLOWANCE_MS)
+        self.assertEqual(slow.allowance_ms(), MAX_ALLOWANCE_MS)
+
+    def test_a_busy_spell_ages_out(self) -> None:
+        delay = DeliveryDelay()
+        for _ in range(LATENESS_SAMPLES):
+            delay.add(0.120)
+        self.assertAlmostEqual(delay.allowance_ms(), 120.0, places=6)
+        for _ in range(LATENESS_SAMPLES):
+            delay.add(0.008)
+        self.assertAlmostEqual(delay.allowance_ms(), 8.0, places=6)
+
+    def test_a_few_slow_events_set_it_when_they_are_over_five_percent(self) -> None:
+        delay = DeliveryDelay()
+        for index in range(LATENESS_SAMPLES):
+            delay.add(0.090 if index % 16 == 0 else 0.010)  # 4 of 64 slow
+        self.assertAlmostEqual(delay.allowance_ms(), 90.0, places=6)
+        delay = DeliveryDelay()
+        for index in range(LATENESS_SAMPLES):
+            delay.add(0.090 if index % 32 == 0 else 0.010)  # 2 of 64 slow
+        self.assertAlmostEqual(delay.allowance_ms(), 10.0, places=6)
+
+    def test_stamps_from_another_clock_are_ignored(self) -> None:
+        delay = DeliveryDelay()
+        for seconds in (5_000.0, -3.0, float("nan"), float("inf")):
+            delay.add(seconds)
+        self.assertEqual(delay.allowance_ms(), DEFAULT_ALLOWANCE_MS)
+
+    def test_a_stamp_a_hair_ahead_counts_as_on_time(self) -> None:
+        delay = DeliveryDelay()
+        delay.add(-0.0004)
+        self.assertEqual(delay.allowance_ms(), MIN_ALLOWANCE_MS)
