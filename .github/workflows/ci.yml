@@ -98,6 +98,11 @@ jobs:
             ForEach-Object { "{0,8:N1} MB  {1}" -f ($_.Length / 1MB), $_.FullName.Substring($PWD.Path.Length + 1) }
           $mesa = Join-Path (python -c "import os, PySide6; print(os.path.dirname(PySide6.__file__))") "opengl32sw.dll"
           if (Test-Path $mesa) { "left out: PySide6's opengl32sw.dll, {0:N1} MB" -f ((Get-Item $mesa).Length / 1MB) }
+          # The OpenSSL files Qt's OpenSSL backend loads by name, wherever PATH has them.
+          foreach ($name in "libcrypto-3-x64.dll", "libssl-3-x64.dll") {
+            $env:PATH -split ";" | Where-Object { $_ -and (Test-Path -LiteralPath (Join-Path $_ $name)) } |
+              ForEach-Object { "on PATH: $(Join-Path $_ $name)" }
+          }
           Select-String -Path build\notices\THIRD_PARTY_NOTICES.md -Pattern '^\| ' | ForEach-Object { $_.Line }
       - name: Download the old installers to upgrade from
         shell: pwsh
