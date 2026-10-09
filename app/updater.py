@@ -2,10 +2,11 @@
 
 The updater asks GitHub for the latest release and downloads its
 SHA256SUMS.txt with that file's minisign signature. The signature must come
-from one of the release keys below, which the owner keeps offline, and its
-signed comment must name the release's version (app/update_signature.py has
-the format, tools/sign_release.py makes it). Only then is the file for this
-platform downloaded, checked against the signed checksums, and installed:
+from one of the release keys below, and its signed comment must name the
+release's version (app/update_signature.py has the format,
+tools/sign_release.py makes it); a release that fails this is never offered.
+Installing it downloads the file for this platform, checks it against the
+signed checksums, and installs it:
 
 * macOS: a zipped app bundle. It must carry a valid code signature whose
   designated requirement matches the running app's. That is what macOS keys
@@ -24,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import platform
 import plistlib
@@ -42,6 +44,8 @@ from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequ
 from . import __version__
 from .update_signature import PublicKey, ReleaseClaim, SignatureError, parse_claim, parse_public_key, verify
 
+log = logging.getLogger(__name__)
+
 REPOSITORY = "arnav-goel10/doubleclick-fixer"
 LATEST_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
 #: Points the updater at another server; used by the end-to-end test.
@@ -53,10 +57,13 @@ WINDOWS_PORTABLE_ASSET = "DoubleClickFixer.exe"
 CHECKSUM_ASSET = "SHA256SUMS.txt"
 SIGNATURE_ASSET = CHECKSUM_ASSET + ".minisig"
 
-#: The minisign public keys a release must be signed with (the same keys are
-#: in tools/keys/). The owner keeps the secret keys offline. The backup key is
-#: built in from the start, so a lost or retired primary key can be replaced
-#: without stranding every installed copy.
+#: The minisign public keys a release must be signed with. tools/sign_release.py
+#: reads this list too, and tools/keys/ has copies for the minisign tool. The
+#: secret keys never go to GitHub or CI: they are files on the owner's Mac, in
+#: ~/.doubleclick-fixer-signing/update-keys/ with owner-only permissions, and
+#: releases are signed there. The backup key is built in from the start, so a
+#: lost or retired primary key can be replaced without stranding every
+#: installed copy.
 RELEASE_KEYS = (
     "RWR9XcCRL9bZ1OD22V5J6uVhJgblDA9o4UFwJBjMU6CtTyqCeWOC6jDf",  # primary, D4D9D62F91C05D7D
     "RWTUZv3t2LmICpA6R0C6kmRCHkbU8DUvmw5kDkjIXZ1yJnUNuTXlEq7Z",  # backup, 0A88B9D8EDFD66D4
@@ -82,9 +89,14 @@ WORKDIR_PREFIX = "dcf-update-"
 #: unattended, only when the user asks. Retrying it would quit the app again at
 #: every sign-in.
 GIVE_UP_AFTER = 2
+#: The checksums and their signature are a few hundred bytes; a download much
+#: bigger than this isn't them, and is stopped.
+SMALL_FILE_LIMIT = 64 * 1024
 
-UNSIGNED = "This update isn’t signed, so it wasn’t installed."
+UNSIGNED = "This update isn’t signed, so it can’t be installed."
 MOVE_TO_APPLICATIONS = "Move DoubleClick Fixer to Applications to update it."
+CHECK_FAILED = "Couldn’t check for updates."
+INSTALL_FAILED = "The update didn’t install. Try again."
 
 
 # -- pure helpers (unit tested) ---------------------------------------------------
@@ -128,7 +140,7 @@ class Release:
     asset_name: str
     asset_url: str
     checksum_url: str
-    #: Empty when the release has no signature; installing it is refused.
+    #: Empty when the release has no signature; it is then never offered.
     signature_url: str = ""
 
 
@@ -198,12 +210,14 @@ def verified_claim(
     try:
         comment = verify(checksums, signature, trusted_keys() if keys is None else keys)
     except SignatureError as error:
-        raise UpdateError("This update’s signature isn’t valid, so it wasn’t installed.") from error
+        raise UpdateError("This update’s signature isn’t valid, so it can’t be installed.") from error
     claim = parse_claim(comment)
-    if claim is None or claim.version != version:
-        raise UpdateError("This update’s signature is for another version, so it wasn’t installed.")
+    if claim is None:
+        raise UpdateError("This update isn’t signed for this version, so it can’t be installed.")
+    if claim.version != version:
+        raise UpdateError("This update’s signature is for another version, so it can’t be installed.")
     if not is_newer(claim.version, __version__):
-        raise UpdateError("This update isn’t newer than the installed version, so it wasn’t installed.")
+        raise UpdateError("This update isn’t newer than the installed version, so it can’t be installed.")
     return claim
 
 
@@ -231,8 +245,12 @@ def install_location_problem(kind: str) -> str:
         # which access() reports too.
         if os.access(bundle.parent, os.W_OK):
             return ""
-        if bundle.parent in (Path("/Applications"), Path.home() / "Applications"):
+        if bundle.parent == Path("/Applications"):
             return "Your account can’t change apps in Applications. Ask an administrator to update it."
+        if bundle.parent == Path.home() / "Applications":
+            # The user's own folder: moving the app wouldn't help, and only
+            # its permissions stand in the way.
+            return f"No permission to replace the app in {bundle.parent}."
         return MOVE_TO_APPLICATIONS
     if kind in ("windows-installed", "windows-portable"):
         folder = Path(sys.executable).parent
@@ -410,8 +428,11 @@ class Updater(QObject):
 
     @property
     def auto_check(self) -> bool:
-        """Look for updates in the background."""
-        return bool(self.controller.settings.get("auto_check", True))
+        """Look for updates in the background. Until this is set, it follows
+        the install switch: before the two were separate, turning that off
+        stopped the checks too, and a copy updated from then still does."""
+        settings = self.controller.settings
+        return bool(settings.get("auto_check", settings.get("auto_update", True)))
 
     @property
     def auto_install(self) -> bool:
@@ -448,13 +469,12 @@ class Updater(QObject):
             return
         if not user_initiated and not self.auto_check:
             return
+        self._forget_release()
         self._set(self.CHECKING, "")
-        request = QNetworkRequest(QUrl(os.environ.get(URL_OVERRIDE_ENV) or LATEST_URL))
+        request = self._request(os.environ.get(URL_OVERRIDE_ENV) or LATEST_URL)
         request.setRawHeader(b"Accept", b"application/vnd.github+json")
-        request.setRawHeader(b"User-Agent", f"DoubleClickFixer/{__version__}".encode())
-        request.setTransferTimeout(STALL_TIMEOUT_MS)
         self._reply = self._network.get(request)
-        self._reply.finished.connect(lambda: self._on_checked(user_initiated))
+        self._reply.finished.connect(lambda: self._step(self._on_checked, CHECK_FAILED, user_initiated))
 
     def install(self, unattended: bool = False) -> None:
         """Download the available update and apply it. `unattended` (a
@@ -463,20 +483,51 @@ class Updater(QObject):
         if self.state == self.READY:
             self._apply(self._ready_file)
             return
-        if self.release is None or self.state in (self.DOWNLOADING, self.INSTALLING):
+        if self.release is None or self.state in (self.CHECKING, self.DOWNLOADING, self.INSTALLING):
             return
-        problem = UNSIGNED if not self.release.signature_url else install_location_problem(self.kind)
+        # A release is only ever offered with its signature checked (see
+        # _on_signature), but nothing unverified is downloaded either way.
+        problem = UNSIGNED if self._claim is None else install_location_problem(self.kind)
         if problem:
             self._set(self.FAILED, problem)
             return
         self._unattended = unattended
         self._remove_workdir()
-        self._workdir = Path(tempfile.mkdtemp(prefix=WORKDIR_PREFIX))
-        self._claim = None
+        try:
+            self._workdir = Path(tempfile.mkdtemp(prefix=WORKDIR_PREFIX))
+        except OSError:
+            self._set(self.FAILED, "Couldn’t save the update.")
+            return
         self._set(self.DOWNLOADING, "")
-        self._download(self.release.checksum_url, self._workdir / CHECKSUM_ASSET, self._on_checksums)
+        self._download(self.release.asset_url, self._workdir / self.release.asset_name, self._on_asset)
 
     # -- steps --------------------------------------------------------------------
+    def _step(self, step, failure: str, *args: object) -> None:
+        """Run one step of a check or an update, as a network reply finishes.
+
+        Whatever goes wrong ends the step in FAILED, showing `failure` unless
+        it was an UpdateError, which says what to show. Nothing may leave the
+        updater in CHECKING or DOWNLOADING, which would block every later
+        check until the app restarts.
+        """
+        try:
+            step(*args)
+        except UpdateError as error:
+            self._fail(str(error))
+        except Exception:
+            log.exception("Update step failed")
+            self._fail(failure)
+
+    def _request(self, url: str) -> QNetworkRequest:
+        request = QNetworkRequest(QUrl(url))
+        request.setRawHeader(b"User-Agent", f"DoubleClickFixer/{__version__}".encode())
+        request.setAttribute(
+            QNetworkRequest.Attribute.RedirectPolicyAttribute,
+            QNetworkRequest.RedirectPolicy.NoLessSafeRedirectPolicy,
+        )
+        request.setTransferTimeout(STALL_TIMEOUT_MS)
+        return request
+
     def _on_checked(self, user_initiated: bool) -> None:
         reply = self._reply
         self._reply = None
@@ -490,7 +541,7 @@ class Updater(QObject):
             if status == 404:
                 self._set(self.FAILED, "No published releases were found.")
             else:
-                self._set(self.FAILED, "Couldn’t check for updates.")
+                self._set(self.FAILED, CHECK_FAILED)
             return
         try:
             data = json.loads(bytes(reply.readAll()).decode("utf-8"))
@@ -500,10 +551,58 @@ class Updater(QObject):
         release = release_from_json(data, self.kind if self.kind != "source" else "mac")
         self.controller.set_last_update_check()
         if release is None or not is_newer(release.version, __version__):
-            self.release = None
             self._set(self.CURRENT, "")
             return
+        # Anyone who can upload files to a GitHub release could announce any
+        # version, so a release is offered only once its signature checks
+        # out. It ends in FAILED rather than CURRENT when it doesn't: a newer
+        # release is there, and calling this copy up to date would hide it
+        # (and "Try Again" picks up a signature uploaded a moment late).
+        if not release.signature_url:
+            self._set(self.FAILED, UNSIGNED)
+            return
+        self._fetch(release.checksum_url, lambda checksums: self._on_checksums(release, checksums, user_initiated))
+
+    def _fetch(self, url: str, done) -> None:
+        """Download a small file of a check into memory and hand its bytes to
+        `done`; a failure ends the check."""
+        reply = self._network.get(self._request(url))
+        self._reply = reply
+
+        def on_progress(received: int, _total: int) -> None:
+            if received > SMALL_FILE_LIMIT:
+                reply.abort()  # so a huge file isn't held in memory
+
+        def on_finished() -> None:
+            reply.deleteLater()
+            self._reply = None
+            data = bytes(reply.readAll())
+            # A file that arrives in one piece is finished before it can be
+            # stopped, so its size is checked here too.
+            if reply.error() != QNetworkReply.NetworkError.NoError or len(data) > SMALL_FILE_LIMIT:
+                self._set(self.FAILED, CHECK_FAILED)
+                return
+            done(data)
+
+        reply.downloadProgress.connect(on_progress)
+        reply.finished.connect(lambda: self._step(on_finished, CHECK_FAILED))
+
+    def _on_checksums(self, release: Release, checksums: bytes, user_initiated: bool) -> None:
+        self._fetch(
+            release.signature_url,
+            lambda signature: self._on_signature(release, checksums, signature, user_initiated),
+        )
+
+    def _on_signature(self, release: Release, checksums: bytes, signature: bytes, user_initiated: bool) -> None:
+        try:
+            claim = verified_claim(checksums, signature, release.version)
+        except UpdateError as error:
+            self._set(self.FAILED, str(error))
+            return
         self.release = release
+        self._claim = claim
+        # The download's hash comes from the exact bytes the signature covers.
+        self._checksums = parse_checksums(checksums.decode("utf-8", errors="replace"))
         self._set(self.AVAILABLE, "")
         if not user_initiated and self.auto_install and self._attempts(release.version) < GIVE_UP_AFTER:
             self.install(unattended=True)
@@ -515,7 +614,7 @@ class Updater(QObject):
                 self._remember(update_attempt_version="", update_attempt_count=0)
             self._set(self.CURRENT, f"Updated to {__version__}")
         elif result == "failed":
-            self._set(self.FAILED, "The update didn’t install. Try again.")
+            self._set(self.FAILED, INSTALL_FAILED)
 
     def apply_if_ready(self) -> None:
         """A good moment to restart (the window was closed): finish a
@@ -528,19 +627,12 @@ class Updater(QObject):
         self._apply(self._ready_file)
 
     def _download(self, url: str, target: Path, done) -> None:
-        request = QNetworkRequest(QUrl(url))
-        request.setRawHeader(b"User-Agent", f"DoubleClickFixer/{__version__}".encode())
-        request.setAttribute(
-            QNetworkRequest.Attribute.RedirectPolicyAttribute,
-            QNetworkRequest.RedirectPolicy.NoLessSafeRedirectPolicy,
-        )
-        request.setTransferTimeout(STALL_TIMEOUT_MS)
         try:
             handle = open(target, "wb")
         except OSError:
             self._fail("Couldn’t save the update.")
             return
-        reply = self._network.get(request)
+        reply = self._network.get(self._request(url))
         self._reply = reply
 
         failed = []
@@ -559,7 +651,7 @@ class Updater(QObject):
             write(bytes(reply.readAll()))
 
         def on_progress(received: int, total: int) -> None:
-            if total > 0 and target.name not in (CHECKSUM_ASSET, SIGNATURE_ASSET):
+            if total > 0:
                 self.progress = received / total
                 self.changed.emit()
 
@@ -582,37 +674,17 @@ class Updater(QObject):
 
         reply.readyRead.connect(on_ready)
         reply.downloadProgress.connect(on_progress)
-        reply.finished.connect(on_finished)
-
-    def _on_checksums(self, _path: Path) -> None:
-        if self.release is None or self._workdir is None:
-            self._fail("The update was cancelled.")
-            return
-        self._download(self.release.signature_url, self._workdir / SIGNATURE_ASSET, self._on_signature)
-
-    def _on_signature(self, path: Path) -> None:
-        if self.release is None or self._workdir is None:
-            self._fail("The update was cancelled.")
-            return
-        try:
-            checksums = (self._workdir / CHECKSUM_ASSET).read_bytes()
-            signature = path.read_bytes()
-        except OSError:
-            self._fail("Couldn’t read the update’s checksums.")
-            return
-        try:
-            self._claim = verified_claim(checksums, signature, self.release.version)
-        except UpdateError as error:
-            self._fail(str(error))
-            return
-        # The hash comes from the exact bytes the signature covers.
-        self._checksums = parse_checksums(checksums.decode("utf-8", errors="replace"))
-        self._download(self.release.asset_url, self._workdir / self.release.asset_name, self._on_asset)
+        reply.finished.connect(lambda: self._step(on_finished, INSTALL_FAILED))
 
     def _on_asset(self, path: Path) -> None:
-        assert self.release is not None
+        if self.release is None:
+            self._fail("The update was cancelled.")
+            return
         expected = self._checksums.get(self.release.asset_name)
         if not expected or sha256_of(path) != expected:
+            # Counted like a failed install: a release whose file never
+            # matches would otherwise be downloaded in full every few hours.
+            self._count_attempt()
             self._fail("The download didn’t match its checksum, so it wasn’t installed.")
             return
         if self._unattended and not self.auto_install:
@@ -632,14 +704,12 @@ class Updater(QObject):
             return
         self._ready_file = None
         self._set(self.INSTALLING, "")
-        # Counted before trying, so an attempt that never comes back (the app
-        # quits and the new copy doesn't start) counts too. A successful one
-        # changes the running version, after which the count no longer applies.
-        self._remember(
-            update_attempt_version=self.release.version,
-            update_attempt_count=self._attempts(self.release.version) + 1,
-        )
         try:
+            # Counted before trying, so an attempt that never comes back (the
+            # app quits and the new copy doesn't start) counts too. A
+            # successful one changes the running version, after which the
+            # count no longer applies.
+            self._count_attempt()
             if self.kind == "mac":
                 self._install_mac(path)
             elif self.kind == "windows-installed":
@@ -651,6 +721,10 @@ class Updater(QObject):
                 return
         except UpdateError as error:
             self._fail(str(error))
+            return
+        except Exception:
+            log.exception("Installing the update failed")
+            self._fail(INSTALL_FAILED)
             return
         # Checked after the relaunch, to say whether it worked.
         self.controller.set_pending_update(self.release.version)
@@ -730,15 +804,28 @@ class Updater(QObject):
         except (TypeError, ValueError):
             return 0
 
+    def _count_attempt(self) -> None:
+        """Note one more try at installing the release on offer."""
+        if self.release is not None:
+            version = self.release.version
+            self._remember(update_attempt_version=version, update_attempt_count=self._attempts(version) + 1)
+
     def _remember(self, **values: object) -> None:
         # The updater's own settings are written by the controller with all the
-        # others, so they survive its next save.
-        self.controller._store(**values)
+        # others, so they survive its next save. A controller without
+        # store_update_state predates it, and its _store does the same.
+        store = getattr(self.controller, "store_update_state", None) or self.controller._store
+        store(**values)
 
     def _remove_workdir(self) -> None:
         if self._workdir is not None:
             shutil.rmtree(self._workdir, ignore_errors=True)
             self._workdir = None
+
+    def _forget_release(self) -> None:
+        self.release = None
+        self._claim = None
+        self._checksums = {}
 
     def _discard_download(self) -> None:
         """Drop a waiting download: the update stays available, to install

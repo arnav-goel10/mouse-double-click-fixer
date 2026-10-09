@@ -1,3 +1,4 @@
+import hashlib
 import http.server
 import json
 import os
@@ -18,6 +19,7 @@ from run import _unhide_qt_plugins
 
 _unhide_qt_plugins()
 
+from app import settings as settings_store
 from app import updater
 from app.updater import (
     CHECKSUM_ASSET,
@@ -86,7 +88,7 @@ class ReleaseTests(unittest.TestCase):
         self.assertIsNone(release_from_json(release_json(assets=(MAC_ASSET,)), "mac"))
 
     def test_an_unsigned_release_is_still_seen(self) -> None:
-        # Offered, so that installing it can say why it is refused.
+        # Seen, so that the check can say why it isn't offered.
         release = release_from_json(release_json(assets=(MAC_ASSET, CHECKSUM_ASSET)), "mac")
         self.assertEqual(release.signature_url, "")
 
@@ -157,9 +159,14 @@ class ReleaseSignatureTests(unittest.TestCase):
                 verified_claim(self.checksums, sign(self.checksums), "9.9.9")
 
     def test_a_comment_for_another_version_is_refused(self) -> None:
-        for comment in ("dcf 9.9.8", "dcf 9.9.9.1", "dcf 9.9.9x", "dcf  9.9.9", "9.9.9", "dcf v9.9.9", ""):
+        for comment in ("dcf 9.9.8", "dcf 9.9.9.1", "dcf 9.9.9x", "dcf v9.9.9"):
             signature = signature_text(self.checksums, TEST_KEY_ID, TEST_SEED, comment)
-            with self.assertRaisesRegex(updater.UpdateError, "another version", msg=comment):
+            with self.assertRaisesRegex(updater.UpdateError, "is for another version", msg=comment):
+                verified_claim(self.checksums, signature, "9.9.9", self.keys)
+        # A comment that names no version at all.
+        for comment in ("dcf  9.9.9", "9.9.9", "", "dcf"):
+            signature = signature_text(self.checksums, TEST_KEY_ID, TEST_SEED, comment)
+            with self.assertRaisesRegex(updater.UpdateError, "isn’t signed for this version", msg=comment):
                 verified_claim(self.checksums, signature, "9.9.9", self.keys)
 
     def test_an_older_version_is_refused(self) -> None:
@@ -211,6 +218,13 @@ class InstallLocationTests(unittest.TestCase):
             self.assertIn("administrator", updater.install_location_problem("mac"))
         with mock.patch.object(updater, "bundle_path", return_value=None):
             self.assertIn("Couldn’t find", updater.install_location_problem("mac"))
+
+    def test_mac_copy_in_the_users_own_applications_folder(self) -> None:
+        # Their own folder: no administrator to ask, and nowhere to move it.
+        own = Path.home() / "Applications"
+        with mock.patch.object(updater, "bundle_path", return_value=own / "DoubleClick Fixer.app"), \
+                mock.patch.object(updater.os, "access", return_value=False):
+            self.assertEqual(updater.install_location_problem("mac"), f"No permission to replace the app in {own}.")
 
     def test_windows_folder_is_probed_by_writing(self) -> None:
         exe = self.root / "DoubleClickFixer.exe"
@@ -335,14 +349,16 @@ class _Server(http.server.ThreadingHTTPServer):
 
 
 class FakeController:
-    """The settings side of AppController, kept in memory."""
+    """The settings side of AppController, kept in memory. `settings` are
+    what the settings file holds; they are read the way the app reads them,
+    defaults and all."""
 
     def __init__(self, **settings) -> None:
-        self.settings = {"auto_update": False, **settings}
+        self.settings = settings_store.coerce(settings)
         self.suspended = False
 
     def _store(self, **values) -> None:
-        self.settings = {**self.settings, **values}
+        self.settings = settings_store.coerce({**self.settings, **values})
 
     def set_auto_update(self, enabled: bool) -> None:
         self._store(auto_update=bool(enabled))
@@ -450,15 +466,11 @@ class NetworkTests(unittest.TestCase):
         return instance
 
     def test_finds_a_newer_release(self) -> None:
-        files: dict[str, bytes] = {}
-        base = self.serve(files)
-        files["latest"] = json.dumps(release_json("9.9.9", base=base)).encode()
-        instance = self.make_updater(f"{base}/latest")
-        with mock.patch.dict(os.environ, {updater.URL_OVERRIDE_ENV: f"{base}/latest"}):
-            instance.check(user_initiated=True)
-            self.wait_for(instance, {instance.AVAILABLE, instance.FAILED})
-        self.assertEqual(instance.state, instance.AVAILABLE)
+        base = self.matching_files()
+        instance = self.available(base)
         self.assertEqual(instance.release.version, "9.9.9")
+        self.assertEqual(instance._claim.version, "9.9.9")
+        self.assertEqual(self.requested, ["latest", CHECKSUM_ASSET, SIGNATURE_ASSET], "only the small files")
 
     def test_same_version_is_up_to_date(self) -> None:
         from app import __version__
@@ -479,6 +491,21 @@ class NetworkTests(unittest.TestCase):
         self.wait_for(instance, {instance.FAILED, instance.INSTALLING})
         self.assertEqual(instance.state, instance.FAILED)
         self.assertIn("checksum", instance.message)
+        self.assertEqual(instance.controller.settings["update_attempt_count"], 1, "it counts as a failed attempt")
+
+    def test_files_swapped_after_the_check_are_refused(self) -> None:
+        # The download is held to the checksums whose signature the check
+        # verified, whatever the release holds by the time it is installed.
+        base, files = self.release_files()
+        instance = self.available(base)
+        files[MAC_ASSET] = b"something else"
+        files[CHECKSUM_ASSET] = f"{hashlib.sha256(b'something else').hexdigest()}  {MAC_ASSET}\n".encode()
+        with mock.patch.object(instance, "_install_mac") as install:
+            instance.install()
+            self.wait_for(instance, {instance.FAILED, instance.INSTALLING})
+        self.assertEqual(instance.state, instance.FAILED)
+        self.assertIn("checksum", instance.message)
+        install.assert_not_called()
 
     def test_download_that_matches_reaches_install(self) -> None:
         base = self.matching_files()
@@ -493,43 +520,85 @@ class NetworkTests(unittest.TestCase):
         install.assert_called_once()
         self.assertEqual(instance._claim.version, "9.9.9")
 
-    def test_an_unsigned_release_is_refused_before_downloading_it(self) -> None:
-        base, _files = self.release_files(signature=b"")
-        instance = self.available(base)
-        instance.install()
-        self.assertEqual(instance.state, instance.FAILED)
-        self.assertEqual(instance.message, "This update isn’t signed, so it wasn’t installed.")
-        self.settle()
-        self.assertNotIn(MAC_ASSET, self.requested)
-
-    def assert_refused(self, signature: bytes, message: str) -> None:
-        base, _files = self.release_files(signature=signature)
-        instance = self.available(base)
-        with mock.patch.object(instance, "_install_mac") as install:
+    def refused(self, base: str, user_initiated: bool = True, **settings):
+        """An updater whose check of the release at `base` ended in FAILED."""
+        instance = self.make_updater(f"{base}/latest", **settings)
+        instance.window_visible = lambda: False
+        install = mock.patch.object(instance, "_install_mac").start()
+        self.addCleanup(mock.patch.stopall)
+        with mock.patch.dict(os.environ, {updater.URL_OVERRIDE_ENV: f"{base}/latest"}):
+            instance.check(user_initiated=user_initiated)
+            self.wait_for(instance, {instance.AVAILABLE, instance.FAILED, instance.INSTALLING})
+            # Nothing it could install is offered: no "Update to" in the
+            # menus, and Update Now does nothing.
+            self.assertEqual(instance.state, instance.FAILED, instance.message)
+            self.assertIsNone(instance.release)
             instance.install()
-            self.wait_for(instance, {instance.FAILED, instance.INSTALLING})
-        self.assertEqual(instance.state, instance.FAILED)
-        self.assertIn(message, instance.message)
+            self.settle()
         install.assert_not_called()
         self.assertNotIn(MAC_ASSET, self.requested, "nothing unverified is downloaded")
-        self.assertIsNone(instance._workdir, "the download folder is removed")
+        self.assertIsNone(instance._workdir)
+        return instance
 
-    def test_a_forged_signature_is_refused(self) -> None:
+    def test_an_unsigned_release_is_not_offered(self) -> None:
+        base, _files = self.release_files(signature=b"")
+        instance = self.refused(base)
+        self.assertEqual(instance.message, "This update isn’t signed, so it can’t be installed.")
+        self.assertEqual(self.requested, ["latest"])
+
+    def test_a_forged_signature_is_not_offered(self) -> None:
         checksums = b"anything"
         forged = signature_text(checksums, TEST_KEY_ID, os.urandom(32), "dcf 9.9.9")
-        self.assert_refused(forged, "signature isn’t valid")
+        base, _files = self.release_files(signature=forged)
+        self.assertIn("signature isn’t valid", self.refused(base).message)
 
-    def test_a_signature_of_other_checksums_is_refused(self) -> None:
-        self.assert_refused(sign(f"{'1' * 64}  {MAC_ASSET}\n".encode()), "signature isn’t valid")
+    def test_a_forged_release_isnt_installed_in_the_background(self) -> None:
+        forged = signature_text(b"anything", TEST_KEY_ID, os.urandom(32), "dcf 9.9.9")
+        base, _files = self.release_files(signature=forged)
+        instance = self.refused(base, user_initiated=False, auto_update=True)
+        self.assertIn("signature isn’t valid", instance.message)
+        self.assertNotIn("update_attempt_version", instance.controller.settings)
 
-    def test_a_signature_for_another_version_is_refused(self) -> None:
+    def test_a_signature_of_other_checksums_is_not_offered(self) -> None:
+        base, _files = self.release_files(signature=sign(f"{'1' * 64}  {MAC_ASSET}\n".encode()))
+        self.assertIn("signature isn’t valid", self.refused(base).message)
+
+    def test_a_signature_for_another_version_is_not_offered(self) -> None:
         # The genuine checksums, signed for an older release.
         base, files = self.release_files()
         files[SIGNATURE_ASSET] = sign(files[CHECKSUM_ASSET], "9.9.8")
-        instance = self.available(base)
-        instance.install()
-        self.wait_for(instance, {instance.FAILED, instance.INSTALLING})
-        self.assertIn("another version", instance.message)
+        self.assertIn("is for another version", self.refused(base).message)
+
+    def test_a_signature_without_a_version_is_not_offered(self) -> None:
+        base, files = self.release_files()
+        files[SIGNATURE_ASSET] = sign(files[CHECKSUM_ASSET], comment="release")
+        self.assertEqual(self.refused(base).message, "This update isn’t signed for this version, so it can’t be installed.")
+
+    def test_a_signature_that_cant_be_fetched_ends_the_check(self) -> None:
+        base, files = self.release_files()
+        del files[SIGNATURE_ASSET]  # listed, but the server says 404
+        self.assertEqual(self.refused(base).message, updater.CHECK_FAILED)
+
+    def test_an_oversized_checksum_file_is_stopped(self) -> None:
+        base, files = self.release_files()
+        files[CHECKSUM_ASSET] = b"0" * (updater.SMALL_FILE_LIMIT * 4)
+        self.assertEqual(self.refused(base).message, updater.CHECK_FAILED)
+        self.assertNotIn(SIGNATURE_ASSET, self.requested)
+
+    def test_an_unexpected_error_while_verifying_ends_the_check(self) -> None:
+        # What a packaged build without hashlib's _blake2 module would do.
+        base = self.matching_files()
+        missing = AttributeError("module 'hashlib' has no attribute 'blake2b'")
+        with mock.patch.object(updater, "verified_claim", side_effect=missing), \
+                self.assertLogs("app.updater", "ERROR") as logged:
+            instance = self.refused(base)
+        self.assertEqual(instance.message, updater.CHECK_FAILED)
+        self.assertIn("blake2b", "\n".join(logged.output))
+        # The next check isn't blocked.
+        with mock.patch.dict(os.environ, {updater.URL_OVERRIDE_ENV: f"{base}/latest"}):
+            instance.check(user_initiated=True)
+            self.wait_for(instance, {instance.AVAILABLE, instance.FAILED})
+        self.assertEqual(instance.state, instance.AVAILABLE, instance.message)
 
     def test_a_copy_that_cant_replace_itself_says_so_before_downloading(self) -> None:
         base = self.matching_files()
@@ -539,7 +608,7 @@ class NetworkTests(unittest.TestCase):
         self.assertEqual(instance.state, instance.FAILED)
         self.assertEqual(instance.message, "Move DoubleClick Fixer to Applications to update it.")
         self.settle()
-        self.assertEqual(self.requested, ["latest"])
+        self.assertEqual(self.requested, ["latest", CHECKSUM_ASSET, SIGNATURE_ASSET], "only the check's files")
 
     def test_a_new_download_replaces_the_previous_folder(self) -> None:
         base = self.matching_files()
@@ -551,6 +620,28 @@ class NetworkTests(unittest.TestCase):
             self.assertFalse(previous.exists())
             self.wait_for(instance, {instance.INSTALLING, instance.FAILED})
         self.assertNotEqual(instance._workdir, previous)
+
+    def test_an_unexpected_error_while_downloading_doesnt_leave_it_stuck(self) -> None:
+        base = self.matching_files()
+        instance = self.available(base)
+        with mock.patch.object(updater, "sha256_of", side_effect=RuntimeError("boom")), \
+                self.assertLogs("app.updater", "ERROR"):
+            instance.install()
+            self.wait_for(instance, {instance.FAILED, instance.INSTALLING, instance.READY})
+        self.assertEqual((instance.state, instance.message), (instance.FAILED, updater.INSTALL_FAILED))
+        self.assertIsNone(instance._workdir, "the download folder is removed")
+
+    def test_an_unexpected_error_while_installing_doesnt_leave_it_stuck(self) -> None:
+        base = self.matching_files()
+        instance = self.available(base)
+        quits: list[bool] = []
+        instance.quit_requested.connect(lambda: quits.append(True))
+        with mock.patch.object(instance, "_install_mac", side_effect=FileNotFoundError("ditto")), \
+                self.assertLogs("app.updater", "ERROR"):
+            instance.install()
+            self.wait_for(instance, {instance.FAILED, instance.READY})
+        self.assertEqual((instance.state, instance.message), (instance.FAILED, updater.INSTALL_FAILED))
+        self.assertEqual(quits, [], "the app isn't quit for an update that didn't start")
 
     def test_a_full_disk_fails_instead_of_hanging(self) -> None:
         base = self.matching_files()
@@ -626,6 +717,23 @@ class NetworkTests(unittest.TestCase):
         self.wait_for(instance, {instance.INSTALLING, instance.FAILED})
         self.assertEqual(instance.state, instance.INSTALLING, instance.message)
 
+    def test_turning_off_automatic_installs_during_a_download_stops_short_of_installing(self) -> None:
+        base = self.matching_files()
+        instance = self.available(base, auto_update=True)
+        instance.window_visible = lambda: False
+        with mock.patch.object(instance, "_install_mac") as install:
+            instance.install(unattended=True)
+            self.assertEqual(instance.state, instance.DOWNLOADING)
+            workdir = instance._workdir
+            instance.set_auto_install(False)  # before any of the download has arrived
+            self.wait_for(instance, {instance.AVAILABLE, instance.INSTALLING, instance.READY, instance.FAILED})
+            self.settle()
+        install.assert_not_called()
+        self.assertEqual(instance.state, instance.AVAILABLE, "left for the user to install")
+        self.assertIn(MAC_ASSET, self.requested, "the download did finish")
+        self.assertFalse(workdir.exists(), "and was thrown away")
+        self.assertNotIn("update_attempt_version", instance.controller.settings)
+
     def background_check(self, base: str, **settings):
         instance = self.make_updater(f"{base}/latest", **settings)
         instance.window_visible = lambda: False
@@ -653,6 +761,33 @@ class NetworkTests(unittest.TestCase):
         self.assertEqual(instance.controller.settings["update_attempt_version"], "9.9.9")
         self.assertEqual(instance.controller.settings["update_attempt_count"], 1)
 
+    def test_an_old_opt_out_still_stops_background_checks(self) -> None:
+        # Before checking and installing were separate, auto_update off meant
+        # no checks either; a copy updated from then has no auto_check yet.
+        base = self.matching_files()
+        instance, _install = self.background_check(base, auto_update=False)
+        self.assertEqual((instance.state, self.requested), (instance.IDLE, []), "no background request")
+        self.assertFalse(instance.auto_check)
+
+        instance, _install = self.background_check(base, auto_update=False, auto_check=True)
+        self.assertEqual(instance.state, instance.AVAILABLE, "checking was turned back on by itself")
+
+    def test_a_download_that_never_matches_is_given_up_on(self) -> None:
+        base, _files = self.release_files(checksum="0" * 64)
+        instance = self.make_updater(f"{base}/latest", auto_update=True)
+        instance.window_visible = lambda: False
+        with mock.patch.dict(os.environ, {updater.URL_OVERRIDE_ENV: f"{base}/latest"}):
+            for attempt in range(1, updater.GIVE_UP_AFTER + 1):
+                instance.check(user_initiated=False)
+                self.wait_for(instance, {instance.FAILED})
+                self.assertIn("checksum", instance.message)
+                self.assertEqual(instance.controller.settings["update_attempt_count"], attempt)
+            instance.check(user_initiated=False)
+            self.wait_for(instance, {instance.AVAILABLE, instance.FAILED})
+            self.settle()
+        self.assertEqual(instance.state, instance.AVAILABLE, "found, and left for the user")
+        self.assertEqual(self.requested.count(MAC_ASSET), updater.GIVE_UP_AFTER)
+
     def test_a_version_that_failed_twice_is_not_retried_unattended(self) -> None:
         base = self.matching_files()
         instance, install = self.background_check(
@@ -679,11 +814,15 @@ class NetworkTests(unittest.TestCase):
     def test_settings_switches(self) -> None:
         instance = self.make_updater("http://127.0.0.1:9/latest")
         self.assertTrue(instance.auto_check, "on unless turned off")
+        self.assertTrue(instance.auto_install, "on unless turned off")
         instance.set_auto_check(False)
         self.assertFalse(instance.auto_check)
         self.assertFalse(instance.controller.settings["auto_check"])
-        instance.set_auto_install(True)
-        self.assertTrue(instance.auto_install)
+        instance.set_auto_install(False)
+        self.assertFalse(instance.auto_install)
+        instance.set_auto_check(True)
+        self.assertTrue(instance.auto_check, "each switch is its own")
+        self.assertFalse(instance.auto_install)
 
 
 class AssetStateTests(unittest.TestCase):
@@ -760,6 +899,65 @@ class WindowsPortableSwapTests(unittest.TestCase):
         self.assertEqual(marker.read_text().strip(), "new --updated", "the new copy is moved in and started")
         self.assertFalse(downloaded.exists())
         self.assertFalse(script.exists(), "the script removes itself")
+
+
+class StoredSettingsTests(unittest.TestCase):
+    """The update settings as the real AppController reads and writes them."""
+
+    def controller(self, stored: dict):
+        from app.controller import AppController
+
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, folder, True)
+        for patch in (
+            mock.patch("app.settings.config_dir", return_value=folder),
+            mock.patch("app.settings.LEGACY_PATH", folder / "legacy.json"),
+            mock.patch("app.startup.is_supported", return_value=False),  # leave the real login item alone
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+        (folder / "settings.json").write_text(json.dumps(stored))
+        return AppController()
+
+    def updater_for(self, controller):
+        from app.updater import Updater
+
+        instance = Updater(controller)
+        self.addCleanup(instance.deleteLater)
+        instance.kind = "mac"
+        instance._network = mock.Mock()
+        return instance
+
+    def test_an_opt_out_saved_before_the_split_stops_background_checks(self) -> None:
+        instance = self.updater_for(self.controller({"auto_update": False}))
+        instance.check(user_initiated=False)
+        instance._network.get.assert_not_called()
+        self.assertEqual(instance.state, instance.IDLE)
+        instance.check(user_initiated=True)  # asking still works
+        instance._network.get.assert_called_once()
+
+    def test_the_updaters_settings_are_saved_with_the_others(self) -> None:
+        controller = self.controller({"auto_update": True, "threshold_ms": 70})
+        instance = self.updater_for(controller)
+        instance.set_auto_check(False)
+        instance.release = updater.Release("9.9.9", "", MAC_ASSET, "", "", "")
+        instance._count_attempt()
+        saved = json.loads(settings_store.settings_path().read_text())
+        self.assertEqual(
+            {key: saved.get(key) for key in ("auto_check", "update_attempt_version", "update_attempt_count")},
+            {"auto_check": False, "update_attempt_version": "9.9.9", "update_attempt_count": 1},
+        )
+        self.assertEqual(saved["threshold_ms"], 70)
+
+    def test_the_controllers_own_method_is_used_when_it_has_one(self) -> None:
+        from app.updater import Updater
+
+        controller = FakeController()
+        controller.store_update_state = mock.Mock()
+        instance = Updater(controller)
+        self.addCleanup(instance.deleteLater)
+        instance.set_auto_check(False)
+        controller.store_update_state.assert_called_once_with(auto_check=False)
 
 
 class RelaunchNoticeTests(unittest.TestCase):

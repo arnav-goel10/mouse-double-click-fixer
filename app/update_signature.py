@@ -16,10 +16,10 @@ The files, as minisign writes them (https://jedisct1.github.io/minisign/):
                  base64(global signature: 64 bytes)
 
 The algorithm "ED" signs the BLAKE2b-512 hash of the file (what minisign
-writes by default); "Ed" is its legacy format and signs the file itself. The global
-signature covers the 64-byte signature followed by the trusted comment, so a
-comment can't be moved onto another file's signature. The untrusted comment
-lines carry nothing that is checked, so they are skipped.
+writes by default); "Ed" is its legacy format and signs the file itself. The
+global signature covers the 64-byte signature followed by the trusted comment,
+so a comment can't be moved onto another file's signature. The untrusted
+comment lines carry nothing that is checked, so they are skipped.
 
 The trusted comment says which release the signature is for: "dcf <version>",
 optionally followed by " dr=<designated requirement>" when a release moves the
@@ -27,8 +27,10 @@ macOS app to a new signing identity (see `ReleaseClaim`).
 
 Ed25519 follows RFC 8032 and its reference code. Pure Python is much slower
 than libsodium, a few milliseconds per signature, but an update checks one
-small file, and it needs nothing outside the standard library. tools/sign_release.py signs with the same
-curve arithmetic, which is why the point helpers here are public.
+small file, and it needs nothing outside the standard library.
+tools/sign_release.py signs with the same curve arithmetic, which is why the
+point helpers here are public. `self_test` checks that a packaged build has
+every hash the checks need.
 """
 
 from __future__ import annotations
@@ -271,3 +273,57 @@ def parse_claim(comment: str) -> Optional[ReleaseClaim]:
     if match is None:
         return None
     return ReleaseClaim(match.group("version"), match.group("requirement") or "")
+
+
+# -- self-test ------------------------------------------------------------------
+
+# RFC 8032 section 7.1, TEST 2: public key, message, signature.
+_RFC_8032_KEY = "3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c"
+_RFC_8032_MESSAGE = "72"
+_RFC_8032_SIGNATURE = (
+    "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da"
+    "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00"
+)
+# A prehashed ("ED") signature made by minisign 0.12 with a throwaway key, so
+# the BLAKE2b-512 path and the file format are covered too.
+_MINISIGN_KEY = "RWTvrygDEraX1MOspOpau20Qyo9VY/XdzZBnGk1uaMHFGPKnIqquoy4M"
+_MINISIGN_MESSAGE = b"hello world\n"
+_MINISIGN_SIGNATURE = b"""untrusted comment: signature from minisign secret key
+RUTvrygDEraX1M5UZpns1s64JagpsYLo+M0risX86v8DIMX2OAPsG8EN9XxHIXMmWpaV4lAVKGnR25t7TI3FoFnLOf52fALdwAU=
+trusted comment: dcf 1.2.3
+WY/LS+z/d92SSVnFW3eopDPrNDWWn2eNAW4c6t4v2+TKrKeBTNRf3/zAzC/tWVkrQtNrt5QtlG5xdXN4wv5XAA==
+"""
+
+
+def self_test() -> None:
+    """Check that this build can verify release signatures at all.
+
+    A packaged app carries its own copy of hashlib's backends, and a build
+    that lost one (the _blake2 module, say) would refuse every update and
+    show it only when the first one arrives. This verifies a known RFC 8032
+    signature and a known minisign file, and makes sure a changed message is
+    refused, so a launch smoke test can catch such a build before release.
+    Raises SignatureError saying what failed.
+    """
+    try:
+        known = ed25519_verify(
+            bytes.fromhex(_RFC_8032_KEY), bytes.fromhex(_RFC_8032_MESSAGE), bytes.fromhex(_RFC_8032_SIGNATURE)
+        )
+        changed = ed25519_verify(bytes.fromhex(_RFC_8032_KEY), b"\x73", bytes.fromhex(_RFC_8032_SIGNATURE))
+        if not known or changed:
+            raise SignatureError("Ed25519 gives the wrong answer for the RFC 8032 test vector.")
+        key = parse_public_key(_MINISIGN_KEY)
+        if verify(_MINISIGN_MESSAGE, _MINISIGN_SIGNATURE, [key]) != "dcf 1.2.3":
+            raise SignatureError("The minisign test signature gives the wrong trusted comment.")
+        try:
+            verify(_MINISIGN_MESSAGE + b"!", _MINISIGN_SIGNATURE, [key])
+        except SignatureError:
+            pass
+        else:
+            raise SignatureError("A changed file passed the minisign test signature.")
+    except SignatureError as error:
+        raise SignatureError(f"Release signatures can't be checked in this build: {error}") from error
+    except Exception as error:  # a missing hash backend raises AttributeError or ValueError
+        raise SignatureError(
+            f"Release signatures can't be checked in this build: {type(error).__name__}: {error}"
+        ) from error
