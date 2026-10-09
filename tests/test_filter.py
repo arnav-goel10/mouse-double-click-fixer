@@ -82,7 +82,7 @@ class HandlerTests(unittest.TestCase):
         press, _ = self.click(Button.LEFT, 1.05, 1.06)  # 30 ms gap
         # Delivered, after the release held before it.
         self.assertFalse(press.is_bounce)
-        self.assertTrue(press.flush_held)
+        self.assertTrue(press.deferred)
 
     def test_every_event_is_reported_to_the_ui(self) -> None:
         self.click(Button.LEFT, 1.0, 1.05)
@@ -415,6 +415,67 @@ class EventTimeTests(unittest.TestCase):
         self.assertFalse(self.move(100.200, "m", (1, 0)))
         self.assertEqual(self.sent, [(Button.RIGHT, False, "rup"), (Button.LEFT, False, "lup")])
 
+    def test_a_press_settles_its_own_release_in_turn_with_the_others(self) -> None:
+        self.handle(Button.LEFT, True, 100.000, "ldown")
+        self.handle(Button.RIGHT, True, 100.010, "rdown")
+        self.assertTrue(self.handle(Button.LEFT, False, 100.100, "lup").held)
+        self.assertTrue(self.handle(Button.RIGHT, False, 100.110, "rup").held)
+        # Past both windows. The left release came first, so apps see it
+        # first, then the right one, then this press.
+        press = self.handle(Button.LEFT, True, 100.200, "ldown2")
+        self.assertTrue(press.deferred)
+        self.assertFalse(press.is_bounce)
+        self.assertEqual(self.sent, [
+            (Button.LEFT, False, "lup"),
+            (Button.RIGHT, False, "rup"),
+            (Button.LEFT, True, "ldown2"),
+        ])
+
+    def test_releases_settled_together_keep_their_order_when_the_older_must_wait(self) -> None:
+        self.handle(Button.LEFT, True, 100.000, "down1")
+        self.handle(Button.LEFT, False, 100.100, "up1")
+        self.timers[-1].fire()                                        # up1 re-sent, still on its way
+        self.assertTrue(self.handle(Button.LEFT, True, 100.150, "down2").deferred)
+        self.assertTrue(self.handle(Button.RIGHT, True, 100.160, "rdown").accepted)
+        self.assertTrue(self.handle(Button.LEFT, False, 100.200, "up2").held)
+        self.assertTrue(self.handle(Button.RIGHT, False, 100.210, "rup").held)
+        # A right press past both windows: up2, the older, must wait behind
+        # down2, and rup, then the press, follow it there.
+        self.assertTrue(self.handle(Button.RIGHT, True, 100.300, "rdown2").deferred)
+        self.assertEqual(self.sent, [(Button.LEFT, False, "up1")])
+        self.filter._injected_passed(Button.LEFT)                     # up1 delivered
+        self.assertEqual(self.sent, [
+            (Button.LEFT, False, "up1"),
+            (Button.LEFT, True, "down2"),
+            (Button.LEFT, False, "up2"),
+            (Button.RIGHT, False, "rup"),
+            (Button.RIGHT, True, "rdown2"),
+        ])
+
+    def test_a_press_once_its_button_is_not_filtered_follows_its_parked_events(self) -> None:
+        # A press inside the window of a button no longer filtered delivers
+        # the held release and itself, behind that button's events still
+        # waiting to be re-sent: here one parked in the right queue.
+        self.handle(Button.RIGHT, True, 100.000, "rdown1")
+        self.handle(Button.RIGHT, False, 100.100, "rup1")
+        self.timers[-1].fire()                                        # rup1 re-sent, still on its way
+        self.assertTrue(self.handle(Button.RIGHT, True, 100.150, "rdown2").deferred)
+        self.assertTrue(self.handle(Button.RIGHT, False, 100.200, "rup2").held)
+        self.assertTrue(self.handle(Button.LEFT, True, 100.250, "ldown").deferred)  # behind rup2
+        self.assertTrue(self.handle(Button.LEFT, False, 100.350, "lup").held)
+        self.filter.update(buttons=[Button.RIGHT])
+        self.assertTrue(self.handle(Button.LEFT, True, 100.360, "ldown2").flush_held)
+        self.assertEqual(self.sent, [(Button.RIGHT, False, "rup1")])
+        self.filter._injected_passed(Button.RIGHT)                    # rup1 delivered
+        self.assertEqual(self.sent, [
+            (Button.RIGHT, False, "rup1"),
+            (Button.RIGHT, True, "rdown2"),
+            (Button.RIGHT, False, "rup2"),
+            (Button.LEFT, True, "ldown"),
+            (Button.LEFT, False, "lup"),
+            (Button.LEFT, True, "ldown2"),
+        ])
+
     def test_a_settled_release_waiting_in_its_queue_keeps_the_event_behind_it(self) -> None:
         self.handle(Button.LEFT, True, 100.000, "down1")
         self.handle(Button.LEFT, False, 100.100, "up1")
@@ -663,7 +724,8 @@ class WindowsClickTimingTests(unittest.TestCase):
         click_filter._handle(Button.LEFT, True, self.stamp(0), "down")
         click_filter._handle(Button.LEFT, False, self.stamp(100, seen_ms=170), "up")
         second = click_filter._handle(Button.LEFT, True, self.stamp(220), "down2")
-        self.assertTrue(second.flush_held, "the double-click was taken for a dropout")
+        self.assertFalse(second.cancels_held, "the double-click was taken for a dropout")
+        self.assertTrue(second.deferred)
         self.assertEqual(self.injected, [(False, "up"), (True, "down2")])
 
 
@@ -1162,7 +1224,7 @@ class QueuedReleaseTests(unittest.TestCase):
         self.queue_a_press()
         # The next press comes after up2's window, before its timer ran.
         event = self.filter._handle(Button.LEFT, True, 1.300, "down3", location=(0, 0))
-        self.assertTrue(event.flush_held)
+        self.assertTrue(event.deferred)
         self.assertEqual(self.sent, [(False, "up1")])
         self.filter._injected_passed(Button.LEFT)
         self.assertEqual(self.sent, [(False, "up1"), (True, "down2"), (False, "up2"), (True, "down3")])
