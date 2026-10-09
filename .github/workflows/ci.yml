@@ -89,6 +89,16 @@ jobs:
           python tools/ci_update_key.py check dist\DoubleClickFixer.exe dist\onedir
           if ($LASTEXITCODE -ne 1) { throw "the check release.yml runs missed CI's key in a build that carries it" }
           exit 0
+      - name: What the installed folder ships
+        shell: pwsh
+        run: |
+          $files = Get-ChildItem dist\onedir\DoubleClickFixer -Recurse -File
+          "{0:N1} MB in {1} files" -f (($files | Measure-Object Length -Sum).Sum / 1MB), $files.Count
+          $files | Where-Object Extension -eq ".dll" | Sort-Object Length -Descending | Select-Object -First 12 |
+            ForEach-Object { "{0,8:N1} MB  {1}" -f ($_.Length / 1MB), $_.FullName.Substring($PWD.Path.Length + 1) }
+          $mesa = Join-Path (python -c "import os, PySide6; print(os.path.dirname(PySide6.__file__))") "opengl32sw.dll"
+          if (Test-Path $mesa) { "left out: PySide6's opengl32sw.dll, {0:N1} MB" -f ((Get-Item $mesa).Length / 1MB) }
+          Select-String -Path build\notices\THIRD_PARTY_NOTICES.md -Pattern '^\| ' | ForEach-Object { $_.Line }
       - name: Download the old installers to upgrade from
         shell: pwsh
         env:
