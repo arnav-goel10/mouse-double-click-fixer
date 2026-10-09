@@ -2,8 +2,10 @@
 # (one file) and dist\onedir\DoubleClickFixer\ (the folder the installer
 # ships). Then compile installer\windows.iss with Inno Setup for the installer.
 $ErrorActionPreference = "Stop"
-python -c "import PyInstaller, PySide6" 2>$null
-if ($LASTEXITCODE -ne 0) { python -m pip install -r requirements.txt pyinstaller }
+# Build with exactly the pinned packages and build tools, each file checked
+# against its hash (requirements-build.txt; see requirements-build.in).
+python -m pip install --require-hashes --only-binary :all: -r requirements-build.txt
+if ($LASTEXITCODE -ne 0) { throw "pip could not install requirements-build.txt" }
 
 # Separate work folders: both builds make an exe called DoubleClickFixer.
 Remove-Item Env:\DCF_ONEDIR -ErrorAction SilentlyContinue
