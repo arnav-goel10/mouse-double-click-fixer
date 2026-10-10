@@ -6,6 +6,7 @@ try:
 except ImportError:  # run as tests.<module> from the repository root
     from tests import _isolation  # noqa: F401
 
+import json
 import logging
 import os
 import plistlib
@@ -237,6 +238,116 @@ class FilterPaneTests(PaneTestCase):
         self.assertEqual(box.value(), 45)
         self.assertEqual(self.controller.threshold_for(Button.LEFT), 45, "chosen on purpose, so saved")
 
+    def writes(self):
+        """Count the writes of settings.json, which really happen."""
+        from app import settings
+
+        return mock.patch.object(settings, "write_json", wraps=settings.write_json)
+
+    def stored(self) -> dict:
+        return json.loads((self.directory / "settings.json").read_text())
+
+    def test_a_run_of_steps_is_one_write_and_the_filter_has_each_step(self) -> None:
+        from PySide6.QtTest import QTest
+
+        from app.controller import SAVE_DELAY_MS
+        from app.core import Button
+
+        hook = self.hook()
+        box = self.window.filter_page.window_boxes[Button.LEFT]
+        before = len(hook.updates)
+        with self.writes() as write:
+            for _ in range(10):
+                box.stepUp()
+            self.assertEqual(box.value(), 56)
+            self.assertEqual(self.controller.threshold_for(Button.LEFT), 56)
+            self.assertEqual(len(hook.updates) - before, 10, "the filter follows every step at once")
+            self.assertEqual(hook.updates[-1].thresholds[Button.LEFT], 56)
+            write.assert_not_called()
+            self.assertEqual(self.stored()["thresholds"]["left"], 46, "the file waits")
+            QTest.qWait(SAVE_DELAY_MS + 400)
+            write.assert_called_once()
+        self.assertEqual(self.stored()["thresholds"]["left"], 56, "the last step is what is saved")
+        self.assertEqual(SAVE_DELAY_MS, 300)
+
+    def test_a_run_of_steps_in_the_wheel_box_is_one_write_too(self) -> None:
+        from PySide6.QtTest import QTest
+
+        from app.controller import SAVE_DELAY_MS
+        from app.settings import WHEEL_MAX_MS
+
+        box = self.window.filter_page.wheel_box
+        start = box.value()
+        with self.writes() as write:
+            for _ in range(10):
+                box.stepUp()
+            self.assertEqual(self.controller.wheel_window_ms, min(start + 10, WHEEL_MAX_MS))
+            write.assert_not_called()
+            QTest.qWait(SAVE_DELAY_MS + 400)
+            write.assert_called_once()
+        self.assertEqual(self.stored()["wheel_window_ms"], start + 10)
+
+    def test_a_pause_between_steps_writes_each_run(self) -> None:
+        from app.core import Button
+
+        box = self.window.filter_page.window_boxes[Button.LEFT]
+        with self.writes() as write:
+            box.stepUp()
+            self.controller.flush_settings()  # the wait is over
+            box.stepUp()
+            self.controller.flush_settings()
+            self.controller.flush_settings()  # nothing held: nothing written
+            self.assertEqual(write.call_count, 2)
+        self.assertEqual(self.stored()["thresholds"]["left"], 48)
+
+    def test_closing_the_window_writes_what_is_waiting(self) -> None:
+        from PySide6.QtCore import QEvent
+        from PySide6.QtTest import QTest
+
+        from app.controller import SAVE_DELAY_MS
+        from app.core import Button
+
+        self.window.save_geometry()  # closing then has nothing else to write
+        box = self.window.filter_page.window_boxes[Button.LEFT]
+        with self.writes() as write:
+            for _ in range(3):
+                box.stepUp()
+            write.assert_not_called()
+            self.window.closeEvent(QEvent(QEvent.Type.Close))
+            write.assert_called_once()
+            self.assertEqual(self.stored()["thresholds"]["left"], 49)
+            QTest.qWait(SAVE_DELAY_MS + 400)
+            write.assert_called_once()  # the wait was ended, not repeated
+
+    def test_quitting_and_other_changes_write_what_is_waiting(self) -> None:
+        from app.core import Button
+
+        box = self.window.filter_page.window_boxes[Button.LEFT]
+        with self.writes() as write:
+            box.stepUp()
+            self.window.filter_page.button_switches[Button.BACK].click()  # an immediate change
+            write.assert_called_once()
+            self.assertEqual(self.stored()["thresholds"]["left"], 47, "it went out with the other change")
+            self.assertIn("back", self.stored()["buttons"])
+            self.assertFalse(self.controller._save_timer.isActive())
+        with self.writes() as write:
+            box.stepUp()
+            self.controller.shutdown()
+            write.assert_called_once()
+        self.assertEqual(self.stored()["thresholds"]["left"], 48)
+
+    def test_a_write_that_fails_is_held_for_the_next(self) -> None:
+        from app import settings
+        from app.core import Button
+
+        box = self.window.filter_page.window_boxes[Button.LEFT]
+        with mock.patch.object(settings, "write_json", side_effect=OSError("disk full")):
+            box.stepUp()
+            self.controller.flush_settings()
+        self.assertEqual(self.controller.threshold_for(Button.LEFT), 47, "still takes effect")
+        self.controller.flush_settings()  # still unsaved, so it tries again
+        self.assertEqual(self.stored()["thresholds"]["left"], 47)
+
     def test_scrolling_over_a_button_picker_keeps_the_button(self) -> None:
         from app.core import Button
 
@@ -295,6 +406,51 @@ class CalibrateEachButtonTests(PaneTestCase):
         self.assertIn(Button.BACK, self.controller.buttons, "it was worth measuring, so it is filtered")
         self.assertIs(page.button, Button.BACK, "the choice stays for next time")
 
+    def measure(self, button, bounce_ms=None, double_ms=150.0):
+        """A whole calibration of `button`, stopping at its result."""
+        from app.core import REQUIRED_DOUBLE_CLICKS, REQUIRED_SINGLE_CLICKS
+
+        page = self.window.calibrate
+        self.window.show_calibration(button)
+        page._advance()
+        for _ in range(REQUIRED_SINGLE_CLICKS):
+            page._on_pad_press(900.0, 960.0, button)
+        if bounce_ms is not None:
+            page._on_pad_press(bounce_ms, 40.0, button)
+        for _ in range(REQUIRED_DOUBLE_CLICKS):
+            page._on_pad_press(900.0, 960.0, button)
+            page._on_pad_press(double_ms, 210.0, button)
+        self.assertEqual(page.phase, "done")
+        return page
+
+    def test_the_result_notes_speak_of_the_button_measured(self) -> None:
+        from app.core import Button
+
+        # No bounce: said of the button, claiming nothing of a filter that
+        # isn't on for it until Apply (the back button) or that Apply keeps.
+        page = self.measure(Button.BACK)
+        note = page.summary.text()
+        self.assertIn("back button didn’t bounce", note)
+        self.assertNotIn("Your mouse", note)
+        self.assertNotIn("kept on", note, "the back button isn't filtered until Apply")
+        self.assertIn("starts filtering it", page.step_row.detail.text())
+        page.restart()
+        page = self.measure(Button.LEFT)
+        self.assertIn("left button didn’t bounce", page.summary.text())
+        self.assertNotIn("kept on", page.summary.text())
+        self.assertNotIn("starts filtering", page.step_row.detail.text(), "the left button is filtered already")
+
+    def test_a_tight_result_says_repeats_for_the_side_buttons(self) -> None:
+        from app.core import Button
+
+        page = self.measure(Button.FORWARD, bounce_ms=28.0, double_ms=60.0)
+        self.assertFalse(page.suggestion.confident)
+        self.assertIn("quick repeats", page.summary.text())
+        self.assertNotIn("double-click", page.summary.text())
+        page.restart()
+        page = self.measure(Button.RIGHT, bounce_ms=28.0, double_ms=60.0)
+        self.assertIn("your double-clicks", page.summary.text())
+
     def test_the_picker_chooses_and_locks_while_measuring(self) -> None:
         from app.core import Button
 
@@ -346,6 +502,31 @@ class CalibrateEachButtonTests(PaneTestCase):
         self.assertEqual([bounce for _gap, bounce in page.timeline._gaps], [False, True])
         self.assertTrue(page.last_value.text().endswith("ms"))
 
+    def test_the_test_pane_draws_the_window_of_the_button_it_shows(self) -> None:
+        from app.core import Button
+        from app.core import ClickEvent
+
+        self.controller.set_threshold(Button.BACK, 20)
+        self.controller.set_threshold(Button.RIGHT, 33)
+        page = self.window.test_page
+        self.show("test")
+        self.assertEqual(page.timeline._threshold, 46, "the left button's, before any press")
+        self.assertNotIn("button’s window", page.chart_note.text())
+        page._on_pad_press(30.0, 90.0, Button.BACK)
+        self.assertEqual(page.timeline._threshold, 20, "judged against 20, so the line is at 20")
+        self.assertIn("back button’s window", page.chart_note.text())
+        page._on_pad_press(30.0, 90.0, Button.LEFT)
+        self.assertEqual(page.timeline._threshold, 46)
+        self.assertNotIn("button’s window", page.chart_note.text())
+        # A bounce the filter blocked is that button's too.
+        page.note_global_event(ClickEvent(Button.RIGHT, True, False, 9.0, None))
+        self.assertEqual(page.timeline._threshold, 33)
+        # And the line follows its window being changed.
+        self.controller.set_threshold(Button.RIGHT, 38)
+        self.assertEqual(page.timeline._threshold, 38)
+        page.reset()
+        self.assertEqual(page.timeline._threshold, 46, "clearing starts from the left button again")
+
 
 class HistoryPaneTests(PaneTestCase):
     def seed(self, button=None, days=30, clicks=500, bounces=(3, 9)) -> None:
@@ -384,6 +565,17 @@ class HistoryPaneTests(PaneTestCase):
         self.assertEqual(dict(page.histogram.histogram.bins)[10], 15 * 3 + 15 * 9)
         self.assertIn("1.8 bounces per 100 clicks", page.rate_chart.accessibleDescription())
         self.window.grab()
+
+    def test_the_trend_is_read_out_with_its_value(self) -> None:
+        from PySide6.QtGui import QAccessible
+
+        self.show("history")
+        page = self.window.history
+        name = lambda: QAccessible.queryAccessibleInterface(page.trend_value).text(QAccessible.Text.Name)
+        self.assertEqual(name(), "Trend: Not enough clicks yet")
+        self.seed()
+        page.refresh()
+        self.assertEqual(name(), "Trend: Getting worse", "a screen reader hears the value, not the title alone")
 
     def test_the_picker_shows_buttons_with_history(self) -> None:
         from app.core import Button

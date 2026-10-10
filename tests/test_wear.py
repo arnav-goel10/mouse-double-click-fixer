@@ -273,6 +273,34 @@ class WearTests(unittest.TestCase):
         self.assertNotIn("2026-10-09", days, "older than 365 days")
         self.assertEqual(len(days), 2)
 
+    def test_a_clock_jumping_far_ahead_does_not_take_the_history(self) -> None:
+        self.clicks(2)
+        self.clock.advance(days=10)
+        self.clicks(3)
+        self.history.save()
+        self.clicks(1)  # counted, not yet written
+        self.clock.advance(days=800)  # a date set wrong, a flat battery
+        self.assertTrue(self.history.save())
+        file = self.directory / "wear.json"
+        self.assertEqual(sorted(json.loads(file.read_text())["days"]), ["2026-10-09", "2026-10-19"],
+                         "a save during the jump deletes nothing")
+        # Nor does starting during it.
+        loaded = WearHistory(clock=self.clock)
+        loaded.load()
+        self.assertEqual(sorted(loaded._days), ["2026-10-09", "2026-10-19"])
+        # The clock comes back: the history is all there.
+        self.clock.advance(days=-800)
+        self.assertEqual(self.history.totals(Button.LEFT).presses, 6, "all of it, as before the jump")
+        self.clicks(1)
+        self.history.save()
+        self.assertEqual(len(json.loads(file.read_text())["days"]), 2)
+        # A click on a day that far on is a year gone by: that is what the
+        # first click says, and the old days then expire as they always did.
+        self.clock.advance(days=800)
+        self.clicks(1)
+        self.history.save()
+        self.assertEqual(list(json.loads(file.read_text())["days"]), ["2028-12-27"])
+
     def test_old_days_in_the_file_are_dropped_on_load(self) -> None:
         old = (datetime(2026, 10, 9) - timedelta(days=wear.KEEP_DAYS)).date().isoformat()
         (self.directory / "wear.json").write_text(json.dumps({"version": 1, "days": {

@@ -318,7 +318,21 @@ class WearHistory:
 
     # -- the file ----------------------------------------------------------------
     def _prune(self) -> None:
-        oldest = (date.fromisoformat(self.today()) - timedelta(days=KEEP_DAYS - 1)).isoformat()
+        """Drop the days older than KEEP_DAYS, counted back from today.
+
+        Except when that would drop every day on record (the newest is a year
+        or more behind today): a clock that jumped years ahead (a date set
+        wrong, a flat battery) is likelier than a year without a click, and
+        pruning against it would delete the history for good. The year is
+        then counted back from the newest recorded day instead, and the
+        first click on the new day (or the clock coming back) settles it.
+        """
+        if not self._days:
+            return
+        today = date.fromisoformat(self.today())
+        newest = date.fromisoformat(max(self._days))
+        anchor = newest if (today - newest).days >= KEEP_DAYS else today
+        oldest = (anchor - timedelta(days=KEEP_DAYS - 1)).isoformat()
         for key in [key for key in self._days if key < oldest]:
             del self._days[key]
 

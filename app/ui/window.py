@@ -247,8 +247,10 @@ class FilterPage(Page):
             self.session_value.setText(f"{self.controller.session_filtered:,}")
 
     def _on_window(self, button: Button, value: int) -> None:
+        # Each step reaches the filter at once; the file is written once the
+        # steps stop, not on every one.
         if not self._loading:
-            self.controller.set_threshold(button, value)
+            self.controller.set_threshold(button, value, deferred=True)
 
     def _on_buttons(self, _checked: bool) -> None:
         if self._loading:
@@ -266,7 +268,7 @@ class FilterPage(Page):
 
     def _on_wheel_window(self, value: int) -> None:
         if not self._loading:
-            self.controller.set_wheel_fix(self.controller.wheel_fix, value)
+            self.controller.set_wheel_fix(self.controller.wheel_fix, value, deferred=True)
 
 
 class TestPage(Page):
@@ -275,6 +277,9 @@ class TestPage(Page):
         self.controller = controller
         self.clicks = 0
         self.shortest_gap: Optional[float] = None
+        # The button whose window the chart's line marks: the one last pressed
+        # (its press is what "Last gap" names), the left until one is.
+        self.shown_button: Button = Button.LEFT
 
         self.pad = ClickPad()
         self.pad.setMaximumHeight(320)
@@ -313,19 +318,30 @@ class TestPage(Page):
         self.pad.pressed_with_gap.connect(self._on_pad_press)
 
     def refresh(self) -> None:
-        self.timeline.set_threshold(self.controller.threshold_ms)
+        # Each press is judged by its own button's window, so the line is
+        # that button's, and the note says whose when it isn't the left's.
+        self.timeline.set_threshold(self.controller.threshold_for(self.shown_button))
         # With the filter on, bounces are removed before this pad sees them,
         # so an all-green chart would otherwise read as a healthy mouse.
-        self.chart_note.setText(
+        note = (
             "Bounce Filter is on: red bars are bounces it blocked."
             if self.controller.active
             else "Red bars fall within the filter window."
         )
+        if self.shown_button is not Button.LEFT:
+            note += f" The line is the {button_name(self.shown_button).lower()} button’s window."
+        self.chart_note.setText(note)
+
+    def _show_button(self, button: Button) -> None:
+        if button is not self.shown_button:
+            self.shown_button = button
+            self.refresh()
 
     def note_global_event(self, event: ClickEvent) -> None:
         """A bounce the system-wide filter blocked. With the filter on, this
         pad never receives it, so show it here: proof the filter works."""
         if self.isVisible() and event.is_bounce and event.gap_ms is not None:
+            self._show_button(as_button(event.button))
             self.timeline.add(event.gap_ms, True)
             self.pad.flash(True)
 
@@ -333,6 +349,7 @@ class TestPage(Page):
         self.clicks = 0
         self.shortest_gap = None
         self.timeline.clear()
+        self._show_button(Button.LEFT)
         self.pad.reset()
         self.last_value.setText("—")
         self.shortest_value.setText("—")
@@ -346,10 +363,12 @@ class TestPage(Page):
         if gap_ms is None:
             self.pad.flash(False)
             return
+        button = as_button(button)
+        self._show_button(button)
         bounce = gap_ms <= self.controller.threshold_for(button)
         self.timeline.add(gap_ms, bounce)
         # Each button is timed against its own release; say which one.
-        which = "" if as_button(button) is Button.LEFT else f" ({button_name(button).lower()})"
+        which = "" if button is Button.LEFT else f" ({button_name(button).lower()})"
         self.last_value.setText(f"{gap_ms:.0f} ms{which}")
         if self.shortest_gap is None or gap_ms < self.shortest_gap:
             self.shortest_gap = gap_ms
@@ -648,15 +667,17 @@ class CalibratePage(Page):
             )
             self.double_value.setText(f"{suggestion.fastest_double_click_ms:.0f} ms")
             # Only speak up when the result needs a caveat or an explanation.
+            # About this button alone: it may not be filtered until Apply, and
+            # a side button is repeated, not double-clicked.
             if not suggestion.confident:
                 note = (
-                    "Little margin between bounce and your double-clicks. "
+                    f"Little margin between bounce and your {'quick repeats' if side else 'double-clicks'}. "
                     "Raise the window if bounce still gets through."
                 )
             elif suggestion.worst_bounce_ms is None:
                 note = (
-                    "Your mouse didn’t bounce this time. Bounce comes and goes, so a light "
-                    "filter is kept on; the Test pane shows bounce when it happens."
+                    f"The {name} button didn’t bounce this time. Bounce comes and goes, so this is a "
+                    "light window, to catch it when it does; the Test pane shows bounce when it happens."
                 )
             else:
                 note = ""
@@ -1399,6 +1420,7 @@ class MainWindow(QWidget):
         if self.calibrate.phase != "intro":
             self.calibrate.restart()
         self.save_geometry()
+        self.controller.flush_settings()
         self.controller.flush_stats()
         self.hide()
         self._sync_pause()
