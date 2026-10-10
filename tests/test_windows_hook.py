@@ -1577,11 +1577,12 @@ class WindowsInputFeatureTests(RealWindows):
         self.report(f"[raw input] {devices.drained - drained} WM_INPUT read out of the queue by 10 hook calls")
         self.assertEqual(self.filter.passed_counts, {})
         # Each report's RAWMOUSE is read whole: the left's transitions are
-        # there (RI_MOUSE_LEFT_BUTTON_DOWN, _UP; the held ups re-sent make
-        # more of those), from no device.
+        # there (RI_MOUSE_LEFT_BUTTON_DOWN, _UP; what the filter re-sends
+        # makes more of them), from no device.
         flags = [flags for _handle, _type, flags in reads if flags]
         self.report(f"[raw input] button flags read: {[hex(flag) for flag in flags]}")
-        self.assertEqual(flags.count(0x0001), 5)
+        self.assertEqual(set(flags), {0x0001, 0x0002})
+        self.assertGreaterEqual(flags.count(0x0001), 5)
         self.assertGreaterEqual(flags.count(0x0002), 5)
         self.assertEqual({(handle, raw_type) for handle, raw_type, _flags in reads}, {(0, 0)})
         # A device unplugged: its handle is forgotten (WM_INPUT_DEVICE_CHANGE,
