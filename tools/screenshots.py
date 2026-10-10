@@ -147,13 +147,15 @@ def parse_size(argv) -> tuple[int, int] | None:
     return None
 
 
-def pane_height(app, window, room: int | None = None) -> int:
-    """The window height that shows the current pane whole, no scrolling.
+def fit_pane(app, window, room: int | None = None) -> tuple[int, int | None]:
+    """The window height that shows the current pane whole, no scrolling, and
+    the index of the last item of the page to keep (None: all of them).
 
     Squeezed to its shortest the pane is as tall as its content, so the
     difference to the viewport is what the rest of the window adds. With
     `room` (the most the screen can show) and a pane taller than that, the
-    height ends below the last section that fits, so nothing is cut through.
+    height ends below the last section or note that fits, never through a
+    row and never between a heading and what it heads.
     """
     from PySide6.QtCore import QPoint
 
@@ -164,14 +166,17 @@ def pane_height(app, window, room: int | None = None) -> int:
     chrome = window.height() - area.viewport().height()
     full = chrome + page.height()
     if room is None or full <= room:
-        return full
-    pad = 12
-    bottoms = [
-        chrome + page.body.itemAt(index).widget().mapTo(page, QPoint(0, page.body.itemAt(index).widget().height())).y()
-        for index in range(page.body.count())
-        if page.body.itemAt(index).widget() is not None
-    ]
-    return max(bottom + pad for bottom in bottoms if bottom + pad <= room)
+        return full, None
+    pad = 14
+    fits = []
+    for index in range(page.body.count()):
+        item = page.body.itemAt(index).widget()
+        if item is None or getattr(item, "role", "") in ("headline", "title"):
+            continue
+        bottom = chrome + item.mapTo(page, QPoint(0, item.height())).y() + pad
+        if bottom <= room:
+            fits.append((bottom, index))
+    return max(fits)
 
 
 def dark_palette():
@@ -276,7 +281,13 @@ def capture_docs(app, main_window, target: Path, size: tuple[int, int] | None) -
     if not LIVE:
         # Offscreen, the picture is the window as the Mac draws one: the
         # whole window, so `size` counts the title bar's room too.
-        width, height = size or (DOCS_WIDTH, pane_height(app, main_window))
+        width, height = size or (DOCS_WIDTH, 0)
+        wanted, last = fit_pane(app, main_window, height or None)
+        height = height or wanted
+        page = main_window.stack.currentWidget().widget()
+        for index in range(page.body.count() if last is not None else 0):
+            if index > last and page.body.itemAt(index).widget() is not None:
+                page.body.itemAt(index).widget().hide()
         main_window.resize(width, height)
         app.processEvents()
         wait(app, 50)
@@ -290,7 +301,7 @@ def capture_docs(app, main_window, target: Path, size: tuple[int, int] | None) -
     main_window.move(available.x(), available.y())
     wait(app, 300)
     room = available.height() - WINDOWS_TITLE_BAR - 8
-    wanted = size[1] - WINDOWS_TITLE_BAR if size else pane_height(app, main_window, room)
+    wanted = size[1] - WINDOWS_TITLE_BAR if size else fit_pane(app, main_window, room)[0]
     print(f"The pane shows {wanted} px of the {room} the screen leaves")
     main_window.resize(size[0] if size else DOCS_WIDTH, min(wanted, room))
     main_window.move(available.x(), available.y())
