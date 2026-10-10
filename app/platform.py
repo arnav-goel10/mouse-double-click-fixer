@@ -380,6 +380,9 @@ class GlobalClickFilter:
         # Input (see devices_win), while it runs.
         self._hook_window = None
         self._raw_input = None
+        # Whether Windows' Raw Input works (see device_lookup), once the
+        # hook has started.
+        self._device_lookup = "not started"
         # The macOS tap's device lookups (devices_mac.SenderCache), while it runs.
         self._senders = None
         self._use_os_time: Optional[bool] = None
@@ -608,6 +611,18 @@ class GlobalClickFilter:
     @property
     def config(self) -> FilterConfig:
         return self._config
+
+    @property
+    def device_lookup(self) -> str:
+        """Whether the hook can tell which device a click came from, for the
+        diagnostics. Windows: "raw input ok", or "raw input unavailable:
+        <why>", as the hook found it when it started. macOS: "iokit ok", or
+        "iokit unavailable: <why>" (see devices_mac.lookup_status)."""
+        if platform.system() == "Darwin":
+            from . import devices_mac
+
+            return devices_mac.lookup_status()
+        return self._device_lookup
 
     def update(self, config: FilterConfig) -> None:
         """Take a new configuration while the hook keeps running. It applies

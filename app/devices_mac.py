@@ -312,6 +312,8 @@ def connected_senders(registry: Optional[IOKitRegistry] = None) -> dict[int, Mac
 
 _registry_lock = threading.Lock()
 _shared_registry: list = []
+# Why IOKit couldn't be set up, if it couldn't (see lookup_status).
+_registry_failure: list = []
 
 
 def _registry() -> Optional[IOKitRegistry]:
@@ -319,10 +321,19 @@ def _registry() -> Optional[IOKitRegistry]:
         if not _shared_registry:
             try:
                 _shared_registry.append(IOKitRegistry())
-            except (OSError, ImportError, AttributeError):
+            except (OSError, ImportError, AttributeError) as error:
                 log.warning("IOKit is unavailable: devices can't be told apart", exc_info=True)
                 _shared_registry.append(None)
+                _registry_failure.append(f"{type(error).__name__}: {error}")
         return _shared_registry[0]
+
+
+def lookup_status() -> str:
+    """Whether devices can be looked up, for the diagnostics: "iokit ok",
+    or "iokit unavailable: <why>"."""
+    if _registry() is not None:
+        return "iokit ok"
+    return f"iokit unavailable: {_registry_failure[0] if _registry_failure else 'unknown'}"
 
 
 class SenderCache:

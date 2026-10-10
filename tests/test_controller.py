@@ -49,6 +49,7 @@ class FakeFilter:
         self.on_permission_lost = on_permission_lost
         self.tap_resets = 0
         self.hook_rearms = 0
+        self.device_lookup = "raw input ok"
         FakeFilter.instances.append(self)
 
     @property
@@ -541,6 +542,10 @@ class ControllerFeatureTests(unittest.TestCase):
         self.assertEqual(state["ignored devices"], "G502 HERO")
         self.assertEqual(state["seen devices"], "Magic Mouse (mouse)")
         self.assertEqual(state["passed untouched"], "none")
+        self.assertEqual(state["device lookup"], "raw input ok", "read from the filter")
+        hook.device_lookup = "raw input unavailable: RegisterRawInputDevices failed (error 5)"
+        self.assertEqual(self.controller.diagnostic_state()["device lookup"],
+                         "raw input unavailable: RegisterRawInputDevices failed (error 5)")
         hook.passed_counts = {"touch": 3, "excluded app": 1}
         hook.wheel_dropped = 2
         state = self.controller.diagnostic_state()
