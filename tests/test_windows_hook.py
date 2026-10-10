@@ -14,6 +14,7 @@ except ImportError:  # run as tests.<module> from the repository root
     from tests import _isolation  # noqa: F401
 
 import faulthandler
+import itertools
 import os
 import platform
 import statistics
@@ -1408,6 +1409,155 @@ class WindowsInputFeatureTests(RealWindows):
         self.assertGreaterEqual(len(wheel), 2000)
         self.assertLess(sorted(wheel)[int(len(wheel) * 0.99) - 1] * 1000, 1.0)
         self.assertLess(sorted(raw)[int(len(raw) * 0.99) - 1] * 1000, 1.0)
+
+
+@unittest.skipUnless(_run_e2e(), "needs Windows and DCF_E2E=1 (it injects real input)")
+class WindowsRawInputOrderTests(RealWindows):
+    """A measurement the device attribution rests on (see devices_win): on
+    one thread that has both a low-level mouse hook and a window registered
+    for Raw Input, as the filter's hook thread has, does the hook's callback
+    for a click run before or after that click's WM_INPUT; is the WM_INPUT
+    already in the thread's queue while the callback runs, so that the
+    callback could read it; and does a click the hook drops still produce
+    one? SendInput's input stands in for a mouse's: its WM_INPUT names no
+    device, but it goes through the same queue."""
+
+    QS_RAWINPUT = 0x0400
+    PM_REMOVE = 0x0001
+    PM_QS_INPUT = 0x1C07 << 16  # QS_INPUT: input only, no sent messages (no hook re-entry)
+    RID_INPUT = 0x10000003
+    WM_INPUT = 0x00FF
+
+    def probe(self, drop: bool, drain: bool, clicks: int = 12) -> dict:
+        import ctypes
+        from ctypes import wintypes
+
+        from app.devices_win import Win32RawInput
+        from app.platform import SessionWindow
+
+        events: list = []
+        ready, done = threading.Event(), threading.Event()
+        state = {"in_hook": False, "thread": None, "registered": False}
+        LRESULT = ctypes.c_ssize_t
+        HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+
+        def run() -> None:
+            api = WindowsApi()
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            user32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, ctypes.c_void_p, wintypes.DWORD]
+            user32.SetWindowsHookExW.restype = ctypes.c_void_p
+            user32.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+            user32.CallNextHookEx.restype = LRESULT
+            user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+            user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
+            user32.PeekMessageW.argtypes = [
+                ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT, wintypes.UINT
+            ]
+            user32.PeekMessageW.restype = wintypes.BOOL
+            user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+            user32.GetQueueStatus.argtypes = [wintypes.UINT]
+            user32.GetQueueStatus.restype = wintypes.DWORD
+            user32.GetRawInputData.argtypes = [
+                wintypes.HANDLE, wintypes.UINT, ctypes.c_void_p, ctypes.POINTER(wintypes.UINT), wintypes.UINT
+            ]
+            user32.GetRawInputData.restype = wintypes.UINT
+            state["thread"] = kernel32.GetCurrentThreadId()
+            raw = Win32RawInput()
+            header = raw._header_size
+            buffer = (ctypes.c_ubyte * 1024)()
+
+            def on_input(lparam: int) -> None:
+                size = wintypes.UINT(1024)
+                if user32.GetRawInputData(lparam, self.RID_INPUT, buffer, ctypes.byref(size), header) == 0xFFFFFFFF:
+                    return
+                data = bytes(buffer[: size.value])
+                kind = int.from_bytes(data[0:4], "little")
+                flags = int.from_bytes(data[header + 4: header + 6], "little") if kind == 0 else 0
+                events.append(("input", time.perf_counter(), flags, state["in_hook"]))
+
+            window = SessionWindow(api, lambda: None, on_input=on_input)
+            state["registered"] = bool(window.hwnd) and raw.register(window.hwnd)
+            message = wintypes.MSG()
+            peeked = wintypes.MSG()
+
+            @HOOKPROC
+            def callback(code: int, wparam: int, lparam: int) -> int:
+                if code >= 0 and wparam in (WM_LBUTTONDOWN, WM_LBUTTONUP):
+                    queued = bool((user32.GetQueueStatus(self.QS_RAWINPUT) >> 16) & self.QS_RAWINPUT)
+                    events.append(("hook", time.perf_counter(), int(wparam), queued))
+                    if drain:
+                        state["in_hook"] = True
+                        try:
+                            while user32.PeekMessageW(
+                                ctypes.byref(peeked), window.hwnd, self.WM_INPUT, self.WM_INPUT,
+                                self.PM_REMOVE | self.PM_QS_INPUT,
+                            ):
+                                user32.DispatchMessageW(ctypes.byref(peeked))
+                        finally:
+                            state["in_hook"] = False
+                    if drop:
+                        return 1
+                return user32.CallNextHookEx(None, code, wparam, lparam)
+
+            hook = user32.SetWindowsHookExW(14, callback, None, 0)
+            ready.set()
+            try:
+                while not done.is_set():
+                    if user32.GetMessageW(ctypes.byref(message), None, 0, 0) <= 0:
+                        break
+                    user32.TranslateMessage(ctypes.byref(message))
+                    user32.DispatchMessageW(ctypes.byref(message))
+            finally:
+                user32.UnhookWindowsHookEx(hook)
+                raw.register(None, remove=True)
+                window.close()
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        self.assertTrue(ready.wait(5))
+        self.assertTrue(state["registered"], "Raw Input registration failed")
+        time.sleep(0.2)
+        for _ in range(clicks):
+            self.button(0x0002)
+            time.sleep(0.05)
+            self.button(0x0004)
+            time.sleep(0.1)
+        time.sleep(0.3)
+        done.set()
+        self.user32.PostThreadMessageW(state["thread"], 0x0012, 0, 0)
+        thread.join(3)
+        # Pair each hook call with the WM_INPUT carrying the same transition
+        # (the k-th left down with the k-th RI_MOUSE_LEFT_BUTTON_DOWN).
+        result = {"hook first": 0, "input first": 0, "queued at hook": 0, "read in hook": 0, "unpaired": 0,
+                  "inputs": 0, "hooks": 0, "lag_ms": []}
+        for message, flag in ((WM_LBUTTONDOWN, 0x0001), (WM_LBUTTONUP, 0x0002)):
+            hooks = [(index, entry) for index, entry in enumerate(events) if entry[0] == "hook" and entry[2] == message]
+            inputs = [(index, entry) for index, entry in enumerate(events) if entry[0] == "input" and entry[2] & flag]
+            result["hooks"] += len(hooks)
+            result["inputs"] += len(inputs)
+            for pair in itertools.zip_longest(hooks, inputs[: len(hooks)]):
+                if pair[0] is None or pair[1] is None:
+                    result["unpaired"] += 1
+                    continue
+                (hook_index, hook), (input_index, raw) = pair
+                result["queued at hook"] += hook[3]
+                result["read in hook"] += raw[3]
+                result["hook first" if hook_index < input_index else "input first"] += 1
+                result["lag_ms"].append(round((raw[1] - hook[1]) * 1000, 3))
+        return result
+
+    def test_the_order_of_a_clicks_hook_call_and_its_raw_input(self) -> None:
+        self.place(300, 300)
+        passed = self.probe(drop=False, drain=False)
+        drained = self.probe(drop=False, drain=True)
+        dropped = self.probe(drop=True, drain=False)
+        for name, result in (("passed", passed), ("passed, read in the hook", drained), ("dropped", dropped)):
+            lags = sorted(result.pop("lag_ms"))
+            spread = f"lag ms min={lags[0]} median={statistics.median(lags)} max={lags[-1]}" if lags else "no pairs"
+            self.report(f"[raw order] {name}: {result}; WM_INPUT minus hook call: {spread}")
+        self.assertEqual(passed["hooks"], 24)
+        self.assertEqual(passed["inputs"], 24, "every injected press and release produced a WM_INPUT")
 
 
 @unittest.skipUnless(_run_e2e(), "needs Windows and DCF_E2E=1 (it installs real hooks)")
