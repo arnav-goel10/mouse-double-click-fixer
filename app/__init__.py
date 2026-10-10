@@ -1,6 +1,6 @@
 """Mouse Double-Click Fixer application package."""
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 #: The app's name wherever people see it: windows, menus, notifications,
 #: dialogs, the macOS bundle and the Windows installer all use this.

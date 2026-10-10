@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.0.1 — 2026-10-10
+
+- **The settings controls added in 1.0 look like the rest of each system.**
+  On macOS, a style setting meant only to keep the panes see-through also
+  changed how every control inside them was drawn: the window values showed
+  as boxed number fields, the button pickers drew a menu item inside the
+  button, and **Add App…** was a dark pill. Each window value is now a
+  pop-up button (macOS) or a drop-down list (Windows) of common values, with
+  a calibrated value listed among them; the button pickers and the
+  **Add App…** menu open the system's own menus on macOS; and every control
+  is drawn natively on both systems, in light and dark appearance.
+- Windows: the Test pad says "Click here", in sentence case like the rest of
+  the Windows app.
+- A Mac copy that updates itself from 1.0.0 is renamed to
+  **Mouse Double-Click Fixer** in Applications on this update. One that
+  updates straight from 0.x keeps its old name until the update after.
+
 ## 1.0.0 — 2026-10-10
 
 - **DoubleClick Fixer is now Mouse Double-Click Fixer.** Your settings, the
