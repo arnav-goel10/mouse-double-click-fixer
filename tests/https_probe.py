@@ -43,13 +43,15 @@ TOKEN_HOST = "api.github.com"
 HOMEBREW_OPENSSL = ("/opt/homebrew/opt/openssl@3/lib", "/usr/local/opt/openssl@3/lib")
 #: badssl.com's servers now and then reset a connection before the handshake
 #: gets anywhere (more often when the client offers a post-quantum key share,
-#: as OpenSSL 3.5 and later do), which says nothing about the certificate. A
-#: request that ends so, with no HTTP status and no certificate error, is
-#: made again, up to this many times in all.
+#: as OpenSSL 3.5 and later do), and api.github.com now and then answers a CI
+#: runner with an HTTP/2 protocol error; neither says anything about the
+#: certificate. A request that ends so, with no HTTP status and no certificate
+#: error, is made again, up to this many times in all.
 ATTEMPTS = 4
 CONNECTION_FAILURES = {
     "RemoteHostClosedError", "ConnectionRefusedError", "TimeoutError", "OperationCanceledError",
     "TemporaryNetworkFailureError", "UnknownNetworkError", "HostNotFoundError",
+    "ProtocolFailure", "NetworkSessionFailedError",
 }
 
 

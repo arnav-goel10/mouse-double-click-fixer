@@ -126,6 +126,39 @@ REFUSED = {
 PROBE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "https_probe.py")
 
 
+class ProbeRetryTests(unittest.TestCase):
+    """The HTTPS probe tries a request again only when it failed before any
+    certificate was judged, so a retry can never hide a certificate error."""
+
+    def probe(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("https_probe_under_test", PROBE)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def run_get(self, results):
+        probe = self.probe()
+        answers = iter(results)
+        with mock.patch.object(probe, "get_once", side_effect=lambda *_args: dict(next(answers))), \
+                mock.patch.object(probe.time, "sleep"):
+            return probe.get(None, "https://api.github.com/zen", None)
+
+    def test_a_protocol_error_is_tried_again(self) -> None:
+        failed = {"status": None, "ssl_errors": [], "error": "ProtocolFailure", "error_string": "HTTP/2 protocol error"}
+        result = self.run_get([failed, {"status": 200, "ssl_errors": [], "error": "NoError", "error_string": ""}])
+        self.assertEqual(result["status"], 200)
+        self.assertEqual(result["earlier_attempts"], ["ProtocolFailure: HTTP/2 protocol error"])
+
+    def test_a_certificate_error_is_never_tried_again(self) -> None:
+        refused = {"status": None, "ssl_errors": ["CertificateExpired"], "error": "SslHandshakeFailedError",
+                   "error_string": "expired"}
+        result = self.run_get([refused, {"status": 200, "ssl_errors": [], "error": "NoError", "error_string": ""}])
+        self.assertEqual(result["ssl_errors"], ["CertificateExpired"])
+        self.assertEqual(result["earlier_attempts"], [])
+
+
 @unittest.skipUnless(os.environ.get("DCF_REAL_HTTPS") == "1", "reaches the internet; ci.yml runs it in a step of its own")
 class RealHttpsTests(unittest.TestCase):
     """Real requests through the backend the app ships with (tests/https_probe.py,
