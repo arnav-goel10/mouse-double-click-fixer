@@ -204,7 +204,9 @@ class CopyDiagnosticsTests(unittest.TestCase):
         from app.controller import AppController
         from app.ui.window import DIAGNOSTICS_DETAIL, GeneralPage
 
-        page = GeneralPage(AppController())
+        controller = AppController()
+        self.addCleanup(controller.shutdown)  # before the patches are undone
+        page = GeneralPage(controller)
         self.addCleanup(page.deleteLater)
         page.diagnostics_button.click()
         text = application.clipboard().text()

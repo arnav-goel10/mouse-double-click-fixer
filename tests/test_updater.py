@@ -1294,7 +1294,9 @@ class StoredSettingsTests(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
         (folder / "settings.json").write_text(json.dumps(stored))
-        return AppController()
+        controller = AppController()
+        self.addCleanup(controller.shutdown)  # before the patches are undone
+        return controller
 
     def updater_for(self, controller):
         from app.updater import Updater
@@ -1345,11 +1347,14 @@ class RelaunchNoticeTests(unittest.TestCase):
                 mock.patch("app.settings.config_dir", return_value=Path(folder)), \
                 mock.patch("app.settings.LEGACY_PATH", Path(folder) / "legacy.json"):
             controller = AppController()
-            controller.set_pending_update("9.9.9")
-            self.assertEqual(controller.take_update_result("9.9.9"), "updated")
-            self.assertEqual(controller.take_update_result("9.9.9"), "")
-            controller.set_pending_update("9.9.9")
-            self.assertEqual(controller.take_update_result("0.2.8"), "failed")
+            try:
+                controller.set_pending_update("9.9.9")
+                self.assertEqual(controller.take_update_result("9.9.9"), "updated")
+                self.assertEqual(controller.take_update_result("9.9.9"), "")
+                controller.set_pending_update("9.9.9")
+                self.assertEqual(controller.take_update_result("0.2.8"), "failed")
+            finally:
+                controller.shutdown()  # inside the patches and the folder
 
     def test_a_successful_update_clears_the_attempt_count(self) -> None:
         from app.updater import Updater

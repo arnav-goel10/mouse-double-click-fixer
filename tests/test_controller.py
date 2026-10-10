@@ -5,6 +5,7 @@ try:
 except ImportError:  # run as tests.<module> from the repository root
     from tests import _isolation  # noqa: F401
 
+import json
 import logging
 import os
 import tempfile
@@ -93,6 +94,7 @@ class ControllerStateTests(unittest.TestCase):
         from app.controller import AppController
 
         self.controller = AppController()
+        self.addCleanup(self.controller.shutdown)  # before the patches are undone
         self.states = []
         self.controller.filter_state_changed.connect(lambda active, error: self.states.append((active, error)))
 
@@ -288,6 +290,7 @@ class ControllerFeatureTests(unittest.TestCase):
         from app.controller import AppController
 
         self.controller = AppController()
+        self.addCleanup(self.controller.shutdown)  # before the patches are undone
         self.changes = []
         self.controller.settings_changed.connect(lambda: self.changes.append(True))
 
@@ -440,6 +443,35 @@ class ControllerFeatureTests(unittest.TestCase):
         hook.on_wheel(1, False)
         self.assertEqual(self.controller.wear.wheel_totals(), (2, 1))
 
+    def test_quitting_ends_the_wait_for_a_write_even_when_the_write_fails(self) -> None:
+        # A step in a window box leaves its write waiting (_store_later).
+        # Quitting writes it, and if the write fails (a locked file) there is
+        # no next try: the timer must not fire after the app has quit.
+        from PySide6.QtTest import QTest
+
+        from app import settings
+        from app.controller import SAVE_DELAY_MS
+        from app.core import Button
+
+        self.controller.set_threshold(Button.LEFT, 50, deferred=True)
+        timer = self.controller._save_timer
+        self.assertTrue(timer.isActive())
+        with mock.patch.object(settings, "write_json", side_effect=OSError("locked")) as write:
+            self.controller.shutdown()
+            tried = write.call_count
+            self.assertGreaterEqual(tried, 1, "quitting tried to write it")
+            self.assertFalse(timer.isActive(), "and then the wait is over")
+            QTest.qWait(SAVE_DELAY_MS + 100)
+            self.assertEqual(write.call_count, tried, "nothing wrote after quitting")
+
+    def test_a_write_waiting_is_written_at_quit_and_leaves_no_timer(self) -> None:
+        from app.core import Button
+
+        self.controller.set_threshold(Button.LEFT, 50, deferred=True)
+        self.controller.shutdown()
+        self.assertEqual(json.loads((self.directory / "settings.json").read_text())["thresholds"]["left"], 50)
+        self.assertFalse(self.controller._save_timer.isActive())
+
     def test_the_history_is_written_when_due_and_at_quit(self) -> None:
         from app.core import Button
         from app.core import ClickEvent
@@ -466,7 +498,9 @@ class ControllerFeatureTests(unittest.TestCase):
         self.controller.wear.note_event(mock.Mock(pressed=True, button=Button.LEFT, cancels_held=False,
                                                   is_bounce=False, gap_ms=400.0), 46)
         self.controller.wear.save()
-        self.assertEqual(AppController().wear.daily(Button.LEFT)[-1].presses, 1)
+        reopened = AppController()
+        self.addCleanup(reopened.shutdown)
+        self.assertEqual(reopened.wear.daily(Button.LEFT)[-1].presses, 1)
 
     def test_presses_from_devices_passed_through_are_not_the_switchs_wear(self) -> None:
         from types import SimpleNamespace

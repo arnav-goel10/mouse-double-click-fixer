@@ -177,7 +177,9 @@ class ControllerLoginItemTests(unittest.TestCase):
         with mock.patch.object(startup, "status", return_value=state), \
                 mock.patch.object(startup.sys, "executable", executable), \
                 mock.patch("app.controller.sys.frozen", frozen, create=True):
-            return AppController()
+            controller = AppController()
+        self.addCleanup(controller.shutdown)  # before the patches of setUp are undone
+        return controller
 
     def test_the_installed_copy_rewrites_its_login_item(self) -> None:
         controller = self.controller(startup.ON, "/Applications/Mouse Double-Click Fixer.app/Contents/MacOS/DoubleClickFixer")

@@ -318,6 +318,7 @@ class DurabilityTests(unittest.TestCase):
         from app.controller import AppController
 
         controller = AppController()
+        self.addCleanup(controller.shutdown)
         with mock.patch.object(Path, "read_bytes", side_effect=PermissionError(32, "locked")):
             controller._store(filtered_total=905)
         self.assertEqual(controller.settings["threshold_ms"], 120)
@@ -387,6 +388,7 @@ class DurabilityTests(unittest.TestCase):
         self.assertFalse((self.directory / "settings.json.bak").exists(), "nothing to stand in")
         with self.locked("settings.json"), mock.patch.object(settings, "sleep"):
             controller = AppController()
+            self.addCleanup(controller.shutdown)
             controller._store(fix_enabled=False, window_geometry="g")
             controller.set_threshold(Button.BACK, 25)
             self.assertEqual(controller.threshold_for(Button.BACK), 25, "it still takes effect")

@@ -80,6 +80,10 @@ class PaneTestCase(unittest.TestCase):
         from app.ui.window import MainWindow
 
         self.controller = AppController()
+        # Ends a write a step left waiting (see AppController._store_later):
+        # its timer would fire in whichever test runs next, and write into
+        # that test's settings folder. Runs before the patches are undone.
+        self.addCleanup(self.controller.shutdown)
         self.window = MainWindow(self.controller)
         self.window.isActiveWindow = lambda: True
         self.window.setMinimumSize(300, 200)
@@ -101,6 +105,34 @@ class PaneTestCase(unittest.TestCase):
     def hook(self) -> StandInFilter:
         self.assertTrue(self.controller.set_active(True))
         return self.controller._filter
+
+
+class PaneTestCaseCleanupTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.application = QApplication.instance() or QApplication([])
+
+    def test_a_pane_test_leaves_no_write_waiting_for_the_next_test_to_run(self) -> None:
+        # A step in a window box leaves its write waiting on a timer. Left
+        # running, it fires in whichever test runs next, and writes this
+        # test's settings into that one's folder (it once failed
+        # test_scrolling_over_a_window_box... on 2 of 8 CI jobs). Ending the
+        # test ends its controller.
+        from app.core import Button
+
+        left = []
+
+        class Steps(PaneTestCase):
+            def test_a_step(inner) -> None:
+                inner.controller.set_threshold(Button.LEFT, 50, deferred=True)
+                inner.assertTrue(inner.controller._save_timer.isActive())
+                left.append(inner.controller)
+
+        result = unittest.TestResult()
+        Steps("test_a_step").run(result)
+        self.assertEqual([failure for _test, failure in result.errors + result.failures], [])
+        (controller,) = left
+        self.assertFalse(controller._save_timer.isActive())
 
 
 class FilterPaneTests(PaneTestCase):

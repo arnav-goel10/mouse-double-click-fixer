@@ -409,6 +409,11 @@ class AppController(QObject):
         self.flush_settings()
         self.flush_stats()
         self.wear.save()
+        # A write that failed just now is not tried again after the app has
+        # quit (and a timer left running in a process that goes on, as a
+        # test's does, would fire into whatever is open by then).
+        if self._save_timer is not None:
+            self._save_timer.stop()
 
     def diagnostic_state(self) -> dict:
         """The filter's state for a bug report. Counts only, never clicks."""

@@ -492,7 +492,9 @@ class AcknowledgementsButtonTests(unittest.TestCase):
         from app.controller import AppController
         from app.ui.window import GeneralPage
 
-        self.page = GeneralPage(AppController())
+        controller = AppController()
+        self.addCleanup(controller.shutdown)  # before the patches are undone
+        self.page = GeneralPage(controller)
         self.addCleanup(self.page.deleteLater)
 
     def test_general_has_an_acknowledgements_button(self) -> None:

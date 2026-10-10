@@ -53,6 +53,7 @@ class WindowTests(unittest.TestCase):
         from app.ui.window import MainWindow
 
         self.controller = AppController()
+        self.addCleanup(self.controller.shutdown)  # before the patches are undone
         self.window = MainWindow(self.controller)
         self.addCleanup(self.window.deleteLater)
         self.addCleanup(LiveWindowTests.stop_timers, self.window)
@@ -302,6 +303,7 @@ class LiveWindowTests(unittest.TestCase):
         from app.ui.window import MainWindow
 
         self.controller = AppController()
+        self.addCleanup(self.controller.shutdown)  # before the patches are undone
         self.window = MainWindow(self.controller)
         self.addCleanup(self.window.deleteLater)
         # The window outlives the test until Qt deletes it; its timers must
@@ -962,6 +964,7 @@ class UpdateSettingsTests(LiveWindowTests):
         from app.controller import AppController
 
         self.controller = AppController()
+        self.addCleanup(self.controller.shutdown)
         page, _updater = self.general()
         self.assertFalse(page.auto_check_switch.isChecked(), "no background checks either")
         self.assertFalse(page.auto_install_switch.isChecked())
@@ -1300,6 +1303,7 @@ class ControllerFixTests(unittest.TestCase):
         from app.controller import AppController
 
         self.controller = AppController()
+        self.addCleanup(self.controller.shutdown)  # before the patches are undone
 
     def bounce(self) -> None:
         from app.core import Button, ClickEvent
@@ -1447,6 +1451,7 @@ class SmallFixTests(LiveWindowTests):
         Application._note_hidden(stand_in)
         self.assertEqual(stand_in.tray.showMessage.call_count, 1)
         stand_in.controller = AppController()  # the next sign-in reads the saved flag
+        self.addCleanup(stand_in.controller.shutdown)
         Application._note_hidden(stand_in)
         self.assertEqual(stand_in.tray.showMessage.call_count, 1)
 
@@ -1554,6 +1559,7 @@ class StateFixTests(unittest.TestCase):
         from app.controller import AppController
 
         self.controller = AppController()
+        self.addCleanup(self.controller.shutdown)  # before the folder goes and the patches are undone
 
     def test_turning_off_while_waiting_for_permission_is_saved(self) -> None:
         self.controller._store(fix_enabled=True)
