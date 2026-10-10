@@ -8,6 +8,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon, QWidget
 
+from .. import DISPLAY_NAME
 from ..controller import AppController
 from . import icons
 from .theme import IS_MAC
@@ -36,6 +37,7 @@ class Tray(QSystemTrayIcon):
         on_toggle: Optional[Callable[[bool], None]] = None,
         updater=None,
         on_check_updates: Optional[Callable[[], None]] = None,
+        on_install_update: Optional[Callable[[], None]] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
@@ -50,11 +52,13 @@ class Tray(QSystemTrayIcon):
 
         self.toggle_action = QAction("Bounce Filter", menu)
         self.toggle_action.setCheckable(True)
-        self.toggle_action.triggered.connect(lambda checked: self._on_toggle(checked))
+        # The user's choice, not the running state: choosing the item while
+        # waiting for permission or paused turns it off.
+        self.toggle_action.triggered.connect(lambda _checked: self._on_toggle(not self.controller.wanted))
         menu.addAction(self.toggle_action)
         menu.addSeparator()
 
-        open_action = QAction("Open DoubleClick Fixer", menu)
+        open_action = QAction(f"Open {DISPLAY_NAME}", menu)
         # Windows wording: sentence case (the macOS menu has its own module).
         open_action.triggered.connect(lambda: on_open())
         menu.addAction(open_action)
@@ -65,12 +69,13 @@ class Tray(QSystemTrayIcon):
         self.update_action = QAction("Check for updates…", menu)
         self.update_action.triggered.connect(self._on_update_action)
         self._on_check_updates = on_check_updates
+        self._on_install_update = on_install_update
         if updater is not None and updater.supported:
             menu.addAction(self.update_action)
             updater.changed.connect(self.refresh)
         menu.addSeparator()
 
-        quit_action = QAction("Quit DoubleClick Fixer" if IS_MAC else "Exit", menu)
+        quit_action = QAction(f"Quit {DISPLAY_NAME}" if IS_MAC else "Exit", menu)
         quit_action.triggered.connect(lambda: on_quit())
         menu.addAction(quit_action)
 
@@ -100,7 +105,8 @@ class Tray(QSystemTrayIcon):
 
     def _on_update_action(self) -> None:
         if self.updater is not None and self.updater.state in (self.updater.AVAILABLE, self.updater.READY):
-            self.updater.install()
+            # Opens General first, so the install shows its progress.
+            (self._on_install_update or self.updater.install)()
         elif self._on_check_updates is not None:
             self._on_check_updates()
 
@@ -116,10 +122,7 @@ class Tray(QSystemTrayIcon):
             # filter state or the taskbar theme.
             self._icon_state = state
             self.setIcon(icons.tray_icon(active))
-        self.toggle_action.setChecked(active)
+        self.toggle_action.setChecked(self.controller.wanted)
         status = self.controller.status_text()
         self.status_action.setText(status)
-        self.setToolTip(
-            f"DoubleClick Fixer: on, {self.controller.threshold_ms} ms" if active
-            else f"DoubleClick Fixer: {status[0].lower()}{status[1:]}"
-        )
+        self.setToolTip(self.controller.tooltip_text())

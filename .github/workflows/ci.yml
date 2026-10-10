@@ -5,9 +5,15 @@ on:
     branches: [main, modern-ui]
   pull_request:
   workflow_dispatch:
+  # release.yml runs these checks too, and publishes nothing unless they pass.
+  workflow_call:
 
 permissions:
   contents: read
+
+env:
+  # Inno Setup builds the Windows installer; release.yml pins the same version.
+  INNO_SETUP_VERSION: "6.7.1"
 
 jobs:
   test:
@@ -15,31 +21,79 @@ jobs:
       fail-fast: false
       matrix:
         os: [windows-latest, macos-14]
-        python-version: ["3.11", "3.12", "3.13"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-      - run: python -m pip install --upgrade pip
-      - run: python -m pip install -r requirements.txt
+          cache-dependency-path: requirements-build.txt
+      - name: Install the pinned packages, each checked against its hash
+        run: |
+          python -m pip install --require-hashes --only-binary :all: -r requirements-build.txt
       - name: Run tests
         run: python -m unittest discover -s tests -v
         env:
           QT_QPA_PLATFORM: offscreen
+      - name: Self-test from source, which says which OpenSSL this Python runs
+        # Only a built app fails on an OpenSSL older than the floor
+        # (app/selftest.py's OPENSSL_FLOOR); from source the line says why a
+        # build on this Python would.
+        run: python run.py --self-test
+      - name: Real HTTPS through the TLS backend the app ships with
+        # tests/test_tls.py's RealHttpsTests, through tests/https_probe.py:
+        # Schannel on Windows, Qt's OpenSSL backend on Python's OpenSSL on
+        # macOS. GitHub must answer; expired, self-signed and wrong-host
+        # certificates (badssl.com) must be refused.
+        run: python -m unittest tests.test_tls.RealHttpsTests -v
+        env:
+          QT_QPA_PLATFORM: offscreen
+          DCF_REAL_HTTPS: "1"
+          # Sent to api.github.com alone: GitHub limits unauthenticated calls
+          # per address, and CI's Macs share theirs.
+          GITHUB_TOKEN: ${{ github.token }}
       - run: python -m compileall -q app run.py
+
+  macos-tap:
+    name: macOS event tap end-to-end
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest and newest macOS GitHub runs: the order WindowServer
+        # delivers events in is what this checks.
+        os: [macos-14, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Install the pinned packages, each checked against its hash
+        run: |
+          python -m pip install --require-hashes --only-binary :all: -r requirements-build.txt
+      - name: Post clicks through the real event tap
+        # GitHub's Macs let a job create event taps and post events, so the
+        # real filter runs in the real event stream (tests/test_macos_tap_e2e.py).
+        run: python -m unittest tests.test_macos_tap_e2e -v
+        env:
+          DCF_E2E: "1"
 
   windows-hook:
     name: Windows hook end-to-end
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.13"
-      - run: python -m pip install -r requirements.txt
+          python-version: "3.14"
+      - name: Install the pinned packages, each checked against its hash
+        run: |
+          python -m pip install --require-hashes --only-binary :all: -r requirements-build.txt
       - name: Inject clicks through the real low-level hook
         run: python -m unittest tests.test_windows_hook -v
         env:
@@ -54,7 +108,7 @@ jobs:
           Set-ItemProperty -Path $key -Name AppsUseLightTheme -Value 0 -Type DWord
           Set-ItemProperty -Path $key -Name SystemUsesLightTheme -Value 0 -Type DWord
           python tools/screenshots.py screenshots --live --docs
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows-screenshots
           path: screenshots/
@@ -62,24 +116,87 @@ jobs:
   windows-install:
     name: Windows install, quit and update end-to-end
     runs-on: windows-latest
+    timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.13"
-      - run: python -m pip install -r requirements.txt pyinstaller
+          # Builds run on python.org's CPython 3.14, which ships OpenSSL 3.5
+          # (LTS) from 3.14.6 on, as the app's self-test requires (OPENSSL_FLOOR
+          # in app/selftest.py); 3.13 ships OpenSSL 3.0, out of support since
+          # 2026-09-07. check-latest: the newest 3.14, never an older one the
+          # runner has cached.
+          python-version: "3.14"
+          check-latest: true
+      - name: Install the pinned packages and build tools, each checked against its hash
+        run: |
+          python -m pip install --require-hashes --only-binary :all: -r requirements-build.txt
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --version=$env:INNO_SETUP_VERSION --allow-downgrade --no-progress -y
+          if ($LASTEXITCODE -ne 0) { throw "choco couldn't install Inno Setup $env:INNO_SETUP_VERSION" }
+          # ISCC.exe carries no version of its own (it reads 0.0.0.0); ask Chocolatey.
+          $found = (choco list innosetup --exact --limit-output) -join " "
+          Write-Host "Chocolatey has $found"
+          if ($found -ne "innosetup|$env:INNO_SETUP_VERSION") { throw "Inno Setup is $found, not $env:INNO_SETUP_VERSION" }
       - name: Build the exe and the installer
         shell: pwsh
         run: |
+          # The app installs only signed updates. This build alone also trusts
+          # a key made for this run, so the update leg can sign its stand-in
+          # release: with DCF_CI_UPDATE_KEY set, the spec freezes a start-up
+          # hook into it that names the key (tools/ci_update_key.py). The same
+          # holds when release.yml runs this job for a tag; release.yml's own
+          # builds refuse the variable and are checked for the hook.
+          python tools/ci_update_key.py make "$env:RUNNER_TEMP\dcf-ci-key"
+          $env:DCF_CI_UPDATE_KEY = "$env:RUNNER_TEMP\dcf-ci-key\dcf-ci-update-key.pub"
           .\installer\build_windows.ps1
-          choco install innosetup --no-progress -y
           $version = (python -c "import app; print(app.__version__)")
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" "installer\windows.iss"
-      - name: Download the oldest installer still in use (0.2.6, before --quit)
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed to build the installer" }
+      - name: The release guard finds CI's key in each build
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release download v0.2.6 -p DoubleClickFixer-Setup.exe -D old
-      - name: Install over a running copy, quit, update, uninstall
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+          foreach ($build in "dist\DoubleClickFixer.exe", "dist\onedir") {
+            python tools/ci_update_key.py check $build
+            if ($LASTEXITCODE -ne 1) { throw "the check release.yml runs missed CI's key in $build, which carries it" }
+          }
+          exit 0
+      - name: What the installed folder ships
         shell: pwsh
-        run: .\tools\windows_install_e2e.ps1 -OldSetup old\DoubleClickFixer-Setup.exe -NewSetup installer\Output\DoubleClickFixer-Setup.exe
+        run: |
+          $files = Get-ChildItem dist\onedir\DoubleClickFixer -Recurse -File
+          "{0:N1} MB in {1} files" -f (($files | Measure-Object Length -Sum).Sum / 1MB), $files.Count
+          $files | Where-Object Extension -eq ".dll" | Sort-Object Length -Descending | Select-Object -First 12 |
+            ForEach-Object { "{0,8:N1} MB  {1}" -f ($_.Length / 1MB), $_.FullName.Substring($PWD.Path.Length + 1) }
+          $mesa = Join-Path (python -c "import os, PySide6; print(os.path.dirname(PySide6.__file__))") "opengl32sw.dll"
+          if (Test-Path $mesa) { "left out: PySide6's opengl32sw.dll, {0:N1} MB" -f ((Get-Item $mesa).Length / 1MB) }
+          # OpenSSL files on this runner's PATH, which Qt's OpenSSL backend would load by
+          # name; the build leaves them out, and fails if one comes from anywhere unexpected.
+          foreach ($name in "libcrypto-3-x64.dll", "libssl-3-x64.dll") {
+            $env:PATH -split ";" | Where-Object { $_ -and (Test-Path -LiteralPath (Join-Path $_ $name)) } |
+              ForEach-Object { "on PATH: $(Join-Path $_ $name)" }
+          }
+          Select-String -Path build\notices\THIRD_PARTY_NOTICES.md -Pattern '^\| ' | ForEach-Object { $_.Line }
+      - name: Restore the old installers to upgrade from
+        # 0.2.6: the oldest still in use, before --quit (taskkill closes it).
+        # 0.5.3: the last one-file release, the upgrade every current user
+        # takes; its own --quit closes the running copy. Downloading them from
+        # the project's Releases on every run would count in its public
+        # download numbers, so they are cached. The key is a hash of the file
+        # that lists their URLs and SHA-256s, so a change to either starts a
+        # new cache.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: old
+          key: old-installers-${{ hashFiles('tools/old_installers.json') }}
+      - name: Fetch the old installers the cache lacks, and check each one's SHA-256
+        # Downloads only on a cache miss; a cached file is checked all the
+        # same, and one that doesn't match is fetched again.
+        shell: pwsh
+        run: python tools/old_installers.py fetch old
+      - name: Install over running copies, quit, update, uninstall
+        shell: pwsh
+        run: .\tools\windows_install_e2e.ps1 -OldSetup old\0.2.6\DoubleClickFixer-Setup.exe,old\0.5.3\DoubleClickFixer-Setup.exe -NewSetup installer\Output\DoubleClickFixer-Setup.exe -SigningKey "$env:RUNNER_TEMP\dcf-ci-key\dcf-ci-update-key.key"

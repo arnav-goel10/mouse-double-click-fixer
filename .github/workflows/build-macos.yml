@@ -1,19 +1,32 @@
 name: Build macOS
 
+# A quick macOS packaging check. release.yml builds both platforms the same way.
 on:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
     runs-on: macos-26
+    timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.13"
+          # Builds run on python.org's CPython 3.14, which ships OpenSSL 3.5
+          # (LTS) from 3.14.6 on, as the app's self-test requires (OPENSSL_FLOOR
+          # in app/selftest.py); 3.13 ships OpenSSL 3.0, out of support since
+          # 2026-09-07. check-latest: the newest 3.14, never an older one the
+          # runner has cached.
+          python-version: "3.14"
+          check-latest: true
       - name: Build app and DMG
+        # Installs the pinned packages and build tools first, each checked
+        # against its hash.
         run: bash installer/build_macos.sh
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: DoubleClickFixer-macos
           path: dist/DoubleClickFixer.dmg

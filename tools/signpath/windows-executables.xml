@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SignPath artifact configuration "windows-executables" (docs/DISTRIBUTION.md).
+  release.yml's Windows job uploads the two executables PyInstaller built,
+  before the installer is compiled, so the installer ships the signed one:
+    portable/DoubleClickFixer.exe    the portable release file
+    installed/DoubleClickFixer.exe   the exe in the folder the installer ships
+  Only these, our own builds, are signed. The Python and Qt libraries beside
+  the installed exe come from upstream and are never sent to SignPath.
+  SignPath Foundation requires the product name and version to be enforced.
+-->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <parameters>
+    <parameter name="version" required="true" />
+  </parameters>
+  <zip-file>
+    <pe-file-set product-name="Mouse Double-Click Fixer" product-version="${version}">
+      <include path="portable/DoubleClickFixer.exe" />
+      <include path="installed/DoubleClickFixer.exe" />
+      <for-each>
+        <authenticode-sign />
+      </for-each>
+    </pe-file-set>
+  </zip-file>
+</artifact-configuration>

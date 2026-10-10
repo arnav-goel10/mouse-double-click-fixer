@@ -1,8 +1,14 @@
 name: Release
 
-# Push a tag like v0.3.0 (matching app/__init__.py) to build, sign and publish.
-# Installed copies of the app find the release through the GitHub API and
-# update themselves. A manual run only builds, as a packaging check.
+# Push a tag like v1.0.1 (matching app/__init__.py) to build, test and put up
+# a draft release. Nothing reaches users from here: the owner checks, signs
+# and publishes the draft on the Mac that holds the update keys, with
+#   python3 tools/sign_release.py publish v1.0.1
+# `python3 tools/sign_release.py --help` lists every step of a release, from
+# merging to main to publishing. A tag with a suffix (v1.1.0-rc.1) makes a
+# pre-release. A manual run (workflow_dispatch), on a branch or on a tag, only
+# builds and tests, as a packaging check: it never loads the signing
+# certificate and never puts anything up.
 on:
   workflow_dispatch:
   push:
@@ -10,71 +16,353 @@ on:
       - "v*.*.*"
 
 permissions:
-  contents: write
+  contents: read
+
+# One release run at a time. GitHub keeps at most one more run of the group
+# waiting: while one runs, a newer run cancels the one already waiting and
+# takes its place. Push one release tag at a time, and re-run a cancelled one
+# from the Actions tab.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  # Inno Setup builds the Windows installer; ci.yml pins the same version.
+  INNO_SETUP_VERSION: "6.7.1"
 
 jobs:
-  windows:
-    runs-on: windows-latest
+  version:
+    name: Version, changelog and pins
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: The tag matches app/__init__.py and the changelog has its entry
+        # On a tag, tests/test_release.py also checks the tag against the app.
+        run: python3 -m unittest tests.test_release -v
+
+  checks:
+    uses: ./.github/workflows/ci.yml
+
+  windows:
+    name: Windows build
+    needs: version
+    runs-on: windows-latest
+    # Long enough for two SignPath signing requests, each waiting up to 30
+    # minutes for the owner to approve it.
+    timeout-minutes: 80
+    # SignPath fetches the files to sign from this run's artifacts with the
+    # job's token, which must be able to read them.
+    permissions:
+      contents: read
+      actions: read
+    # SignPath's API token is kept in the "release" environment, which only
+    # tags may use, and only the push of a tag loads it (as for the macOS
+    # job). A manual run never signs.
+    environment: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && 'release' || '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.13"
-      - name: Install dependencies
-        run: python -m pip install -r requirements.txt
-      - name: Check the tag matches the app version
-        if: startsWith(github.ref, 'refs/tags/')
+          # Builds run on python.org's CPython 3.14, which ships OpenSSL 3.5
+          # (LTS) from 3.14.6 on, as the app's self-test requires (OPENSSL_FLOOR
+          # in app/selftest.py); 3.13 ships OpenSSL 3.0, out of support since
+          # 2026-09-07. check-latest: the newest 3.14, never an older one the
+          # runner has cached.
+          python-version: "3.14"
+          check-latest: true
+      - name: Install the pinned packages and build tools, each checked against its hash
+        run: |
+          python -m pip install --require-hashes --only-binary :all: -r requirements-build.txt
+      - name: Refuse CI's throwaway update key
+        # With this set, the spec would freeze in a start-up hook that trusts
+        # a key made for one CI run (tools/ci_update_key.py). A release must
+        # trust the release keys only.
         shell: pwsh
         run: |
-          $tag = "${{ github.ref_name }}".TrimStart("v")
-          $app = (python -c "import app; print(app.__version__)")
-          if ($tag -ne $app) { throw "Tag $tag does not match app version $app" }
-      - name: Run tests
-        run: python -m unittest discover -s tests -v
-        env:
-          QT_QPA_PLATFORM: offscreen
-      - name: Build portable Windows executable
+          if ($env:DCF_CI_UPDATE_KEY) { throw "DCF_CI_UPDATE_KEY is set: a release must never trust CI's update key" }
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --version=$env:INNO_SETUP_VERSION --allow-downgrade --no-progress -y
+          if ($LASTEXITCODE -ne 0) { throw "choco couldn't install Inno Setup $env:INNO_SETUP_VERSION" }
+          # ISCC.exe carries no version of its own (it reads 0.0.0.0); ask Chocolatey.
+          $found = (choco list innosetup --exact --limit-output) -join " "
+          Write-Host "Chocolatey has $found"
+          if ($found -ne "innosetup|$env:INNO_SETUP_VERSION") { throw "Inno Setup is $found, not $env:INNO_SETUP_VERSION" }
+      - name: Build the portable executable and the installed folder
         shell: pwsh
         run: .\installer\build_windows.ps1
-      - name: Build Windows installer
+      - name: Confirm no build carries CI's update key or its start-up hook
+        shell: pwsh
+        run: python tools/ci_update_key.py check dist\DoubleClickFixer.exe dist\onedir
+      # Code signing with SignPath (docs/DISTRIBUTION.md). The executables are
+      # signed before the installer is compiled around them, then the
+      # installer itself, so every release file is the signed one: the
+      # artifacts, the draft, SHA256SUMS.txt and its signature all cover
+      # signed files. Until SignPath is set up, nothing is signed.
+      - name: Decide whether SignPath signs this build
+        id: signpath
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          SIGNPATH_API_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN }}
+          SIGNPATH_ORGANIZATION_ID: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          SIGNPATH_PROJECT_SLUG: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          SIGNPATH_POLICY_SLUG: ${{ vars.SIGNPATH_POLICY_SLUG }}
+        run: |
+          set -eu
+          names="SIGNPATH_API_TOKEN SIGNPATH_ORGANIZATION_ID SIGNPATH_PROJECT_SLUG SIGNPATH_POLICY_SLUG"
+          missing=""
+          for name in $names; do
+            if [ -z "$(printenv "$name" || true)" ]; then missing="$missing $name"; fi
+          done
+          # Windows checkouts have CRLF line endings.
+          version="$(tr -d '\r' < app/__init__.py | sed -n 's/^__version__ = "\(.*\)"$/\1/p')"
+          if [ "$EVENT" != push ] || [ "${REF#refs/tags/}" = "$REF" ]; then
+            echo "Not signed: only the push of a release tag is signed, and this is a $EVENT run of $REF."
+            echo "sign=false" >> "$GITHUB_OUTPUT"
+          elif [ "$missing" = " $names" ]; then
+            echo "::warning::Not signed: SignPath isn't set up (docs/DISTRIBUTION.md), so the Windows files go out unsigned."
+            echo "sign=false" >> "$GITHUB_OUTPUT"
+          elif [ -n "$missing" ]; then
+            echo "::error::SignPath is only partly set up. Missing:$missing (docs/DISTRIBUTION.md)."
+            exit 1
+          elif [ -z "$version" ]; then
+            echo "::error::app/__init__.py gives no __version__ for SignPath's version check."
+            exit 1
+          else
+            echo "Signing the Windows files of $version with SignPath."
+            echo "sign=true" >> "$GITHUB_OUTPUT"
+            echo "version=$version" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Gather the executables to sign
+        if: steps.signpath.outputs.sign == 'true'
         shell: pwsh
         run: |
-          choco install innosetup --no-progress -y
+          New-Item -ItemType Directory signing\unsigned\portable, signing\unsigned\installed | Out-Null
+          Copy-Item dist\DoubleClickFixer.exe signing\unsigned\portable\
+          Copy-Item dist\onedir\DoubleClickFixer\DoubleClickFixer.exe signing\unsigned\installed\
+      - name: Hand the executables to SignPath
+        id: unsigned-executables
+        if: steps.signpath.outputs.sign == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unsigned-windows-executables
+          path: signing/unsigned/
+          if-no-files-found: error
+          # Only SignPath reads it, while the job waits.
+          retention-days: 1
+          # A re-run of this job (a denied or timed-out request is re-run;
+          # docs/DISTRIBUTION.md) finds the name taken by its first run's
+          # upload, and without this the upload fails. The new upload gets a
+          # new artifact ID, which the signing step reads from this step.
+          overwrite: true
+      - name: Sign the executables (SignPath artifact configuration windows-executables)
+        if: steps.signpath.outputs.sign == 'true'
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG }}
+          artifact-configuration-slug: windows-executables
+          github-artifact-id: ${{ steps.unsigned-executables.outputs.artifact-id }}
+          parameters: |
+            version: "${{ steps.signpath.outputs.version }}"
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 1800
+          output-artifact-directory: signing/signed-executables
+      - name: Put the signed executables in place
+        if: steps.signpath.outputs.sign == 'true'
+        shell: pwsh
+        run: |
+          Copy-Item signing\signed-executables\portable\DoubleClickFixer.exe dist\DoubleClickFixer.exe -Force
+          Copy-Item signing\signed-executables\installed\DoubleClickFixer.exe dist\onedir\DoubleClickFixer\DoubleClickFixer.exe -Force
+          python tools/ci_update_key.py check dist\DoubleClickFixer.exe dist\onedir
+      - name: Run the portable executable's self-test
+        # The portable exe that becomes the release file, signed or not: a
+        # build that can't start, or that its signing breaks, could never
+        # update itself again (app/selftest.py). The installed exe's self-test
+        # runs in the install test, from the installer. The time limit is for
+        # a build that ignores --self-test and starts the app instead.
+        shell: pwsh
+        run: |
+          $log = Join-Path $env:RUNNER_TEMP "portable-self-test.txt"
+          $exe = (Resolve-Path dist\DoubleClickFixer.exe).Path
+          $process = Start-Process $exe -ArgumentList "--self-test" -PassThru -NoNewWindow `
+              -RedirectStandardOutput $log -RedirectStandardError "$log.err"
+          $null = $process.Handle  # keeps the exit code readable once it exits
+          if (-not $process.WaitForExit(300000)) {
+            taskkill /F /T /PID $process.Id
+            throw "the portable exe's self-test didn't finish within 5 minutes"
+          }
+          $process.WaitForExit()
+          Get-Content $log, "$log.err" | Write-Host
+          if ($process.ExitCode -ne 0) { throw "the portable exe's self-test failed (exit $($process.ExitCode))" }
+          if (-not (Select-String -Path $log -Pattern "^self-test passed: " -Quiet)) { throw "the portable exe reported no self-test result" }
+      - name: Build the Windows installer
+        shell: pwsh
+        run: |
           $version = (python -c "import app; print(app.__version__)")
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" "installer\windows.iss"
-      - uses: actions/upload-artifact@v7
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed to build the installer" }
+      - name: Hand the installer to SignPath
+        id: unsigned-installer
+        if: steps.signpath.outputs.sign == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unsigned-windows-installer
+          path: installer/Output/DoubleClickFixer-Setup.exe
+          if-no-files-found: error
+          # Only SignPath reads it, while the job waits.
+          retention-days: 1
+          # A re-run of this job (a denied or timed-out request is re-run;
+          # docs/DISTRIBUTION.md) finds the name taken by its first run's
+          # upload, and without this the upload fails. The new upload gets a
+          # new artifact ID, which the signing step reads from this step.
+          overwrite: true
+      - name: Sign the installer (SignPath artifact configuration windows-installer)
+        if: steps.signpath.outputs.sign == 'true'
+        uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG }}
+          artifact-configuration-slug: windows-installer
+          github-artifact-id: ${{ steps.unsigned-installer.outputs.artifact-id }}
+          parameters: |
+            version: "${{ steps.signpath.outputs.version }}"
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 1800
+          output-artifact-directory: signing/signed-installer
+      - name: Put the signed installer in place
+        if: steps.signpath.outputs.sign == 'true'
+        shell: pwsh
+        run: Copy-Item signing\signed-installer\DoubleClickFixer-Setup.exe installer\Output\DoubleClickFixer-Setup.exe -Force
+      - name: Check what SignPath checks, and every signature
+        # SignPath refuses a file whose product name and version differ from
+        # its artifact configuration's (tools/signpath/), so a build that
+        # would be refused fails here, signed or not. Inno Setup writes the
+        # installer's into fixed-size fields padded with spaces, so they are
+        # compared trimmed and shown in quotes. Then each program file in the
+        # installed folder, with its signature: the Microsoft Store's EXE
+        # route needs every one signed (docs/DISTRIBUTION.md).
+        shell: pwsh
+        env:
+          SIGNED: ${{ steps.signpath.outputs.sign }}
+        run: |
+          $version = (python -c "import app; print(app.__version__)")
+          $name = (python -c "import app; print(app.DISPLAY_NAME)")
+          $ours = "dist\DoubleClickFixer.exe", "dist\onedir\DoubleClickFixer\DoubleClickFixer.exe", "installer\Output\DoubleClickFixer-Setup.exe"
+          foreach ($file in $ours) {
+            $info = (Get-Item $file).VersionInfo
+            $signature = Get-AuthenticodeSignature $file
+            Write-Host "${file}: product '$($info.ProductName)' '$($info.ProductVersion)', signature $($signature.Status) $($signature.SignerCertificate.Subject)"
+            if ($info.ProductName.Trim() -ne $name -or $info.ProductVersion.Trim() -ne $version) {
+              throw "$file says it is '$($info.ProductName)' '$($info.ProductVersion)', not '$name' '$version'; SignPath would refuse to sign it"
+            }
+            if ($env:SIGNED -eq "true" -and $signature.Status -ne "Valid") { throw "$file isn't validly signed: $($signature.StatusMessage)" }
+          }
+          $files = Get-ChildItem dist\onedir -Recurse -File -Include *.exe, *.dll, *.pyd
+          $rows = foreach ($file in $files) {
+            $signature = Get-AuthenticodeSignature $file.FullName
+            [pscustomobject]@{ Status = $signature.Status; Signer = $signature.SignerCertificate.Subject; File = $file.FullName.Substring((Resolve-Path dist\onedir).Path.Length + 1) }
+          }
+          $rows | Sort-Object Status, File | Format-Table -AutoSize | Out-String -Width 300 | Write-Host
+          $unsigned = @($rows | Where-Object { $_.Status -ne "Valid" }).Count
+          Write-Host "$unsigned of $($rows.Count) program files in the installed folder carry no valid signature."
+      - name: Collect the release files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory release | Out-Null
+          Copy-Item dist\DoubleClickFixer.exe, installer\Output\DoubleClickFixer-Setup.exe release\
+          # The notices the installer puts beside the app (windows.iss's {app}
+          # entry); build_windows.ps1 checked the portable exe ships the same.
+          Copy-Item build\notices\THIRD_PARTY_NOTICES.md release\THIRD_PARTY_NOTICES-windows.md
+          Get-FileHash release\* -Algorithm SHA256 | Format-Table Hash, Path -AutoSize | Out-String -Width 200 | Write-Host
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: DoubleClickFixer-windows
+          path: release/
+          if-no-files-found: error
+      - name: Keep what the install test compares the installed copy with
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-build-reference
           path: |
-            dist/DoubleClickFixer.exe
-            installer/Output/DoubleClickFixer-Setup.exe
+            dist/onedir/DoubleClickFixer/DoubleClickFixer.exe
+            build/notices/THIRD_PARTY_NOTICES.md
+          if-no-files-found: error
+
+  windows-e2e:
+    name: Windows install and upgrade, with the release's own installer
+    needs: windows
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: DoubleClickFixer-windows
+          path: release
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-build-reference
+          path: .
+      - name: Restore the old installers to upgrade from
+        # 0.2.6: the oldest still in use, before --quit (taskkill closes it).
+        # 0.5.3: the last one-file release; its own --quit closes it. Cached,
+        # as in ci.yml, so a release doesn't add to the Releases' download
+        # numbers.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: old
+          key: old-installers-${{ hashFiles('tools/old_installers.json') }}
+      - name: Fetch the old installers the cache lacks, and check each one's SHA-256
+        shell: pwsh
+        run: python tools/old_installers.py fetch old
+      - name: Install over running copies, quit, refuse an unsigned update, uninstall
+        # The release trusts the release keys only, so the leg that installs
+        # a signed update runs in ci.yml, on a build made to trust CI's key.
+        shell: pwsh
+        run: .\tools\windows_install_e2e.ps1 -OldSetup old\0.2.6\DoubleClickFixer-Setup.exe,old\0.5.3\DoubleClickFixer-Setup.exe -NewSetup release\DoubleClickFixer-Setup.exe
 
   macos:
+    name: macOS build
+    needs: version
     runs-on: macos-26
+    timeout-minutes: 40
+    # The signing certificate is kept in the "release" environment, which
+    # only tags may use, and only the push of a tag loads it. A manual run,
+    # even on a tag, builds without it, ad-hoc signed.
+    environment: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && 'release' || '' }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-python@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
-          python-version: "3.13"
-      - name: Run tests
+          # The newest 3.14, for its OpenSSL 3.5 (see the Windows build).
+          python-version: "3.14"
+          check-latest: true
+      - name: Install the pinned packages and build tools, each checked against its hash
         run: |
-          python -m pip install -r requirements.txt pyinstaller dmgbuild
-          python -m unittest discover -s tests -v
-        env:
-          QT_QPA_PLATFORM: offscreen
+          python -m pip install --require-hashes --only-binary :all: -r requirements-build.txt
       - name: Load the signing certificate
         # macOS keeps the Accessibility permission only while updates are
         # signed with the same certificate, so a release must never go out
         # without it.
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         env:
           P12: ${{ secrets.MACOS_SIGNING_P12 }}
           P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
         run: |
           if [ -z "$P12" ]; then
-            if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-              echo "::error::MACOS_SIGNING_P12 is not set; refusing to publish an unsigned release"; exit 1
-            fi
-            echo "No signing certificate; this packaging check will be ad-hoc signed."; exit 0
+            echo "::error::MACOS_SIGNING_P12 is not set; refusing to build an unsigned release"; exit 1
           fi
           keychain="$RUNNER_TEMP/signing.keychain-db"
           password="$(openssl rand -hex 16)"
@@ -90,62 +378,97 @@ jobs:
           identity="$(security find-identity -p codesigning "$keychain" | awk '/DoubleClick Fixer Signing/ {print $2; exit}')"
           echo "DCF_SIGN_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
           echo "DCF_SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+      - name: Show whether this Mac enforces code signatures
+        # With System Integrity Protection off, as on GitHub's Macs, dyld loads
+        # DYLD_INSERT_LIBRARIES into any app and need not refuse relative
+        # paths, so the build's injection check skips its dyld and cwd legs
+        # here; tools/sign_release.py runs it in full, with SIP on, before a
+        # release is published.
+        run: csrutil status || true
       - name: Build macOS app, DMG and update archive
         run: bash installer/build_macos.sh
       - name: Confirm the app reports the release's version
         run: |
           version="$(python -c 'import app; print(app.__version__)')"
-          bundled="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' 'dist/DoubleClick Fixer.app/Contents/Info.plist')"
+          bundled="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' 'dist/Mouse Double-Click Fixer.app/Contents/Info.plist')"
           [ "$bundled" = "$version" ] || { echo "::error::app bundle says $bundled, expected $version"; exit 1; }
-      - name: Confirm a release is signed with the stable certificate
-        if: startsWith(github.ref, 'refs/tags/')
+      - name: Confirm the app keeps the designated requirement installed copies have
+        # The requirement is what macOS keys the Accessibility permission on;
+        # tools/sign_release.py checks it again before publishing.
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
         run: |
-          codesign -d -r- "dist/DoubleClick Fixer.app" 2>&1 | tee /dev/stderr | grep -q "certificate root"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: DoubleClickFixer-macos
-          path: |
-            dist/DoubleClickFixer.dmg
-            dist/DoubleClickFixer-macos.zip
-
-  publish:
-    needs: [windows, macos]
-    runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
-        with:
-          path: artifacts
-          merge-multiple: true
-      - name: Collect release files and checksums
-        # The updater installs a download only if it matches this list.
+          expected='identifier "com.doubleclickfixer.app" and certificate root = H"81a512665a945aebb386f04541f5c41f341a6c31"'
+          found="$(codesign -d -r- "dist/Mouse Double-Click Fixer.app" 2>&1 | sed -n 's/^designated => //p')"
+          echo "designated => $found"
+          [ "$found" = "$expected" ] || { echo "::error::the app's designated requirement changed"; exit 1; }
+      - name: Collect the release files
         run: |
           mkdir release
-          find artifacts -type f \( -name '*.exe' -o -name '*.dmg' -o -name '*.zip' \) -exec cp {} release/ \;
-          cd release && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+          cp dist/DoubleClickFixer.dmg dist/DoubleClickFixer-macos.zip release/
+          cp "dist/Mouse Double-Click Fixer.app/Contents/Resources/THIRD_PARTY_NOTICES.md" release/THIRD_PARTY_NOTICES-macos.md
+          shasum -a 256 release/*
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: DoubleClickFixer-macos
+          path: release/
+          if-no-files-found: error
+      - name: Remove the signing keychain
+        if: always() && env.DCF_SIGN_KEYCHAIN != ''
+        run: security delete-keychain "$DCF_SIGN_KEYCHAIN"
+
+  publish:
+    name: Put the release up as a draft
+    needs: [checks, windows, macos, windows-e2e]
+    # Only the push of a tag: a manual run never puts up a draft.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: DoubleClickFixer-*
+          path: release
+          merge-multiple: true
+      - name: Check the files and write their checksums
+        # The updater installs a download only if it matches this list, and
+        # only once the owner has signed the list.
+        run: |
+          cd release
+          expected="DoubleClickFixer-Setup.exe DoubleClickFixer-macos.zip DoubleClickFixer.dmg DoubleClickFixer.exe THIRD_PARTY_NOTICES-macos.md THIRD_PARTY_NOTICES-windows.md"
+          found="$(LC_ALL=C ls | tr '\n' ' ' | sed 's/ $//')"
+          [ "$found" = "$expected" ] || { echo "::error::expected $expected, found $found"; exit 1; }
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
       - name: Write the release page
         # Downloads and first-launch help, then this version's CHANGELOG entry.
         run: |
-          version="${GITHUB_REF_NAME#v}"
-          python3 tools/release_notes.py "$version" "$GITHUB_REPOSITORY" > release-notes.md
+          python3 tools/release_notes.py "${GITHUB_REF_NAME#v}" "$GITHUB_REPOSITORY" > release-notes.md
           cat release-notes.md
-          echo "VERSION=$version" >> "$GITHUB_ENV"
-      - name: Publish GitHub release
-        uses: softprops/action-gh-release@v3
-        with:
-          name: DoubleClick Fixer ${{ env.VERSION }}
-          body_path: release-notes.md
-          make_latest: true
-          files: release/*
-      - name: Point older release pages at this one
+      - name: Put up the draft
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          for tag in $(gh release list --repo "$GITHUB_REPOSITORY" --limit 100 --json tagName -q '.[].tagName'); do
-            older="${tag#v}"
-            [ "$older" = "$VERSION" ] && continue
-            if python3 tools/release_notes.py "$older" "$GITHUB_REPOSITORY" --latest "$VERSION" > older.md; then
-              gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --notes-file older.md
-            fi
-          done
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::$GITHUB_REF_NAME already has a release. Delete its draft to put this build up instead."
+            exit 1
+          fi
+          prerelease=()
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then prerelease=(--prerelease); fi
+          # A draft is never the latest release; publishing decides that.
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
+            "${prerelease[@]}" --latest=false --title "Mouse Double-Click Fixer ${GITHUB_REF_NAME#v}" \
+            --notes-file release-notes.md release/*
+          {
+            echo "### Draft ready"
+            echo "Check, sign and publish it on the Mac that holds the update keys (System Integrity"
+            echo "Protection on, Xcode's command line tools installed), in a checkout of main at $GITHUB_REF_NAME:"
+            echo '```'
+            echo "python3 tools/sign_release.py publish $GITHUB_REF_NAME --dry-run"
+            echo "python3 tools/sign_release.py publish $GITHUB_REF_NAME"
+            echo '```'
+            echo "Both run every check, including the injection check on the draft's own macOS app;"
+            echo "only the second signs, uploads SHA256SUMS.txt.minisig and publishes."
+          } >> "$GITHUB_STEP_SUMMARY"

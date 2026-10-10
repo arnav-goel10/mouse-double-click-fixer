@@ -11,20 +11,38 @@ import sys
 import threading
 from pathlib import Path
 
+from . import DISPLAY_NAME, FORMER_DISPLAY_NAME
+
 log = logging.getLogger(__name__)
+
+#: What the app may be called, in a disk image or installed: its name today,
+#: and its name before 1.0. A copy that 0.5.3 or earlier updated keeps the old
+#: name until its next update, so the two names can differ.
+BUNDLE_NAMES = (f'{DISPLAY_NAME}.app', f'{FORMER_DISPLAY_NAME}.app')
 
 
 def _fingerprint(bundle: Path) -> tuple[bytes, str]:
     metadata = (bundle / 'Contents/Info.plist').read_bytes()
     info = plistlib.loads(metadata)
     if info.get('CFBundleIdentifier') != 'com.doubleclickfixer.app':
-        raise ValueError('Not a DoubleClick Fixer bundle')
+        raise ValueError(f'Not a {DISPLAY_NAME} bundle')
     executable = info['CFBundleExecutable']
     if executable != 'DoubleClickFixer':
         raise ValueError('Unexpected executable')
     with (bundle / 'Contents/MacOS' / executable).open('rb') as stream:
         digest = hashlib.file_digest(stream, 'sha256').hexdigest()
     return metadata, digest
+
+
+def _holds(mount: Path, names: tuple[str, ...], fingerprint: tuple[bytes, str]) -> bool:
+    """Whether the volume holds this very app under one of `names`."""
+    for name in names:
+        try:
+            if _fingerprint(mount / name) == fingerprint:
+                return True
+        except (OSError, ValueError, KeyError):
+            continue
+    return False
 
 
 def _identity(path: Path) -> tuple:
@@ -77,7 +95,7 @@ def cleanup(installed: Path, downloads: Path, volumes: Path = Path('/Volumes')) 
                 if not shortcut.is_symlink() or os.readlink(shortcut) != '/Applications':
                     continue
                 try:
-                    if _fingerprint(mount / installed.name) != fingerprint:
+                    if not _holds(mount, tuple(dict.fromkeys((installed.name, *BUNDLE_NAMES))), fingerprint):
                         continue
                     # Remember the image identity before unmounting. Never trash a
                     # replacement file or follow a symlink out of Downloads.

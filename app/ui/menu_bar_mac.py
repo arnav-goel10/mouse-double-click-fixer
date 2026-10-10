@@ -15,6 +15,7 @@ from typing import Callable, Optional
 
 from PySide6.QtCore import QBuffer, QIODevice
 
+from .. import DISPLAY_NAME
 from ..controller import AppController
 from . import icons
 
@@ -56,6 +57,9 @@ def _handler_class():
     return _HANDLER_CLASS
 
 
+#: The status item's position is saved under this name.
+AUTOSAVE_NAME = "com.doubleclickfixer.app.status-item"
+
 #: SF Symbols for the menu bar: filled while filtering, outline when off.
 #: Apple's own menu extras are drawn this way, and the system renders them at
 #: the right weight and size for the menu bar, which a shrunken bitmap cannot.
@@ -72,7 +76,7 @@ def _status_image(active: bool, size: int = 18):
     from AppKit import NSFontWeightMedium, NSImage, NSImageSymbolConfiguration
 
     name = SYMBOL_ON if active else SYMBOL_OFF
-    image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, "DoubleClick Fixer")
+    image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, DISPLAY_NAME)
     if image is not None:
         configured = image.imageWithSymbolConfiguration_(
             NSImageSymbolConfiguration.configurationWithPointSize_weight_(SYMBOL_POINT_SIZE, NSFontWeightMedium)
@@ -111,6 +115,7 @@ class MacMenuBarItem:
         on_toggle: Optional[Callable[[bool], None]] = None,
         updater=None,
         on_check_updates: Optional[Callable[[], None]] = None,
+        on_install_update: Optional[Callable[[], None]] = None,
         parent=None,
     ) -> None:
         from AppKit import NSMenu, NSMenuItem, NSStatusBar, NSVariableStatusItemLength
@@ -119,18 +124,23 @@ class MacMenuBarItem:
         self.updater = updater
         self._on_toggle = on_toggle or controller.set_active
         self._on_check_updates = on_check_updates
+        self._on_install_update = on_install_update
 
         self._target = _handler_class().alloc().initWithActions_(
             {
                 "open": on_open,
                 "calibrate": on_calibrate,
-                "toggle": lambda: self._on_toggle(not controller.active),
+                # The user's choice, not the running state: choosing the
+                # item while waiting for permission or paused turns it off.
+                "toggle": lambda: self._on_toggle(not controller.wanted),
                 "updates": self._check_updates,
                 "quit": on_quit,
             }
         )
 
         self._item = NSStatusBar.systemStatusBar().statusItemWithLength_(NSVariableStatusItemLength)
+        # macOS remembers where the user ⌘-dragged the item to, by this name.
+        self._item.setAutosaveName_(AUTOSAVE_NAME)
         menu = NSMenu.alloc().init()
         menu.setAutoenablesItems_(False)
 
@@ -146,7 +156,7 @@ class MacMenuBarItem:
         menu.addItem_(NSMenuItem.separatorItem())
 
         open_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Open DoubleClick Fixer", b"open:", ""
+            f"Open {DISPLAY_NAME}", b"open:", ""
         )
         open_item.setTarget_(self._target)
         menu.addItem_(open_item)
@@ -166,7 +176,7 @@ class MacMenuBarItem:
 
         menu.addItem_(NSMenuItem.separatorItem())
         quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Quit DoubleClick Fixer", b"quit:", "q"
+            f"Quit {DISPLAY_NAME}", b"quit:", "q"
         )
         quit_item.setTarget_(self._target)
         menu.addItem_(quit_item)
@@ -199,14 +209,11 @@ class MacMenuBarItem:
             # Only two images exist; swap only when the state changes.
             self._shown_active = active
             button.setImage_(_status_image(active))
+        status = self.controller.status_text()
         if button is not None:
-            button.setToolTip_(
-                f"DoubleClick Fixer: on, {self.controller.threshold_ms} ms"
-                if active
-                else "DoubleClick Fixer: off"
-            )
-        self._status_item.setTitle_(self.controller.status_text())
-        self._toggle_item.setState_(NSControlStateValueOn if active else NSControlStateValueOff)
+            button.setToolTip_(self.controller.tooltip_text())
+        self._status_item.setTitle_(status)
+        self._toggle_item.setState_(NSControlStateValueOn if self.controller.wanted else NSControlStateValueOff)
         if self.updater is not None and self.updater.state in (self.updater.AVAILABLE, self.updater.READY) and self.updater.release:
             self._update_item.setTitle_(f"Update to {self.updater.release.version}")
         else:
@@ -214,11 +221,12 @@ class MacMenuBarItem:
 
     def _refresh_count(self) -> None:
         if self.controller.active:
-            self._status_item.setTitle_(f"On · {self.controller.filtered_total:,} blocked")
+            self._status_item.setTitle_(self.controller.status_text())
 
     # -- actions ---------------------------------------------------------------
     def _check_updates(self) -> None:
         if self.updater is not None and self.updater.state in (self.updater.AVAILABLE, self.updater.READY):
-            self.updater.install()
+            # Opens General first, so the install shows its progress.
+            (self._on_install_update or self.updater.install)()
         elif self._on_check_updates is not None:
             self._on_check_updates()

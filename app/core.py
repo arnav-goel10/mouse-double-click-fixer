@@ -12,15 +12,19 @@ too.
 
 from __future__ import annotations
 
+import math
+from collections import deque
 from dataclasses import dataclass
 from enum import Enum
 from statistics import median
 from time import monotonic
 from typing import Optional
 
-# A conservative default: longer than almost any real bounce, far shorter than
-# the gap a human leaves between the two halves of a double-click.
-DEFAULT_THRESHOLD_MS = 60
+# The window for a new or uncalibrated install: longer than almost any real
+# bounce, far shorter than the gap a human leaves between the two halves of a
+# double-click. 46 ms came out of the competitor benchmark (it was 60 before
+# 1.0); calibration replaces it with a window measured on the user's mouse.
+DEFAULT_THRESHOLD_MS = 46
 MIN_THRESHOLD_MS = 5
 MAX_THRESHOLD_MS = 200
 
@@ -43,10 +47,24 @@ class Button(str, Enum):
     LEFT = "left"
     RIGHT = "right"
     MIDDLE = "middle"
+    #: The side buttons: X1 and X2 on Windows, button numbers 3 and 4 on macOS.
+    BACK = "back"
+    FORWARD = "forward"
 
     @property
     def label(self) -> str:
-        return {"left": "Left", "right": "Right", "middle": "Middle"}[self.value]
+        return {"left": "Left", "right": "Right", "middle": "Middle", "back": "Back", "forward": "Forward"}[self.value]
+
+
+#: Filtered by the drop rule only: a press within the window of the last
+#: release is dropped with its release, and releases are never held, so these
+#: buttons add no delay. (Browsers act on a side button's release, and no one
+#: drags with one.)
+SIDE_BUTTONS = frozenset({Button.BACK, Button.FORWARD})
+
+#: Kinds of pointing device (DeviceInfo.kind) whose clicks are never filtered:
+#: they come from taps and touches, not from a switch that can bounce.
+TOUCH_KINDS = frozenset({"trackpad", "touchscreen", "pen"})
 
 
 @dataclass(frozen=True)
@@ -67,25 +85,34 @@ class ClickEvent:
     #: A press that cancelled a held release: the contact dropped out and came
     #: back, so neither the release nor this press ever reach applications.
     cancels_held: bool = False
-    #: A press that arrived after a held release had already expired: the
-    #: caller must deliver that release first, then this press.
+    #: A press that found a held release it does not cancel, because its
+    #: button is no longer filtered or the window had passed: the caller must
+    #: deliver that release first, then this press. (The hook settles a
+    #: release by any event stamped past its window first, so a press there
+    #: comes back `deferred` instead; see GlobalClickFilter._handle.)
     flush_held: bool = False
-    #: Real, but held back by the hook so it reaches apps after an event the
-    #: app re-sent just before it (see GlobalClickFilter._defer).
+    #: Real, but held back by the hook to reach apps behind events that came
+    #: before it and have not reached them yet: events the app re-sent and
+    #: still waits to see come back, the held releases its timestamp settled
+    #: (its own button's among them), or another button's earlier release
+    #: still waiting or on its way (see GlobalClickFilter._handle).
     deferred: bool = False
+    #: Why a release was held: "closing" when it came too soon after the
+    #: contact closed to be a finger letting go (the contact is still
+    #: settling), "lift" otherwise. None for anything not held.
+    hold_reason: Optional[str] = None
+    #: The stable key of the device it came from (DeviceInfo.key), when known.
+    device: Optional[str] = None
 
     @property
     def is_bounce(self) -> bool:
         return self.pressed and not self.accepted and not self.flush_held and not self.deferred
 
 
-#: Releases are held back once the button has been down this long. Worn
-#: switches drop contact as early as 60 ms into a drag, which overlaps the
-#: length of an ordinary click, so only the briefest taps skip the hold.
-HOLD_AFTER_MS = 30.0
-#: A release this soon after its press is the contact bouncing as it closes
-#: (no finger lets go that fast), so it is held too: if the contact settles
-#: and presses again, the press and the hold that follows stay intact.
+#: A release this soon after the contact last closed is the contact bouncing
+#: as it closes: no finger lets go that fast. It is held like every release,
+#: so the press and the hold that follows stay intact, but it is never a click
+#: ending, so pointer motion must not settle it (see ClickEvent.hold_reason).
 IMPOSSIBLE_TAP_MS = 12.0
 
 
@@ -98,10 +125,18 @@ class BounceFilter:
       bounce and is suppressed, together with its matching release, so no
       application ever sees half a click.
     * While the button is held (a drag), the contact can drop out for a few
-      milliseconds, which looks like a release followed by a press. Such a
+      milliseconds, which looks like a release followed by a press. So every
       release is held back for the threshold: if a press follows in time, both
       are dropped and the drag carries on; otherwise the release is delivered
-      late by the caller (see `commit_held`).
+      late by the caller (see `commit_held`). Worn switches drop contact as
+      early as 60 ms into a drag, and bounce as they close, so no length of
+      press is safe to skip.
+
+    "In time" is judged by the events' own timestamps, never by when they
+    reach the filter: events can arrive tens of milliseconds late, but they
+    arrive in the order they happened, so once any event stamped past the
+    window has been seen, no press inside it can still be on its way (see
+    `due`).
     """
 
     def __init__(
@@ -117,7 +152,13 @@ class BounceFilter:
         self.hold_releases = hold_releases
         self._last_release_at: Optional[float] = None
         self._last_press_at: Optional[float] = None
+        # When the contact last closed: every press except one that only
+        # cancelled a lift (see press()). A release too soon after it is held
+        # as "closing".
+        self._last_close_at: Optional[float] = None
         self._held_release_at: Optional[float] = None
+        # The hold_reason of the release being held back.
+        self._held_reason: Optional[str] = None
         # Numbers each held release, so a timer settles only its own one.
         self._held_id = 0
         self._swallow_release = False
@@ -126,7 +167,9 @@ class BounceFilter:
     def reset(self) -> None:
         self._last_release_at = None
         self._last_press_at = None
+        self._last_close_at = None
         self._held_release_at = None
+        self._held_reason = None
         self._swallow_release = False
 
     @property
@@ -142,6 +185,13 @@ class BounceFilter:
                 # The contact dropped out mid-hold and came back: the button
                 # never really went up. Drop both; the drag continues, and the
                 # eventual real release must go through.
+                if self._held_reason == "closing":
+                    # Still bouncing as it closes: the contact settles from
+                    # here, so a second bounce soon after is closing too. A
+                    # comeback after a lift is the release chattering; the
+                    # next release is the finger letting go, not the contact
+                    # closing, and pointer motion may settle it.
+                    self._last_close_at = now
                 self._held_release_at = None
                 self._swallow_release = False
                 self.filtered_count += 1
@@ -151,6 +201,7 @@ class BounceFilter:
             self._held_release_at = None
             flush = True
 
+        self._last_close_at = now
         gap_ms = None if self._last_release_at is None else max(0.0, (now - self._last_release_at) * 1000)
         interval_ms = None if self._last_press_at is None else max(0.0, (now - self._last_press_at) * 1000)
         is_bounce = gap_ms is not None and gap_ms <= self.threshold_ms
@@ -175,14 +226,35 @@ class BounceFilter:
             self._swallow_release = False
             self._last_release_at = now
             return ClickEvent(self.button, False, False, None, None)
-        held_ms = None if self._last_press_at is None else (now - self._last_press_at) * 1000
-        worth_holding = held_ms is not None and (held_ms >= HOLD_AFTER_MS or held_ms < IMPOSSIBLE_TAP_MS)
+        # A release with no press seen since the filter started has nothing
+        # to protect: the button went down before the filter was watching.
+        worth_holding = self._last_press_at is not None
         if self.enabled and self.hold_releases and allow_hold and worth_holding:
             self._held_release_at = now
             self._held_id += 1
-            return ClickEvent(self.button, False, False, None, None, held=True)
+            closing = self._last_close_at is not None and (now - self._last_close_at) * 1000 < IMPOSSIBLE_TAP_MS
+            reason = "closing" if closing else "lift"
+            self._held_reason = reason
+            return ClickEvent(self.button, False, False, None, None, held=True, hold_reason=reason)
         self._last_release_at = now
         return ClickEvent(self.button, False, True, None, None)
+
+    @property
+    def held_at(self) -> Optional[float]:
+        """When the release being held back happened, or None."""
+        return self._held_release_at
+
+    def due(self, timestamp: float) -> bool:
+        """Whether an event stamped `timestamp` settles the held release.
+
+        It does once it comes more than the threshold after the release:
+        events reach the filter in the order they happened, so a press that
+        would have cancelled the release, being earlier, would already have
+        been seen. That holds however late the events arrive, which a timer
+        started on arrival cannot promise.
+        """
+        held = self._held_release_at
+        return held is not None and (float(timestamp) - held) * 1000 > self.threshold_ms
 
     @property
     def held_id(self) -> Optional[int]:
@@ -206,6 +278,154 @@ class BounceFilter:
             return False
         self._last_release_at = self._held_release_at
         self._held_release_at = None
+        return True
+
+
+#: The delivery allowance is judged from this many of the latest events, and
+#: covers this share of them.
+LATENESS_SAMPLES = 64
+LATENESS_SHARE = 0.95
+#: The allowance stays within these bounds, and is this before any event has
+#: been measured.
+MIN_ALLOWANCE_MS = 5.0
+MAX_ALLOWANCE_MS = 150.0
+DEFAULT_ALLOWANCE_MS = 30.0
+#: A measured lateness beyond this is no delivery delay: the event's stamp
+#: came from another clock (see GlobalClickFilter._normalise_time).
+MAX_LATENESS_S = 2.0
+
+
+class DeliveryDelay:
+    """How late events reach the filter on this machine.
+
+    An event is stamped when the hardware made it and reaches the filter
+    later: a millisecond or two on an idle machine, tens of milliseconds and
+    now and then well over a hundred on a busy one. A held release that no
+    later event settles (see BounceFilter.due) is settled by a timer, and the
+    timer must wait out the window and then this lateness too, or a press
+    made inside the window but delivered late finds its release already
+    gone, and a drag breaks. The allowance is the 95th percentile of the
+    latest events' lateness, within MIN_ALLOWANCE_MS and MAX_ALLOWANCE_MS.
+    """
+
+    def __init__(self, size: int = LATENESS_SAMPLES) -> None:
+        self._samples: deque = deque(maxlen=size)
+
+    def add(self, seconds: float) -> None:
+        """Record one event: how long after its timestamp it arrived."""
+        if not math.isfinite(seconds) or abs(seconds) > MAX_LATENESS_S:
+            return
+        # A stamp a hair ahead of the clock read on arrival is on time.
+        self._samples.append(max(0.0, seconds * 1000))
+
+    def allowance_ms(self) -> float:
+        if not self._samples:
+            return DEFAULT_ALLOWANCE_MS
+        ordered = sorted(self._samples)
+        rank = max(0, math.ceil(LATENESS_SHARE * len(ordered)) - 1)
+        return min(MAX_ALLOWANCE_MS, max(MIN_ALLOWANCE_MS, ordered[rank]))
+
+
+#: How long one late event keeps counting towards PeakLateness.
+PEAK_WINDOW_S = 2.0
+
+
+class PeakLateness:
+    """The worst lateness of any event that reached the hook lately.
+
+    An event the hook re-sends comes back about as late as real events reach
+    it, so this sets how long the hook waits for one before giving it up as
+    lost (see GlobalClickFilter._in_flight_timeout). Every button event
+    counts, and pointer motion whenever the hook judges it: while a release
+    is held at a known place, or while re-sent events are on their way, which
+    is when the wait matters. A pause in the event stream shows in whichever
+    event comes out of it. One slow event counts for PEAK_WINDOW_S and no
+    longer, so a lone stall cannot keep the wait long.
+    """
+
+    def __init__(self, window_s: float = PEAK_WINDOW_S) -> None:
+        self._window = window_s
+        # (when it arrived, how late in ms), each later one less late than
+        # the one before: an event no later than one after it can never be
+        # the worst again.
+        self._peaks: deque = deque()
+
+    def add(self, seconds: float, now: float) -> None:
+        """Record an event that arrived at `now`, `seconds` after its
+        timestamp; both on monotonic()'s clock."""
+        if not math.isfinite(seconds) or abs(seconds) > MAX_LATENESS_S:
+            return
+        late_ms = max(0.0, seconds * 1000)
+        while self._peaks and self._peaks[-1][1] <= late_ms:
+            self._peaks.pop()
+        self._peaks.append((now, late_ms))
+        self._forget(now)
+
+    def worst_ms(self, now: float) -> float:
+        """The most an event that arrived in the last PEAK_WINDOW_S before
+        `now` was late, 0 if none did."""
+        self._forget(now)
+        return self._peaks[0][1] if self._peaks else 0.0
+
+    def counts_until(self, now: float) -> float:
+        """Until when the worst lateness counted at `now` keeps counting (see
+        worst_ms); `now` if none does. Something less late may count after."""
+        self._forget(now)
+        return self._peaks[0][0] + self._window if self._peaks else now
+
+    def _forget(self, now: float) -> None:
+        while self._peaks and now - self._peaks[0][0] > self._window:
+            self._peaks.popleft()
+
+
+class WheelFilter:
+    """Drop the stray notch of a worn scroll-wheel encoder.
+
+    A worn encoder now and then reports one notch the wrong way in the middle
+    of a scroll. A discrete tick that goes the opposite way to the last tick
+    delivered on its axis, and comes within the window after it, is that
+    stray notch, and is dropped. Each axis (1 vertical, 2 horizontal) is
+    judged on its own. Nothing is ever held back, so the wheel gets no delay.
+
+    The window counts from the last tick delivered, not the last one seen: a
+    dropped tick changes nothing, so the scroll it interrupted carries on, and
+    a deliberate reversal loses at most one window's worth of ticks before
+    the new direction comes through. Pure: no OS calls; the caller passes
+    discrete ticks only (never a trackpad's continuous scrolling).
+    """
+
+    def __init__(self, window_ms: float) -> None:
+        self.window_ms = window_ms
+        # Per axis: (direction, timestamp) of the last tick delivered.
+        self._last: dict[int, tuple[int, float]] = {}
+
+    @property
+    def window_ms(self) -> int:
+        return self._window_ms
+
+    @window_ms.setter
+    def window_ms(self, value: float) -> None:
+        try:
+            number = int(round(float(value)))
+        except (TypeError, ValueError, OverflowError):
+            number = 0
+        self._window_ms = max(0, number)
+
+    def reset(self) -> None:
+        self._last.clear()
+
+    def tick(self, axis: int, direction: int, timestamp: float) -> bool:
+        """One discrete tick on `axis`, its sign `direction`, at `timestamp`
+        (seconds). True to deliver it, False to drop it."""
+        if not direction:
+            return True
+        direction = 1 if direction > 0 else -1
+        timestamp = float(timestamp)
+        last = self._last.get(axis)
+        # A hair over the window in floating point is still inside it.
+        if last is not None and last[0] != direction and (timestamp - last[1]) * 1000 <= self._window_ms + 1e-6:
+            return False
+        self._last[axis] = (direction, timestamp)
         return True
 
 

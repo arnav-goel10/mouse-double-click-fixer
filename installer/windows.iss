@@ -5,51 +5,177 @@
 [Setup]
 ; Fixed forever: this is how an update finds and replaces the installed copy.
 AppId={{6B0E2F4C-3D7A-4E51-9A0B-DC1F1C5E7A21}
-AppName=DoubleClick Fixer
+AppName=Mouse Double-Click Fixer
 AppVersion={#AppVersion}
-DefaultDirName={autopf}\DoubleClick Fixer
-DefaultGroupName=DoubleClick Fixer
+; New installs only. An update goes where the installed copy is
+; (UsePreviousAppDir, on by default), which before 1.0 was
+; {autopf}\DoubleClick Fixer; the app, its updater and the uninstaller find
+; that folder from the running exe or the uninstall entry, never by name.
+DefaultDirName={autopf}\Mouse Double-Click Fixer
+DefaultGroupName=Mouse Double-Click Fixer
+; An update keeps the Start menu folder the app was installed in, unless it
+; is the one named after the app before 1.0: that one moves to the new name
+; ([InstallDelete] removes the old shortcuts, ShouldSkipPage keeps the
+; folder page away from updates).
+UsePreviousGroup=not PreviousGroupIsFormerDefault
 OutputBaseFilename=DoubleClickFixer-Setup
+; The app is a 64-bit build, and Qt 6 needs Windows 10 1809 or later: say so
+; up front rather than install something that can't start.
+ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
-AppPublisher=DoubleClick Fixer
-AppSupportURL=https://github.com/arnav-goel10/doubleclick-fixer
+MinVersion=10.0.17763
+AppPublisher=Mouse Double-Click Fixer
+AppSupportURL=https://github.com/arnav-goel10/mouse-double-click-fixer
 UninstallDisplayIcon={app}\DoubleClickFixer.exe
 VersionInfoVersion={#AppVersion}
-AppVerName=DoubleClick Fixer {#AppVersion}
-AppPublisherURL=https://github.com/arnav-goel10/doubleclick-fixer
-AppUpdatesURL=https://github.com/arnav-goel10/doubleclick-fixer/releases/latest
+AppVerName=Mouse Double-Click Fixer {#AppVersion}
+AppPublisherURL=https://github.com/arnav-goel10/mouse-double-click-fixer
+AppUpdatesURL=https://github.com/arnav-goel10/mouse-double-click-fixer/releases/latest
 WizardStyle=modern
 SetupIconFile=assets\icon.ico
 PrivilegesRequired=lowest
 ; Ask the running copy to close, so the file is never locked during an update.
 CloseApplications=yes
 
+[InstallDelete]
+; The runtime beside the exe is replaced whole, so an update that moves to a
+; newer Qt or Python leaves none of the old one behind.
+Type: filesandordirs; Name: "{app}\_internal"
+; The shortcuts from before 1.0, when the app was called DoubleClick Fixer:
+; in the folder of that name, or in one the user chose, which the update
+; keeps. The desktop one goes only when the new one replaces it.
+Type: files; Name: "{autoprograms}\DoubleClick Fixer\DoubleClick Fixer.lnk"
+Type: dirifempty; Name: "{autoprograms}\DoubleClick Fixer"
+Type: files; Name: "{group}\DoubleClick Fixer.lnk"
+Type: files; Name: "{autodesktop}\DoubleClick Fixer.lnk"; Tasks: desktopicon
+
 [Files]
-Source: "..\dist\DoubleClickFixer.exe"; DestDir: "{app}"; Flags: ignoreversion
+; A folder, not the portable one-file exe: launching it (and every sign-in)
+; unpacks nothing.
+Source: "..\dist\onedir\DoubleClickFixer\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+; The licences of what the app bundles (Qt's LGPL among them), where anyone
+; looking in the install folder finds them. The PyInstaller spec writes the
+; file for the exact versions it bundled, and the app has its own copy.
+Source: "..\build\notices\THIRD_PARTY_NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\DoubleClick Fixer"; Filename: "{app}\DoubleClickFixer.exe"
-Name: "{autodesktop}\DoubleClick Fixer"; Filename: "{app}\DoubleClickFixer.exe"; Tasks: desktopicon
+Name: "{group}\Mouse Double-Click Fixer"; Filename: "{app}\DoubleClickFixer.exe"
+Name: "{autodesktop}\Mouse Double-Click Fixer"; Filename: "{app}\DoubleClickFixer.exe"; Tasks: desktopicon
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; Flags: unchecked
 ; Offered on the first install only: afterwards "Open at login" in the app
 ; owns the setting, and an update must not switch it back on.
-Name: "startup"; Description: "Start DoubleClick Fixer when I sign in"; Flags: unchecked; Check: not IsUpgrade
+Name: "startup"; Description: "Start Mouse Double-Click Fixer when I sign in"; Flags: unchecked; Check: not IsUpgrade
 
 [Run]
-Filename: "{app}\DoubleClickFixer.exe"; Description: "Open DoubleClick Fixer"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\DoubleClickFixer.exe"; Description: "Open Mouse Double-Click Fixer"; Flags: nowait postinstall skipifsilent
 ; The in-app updater installs silently and asks for the app to come back.
 Filename: "{app}\DoubleClickFixer.exe"; Parameters: "--updated {code:RelaunchArguments}"; Flags: nowait runasoriginaluser; Check: RelaunchRequested
 
 [Code]
-function IsUpgrade: Boolean;
-var
-  Key: String;
+// Inno Setup's own uninstall entry for this AppId.
+function UninstallKey: String;
 begin
-  // Inno Setup's own uninstall entry for this AppId.
-  Key := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{6B0E2F4C-3D7A-4E51-9A0B-DC1F1C5E7A21}_is1';
-  Result := RegKeyExists(HKCU, Key) or RegKeyExists(HKLM, Key);
+  Result := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{6B0E2F4C-3D7A-4E51-9A0B-DC1F1C5E7A21}_is1';
+end;
+
+function IsUpgrade: Boolean;
+begin
+  Result := RegKeyExists(HKCU, UninstallKey) or RegKeyExists(HKLM, UninstallKey);
+end;
+
+// Whether the installed copy's Start menu folder is "DoubleClick Fixer", the
+// default before 1.0. Such a folder moves to the new name; one the user
+// chose is kept (UsePreviousGroup).
+function PreviousGroupIsFormerDefault: Boolean;
+var
+  Group: String;
+begin
+  Group := '';
+  if not RegQueryStringValue(HKCU, UninstallKey, 'Inno Setup: Icon Group', Group) then
+    RegQueryStringValue(HKLM, UninstallKey, 'Inno Setup: Icon Group', Group);
+  Result := CompareText(Group, 'DoubleClick Fixer') = 0;
+end;
+
+// An update never asks for a Start menu folder: it takes the installed
+// copy's, or the new one for a copy from before 1.0 (UsePreviousGroup).
+// Inno would show that page again for such a copy, whose folder it doesn't
+// reuse.
+function ShouldSkipPage(PageID: Integer): Boolean;
+begin
+  Result := (PageID = wpSelectProgramGroup) and IsUpgrade;
+end;
+
+// The version installed now, or '' when there is none.
+function InstalledVersion: String;
+var
+  Version: String;
+begin
+  Result := '';
+  if RegQueryStringValue(HKCU, UninstallKey, 'DisplayVersion', Version) then
+    Result := Version
+  else if RegQueryStringValue(HKLM, UninstallKey, 'DisplayVersion', Version) then
+    Result := Version;
+end;
+
+// Whether a version like "0.2.11" is Major.Minor.Patch or later.
+function VersionAtLeast(const Version: String; Major, Minor, Patch: Integer): Boolean;
+var
+  Rest: String;
+  Parts: array[0..2] of Integer;
+  I, Dot: Integer;
+begin
+  Rest := Version;
+  for I := 0 to 2 do
+  begin
+    Dot := Pos('.', Rest);
+    if Dot = 0 then
+    begin
+      Parts[I] := StrToIntDef(Rest, 0);
+      Rest := '';
+    end
+    else
+    begin
+      Parts[I] := StrToIntDef(Copy(Rest, 1, Dot - 1), 0);
+      Rest := Copy(Rest, Dot + 1, Length(Rest));
+    end;
+  end;
+  if Parts[0] <> Major then
+    Result := Parts[0] > Major
+  else if Parts[1] <> Minor then
+    Result := Parts[1] > Minor
+  else
+    Result := Parts[2] >= Patch;
+end;
+
+const
+  // How long the installed copy gets to ask a running one to quit.
+  QuitWaitSeconds = 20;
+
+// The installed exe, when it can be run to ask a running copy to quit, or ''
+// when it can't (the log says why). It knows how to reach a running copy of
+// its own version; the new exe can't run on its own from {tmp}, as it needs
+// its folder.
+function InstalledQuitter: String;
+var
+  Version: String;
+begin
+  Result := '';
+  Version := InstalledVersion;
+  if not VersionAtLeast(Version, 0, 2, 7) then
+    // Before 0.2.7 "--quit" is unknown: run with it, such a copy may start a
+    // second one that never exits.
+    Log('Quit: taskkill only: no installed copy, or one before 0.2.7 (' + Version + ')')
+  else if VersionAtLeast(Version, 0, 5, 4) and not DirExists(ExpandConstant('{app}\_internal')) then
+    // Every release after 0.5.3 installs a folder build, and its exe can't
+    // start without _internal: a failed update may have removed it
+    // ([InstallDelete] runs first, and rollback doesn't restore it). Run, it
+    // would show "Failed to load Python DLL" and wait for a click. 0.5.3 and
+    // earlier were one self-contained file, which has no _internal.
+    Log('Quit: taskkill only: the installed ' + Version + ' has no _internal folder, so it can''t start')
+  else
+    Result := ExpandConstant('{app}\DoubleClickFixer.exe');
 end;
 
 // A running copy lives in the notification area and ignores window-close
@@ -59,30 +185,61 @@ end;
 procedure AskRunningCopyToQuit(const Exe: String);
 var
   ResultCode: Integer;
+  Script: String;
 begin
-  if FileExists(Exe) then
+  if (Exe <> '') and FileExists(Exe) then
   begin
-    Exec(Exe, '--quit', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+    // Through PowerShell, for a time limit: Exec waits for ever or not at
+    // all, and a copy that can't start or hangs would hold this installer
+    // (a silent update, with the app already closed) for ever. The exe is
+    // found from the folder PowerShell starts in, so no path is ever
+    // quoted into the command. It uses cmdlets only, no .NET methods: where
+    // application control puts PowerShell in Constrained Language Mode, a
+    // method call fails. It switches itself to that mode first (and won't
+    // run in any other), so every machine, and the end-to-end test, runs it
+    // the way those do. Wait-Process fails both when time is up and when the
+    // copy is already gone; which one it was is told by whether the copy is
+    // still there.
+    Script := 'try { $ExecutionContext.SessionState.LanguageMode = ''ConstrainedLanguage'' } catch { }; ' +
+      'if ($ExecutionContext.SessionState.LanguageMode -ne ''ConstrainedLanguage'') { exit 5 }; ' +
+      '$ErrorActionPreference = ''Stop''; ' +
+      'try { $p = Start-Process -FilePath (Join-Path -Path (Get-Location).ProviderPath -ChildPath ''' +
+      ExtractFileName(Exe) + ''') -ArgumentList ''--quit'' -WindowStyle Hidden -PassThru } catch { exit 4 }; ' +
+      '$done = $true; try { Wait-Process -Id $p.Id -Timeout ' + IntToStr(QuitWaitSeconds) + ' } ' +
+      'catch { $done = -not (Get-Process -Id $p.Id -ErrorAction SilentlyContinue) }; if ($done) { exit 0 }; ' +
+      'Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue; exit 3';
+    Log('Quit: asking the installed copy: ' + Exe + ' --quit');
+    if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+      '-NoProfile -NonInteractive -Command "' + Script + '"', ExtractFileDir(Exe), SW_HIDE,
+      ewWaitUntilTerminated, ResultCode) then
+      Log('Quit: couldn''t start PowerShell: ' + SysErrorMessage(ResultCode))
+    else if ResultCode = 0 then
+      Log('Quit: --quit finished')
+    else if ResultCode = 3 then
+      Log(Format('Quit: --quit did not finish within %d s; stopped it', [QuitWaitSeconds]))
+    else if ResultCode = 5 then
+      Log('Quit: --quit wasn''t run: PowerShell didn''t take Constrained Language Mode')
+    else
+      Log(Format('Quit: --quit couldn''t be run (PowerShell exit code %d)', [ResultCode]));
     Sleep(800);
   end;
   // A copy older than 0.2.7 doesn't know "--quit" (it shows its window
   // instead), and one that is hung can't answer: end it, so no file stays
   // in use. Its mouse hook goes with it.
-  Exec(ExpandConstant('{sys}\taskkill.exe'), '/IM DoubleClickFixer.exe /F', '', SW_HIDE,
-    ewWaitUntilTerminated, ResultCode);
+  if Exec(ExpandConstant('{sys}\taskkill.exe'), '/IM DoubleClickFixer.exe /F', '', SW_HIDE,
+    ewWaitUntilTerminated, ResultCode) then
+    Log(Format('Quit: taskkill exit code %d (0 ended a copy, 128 found none running)', [ResultCode]));
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
-  // The copy being replaced may predate "--quit", so use the new one.
-  ExtractTemporaryFile('DoubleClickFixer.exe');
-  AskRunningCopyToQuit(ExpandConstant('{tmp}\DoubleClickFixer.exe'));
+  AskRunningCopyToQuit(InstalledQuitter);
   Result := '';
 end;
 
 function InitializeUninstall(): Boolean;
 begin
-  AskRunningCopyToQuit(ExpandConstant('{app}\DoubleClickFixer.exe'));
+  AskRunningCopyToQuit(InstalledQuitter);
   Result := True;
 end;
 
@@ -106,6 +263,11 @@ end;
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "DoubleClickFixer"; ValueData: """{app}\DoubleClickFixer.exe"" ""--minimized"""; Tasks: startup
 ; The app writes this itself when "start at login" is ticked; clear it on uninstall.
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueName: "DoubleClickFixer"; Flags: dontcreatekey uninsdeletevalue
+; Turning the app off in Task Manager's Startup apps is kept here, and outlives
+; the Run value. Ticking "Start when I sign in" clears an old "off" (updates
+; leave the user's choice alone), and uninstalling leaves nothing behind.
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"; ValueType: none; ValueName: "DoubleClickFixer"; Flags: deletevalue dontcreatekey; Tasks: startup
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"; ValueType: none; ValueName: "DoubleClickFixer"; Flags: dontcreatekey uninsdeletevalue
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{userappdata}\DoubleClickFixer"

@@ -1,7 +1,8 @@
-"""Launch DoubleClick Fixer.
+"""Launch Mouse Double-Click Fixer.
 
 `--minimized` starts it hidden in the menu bar / notification area, which is
-what the start-at-login entry uses.
+what the start-at-login entry uses. `--self-test` checks the build and exits
+without starting the app (see app/selftest.py).
 """
 
 import os
@@ -36,6 +37,15 @@ def _unhide_qt_plugins() -> None:
 
 
 if __name__ == "__main__":
+    if "--self-test" in sys.argv[1:]:
+        # Checks this build and exits, before the app itself is imported: no
+        # single-instance hand-over, no window, no filter (app/selftest.py).
+        from app import selftest
+
+        selftest.use_default_qt_platform()
+        _unhide_qt_plugins()
+        sys.exit(selftest.main())
+
     _unhide_qt_plugins()
 
     from app.main import main

@@ -1,11 +1,19 @@
 # PyInstaller build recipe for both platforms.
+#
+# Windows builds one of two shapes: by default the portable DoubleClickFixer.exe,
+# one file that unpacks itself at each launch; with DCF_ONEDIR=1 the folder the
+# installer ships, which launches (and starts at every sign-in) without
+# unpacking anything. installer/build_windows.ps1 builds both.
+import os
 import sys
 
 import re
 from pathlib import Path
 
-# One source of truth for the version: app/__init__.py.
-VERSION = re.search(r'__version__ = "([^"]+)"', Path("app/__init__.py").read_text()).group(1)
+# One source of truth for the version and the name people see: app/__init__.py.
+PACKAGE = Path("app/__init__.py").read_text()
+VERSION = re.search(r'__version__ = "([^"]+)"', PACKAGE).group(1)
+NAME = re.search(r'^DISPLAY_NAME = "([^"]+)"', PACKAGE, re.MULTILINE).group(1)
 
 # Qt ships far more than this app uses; leaving the rest out keeps the
 # download small and the startup fast.
@@ -32,6 +40,19 @@ EXCLUDES = [
     "PySide6.QtPdfWidgets",
 ]
 
+import importlib.util
+
+
+def load_tool(name):
+    spec = importlib.util.spec_from_file_location(name, f"tools/{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+ci_update_key = load_tool("ci_update_key")
+
 hiddenimports = []
 if sys.platform == "darwin":
     # The event tap is reached through PyObjC at runtime.
@@ -41,6 +62,15 @@ if sys.platform == "darwin":
         collect_submodules("Quartz") + collect_submodules("AppKit") + collect_submodules("Foundation")
     )
 
+# macOS: drop environment variables that would load code from outside the
+# app, before any other code runs (see the hook for which and why).
+RUNTIME_HOOKS = ["installer/runtime_hooks/scrub_env.py"] if sys.platform == "darwin" else []
+# CI's end-to-end Windows build alone: with DCF_CI_UPDATE_KEY set, a hook frozen
+# in makes it trust a key made for that run, so its stand-in update can be
+# signed (tools/ci_update_key.py). No other build has the hook: release.yml
+# refuses the variable and checks its builds, and macOS ignores it.
+RUNTIME_HOOKS += ci_update_key.spec_runtime_hooks(os.environ, sys.platform, Path("build", "ci-update-key"))
+
 analysis = Analysis(
     ["run.py"],
     pathex=["."],
@@ -48,9 +78,38 @@ analysis = Analysis(
     datas=[],
     hiddenimports=hiddenimports,
     hookspath=[],
-    runtime_hooks=[],
+    runtime_hooks=RUNTIME_HOOKS,
     excludes=EXCLUDES,
 )
+
+make_notices = load_tool("make_notices")
+
+# Leave out the Qt image-format and icon-engine plugins the app never uses
+# (it draws its icons in code and only round-trips PNG, which Qt GUI has
+# built in), and Qt SVG, which only they need. Their code (libjpeg, libtiff,
+# libwebp and more) is then neither shipped nor attributed. On Windows also
+# Qt's OpenSSL backend with the OpenSSL files PyInstaller found for it on
+# this machine's PATH (TLS goes through Windows' Schannel, app/tls.py), and
+# the Universal C Runtime, which Windows 10 and later have built in.
+left_out = [entry for entry in analysis.binaries + analysis.datas if make_notices.unused_qt_file(entry[0])]
+analysis.binaries = [entry for entry in analysis.binaries if not make_notices.unused_qt_file(entry[0])]
+analysis.datas = [entry for entry in analysis.datas if not make_notices.unused_qt_file(entry[0])]
+for destination, source, *_rest in sorted(left_out):
+    size = os.path.getsize(source) if source and os.path.isfile(source) else 0
+    print(f"left out: {destination} ({size / 1e6:.1f} MB, from {source})")
+
+# Every library, extension and DLL left must come from Python itself or from
+# this environment's site-packages: one PyInstaller found anywhere else (on
+# Windows, through PATH) fails the build, named with where it came from.
+binary_sources = load_tool("binary_sources")
+print(binary_sources.check(analysis.binaries + analysis.datas))
+
+# Every build carries the licences of what it bundles (Qt's LGPL among them),
+# worked out from the very files it ships: Contents/Resources on macOS,
+# beside the program files on Windows (app/notices.py finds it).
+NOTICES = Path("build", "notices", "THIRD_PARTY_NOTICES.md")
+make_notices.write(NOTICES, make_notices.Build.from_toc(analysis.binaries, analysis.pure, analysis.datas))
+analysis.datas.append(("THIRD_PARTY_NOTICES.md", str(NOTICES.resolve()), "DATA"))
 
 pyz = PYZ(analysis.pure)
 
@@ -69,12 +128,19 @@ if sys.platform == "darwin":
     collected = COLLECT(exe, analysis.binaries, analysis.datas, name="DoubleClickFixer")
     app = BUNDLE(
         collected,
-        name="DoubleClick Fixer.app",
+        # The bundle's name on disk, which Finder, Spotlight and the
+        # Accessibility list show. The executable name and bundle id stay as
+        # they were: macOS keys the permission and the login item on them.
+        name=f"{NAME}.app",
         icon="installer/assets/icon.icns",
         bundle_identifier="com.doubleclickfixer.app",
         info_plist={
-            "CFBundleName": "DoubleClick Fixer",
-            "CFBundleDisplayName": "DoubleClick Fixer",
+            # The full name in both. Apple suggests at most 15 characters for
+            # CFBundleName, but macOS's own apps go past it (Bluetooth File
+            # Exchange has 23), and a short name would give the app menu a
+            # second name for the app.
+            "CFBundleName": NAME,
+            "CFBundleDisplayName": NAME,
             "CFBundleShortVersionString": VERSION,
             "CFBundleVersion": VERSION,
             "NSHighResolutionCapable": True,
@@ -107,28 +173,46 @@ else:
         kids=[
             StringFileInfo([
                 StringTable("040904B0", [
-                    StringStruct("CompanyName", "DoubleClick Fixer"),
-                    StringStruct("FileDescription", "DoubleClick Fixer"),
+                    StringStruct("CompanyName", NAME),
+                    # What Task Manager, Startup apps and notifications call the app.
+                    StringStruct("FileDescription", NAME),
                     StringStruct("FileVersion", VERSION),
                     StringStruct("InternalName", "DoubleClickFixer"),
                     StringStruct("LegalCopyright", "© 2026 Arnav Goel. MIT License."),
                     StringStruct("OriginalFilename", "DoubleClickFixer.exe"),
-                    StringStruct("ProductName", "DoubleClick Fixer"),
+                    StringStruct("ProductName", NAME),
                     StringStruct("ProductVersion", VERSION),
                 ])
             ]),
             VarFileInfo([VarStruct("Translation", [0x0409, 1200])]),
         ],
     )
-    # One portable executable; the installer copies it as is.
-    exe = EXE(
-        pyz,
-        analysis.scripts,
-        analysis.binaries,
-        analysis.datas,
-        [],
-        name="DoubleClickFixer",
-        console=False,
-        icon="installer/assets/icon.ico",
-        version=version_info,
-    )
+    if os.environ.get("DCF_ONEDIR") == "1":
+        # What the installer ships: the exe beside its libraries, in
+        # dist/DoubleClickFixer/ (build_windows.ps1 points --distpath at
+        # dist/onedir). The exe keeps its name: the login item, the shortcuts,
+        # the installer's taskkill and the updater all find it by it.
+        exe = EXE(
+            pyz,
+            analysis.scripts,
+            [],
+            exclude_binaries=True,
+            name="DoubleClickFixer",
+            console=False,
+            icon="installer/assets/icon.ico",
+            version=version_info,
+        )
+        collected = COLLECT(exe, analysis.binaries, analysis.datas, name="DoubleClickFixer")
+    else:
+        # The portable release asset: one executable.
+        exe = EXE(
+            pyz,
+            analysis.scripts,
+            analysis.binaries,
+            analysis.datas,
+            [],
+            name="DoubleClickFixer",
+            console=False,
+            icon="installer/assets/icon.ico",
+            version=version_info,
+        )

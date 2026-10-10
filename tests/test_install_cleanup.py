@@ -1,3 +1,8 @@
+try:
+    import _isolation  # noqa: F401  (first: keeps tests off the real machine)
+except ImportError:  # run as tests.<module> from the repository root
+    from tests import _isolation  # noqa: F401
+
 import plistlib
 import subprocess
 import tempfile
@@ -13,8 +18,8 @@ class CleanupTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.installed = self.root / 'Applications' / 'DoubleClick Fixer.app'
-        self.mount = self.root / 'Volumes' / 'DoubleClick Fixer'
+        self.installed = self.root / 'Applications' / 'Mouse Double-Click Fixer.app'
+        self.mount = self.root / 'Volumes' / 'Mouse Double-Click Fixer'
         self.downloads = self.root / 'Downloads'
         self.downloads.mkdir()
         self.dmg = self.downloads / 'DoubleClickFixer.dmg'
@@ -58,6 +63,21 @@ class CleanupTests(unittest.TestCase):
         (self.source / 'Contents/MacOS/DoubleClickFixer').write_bytes(b'other release')
         self.assertEqual(self.run_cleanup(), [])
 
+    def test_a_copy_under_the_name_before_1_0_matches_the_new_image(self):
+        # 0.5.3 updated it in place, so it kept its old name.
+        old = self.root / 'Applications' / 'DoubleClick Fixer.app'
+        self.installed.rename(old)
+        self.installed = old
+        self.assertEqual(self.run_cleanup(), [('detach', str(self.mount)), ('trash', str(self.dmg))])
+
+    def test_an_image_of_a_release_before_1_0_is_matched_too(self):
+        self.source.rename(self.mount / 'DoubleClick Fixer.app')
+        self.assertEqual(self.run_cleanup(), [('detach', str(self.mount)), ('trash', str(self.dmg))])
+
+    def test_an_app_by_another_name_is_left_alone(self):
+        self.source.rename(self.mount / 'Something Else.app')
+        self.assertEqual(self.run_cleanup(), [])
+
     def test_running_from_disk_image_is_left_alone(self):
         self.installed = self.source
         self.assertEqual(self.run_cleanup(), [])
@@ -89,7 +109,7 @@ class CleanupTests(unittest.TestCase):
             with patch.object(install_cleanup.sys, 'frozen', False, create=True):
                 install_cleanup.start()
             with patch.object(install_cleanup.sys, 'frozen', True, create=True), patch.object(
-                install_cleanup.sys, 'executable', '/Volumes/Installer/DoubleClick Fixer.app/Contents/MacOS/DoubleClickFixer'
+                install_cleanup.sys, 'executable', '/Volumes/Installer/Mouse Double-Click Fixer.app/Contents/MacOS/DoubleClickFixer'
             ):
                 install_cleanup.start()
             thread.assert_not_called()

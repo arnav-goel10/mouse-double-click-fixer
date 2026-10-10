@@ -1,5 +1,289 @@
 # Changelog
 
+## 1.0.0 — 2026-10-10
+
+- **DoubleClick Fixer is now Mouse Double-Click Fixer.** Your settings, the
+  macOS permission and the open-at-login setting carry over. A Mac copy that
+  updates itself to 1.0 keeps its old name in Applications until its next
+  update.
+- **Back and forward buttons can be filtered.** They are off until you turn
+  them on. A press within the window of the last release is dropped with its
+  release. Their releases are never held back for the window, and a drag
+  made with one isn't protected. Calibrate and the Test pane cover them.
+- **Each button has its own filter window.** Calibrate measures the button you
+  pick, and Apply sets that button's window and starts filtering it. A new or
+  uncalibrated install starts at 46 ms; it was 60. The window you had carries
+  over to every button, except that a copy never calibrated and still on 60 ms
+  moves to 46.
+- **A scroll-wheel fix** for a worn encoder that reports one notch the wrong
+  way. A notch that goes against the one before it, within the wheel window,
+  is dropped. The window is 50 ms unless you change it, and can be 10 to 150
+  ms. Vertical and horizontal scrolling are judged separately, no notch is
+  held back for the window, and smooth scrolling from a Mac trackpad, a Magic
+  Mouse or (on Windows) a precision touchpad is never touched. Off by default.
+- **Apps:** a list of apps in which nothing is filtered while they are in
+  front. The active app counts, not the window under the pointer.
+- **Devices:** the mice the app has seen, each of which can be left
+  unfiltered. Trackpads, touchscreens and pens are not filtered and have no
+  switch (on Windows, precision touchpads only; see Windows below).
+- **History:** for each button, bounces per 100 clicks over the last 30 days,
+  a trend, and how long after a release each bounce came. The wheel fix's
+  count is there too. It is kept in wear.json beside the settings, as daily
+  counts only (with the filter window in use that day), for a year.
+- Requires macOS 13 or later on Apple silicon, or 64-bit Windows 10 version
+  1809 or later, or Windows 11.
+
+### Filtering
+
+- **Drags are protected from the first moment.** Every release is now held for
+  the filter window, however short the click. A release 12–30 ms after its
+  press used to go straight through, so a contact that bounced twice as it
+  closed could turn the start of a drag into a click. Very short taps now wait
+  like any other click. The price is that a release reaches apps later than it
+  would unfiltered. A click made in place goes out sooner if the pointer
+  leaves the spot first; otherwise a release goes out once the filter window
+  has passed, and on a still mouse after the window plus the allowance below,
+  which is 5 ms or more.
+- **A small movement no longer ends a drag.** Since 0.5.1 on macOS, a release
+  held in place was settled by any pointer motion, even a hand resting on the
+  mouse, and a dropout's comeback could make a drag look like a click made in
+  place. Now motion inside the filter window settles such a release only once
+  the pointer has moved a few pixels from where the button came up.
+- **A drag survives a busy computer.** A held release is now settled by the
+  time of the events that follow it, not by a timer started when it arrived.
+  Events reach the filter in the order they happened, so once one from after
+  the filter window arrives, no press can still be on its way to cancel the
+  release. Before, a dropout's comeback press that reached the filter late
+  could find its release already sent, and the drag broke. With nothing after
+  it, as on a still mouse, a timer settles the release after the window plus
+  an allowance for how late this computer has lately delivered mouse button
+  events, kept between 5 and 150 ms.
+- A held release that comes due while the app is still re-sending other input
+  now waits behind it, so apps can never see a button come up before it went
+  down.
+- **Input the app re-sends stays in order.** A click of one button no longer
+  overtakes another button's release that is still on its way, which could
+  show apps two buttons down together when they never were.
+- On a slow computer a later click can no longer overtake a release the app
+  re-sent. The app waits for it to come back for twice the worst delay it saw
+  in the last two seconds, but not less than 150 ms or more than half a
+  second; it used to stop waiting after 150 ms. If another program's hook
+  swallows it, the app gives up after that wait and sends what was queued
+  behind it.
+- A click that passes untouched (from a trackpad, touchscreen or pen, from a
+  device you left unfiltered, or while an app on your Apps list is in front)
+  is never half filtered: its release goes the way its press went, and a
+  release of the same button still held is sent first, so apps never see two
+  presses in a row.
+- Turning the filter off or quitting first sends everything held back or
+  waiting, and waits up to a second for a send already under way, so nothing
+  is left to go out once the filter has stopped.
+- Clicks and pointer moves no longer wait up to 5 ms for the app's own window
+  to finish what it is doing.
+
+### macOS
+
+- **Correction to 0.5.3.** 0.5.3 said the driver stamps clicks in
+  nanoseconds. Real clicks, where the filter sees them, carry mach ticks;
+  only clicks other programs post carry nanoseconds. So 0.5.3 still timed
+  real clicks by when its own code ran, and a posted click seen first after
+  the filter started could have put every later click 41.67 times too close
+  together, so clicks seconds apart were dropped as bounce. Each event's
+  timestamp is now read in whichever unit it carries.
+- **A move that takes the pointer off the spot of a click can no longer reach
+  apps ahead of the click's release.** Clicks and pointer motion now come
+  through one event tap, which macOS hands over strictly in order. The
+  separate motion tap 0.5.1 added took effect too late, so the first moves
+  after a click could overtake it. The app now receives every pointer move,
+  but looks at one only while it holds back a release or has input to re-send
+  (where the pointer is, when it moved, and whether the hardware made it);
+  every other move goes straight through.
+- The scroll wheel is in the event tap only while the wheel fix is on, so with
+  it off scroll events never reach the app. Turning the fix on or off replaces
+  the tap: held releases are settled first, and the old tap stays until the
+  new one has taken over and nothing the app re-sent can be lost with it.
+  Scrolling that macOS calls continuous (a trackpad, a Magic Mouse) and
+  scrolling another program posts are left alone.
+- The app finds which mouse sent a click through IOKit, looking each device up
+  once. Clicks macOS marks as coming from a tablet or a touch surface are
+  never filtered. Button numbers 3 and 4 are the back and forward buttons;
+  buttons past those pass untouched.
+- Two separate clicks no longer become a double-click after a blocked
+  bounce. macOS counts a suppressed press toward a double-click; the app now
+  counts only the presses apps receive, by macOS's rule and your
+  double-click speed.
+- After a drag let go while moving, the pointer no longer stays behind where
+  the button came up; it is put back where your hand has taken it.
+- Removing the app's permission while it filters stops the filter within a
+  second, and clicks go through untouched. macOS can keep reporting the app
+  as allowed after it is removed from the list, so the app checks by asking
+  for an event tap. It starts again by itself once allowed, and your "on" is
+  kept.
+- The permission list is named as System Settings names it: **Device
+  Control and Data Access** on macOS 27 and later, **Accessibility** on 26
+  and earlier. **Open Settings…** in General now always opens it.
+- If macOS switches the filter off three times within 30 seconds, the filter
+  stops and says so instead of fighting the system; turn it on again from
+  the menu bar.
+- The filter is rebuilt after sleep and when its tap is found switched off,
+  pauses while your session is in the background with fast user switching,
+  and releases its event tap when it stops (each stop used to leave one
+  registered).
+- The app is signed with the hardened runtime and clears the environment
+  variables that would make the libraries inside it load code from
+  elsewhere. It starts the programs it needs (pgrep, codesign, ditto, open,
+  hdiutil, and bash for an update) by full path, with PATH set to the system
+  folders and bash's start-up variables removed. So other programs can't use
+  those routes to act with its permission. Its signing requirement is
+  unchanged, so the permission carries over from 0.5.
+- A Window menu with Minimize (⌘M) and Zoom, and the menu bar icon keeps the
+  place you drag it to.
+- `installer/uninstall_macos.sh` waits for the app to quit before it
+  removes anything, and stops with a message if the app won't quit.
+
+### Windows
+
+- **Fixed: a click followed by a quick move was lost or became a drag.**
+  This is the Windows fix 0.5.1 promised. While a release is held, the first
+  move off the spot waits, the release goes out where you clicked, and the
+  move follows. A drag let go while moving drops where the button came up.
+  While the pointer is hidden (as it is in most games' mouse-look) the app
+  never holds back or re-sends pointer movement. In that case and in a remote
+  session, a held release goes out once the filter window has passed, with
+  your next click or by a timer, wherever the pointer is then.
+- Precision touchpads, touchscreens and pens are told apart from mice, through
+  Raw Input and the marker Windows puts on pen and touch input, and are not
+  filtered. Touchpads have three exceptions: a tap within about a second of
+  using a mouse counts as that mouse's click; a touchpad that isn't a
+  precision one reports itself to Windows as a mouse; and without Raw Input
+  every touchpad click is filtered. Touchscreens and pens always pass.
+- On Windows the wheel fix judges only a notch that a mouse reported through
+  Raw Input, so a precision touchpad's scrolling is left alone.
+- Clicks are timed on the precise clock as they arrive, not by Windows'
+  15.6 ms tick, which was coarser than the gaps being judged. A bounce at
+  the start of a drag is told apart again, a calibrated window near 30 ms no
+  longer lets 20–30 ms chatter through, the Test pane and calibration show
+  real gaps (they only ever showed 0, 15, 16 or 31 ms), and the first click
+  after weeks without one is no longer swallowed.
+- With the buttons swapped for left-handed use, a re-sent release now comes
+  back as the same button; it came back as the other one.
+- The mouse hook is re-installed every 15 seconds (was every minute) and
+  whenever the session is unlocked or reconnected or the PC wakes, when
+  Windows most often drops it.
+- Re-sent input goes out from a thread of its own. Sending it from inside
+  the hook could stall all input on the PC.
+- One copy runs per user and session. With fast user switching, a second
+  user's copy used to start unreachable, and their later launches showed
+  nothing.
+- The installer installs a folder, which starts without unpacking itself at
+  every launch and sign-in; the portable exe stays one file. It needs
+  64-bit Windows 10 version 1809 or later and says so instead of installing
+  something that can't start. It closes a running copy through the installed
+  one and never waits on it for more than 20 seconds.
+- Ticking "Start Mouse Double-Click Fixer when I sign in" clears an earlier
+  "off" in Task Manager's Startup apps; uninstalling removes both.
+- Updates now finish in folders whose names use characters outside the
+  system's code page (a user name like Łukasz on an English system).
+  Before, the app didn't come back after updating there.
+- The updater starts cmd.exe, and the Windows programs its update script
+  runs, from System32 by full path. Named alone, Windows would look for them
+  in the app's own folder or the current folder first, so a file with one of
+  their names beside the portable exe (in Downloads, say) could have run
+  instead.
+- Windows builds no longer carry Mesa's software OpenGL (opengl32sw.dll,
+  about 20 MB), which the app never used.
+- Update checks and downloads go through Windows' own TLS (Schannel). The
+  build no longer ships Qt's OpenSSL plugin and the copy of OpenSSL it picked
+  up from another program on the build machine, nor a copy of the Universal
+  C Runtime, which Windows 10 and later have built in and keep updated.
+
+### Updates and security
+
+- **Updates are signed.** A release's SHA256SUMS.txt carries a minisign
+  (Ed25519) signature made with a release key that never goes to GitHub or
+  CI. The app has two public keys built in, a primary and a backup. An
+  update is offered only when the signature checks out, names exactly that
+  version, and that version is newer than yours; one that fails is never
+  downloaded, and General says why.
+- Copies older than 1.0 trust checksums alone (on macOS, plus the
+  code-signature check) for the update that brings them to 1.0. From 1.0
+  on, every update is signature-checked.
+- On macOS an update must also be the version it claims and keep the
+  installed app's signing requirement, which the permission depends on. A
+  move to a new signing certificate has to be named in a signed release.
+- Pre-releases, which are for testing, are never signed, and installed copies
+  never offer them: they look only at the latest full release.
+- Releases are now built by CI as drafts. Before one is published, the
+  maintainer's Mac checks every file against CI's build, checks that the
+  macOS app's code signature is valid and that it loads no code named in its
+  environment, and signs the checksums.
+- Every build checks where each binary it collects comes from, and fails if
+  one isn't from Python or its packages, so a library found on the build
+  machine's PATH can't get in.
+- The app now runs on Python 3.14 and ships its OpenSSL 3.5, a long-term
+  support release maintained until April 2030. 0.5.3 and earlier were built
+  on Python 3.13, whose OpenSSL 3.0 stopped getting security fixes on
+  7 September 2026. On macOS this OpenSSL carries update checks and
+  downloads; on Windows, where those go through Schannel, the app uses it
+  for checksums. A build whose OpenSSL is out of support now fails its own
+  self-test.
+- Checking for updates and installing them have separate switches, so
+  turning off automatic installs no longer stops the checks. If you turned
+  updates off before 1.0, both stay off.
+- A copy that can't replace itself says so before downloading anything, for
+  example "Move Mouse Double-Click Fixer to Applications to update it."
+- A version that failed to install twice is no longer retried at every
+  sign-in; it waits for you. A download waiting to install is no longer
+  fetched again by the next check, and "Update to X" in the menu opens
+  General so progress and any failure show.
+- Every build ships THIRD_PARTY_NOTICES.md, the licences of Qt, Python, the
+  code inside them and the other software the app is built on, including
+  the LGPL and GPL texts, worked out from the files that build ships.
+  **General › Acknowledgements…** opens it, and on Windows it is also in the
+  install folder. Each release also carries both platforms' copies, as
+  THIRD_PARTY_NOTICES-macos.md and THIRD_PARTY_NOTICES-windows.md.
+
+### App
+
+- **Copy Diagnostics** (Windows: **Copy diagnostics**) in General copies
+  the version, OS, the filter's state, the settings, the pointing devices
+  the app has seen (by name) and the end of the app's log, for a bug report.
+  The log records start-up, the filter starting and stopping, permission
+  changes, waking from sleep and switching users, the TLS library in use,
+  failures and updates, never clicks; hard crashes go to crash.log beside it.
+- Your "on" survives failures. A filter that can't start at login, or stops
+  on its own, used to switch itself off for good. Now the menu's status line
+  says what happened, a start the app makes itself retries at 1, 3, 8 and
+  20 seconds, and the menu item turns it off rather than trying again.
+- Calibration starts with the first click on the pad (Begin is optional).
+  Double-clicks count as pairs within your system's double-click speed, up
+  to a second, and a pair that is too slow says so. The pad measures every
+  button, and the Test pane shows all of them. Calibrate measures one button
+  at a time, chosen at the top or by the Calibrate link beside it; a side
+  button has no double-click, so it is measured by pressing it twice quickly.
+  The Test pane's line is the window of the button last pressed.
+- Filtering pauses only while Calibrate is measuring with its window in
+  front. Reading the intro, switching to another app or leaving a result
+  unapplied no longer leaves clicks unfiltered, and the menu can turn
+  filtering on from the result screen.
+- Open at login says when the system has it turned off (macOS Login Items,
+  or Task Manager's Startup apps) and how to turn it back on. A copy run
+  from the disk image no longer sets itself to open from there.
+- Settings survive a crash mid-save and a file that can't be read: the last
+  good copy is kept as settings.json.bak and used if settings.json is
+  damaged. A settings.json that stays locked when the app starts (a backup
+  tool or virus scanner holding it) is no longer written over with defaults:
+  nothing is written until it can be read, and then what you changed meanwhile
+  is laid over what it holds. wear.json is saved and protected the same way.
+- Going back to 0.5.3 works, with two losses. It has one window for every
+  button and takes the left button's. It doesn't know the back and forward
+  buttons, so it drops them from the filtered buttons the next time it saves.
+  1.0 reads the rest of its settings again.
+- Switches read as named checkboxes and the sidebar as a list to VoiceOver
+  and Narrator, and keyboard focus is shown.
+- The first window fits the screen, and the Windows "still running"
+  notification shows once rather than at every sign-in.
+
 ## 0.5.3 — 2026-10-08
 
 - macOS: the filter now measures click timing from the driver's own

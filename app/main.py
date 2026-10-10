@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import platform
 import sys
+from functools import lru_cache
 from time import monotonic, sleep
 from typing import Optional
 
@@ -13,35 +14,114 @@ from PySide6.QtGui import QAction, QFont, QKeySequence
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QMenuBar, QMessageBox, QSystemTrayIcon
 
-from . import __version__
+from . import DISPLAY_NAME, __version__, diagnostics
 from .controller import AppController
 from .updater import Updater
 from .ui import dock, icons
 from .ui import tray as tray_module
 from .ui.window import MainWindow
 
-SERVER_NAME = "doubleclick-fixer-single-instance"
+# A suffix only the test suite sets (tests/_isolation.py), so tests can never
+# reach, or quit, a copy of the app that is running for real.
+SERVER_NAME = "doubleclick-fixer-single-instance" + os.environ.get("DCF_INSTANCE_SUFFIX", "")
 #: Taken the moment a copy starts, long before its single-instance channel is
-#: listening (the Windows exe unpacks itself first, which can take seconds).
+#: listening (the portable Windows exe unpacks itself first, which can take
+#: seconds).
 LOCK_NAME = "doubleclick-fixer.lock"
 #: How long a second launch, or --quit, keeps trying to reach a copy that is
 #: still starting up.
 HAND_OVER_WAIT_S = 10.0
 
 
+@lru_cache(maxsize=1)
+def _windows_session_and_user() -> tuple[int, str]:
+    """This process's Terminal Services session and its user's SID (the
+    user's name if the SID can't be read). An elevated copy has the same
+    user SID as a normal one, so the two still find each other."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    session = wintypes.DWORD()
+    kernel32.ProcessIdToSessionId.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    if not kernel32.ProcessIdToSessionId(kernel32.GetCurrentProcessId(), ctypes.byref(session)):
+        session.value = 0
+    user = ""
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.LocalFree.argtypes = [wintypes.HLOCAL]
+    advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)
+    ]
+    advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.LPWSTR)]
+    token = wintypes.HANDLE()
+    if advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(token)):  # TOKEN_QUERY
+        try:
+            buffer = ctypes.create_string_buffer(256)
+            size = wintypes.DWORD()
+            # TokenUser = 1: a TOKEN_USER, whose first field points at the SID.
+            if advapi32.GetTokenInformation(token, 1, buffer, ctypes.sizeof(buffer), ctypes.byref(size)):
+                sid = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_void_p))[0]
+                text = wintypes.LPWSTR()
+                if advapi32.ConvertSidToStringSidW(sid, ctypes.byref(text)):
+                    user = text.value or ""
+                    kernel32.LocalFree(ctypes.cast(text, ctypes.c_void_p))
+        finally:
+            kernel32.CloseHandle(token)
+    if not user:
+        user = os.environ.get("USERNAME", "")
+    return session.value, user
+
+
+def _channel_name() -> str:
+    """The single-instance channel's name, which also names the lock.
+
+    On Windows a named pipe is machine-wide: one name for everyone would let
+    a second signed-in user's copy find the first user's, fail to reach it
+    and fail to listen. So the name carries the session and the user. macOS
+    keeps both in the user's own temporary folder already."""
+    if platform.system() != "Windows":
+        return SERVER_NAME
+    try:
+        session, user = _windows_session_and_user()
+    except Exception:  # noqa: BLE001 - a name per user is still better than none
+        session, user = 0, os.environ.get("USERNAME", "")
+    user = "".join(character if character.isalnum() or character == "-" else "_" for character in user)
+    return f"{SERVER_NAME}-{session}-{user}"
+
+
+def _channel_names() -> list[str]:
+    """Where a running copy may be listening: this session's channel, and on
+    Windows the machine-wide name copies before 1.0 used (another user's copy
+    there refuses the connection, so only this user's own old copy answers)."""
+    name = _channel_name()
+    return [name] if name == SERVER_NAME else [name, SERVER_NAME]
+
+
 def _instance_lock():
     from PySide6.QtCore import QDir, QLockFile
 
-    lock = QLockFile(os.path.join(QDir.tempPath(), f"{LOCK_NAME}-{SERVER_NAME}"))
+    lock = QLockFile(os.path.join(QDir.tempPath(), f"{LOCK_NAME}-{_channel_name()}"))
     # A copy that crashed leaves its lock behind; Qt sees its process is gone
     # and takes the lock over.
     return lock
 
 
+def _same_session(kernel32, pid: int, session: int) -> bool:
+    from ctypes import byref, wintypes
+
+    theirs = wintypes.DWORD()
+    # Unknown counts as another session: never wait on a copy that isn't ours.
+    return bool(kernel32.ProcessIdToSessionId(pid, byref(theirs))) and theirs.value == session
+
+
 def _other_copies_running() -> bool:
-    """Whether another process of this executable exists: one still unpacking
-    itself (the Windows exe does that for a few seconds before any of this
-    code runs, so it holds no lock yet), or an older copy that takes none."""
+    """Whether another process of this executable exists in this session: the
+    portable exe still unpacking itself (it does that for a few seconds before
+    any of this code runs, so it holds no lock yet), or an older copy that
+    takes none. Another signed-in user's copy doesn't count."""
     if not getattr(sys, "frozen", False):
         return False
     mine = {os.getpid(), os.getppid()}  # a one-file exe is a launcher plus the app
@@ -61,15 +141,27 @@ def _other_copies_running() -> bool:
                 ]
 
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+            kernel32.ProcessIdToSessionId.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+            kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry)]
+            kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry)]
+            session = wintypes.DWORD()
+            if not kernel32.ProcessIdToSessionId(os.getpid(), ctypes.byref(session)):
+                return False
             snapshot = kernel32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
-            if snapshot == ctypes.c_void_p(-1).value:
+            if not snapshot or snapshot == ctypes.c_void_p(-1).value:
                 return False
             try:
                 entry = ProcessEntry()
                 entry.dwSize = ctypes.sizeof(entry)
                 more = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
                 while more:
-                    if entry.szExeFile.lower() == name and entry.th32ProcessID not in mine:
+                    if (
+                        entry.szExeFile.lower() == name
+                        and entry.th32ProcessID not in mine
+                        and _same_session(kernel32, entry.th32ProcessID, session.value)
+                    ):
                         return True
                     more = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
             finally:
@@ -77,10 +169,16 @@ def _other_copies_running() -> bool:
             return False
         import subprocess
 
-        found = subprocess.run(["pgrep", "-x", os.path.basename(sys.executable)], capture_output=True, text=True)
+        found = subprocess.run(_pgrep_command(), capture_output=True, text=True)
         return any(int(pid) not in mine for pid in found.stdout.split())
     except Exception:  # noqa: BLE001 - unsure: behave as before
         return False
+
+
+def _pgrep_command() -> list:
+    """How _other_copies_running lists this executable's processes on macOS
+    (the self-test runs the same command)."""
+    return ["/usr/bin/pgrep", "-x", os.path.basename(sys.executable)]
 
 
 def _quit_running_copy() -> None:
@@ -130,25 +228,28 @@ def _hand_over_to_running_instance(request: bytes = b"show") -> bool:
             ctypes.windll.user32.AllowSetForegroundWindow(ctypes.c_uint32(0xFFFFFFFF).value)  # ASFW_ANY
         except Exception:  # noqa: BLE001 - cosmetic
             pass
-    socket = QLocalSocket()
-    socket.connectToServer(SERVER_NAME)
-    # Generous: a copy still starting up answers late, and giving up early
-    # would start a second copy with a second mouse hook.
-    if socket.waitForConnected(1000):
-        socket.write(request)
-        socket.flush()
-        socket.waitForBytesWritten(300)
-        socket.disconnectFromServer()
-        return True
+    for name in _channel_names():
+        socket = QLocalSocket()
+        socket.connectToServer(name)
+        # Generous: a copy still starting up answers late, and giving up
+        # early would start a second copy with a second mouse hook. (A name
+        # nobody listens on fails at once.)
+        if socket.waitForConnected(1000):
+            socket.write(request)
+            socket.flush()
+            socket.waitForBytesWritten(300)
+            socket.disconnectFromServer()
+            return True
     return False
 
 
 class Application:
     def __init__(self, argv: list[str]) -> None:
         self.qt = QApplication(argv)
-        self.qt.setApplicationName("DoubleClick Fixer")
+        self.qt.setApplicationName(DISPLAY_NAME)
+        self.qt.setApplicationDisplayName(DISPLAY_NAME)
         self.qt.setApplicationVersion(__version__)
-        self.qt.setOrganizationName("DoubleClick Fixer")
+        self.qt.setOrganizationName(DISPLAY_NAME)
         self.qt.setWindowIcon(icons.app_icon())
         if platform.system() == "Windows":
             # Windows 11's own UI font and body size (14 px).
@@ -174,6 +275,7 @@ class Application:
                 on_toggle=self.window.request_filter,
                 updater=self.updater,
                 on_check_updates=self.check_for_updates,
+                on_install_update=self.install_update,
                 parent=self.window,
             )
             self.tray.show()
@@ -182,31 +284,51 @@ class Application:
         # A background update waits while the window is open; closing it is
         # the moment to finish.
         self.window.closed_to_tray.connect(self.updater.apply_if_ready)
-        self._told_about_tray = False
 
         self.server = QLocalServer()
-        QLocalServer.removeServer(SERVER_NAME)
-        self.server.listen(SERVER_NAME)
+        channel = _channel_name()
+        if platform.system() == "Windows":
+            # Only this user, elevated or not, may connect: a copy run as
+            # administrator still hears a normal launch, or the installer's
+            # --quit, from the same user.
+            self.server.setSocketOptions(QLocalServer.SocketOption.UserAccessOption)
+        QLocalServer.removeServer(channel)
+        if not self.server.listen(channel):
+            diagnostics.log.warning(
+                "The single-instance channel isn't listening (%s): opening the app again won't "
+                "find this copy",
+                self.server.errorString(),
+            )
         self.server.newConnection.connect(self._on_second_instance)
 
         hints = self.qt.styleHints()
         if hasattr(hints, "colorSchemeChanged"):
             hints.colorSchemeChanged.connect(lambda _scheme: self._on_theme_changed())
-        # Quitting from anywhere (Dock, app menu, logout) stops the hook cleanly.
+        # Quitting from anywhere (Dock, app menu, logout) stops the hook cleanly,
+        # then the log writes out what is left.
         self.qt.aboutToQuit.connect(self.controller.shutdown)
+        self.qt.aboutToQuit.connect(diagnostics.shutdown)
         self.menu_bar = self._build_menu_bar()
         # Opening the app again (Launchpad, Spotlight, Finder, Dock) while it
         # runs from the menu bar shows the window. Installed once the event
         # loop runs, after AppKit has registered its own handler.
         QTimer.singleShot(0, lambda: dock.on_reopen(self.show_window))
+        # Sleep and session switches can leave the event taps dead or in the
+        # way; the window rebuilds or stops the filter on them.
+        dock.observe_system(
+            on_wake=self.window.system_woke,
+            on_session_active=self.window.session_activated,
+            on_session_inactive=self.window.session_resigned,
+            on_permission_change=self.window.check_permission_soon,
+        )
 
     def _build_menu_bar(self) -> Optional[QMenuBar]:
         """macOS app menu: About, Settings… (⌘,) and Quit, where users expect them."""
         if platform.system() != "Darwin":
             return None
         bar = QMenuBar()
-        menu = bar.addMenu("DoubleClick Fixer")
-        about = QAction("About DoubleClick Fixer", menu)
+        menu = bar.addMenu(DISPLAY_NAME)
+        about = QAction(f"About {DISPLAY_NAME}", menu)
         about.setMenuRole(QAction.MenuRole.AboutRole)
         about.triggered.connect(self._about)
         updates = QAction("Check for Updates…", menu)
@@ -217,16 +339,30 @@ class Application:
         settings.setMenuRole(QAction.MenuRole.PreferencesRole)
         settings.setShortcut(QKeySequence.StandardKey.Preferences)
         settings.triggered.connect(lambda: (self.show_window(), self.window.show_page("general")))
-        quit_action = QAction("Quit DoubleClick Fixer", menu)
+        quit_action = QAction(f"Quit {DISPLAY_NAME}", menu)
         quit_action.setMenuRole(QAction.MenuRole.QuitRole)
         quit_action.triggered.connect(self.quit)
         menu.addActions([about, updates, settings, quit_action])
+        # The standard Window menu: Minimize (⌘M) and Zoom, as in every Mac app.
         window_menu = bar.addMenu("Window")
+        minimize = QAction("Minimize", window_menu)
+        minimize.setShortcut(QKeySequence("Ctrl+M"))  # Qt's Ctrl is ⌘ on macOS
+        minimize.triggered.connect(self.window.showMinimized)
+        zoom = QAction("Zoom", window_menu)
+        zoom.triggered.connect(self._zoom)
         close = QAction("Close", window_menu)
         close.setShortcut(QKeySequence.StandardKey.Close)
         close.triggered.connect(self.window.close)
+        window_menu.addActions([minimize, zoom])
+        window_menu.addSeparator()
         window_menu.addAction(close)
         return bar
+
+    def _zoom(self) -> None:
+        if self.window.isMaximized():
+            self.window.showNormal()
+        else:
+            self.window.showMaximized()
 
     def _on_theme_changed(self) -> None:
         self.window.apply_look()
@@ -238,11 +374,18 @@ class Application:
         self.window.show_page("general")
         self.updater.check(user_initiated=True)
 
+    def install_update(self) -> None:
+        """The menu's "Update to X": install with General on screen, where
+        the progress, and any failure, shows."""
+        self.show_window()
+        self.window.show_page("general")
+        self.updater.install()
+
     def _about(self) -> None:
         QMessageBox.about(
             self.window,
-            "About DoubleClick Fixer",
-            f"DoubleClick Fixer {__version__}",
+            f"About {DISPLAY_NAME}",
+            f"{DISPLAY_NAME} {__version__}",
         )
 
     # -- window ------------------------------------------------------------
@@ -264,13 +407,14 @@ class Application:
     def _note_hidden(self) -> None:
         # The window is closed; the app carries on from the menu bar alone.
         dock.set_visible(False)
-        # A one-time hint on Windows, where tray icons hide in the overflow.
-        # macOS apps don't announce this; the menu bar icon speaks for itself.
-        if self.tray is None or self._told_about_tray or platform.system() == "Darwin":
+        # A one-time hint on Windows, where tray icons hide in the overflow:
+        # once ever, not once per sign-in. macOS apps don't announce this;
+        # the menu bar icon speaks for itself.
+        if self.tray is None or self.controller.tray_hint_shown or platform.system() == "Darwin":
             return
-        self._told_about_tray = True
+        self.controller.note_tray_hint_shown()
         self.tray.showMessage(
-            "DoubleClick Fixer is still running",
+            f"{DISPLAY_NAME} is still running",
             "It keeps filtering from the notification area."
             if self.controller.active
             else "Bounce Filter is off. Turn it on from the icon in the notification area.",
@@ -311,8 +455,9 @@ class Application:
 
         if self.controller.settings["fix_enabled"] and self.controller.supported():
             # Restore the filter after the UI is up, so any failure has a
-            # window to be reported in.
-            QTimer.singleShot(0, lambda: self.window.request_filter(True, prompt=not minimized))
+            # window to be reported in, or, in the background, the menu's
+            # status line and a few more tries.
+            QTimer.singleShot(0, lambda: self.window.restore_filter(background=minimized))
         elif not self.controller.supported():
             QTimer.singleShot(0, self._warn_unsupported)
 
@@ -332,17 +477,30 @@ class Application:
         )
 
     def quit(self) -> None:
+        diagnostics.log.info("Quitting")
         if self.window.isVisible():
             self.window.save_geometry()
         self.controller.shutdown()
-        if self.tray is not None:
+        if self.tray is not None and platform.system() != "Darwin":
+            # Windows leaves a dead icon in the notification area otherwise.
+            # macOS removes the item with the app, and hiding it first would
+            # be remembered under its autosave name.
             self.tray.hide()
         self.qt.quit()
+
+
+#: How long Python lets one thread run before another waiting thread gets a
+#: turn. The mouse hook runs Python for every click and pointer move while
+#: the window may be busy in Python too; at the 5 ms default, each event could
+#: wait that long, felt as pointer lag (and on Windows, a slow hook gets
+#: removed). 1 ms keeps the wait short at a negligible cost.
+INTERPRETER_SWITCH_INTERVAL_S = 0.001
 
 
 def main(argv: Optional[list[str]] = None) -> int:
     arguments = list(sys.argv if argv is None else argv)
     minimized = "--minimized" in arguments
+    sys.setswitchinterval(INTERPRETER_SWITCH_INTERVAL_S)
 
     if "--quit" in arguments:
         # Never starts a copy: it only asks a running one to exit.
@@ -367,6 +525,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         lock.unlock()
         return 0
 
+    # Only the copy that runs logs: a second launch that hands over, or
+    # --quit, would otherwise write to the same file at the same time.
+    diagnostics.setup(__version__)
     application = Application(arguments)
     application.instance_lock = lock  # held for as long as the app runs
     return application.start(minimized)
