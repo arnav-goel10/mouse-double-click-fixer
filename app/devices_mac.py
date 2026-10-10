@@ -6,7 +6,11 @@ AppleMultitouchDevice of a trackpad (verified on a MacBook's own trackpad).
 The ID changes whenever the device reconnects, so it is only ever a cache
 key: IOKit turns it into the IOHIDDevice above it, whose VendorID,
 ProductID, Product, Transport and SerialNumber make the stable device key
-(see device_key) and whose usages say what kind of device it is.
+(see device_key) and whose usages say what kind of device it is: its primary
+usage first (a keyboard that also lists a pointer collection is a keyboard,
+not a mouse), the rest of its usages only when that says nothing, and a
+trackpad driver below it trumps both (the internal trackpad's primary usage is
+the mouse; see kind_from_usages).
 
 Field 7 (kCGMouseEventSubtype) says whether a click came from a tablet (1,
 2) or a touch surface (3): those are never filtered, whatever the device.
@@ -43,8 +47,30 @@ MAX_PARENT_STEPS = 8
 #: Senders remembered at most; a reconnect makes a new one each time.
 CACHE_LIMIT = 256
 
-#: HID usages (page, usage) and the kind of device they make, in the order
-#: they are looked for: a combined keyboard and trackpad is a trackpad.
+#: What a keyboard is called to the rest of the app. core.TOUCH_KINDS, the
+#: Devices page (panes.KIND_NAMES) and the Windows side know no "keyboard"
+#: kind, so a keyboard is "unknown" (a pointing device nothing is known of:
+#: filtered like a mouse, listed as one, never looked up ahead of time). Set
+#: this to "keyboard" once those know it; the tests follow.
+KEYBOARD_KIND = "unknown"
+
+#: A device's PRIMARY usage (page, usage), the first thing it says it is, and
+#: the kind that makes it. Looked at before anything else but a trackpad
+#: driver: a keyboard may list a pointer collection among its usages (the
+#: AULA F75's media and mouse-key interfaces) and is still a keyboard.
+KIND_BY_PRIMARY_USAGE = {
+    (0x0D, 0x05): "trackpad",
+    (0x0D, 0x04): "touchscreen",
+    (0x0D, 0x02): "pen",
+    (0x0D, 0x01): "pen",
+    (0x01, 0x02): "mouse",
+    (0x01, 0x01): "mouse",
+    (0x01, 0x06): KEYBOARD_KIND,
+}
+
+#: Every HID usage (page, usage) a device lists, and the kind of device they
+#: make, in the order they are looked for: the fallback for a device with no
+#: primary usage worth going by. A touch surface outranks a pointer.
 KIND_BY_USAGE = (
     ((0x0D, 0x05), "trackpad"),
     ((0x0D, 0x04), "touchscreen"),
@@ -53,6 +79,21 @@ KIND_BY_USAGE = (
     ((0x01, 0x02), "mouse"),
     ((0x01, 0x01), "mouse"),
 )
+
+#: A class in the registry with this in its name (the internal trackpad's
+#: AppleMultitouchTrackpadHIDEventDriver, a Bluetooth Magic Trackpad's
+#: BNBTrackpadDevice) makes the device above it a trackpad whatever its
+#: usages say: an Apple trackpad lists the mouse usage first, for apps that
+#: know no better. "Multitouch" alone is not enough: a Magic Mouse has a touch
+#: surface too, and its button is a switch that bounces.
+TRACKPAD_CLASS_WORD = "trackpad"
+
+#: Every kind this module can say. The rest of the app must know each one.
+KINDS = frozenset(KIND_BY_PRIMARY_USAGE.values()) | {kind for _usage, kind in KIND_BY_USAGE} | {"trackpad", "unknown"}
+
+#: The key `IOKitRegistry.properties` adds to a device's properties: the class
+#: of the device and of every service below it (not a registry property).
+CLASSES_KEY = "DriverClasses"
 
 #: IOKit's Transport values and the bus name a key starts with.
 BUS_BY_TRANSPORT = {"usb": "usb", "bluetooth": "bt", "bluetooth low energy": "bt", "bluetoothlowenergy": "bt"}
@@ -80,11 +121,29 @@ def device_key(transport: Optional[str], vendor: Any, product_id: Any, serial: O
     return f"{bus_name(transport)}:{_hex4(vendor)}:{_hex4(product_id)}:{ident}"
 
 
-def kind_from_usages(pairs: Iterable[tuple[int, int]], primary: Optional[tuple[int, int]] = None) -> str:
-    """The kind of device that reports these HID usages."""
+def kind_from_usages(
+    pairs: Iterable[tuple[int, int]],
+    primary: Optional[tuple[int, int]] = None,
+    classes: Iterable[str] = (),
+) -> str:
+    """The kind of device that reports these HID usages.
+
+    A trackpad driver below it (`classes`, see TRACKPAD_CLASS_WORD) makes it
+    a trackpad. Otherwise its primary usage decides (KIND_BY_PRIMARY_USAGE),
+    whatever else it lists in `pairs`, with one exception: a primary "mouse"
+    that also lists a touchpad collection is a trackpad, since that is how
+    Apple's say it. With no primary usage that means anything here, the first
+    of KIND_BY_USAGE among `pairs` decides, and "unknown" if there is none.
+    """
     found = {(int(page), int(usage)) for page, usage in pairs}
+    if any(TRACKPAD_CLASS_WORD in str(name).lower() for name in classes):
+        return "trackpad"
     if primary is not None:
-        found.add((int(primary[0]), int(primary[1])))
+        kind = KIND_BY_PRIMARY_USAGE.get((int(primary[0]), int(primary[1])))
+        if kind == "mouse" and (0x0D, 0x05) in found:
+            return "trackpad"
+        if kind is not None:
+            return kind
     for usage, kind in KIND_BY_USAGE:
         if usage in found:
             return kind
@@ -94,7 +153,7 @@ def kind_from_usages(pairs: Iterable[tuple[int, int]], primary: Optional[tuple[i
 def describe(properties: dict) -> Optional[MacDevice]:
     """A MacDevice from an IOHIDDevice's properties (VendorID, ProductID,
     Product, Transport, SerialNumber, DeviceUsagePairs, PrimaryUsagePage,
-    PrimaryUsage), as Python values."""
+    PrimaryUsage, and CLASSES_KEY), as Python values."""
     pairs = []
     for pair in properties.get("DeviceUsagePairs") or ():
         try:
@@ -107,11 +166,14 @@ def describe(properties: dict) -> Optional[MacDevice]:
             primary = (int(properties["PrimaryUsagePage"]), int(properties["PrimaryUsage"]))
         except (TypeError, ValueError):
             primary = None
+    classes = properties.get(CLASSES_KEY) or ()
+    if isinstance(classes, str):
+        classes = (classes,)
     product = _text(properties.get("Product"))
     serial = _text(properties.get("SerialNumber"))
     transport = _text(properties.get("Transport"))
     key = device_key(transport, properties.get("VendorID"), properties.get("ProductID"), serial, product)
-    return MacDevice(key, product or "Unknown device", kind_from_usages(pairs, primary))
+    return MacDevice(key, product or "Unknown device", kind_from_usages(pairs, primary, classes))
 
 
 def _hex4(value: Any) -> str:
@@ -166,6 +228,8 @@ class IOKitRegistry:
         iokit.IORegistryEntryCreateCFProperty.restype = c_void_p
         iokit.IOObjectRelease.argtypes = [c_uint32]
         iokit.IOObjectRelease.restype = c_int
+        iokit.IOObjectGetClass.argtypes = [c_uint32, c_char_p]  # an io_name_t: 128 bytes
+        iokit.IOObjectGetClass.restype = c_int
         cf.CFStringCreateWithCString.argtypes = [c_void_p, c_char_p, c_uint32]
         cf.CFStringCreateWithCString.restype = c_void_p
         cf.CFRelease.argtypes = [c_void_p]
@@ -208,7 +272,23 @@ class IOKitRegistry:
                 found[name] = _python_value(self._objc.objc_object(c_void_p=ref))
             finally:
                 self._cf.CFRelease(ref)
+        found[CLASSES_KEY] = self.class_names(entry)
         return found
+
+    def class_names(self, entry: int) -> list[str]:
+        """The class of `entry` and of every service below it, such as
+        "AppleMultitouchTrackpadHIDEventDriver" below a trackpad."""
+        names = [self._class_of(entry)]
+        for child in self._below(entry):
+            names.append(self._class_of(child))
+            self._iokit.IOObjectRelease(child)
+        return [name for name in names if name]
+
+    def _class_of(self, entry: int) -> str:
+        buffer = ctypes.create_string_buffer(128)
+        if self._iokit.IOObjectGetClass(entry, buffer) != 0:
+            return ""
+        return buffer.value.decode("utf-8", "replace")
 
     def release(self, entry: int) -> None:
         if entry:
@@ -225,17 +305,21 @@ class IOKitRegistry:
 
     def descendant_ids(self, entry: int) -> list[int]:
         """The registry IDs of every service below `entry`."""
-        iterator = self._c_uint32()
-        recursive = 0x1  # kIORegistryIterateRecursively
-        if self._iokit.IORegistryEntryCreateIterator(entry, b"IOService", recursive, ctypes.byref(iterator)) != 0:
-            return []
         ids = []
-        for child in self._drain(iterator.value):
+        for child in self._below(entry):
             number = self._c_uint64()
             if self._iokit.IORegistryEntryGetRegistryEntryID(child, ctypes.byref(number)) == 0:
                 ids.append(int(number.value))
             self._iokit.IOObjectRelease(child)
         return ids
+
+    def _below(self, entry: int) -> list[int]:
+        """Every service below `entry` (each to release)."""
+        iterator = self._c_uint32()
+        recursive = 0x1  # kIORegistryIterateRecursively
+        if self._iokit.IORegistryEntryCreateIterator(entry, b"IOService", recursive, ctypes.byref(iterator)) != 0:
+            return []
+        return self._drain(iterator.value)
 
     def _drain(self, iterator: int) -> list[int]:
         entries = []
