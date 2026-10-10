@@ -294,6 +294,29 @@ def sample_state(controller) -> None:
     wear._clock = clock
 
 
+def trim_to_viewport(app, main_window, pad: int = 14) -> None:
+    """Hide what the window shows only part of, so the pane ends below the
+    last section or note that fits, never through a row or under a heading.
+    Measured on the window as laid out (a real window resizes later than
+    an offscreen one, so fit_pane's arithmetic can't be trusted there)."""
+    from PySide6.QtCore import QPoint
+
+    area = main_window.stack.currentWidget()
+    page, viewport = area.widget(), area.viewport()
+    items = [page.body.itemAt(index).widget() for index in range(page.body.count())]
+    items = [item for item in items if item is not None and item.isVisible()]
+    for position, item in enumerate(items):
+        if item.mapTo(viewport, QPoint(0, item.height())).y() + pad <= viewport.height():
+            continue
+        cut = position
+        while cut > 0 and getattr(items[cut - 1], "role", "") == "headline":
+            cut -= 1  # a heading goes with what it heads
+        for hidden in items[cut:]:
+            hidden.hide()
+        break
+    app.processEvents()
+
+
 def capture_docs(app, main_window, target: Path, size: tuple[int, int] | None) -> None:
     """The Filter pane into `target`: whole if the window can show it whole."""
     from PySide6.QtCore import Qt
@@ -328,19 +351,18 @@ def capture_docs(app, main_window, target: Path, size: tuple[int, int] | None) -
     # A Mac window draws its title bar inside itself; Windows adds one.
     title_bar = 0 if sys.platform == "darwin" else WINDOWS_TITLE_BAR
     room = available.height() - title_bar - 8
-    height = min(size[1] - title_bar, room) if size else room
-    wanted, last = fit_pane(app, main_window, height)
-    # As offscreen: end below the last section that fits, never through a row.
-    page = main_window.stack.currentWidget().widget()
-    for index in range(page.body.count() if last is not None else 0):
-        if index > last and page.body.itemAt(index).widget() is not None:
-            page.body.itemAt(index).widget().hide()
-    height = height if size else min(wanted, room)
-    print(f"The pane shows {wanted} px of the {room} the screen leaves; the window is {height} tall")
+    if size:
+        height = min(size[1] - title_bar, room)
+    else:
+        wanted = fit_pane(app, main_window, room)[0]
+        height = min(wanted, room)
+        print(f"The pane shows {wanted} px of the {room} the screen leaves")
     main_window.resize(size[0] if size else DOCS_WIDTH, height)
     main_window.move(available.x(), available.y())
     app.processEvents()
     wait(app, 800)
+    trim_to_viewport(app, main_window)
+    wait(app, 300)
     frame = main_window.frameGeometry()
     print(f"Window frame {frame.width()} x {frame.height()}: {grab_window_live(app, main_window, target)}")
 
