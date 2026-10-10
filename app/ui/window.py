@@ -16,7 +16,6 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
-    QSpinBox,
     QStackedWidget,
     QSystemTrayIcon,
     QVBoxLayout,
@@ -113,18 +112,75 @@ WINDOW_NOTE = (
 WHEEL_DETAIL = "Drops a notch that jumps the wrong way. Smooth scrolling from trackpads and precision touchpads is left alone."
 
 
-def window_box(low: int, high: int, accessible_name: str) -> QSpinBox:
-    """A number of milliseconds, as a native spin box."""
-    box = QSpinBox()
-    box.setRange(low, high)
-    box.setSuffix(" ms")
-    # Typing "120" would otherwise apply 1, 12 and 120 in turn.
-    box.setKeyboardTracking(False)
-    box.setAccessibleName(accessible_name)
-    box.setMinimumWidth(78)
-    # The Filter pane scrolls, and these boxes sit where the pointer passes.
-    wheel_needs_focus(box)
-    return box
+#: The windows a button's pop-up offers, in milliseconds: the default (46)
+#: and enough steps across the allowed range to choose by. A window outside
+#: these (from calibration, or an older version's spin box) is listed too.
+BUTTON_WINDOWS = (10, 15, 20, 25, 30, 35, 40, 46, 50, 55, 60, 70, 80, 90, 100, 120, 150, 200)
+#: The same for the wheel's reversal window.
+WHEEL_WINDOWS = (10, 20, 30, 40, 50, 60, 70, 80, 100, 120, 150)
+
+
+class WindowPicker(QComboBox):
+    """A window in milliseconds, chosen from a pop-up of values: a native
+    pop-up button on macOS (as System Settings uses for a choice like this)
+    and a ComboBox on Windows 11. `valueChanged` carries every change, the
+    user's and the code's, as a spin box's did."""
+
+    valueChanged = Signal(int)
+
+    def __init__(self, presets: tuple[int, ...], low: int, high: int, accessible_name: str) -> None:
+        super().__init__()
+        self._low, self._high = low, high
+        self._presets = tuple(value for value in presets if low <= value <= high)
+        self._value = self._presets[0]
+        self.setAccessibleName(accessible_name)
+        self.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self._fill(self._presets)
+        self.currentIndexChanged.connect(self._follow)
+        # The Filter pane scrolls, and these sit where the pointer passes.
+        wheel_needs_focus(self)
+
+    def _fill(self, values) -> None:
+        self.blockSignals(True)
+        try:
+            current = self._value
+            self.clear()
+            for value in values:
+                self.addItem(f"{value} ms", value)
+            self.setCurrentIndex(max(0, self.findData(current)))
+        finally:
+            self.blockSignals(False)
+
+    def values(self) -> list[int]:
+        return [int(self.itemData(index)) for index in range(self.count())]
+
+    def value(self) -> int:
+        return self._value
+
+    def setValue(self, value: int) -> None:  # noqa: N802 - Qt naming, as QSpinBox
+        """Show `value`, listing it in order among the presets if it isn't
+        one: a calibrated 59 ms reads "59 ms", not the nearest preset."""
+        value = max(self._low, min(self._high, int(value)))
+        if self.findData(value) < 0:
+            self._fill(sorted({*self._presets, value}))
+        self.blockSignals(True)
+        try:
+            self.setCurrentIndex(self.findData(value))
+        finally:
+            self.blockSignals(False)
+        self._follow()
+
+    def _follow(self, _index: int = -1) -> None:
+        data = self.currentData()
+        if data is None or int(data) == self._value:
+            return
+        self._value = int(data)
+        self.valueChanged.emit(self._value)
+
+
+def window_box(low: int, high: int, accessible_name: str, presets: tuple[int, ...] = BUTTON_WINDOWS) -> WindowPicker:
+    """A number of milliseconds, as a native pop-up of values."""
+    return WindowPicker(presets, low, high, accessible_name)
 
 
 class FilterPage(Page):
@@ -160,7 +216,7 @@ class FilterPage(Page):
         self.header("Buttons")
         buttons = self.section()
         self.button_switches: dict[Button, Switch] = {}
-        self.window_boxes: dict[Button, QSpinBox] = {}
+        self.window_boxes: dict[Button, WindowPicker] = {}
         self.button_rows: dict[Button, Row] = {}
         for button in Button:
             name = button_name(button)
@@ -182,7 +238,7 @@ class FilterPage(Page):
         self.header("Scroll wheel")
         wheel = self.section()
         self.wheel_box = window_box(
-            settings_store.WHEEL_MIN_MS, settings_store.WHEEL_MAX_MS, "Wheel reversal window in milliseconds"
+            settings_store.WHEEL_MIN_MS, settings_store.WHEEL_MAX_MS, "Wheel reversal window in milliseconds", WHEEL_WINDOWS
         )
         self.wheel_box.valueChanged.connect(self._on_wheel_window)
         self.wheel_switch = Switch(accessible_name="Fix scroll-wheel reversals")
@@ -900,6 +956,12 @@ class GeneralPage(Page):
 
 # -- window ----------------------------------------------------------------------
 
+def transparent(widget: QWidget) -> None:
+    """Let what is behind `widget` show through: no fill of its own. (Not a
+    transparent palette either: a palette passes down to every control.)"""
+    widget.setAutoFillBackground(False)
+
+
 class MainWindow(QWidget):
     """Sidebar navigation over the panes (PAGES)."""
 
@@ -975,16 +1037,15 @@ class MainWindow(QWidget):
             area.setFocusPolicy(Qt.FocusPolicy.NoFocus)
             area.setFrameShape(QFrame.Shape.NoFrame)
             area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-            # The pane colour is painted once by the window; the scroll area,
-            # its viewport and the page must not paint over it. The rules use
-            # object names so they never reach native controls further down.
-            area.setObjectName("paneArea")
-            area.viewport().setObjectName("paneViewport")
-            page.setObjectName("pane")
-            area.setStyleSheet(
-                "#paneArea, #paneViewport, #pane { background: transparent; border: none; }"
-            )
             area.setWidget(page)
+            # The pane colour is painted once by the window; the scroll area,
+            # its viewport and the page must not paint over it. Never with a
+            # style sheet: one on any ancestor sends every control below it
+            # through Qt's style-sheet style, which on macOS draws pop-up
+            # buttons, spin boxes and menu buttons as boxes of its own.
+            transparent(area)
+            transparent(area.viewport())
+            transparent(page)  # setWidget turned its fill on
             self.stack.addWidget(area)
         content_layout.addWidget(self.stack, 1)
         root.addWidget(content, 1)

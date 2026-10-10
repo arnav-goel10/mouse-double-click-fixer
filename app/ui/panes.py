@@ -7,7 +7,7 @@ import platform
 import time
 from typing import Optional
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QPoint, QTimer
 from PySide6.QtWidgets import QComboBox, QFileDialog, QHBoxLayout, QMenu, QVBoxLayout, QWidget
 
 from .. import app_keys
@@ -199,11 +199,15 @@ class AppsPage(Page):
         actions = QHBoxLayout()
         actions.setContentsMargins(0, 14, 0, 0)
         actions.addStretch(1)
+        # A push button like every other in the app, which opens its menu:
+        # QPushButton.setMenu would draw a pull-down button instead, with a
+        # chevron no other button here has.
         self.add_button = make_button("Add App…")
         self.add_button.setAccessibleName("Add an app")
+        self.add_button.setAccessibleDescription("Opens a menu of running apps and more")
         self.add_menu = QMenu(self.add_button)
         self.add_menu.aboutToShow.connect(self._fill_menu)
-        self.add_button.setMenu(self.add_menu)
+        self.add_button.clicked.connect(self.show_add_menu)
         actions.addWidget(self.add_button)
         self.body.addLayout(actions)
         self.body.addStretch(1)
@@ -225,6 +229,10 @@ class AppsPage(Page):
             detail = entry["key"] if entry["key"] != entry["name"] else ""
             self.list_section.add(Row(entry["name"], detail, remove, card_icon("apps")))
             self.remove_buttons[entry["key"]] = remove
+
+    def show_add_menu(self) -> None:
+        """The menu, under the button and lined up with its leading edge."""
+        self.add_menu.popup(self.add_button.mapToGlobal(QPoint(0, self.add_button.height() + 2)))
 
     def _fill_menu(self) -> None:
         """Running apps first, then the file dialog, built as the menu opens."""
