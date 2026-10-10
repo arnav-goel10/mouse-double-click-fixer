@@ -504,10 +504,31 @@ def capture_popup(app, main_window, open_popup, target: Path) -> None:
     wait(app, 7500)
 
 
+def whole_pane(main_window):
+    """The current pane top to bottom, however much of it the window shows,
+    drawn by Qt with the platform's style on the pane's colour. (A window
+    can't be made taller than the screen, and the window's own grab leaves
+    out the materials, which only the window server draws.)"""
+    from PySide6.QtCore import QPoint
+    from PySide6.QtGui import QImage, QPainter
+
+    from app.ui.widgets import look
+
+    page = main_window.stack.currentWidget().widget()
+    ratio = main_window.devicePixelRatioF()
+    image = QImage(round(page.width() * ratio), round(page.height() * ratio), QImage.Format.Format_ARGB32)
+    image.setDevicePixelRatio(ratio)
+    image.fill(look().pane)
+    painter = QPainter(image)
+    page.render(painter, QPoint(0, 0))
+    painter.end()
+    return image
+
+
 def capture_live(app, main_window, out: Path, scheme: str) -> None:
     """Every pane in a real window, as the screen shows it (`NN-pane-scheme.png`)
-    and whole, however long, as Qt draws it with the platform's own style
-    (`-full.png`); then the pop-ups and menus, and the narrowest window."""
+    and whole, however long (`-full.png`); then the pop-ups and menus, and
+    the narrowest window."""
     from PySide6.QtCore import QPoint
 
     from app.ui import window as window_module
@@ -520,19 +541,12 @@ def capture_live(app, main_window, out: Path, scheme: str) -> None:
     main_window.resize(780, min(660, available.height() - 60))
     main_window.move(available.topLeft() + QPoint(20, 20))
     wait(app, 800)
-    size = main_window.size()
 
     def shoot(name: str) -> None:
         settle(app, main_window)
         wait(app, 500)
         how = grab_window_live(app, main_window, out / f"{name}-{scheme}.png")
-        # The whole pane, as Qt draws the window: tall enough for all of it.
-        page = main_window.stack.currentWidget().widget()
-        main_window.resize(size.width(), max(size.height(), page.sizeHint().height() + main_window.title_bar_height + 40))
-        settle(app, main_window)
-        main_window.grab().save(str(out / f"{name}-{scheme}-full.png"))
-        main_window.resize(size)
-        settle(app, main_window)
+        whole_pane(main_window).save(str(out / f"{name}-{scheme}-full.png"))
         print(f"{name}-{scheme}: {how}")
 
     for index, (key, _title) in enumerate(window_module.PAGES):
