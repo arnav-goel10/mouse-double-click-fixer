@@ -11,10 +11,10 @@ from PySide6.QtCore import QPoint, QTimer
 from PySide6.QtWidgets import QComboBox, QFileDialog, QHBoxLayout, QMenu, QVBoxLayout, QWidget
 
 from .. import app_keys
-from . import popup_mac
 from ..core import Button
 from ..inputs import TOUCH_KINDS, as_button, button_name
 from ..wear import SHOWN_DAYS
+from . import popup_mac
 from .base import Page, card_icon, label, make_button
 from .charts import DailyRateChart, GapHistogram
 from .theme import IS_MAC
