@@ -98,11 +98,21 @@ password (see [Keys and certificates](#keys-and-certificates)).
    ```
 
    Both run every check. Only the second signs, uploads
-   `SHA256SUMS.txt.minisig` and publishes. Installed copies pick the release
-   up at their next check, within six hours.
+   `SHA256SUMS.txt.minisig` and publishes. A copy with **Check for updates
+   automatically** on checks 20 seconds after it starts and then every six
+   hours, so a running copy picks the release up within six hours of
+   publishing. A copy with that switch off checks only when its owner asks.
 
 Then submit the new version to winget: `python3 tools/winget_manifest.py
 1.2.3` writes its manifests (see [Distribution](DISTRIBUTION.md#2-winget)).
+
+A pre-release is for testing. Tag it with a suffix (`v1.1.0-rc.1`) and follow
+the same steps, with two differences. `__version__` in `app/__init__.py` stays
+the base version, `1.1.0`: the version check compares the tag without its
+suffix with it. And `CHANGELOG.md` needs a `## 1.1.0` heading, which needs no
+date until the full release; the release page shows that section. `publish`
+checks it the same way and publishes it without signing it and without making
+it the latest release, so installed copies never offer it.
 
 Publishing a release (not a pre-release) starts the Release pages workflow
 (`.github/workflows/release-pages.yml`), which puts a line at the top of every
@@ -132,8 +142,13 @@ when every one of its jobs passes:
 - **Windows install and upgrade, with the release's own installer** installs
   0.2.6 and 0.5.3, installs the new installer over each while it runs,
   checks that quitting works and an unsigned update is refused, and
-  uninstalls. The leg that installs a signed update needs a build that
-  trusts CI's key, so it runs in `ci.yml` only.
+  uninstalls. The installed app's self-test must report its TLS going through
+  Schannel and a supported OpenSSL, and its folder must hold no Qt OpenSSL
+  plugin, no OpenSSL library files and no copy of the Universal C Runtime. The
+  old installers come from a cache keyed by `tools/old_installers.json`, each
+  checked against its SHA-256, so a run doesn't add to the Releases' download
+  numbers. The leg that installs a signed update needs a build that trusts
+  CI's key, so it runs in `ci.yml` only.
 - **macOS build**, on a macOS 26 runner, loads the signing certificate from
   the `release` environment and refuses to build without it. The build
   script checks the signed app (see
@@ -171,6 +186,13 @@ uploads `SHA256SUMS.txt.minisig` and checks the upload, checks that nothing
 on the draft changed meanwhile, and publishes the draft as the latest
 release. `--dry-run` does every check and signs, uploads and publishes
 nothing.
+
+If a run of `publish` stopped after it uploaded the signature, running it
+again keeps that signature. When the draft already carries one that verifies
+for this version and requirement, `publish` checks it and publishes; it signs
+and uploads only when the draft has none. A signature that doesn't verify, or
+names another requirement, stops it: delete it from the draft and run `publish`
+again.
 
 **Pre-releases are never signed.** `publish` checks a pre-release the same
 way, then publishes it without a signature and without making it the latest
@@ -247,6 +269,14 @@ and on macOS Qt's TLS runs it too, for every update check and download.
 CPython 3.14.6 and later ship OpenSSL 3.5, a long-term support release
 supported until 2030-04-08; python.org's 3.13 still ships OpenSSL 3.0, which
 reached end of life on 2026-09-07.
+
+Every build also checks where each binary it collects comes from
+(`tools/binary_sources.py`, run by `doubleclick-fixer.spec`): each library,
+Python extension and DLL must come from Python itself or from the packages
+installed in the environment that builds, or the build fails and names the
+file. A runner's PATH can lead to anything. GitHub's Windows runners put a
+MySQL OpenSSL and a JDK's copy of the Universal C Runtime there, and both were
+once collected.
 
 The self-test's `openssl` check fails a build if the OpenSSL that Python or
 Qt runs, or any OpenSSL library file inside the app, is older than

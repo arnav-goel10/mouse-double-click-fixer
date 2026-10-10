@@ -16,9 +16,10 @@ body:
       description: >-
         In the app, open General and choose Copy Diagnostics (Windows: Copy
         diagnostics) under Troubleshooting, then paste it here. It has the
-        app version, your OS, the filter's state, your settings and the app's
-        recent log, never your clicks. If the app won't open, give the app
-        version and OS version instead.
+        app version, your OS, the filter's state, your settings, the names of
+        the pointing devices the app has seen and the app's recent log, never
+        your clicks. Remove anything you would rather not share. If the app
+        won't open, give the app version and OS version instead.
       render: text
     validations:
       required: true
@@ -40,8 +41,8 @@ body:
   - type: input
     id: mouse
     attributes:
-      label: Mouse model and filter window
-      placeholder: "Logitech G502, 45 ms"
+      label: Mouse model, button and filter window
+      placeholder: "Logitech G502, left button, 46 ms"
   - type: textarea
     id: logs
     attributes:

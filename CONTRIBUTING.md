@@ -73,20 +73,23 @@ Some tests touch the system on purpose, and only in CI:
   the app for real. CI runs it; never run it on a PC whose copy of
   Mouse Double-Click Fixer you care about.
 
-On a Mac where the Python running the tests is allowed to filter input, two
-unit tests start the real event tap and stop it again. While the first one
-runs, for a moment, it filters left clicks with a 60 ms window, as the app
-would; the second filters no button and only watches. Neither posts any
-input of its own.
+On any Mac where the Python running the tests is allowed to filter input, not
+only in CI, two unit tests start the real event tap and stop it again. While
+the first one runs, for a moment, it filters left clicks with a 60 ms window,
+as the app would; the second filters no button and only watches. Neither posts
+any input of its own. Where the permission isn't there, they skip.
 
 ## How the code is laid out
 
 | Path | Role |
 | --- | --- |
-| `app/core.py` | Click classification and calibration. Platform-neutral and fully unit-tested. |
+| `app/core.py` | Click classification, the scroll-wheel rule and calibration. Platform-neutral and fully unit-tested. |
 | `app/platform.py` | The system-wide hooks (Windows and macOS). Keep the hook callback fast: no disk or UI work. |
+| `app/devices_mac.py`, `app/devices_win.py` | Which device a click came from: IOKit on macOS, Raw Input on Windows. |
+| `app/frontmost.py`, `app/app_keys.py` | Which app is in front, and how the Apps list names an app. |
 | `app/controller.py` | App state; the UI talks to this, never to the hook directly. |
-| `app/ui/` | The window, menu bar and tray, and platform styling. |
+| `app/wear.py` | The History's daily counts, and `wear.json`. |
+| `app/ui/` | The window and its panes, menu bar and tray, and platform styling. |
 | `app/updater.py`, `app/update_signature.py` | Updates from GitHub Releases, and the minisign check every update must pass. |
 | `app/permissions.py`, `app/startup.py`, `app/settings.py` | The macOS permission, open at login, and the settings file. |
 | `app/diagnostics.py` | The log, crash.log and the Copy Diagnostics report. |
@@ -96,7 +99,9 @@ input of its own.
 
 Filtering is defined by the gap between a release and the next press; please
 don't reintroduce press-to-press timing, which cannot tell bounce from a fast
-double-click.
+double-click. Every button has its own window, and the filter takes its
+settings as one `FilterConfig` (`app/platform.py`). The back and forward
+buttons use the drop rule only and never hold a release back.
 
 The hook threads never wait on the disk or the UI: log through `logging`
 (the app writes the log from a queue), and never log per click. On Windows,

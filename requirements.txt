@@ -1,5 +1,7 @@
-# Pinned, so every release is built from the same Qt and PyObjC; Dependabot
-# proposes upgrades. Check the macOS minimum when Qt changes: it sets
+# Pinned, so every release is built from the same Qt and PyObjC. Update the
+# pins by hand, then regenerate requirements-build.txt (see
+# requirements-build.in): Dependabot proposes updates to the workflows' actions
+# only. Check the macOS minimum when Qt changes: it sets
 # LSMinimumSystemVersion in doubleclick-fixer.spec (Qt 6.11 needs macOS 13).
 # Qt user interface, tray icon and native event access.
 PySide6-Essentials==6.11.2

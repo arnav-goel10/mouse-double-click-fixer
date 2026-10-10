@@ -8,10 +8,18 @@
   bundle id `com.doubleclickfixer.app`, the `DoubleClickFixer` executable,
   the settings folders, the login item, the release file names and the
   repository's `doubleclick-fixer.spec`.
-- Keep click classification and calibration platform-neutral in `app/core.py`.
+- Keep click classification, the scroll-wheel rule and calibration
+  platform-neutral in `app/core.py`.
 - Keep OS-specific capture in `app/platform.py`, startup integration in
-  `app/startup.py`, and permission checks in `app/permissions.py`. The UI must
-  not call the platform layer directly; it goes through `app/controller.py`.
+  `app/startup.py`, and permission checks in `app/permissions.py`. Which device
+  a click came from is `app/devices_mac.py` and `app/devices_win.py`, and which
+  app is in front is `app/frontmost.py`. The UI must not call the platform
+  layer directly; it goes through `app/controller.py`.
+- The filter takes one `FilterConfig` (a window for every button, the filtered
+  buttons, the wheel fix, the excluded apps and the ignored devices). Back and
+  forward use the drop rule only and never hold a release back. Clicks from
+  trackpads, touchscreens and pens, from an ignored device, or while an
+  excluded app is in front pass untouched.
 - The hook callback runs on a hook thread and must stay fast: no disk writes,
   no UI calls. Windows silently drops a low-level hook that takes too long, and
   macOS disables a slow tap. Log through `logging` (written from a queue),
@@ -21,6 +29,11 @@
   double-click.
 - Updates must stay signature-checked (`app/update_signature.py`); never add a
   path that installs an update without the minisign check.
+- Text people read (README, release notes, the app's own strings) says what the
+  app costs: releases of the left, right and middle buttons are held for the
+  filter window, and the app re-sends some input. Don't write that it adds no
+  delay, that it is safe with anti-cheat, or that the apps are code-signed:
+  only the updates are signed.
 - Use the standard library for tests unless a dependency is essential. UI tests
   run with `QT_QPA_PLATFORM=offscreen`. Every test module imports
   `tests/_isolation.py` first, so no test touches the user's settings, login

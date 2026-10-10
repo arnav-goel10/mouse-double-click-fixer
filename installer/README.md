@@ -64,7 +64,7 @@ folder, can't be asked, and is ended with `taskkill`.
 ## Uninstalling
 
 The Windows uninstaller closes a running copy, then removes the app, its
-shortcuts, the startup entry, its settings and its log. On macOS,
+shortcuts, the startup entry, its settings, history and log. On macOS,
 `bash installer/uninstall_macos.sh` quits the app and waits until it has
 exited (it stops with a message if the app won't quit), then removes it, its
-login item, settings and permission.
+login item, settings, history and permission.
