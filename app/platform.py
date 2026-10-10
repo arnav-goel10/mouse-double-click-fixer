@@ -143,6 +143,11 @@ IN_FLIGHT_MAX_TIMEOUT_S = 0.5
 #: How long stop() waits for a thread that is sending to finish, so that
 #: nothing it let go is still to go out when it returns.
 STOP_SEND_WAIT_S = 1.0
+#: Turning the wheel fix on or off replaces the macOS tap (see _run_macos).
+#: The old tap stays in the event stream, behind the new one, until the new
+#: one has seen an event and everything this app re-sent meanwhile has come
+#: back, or for at most this long.
+TAP_SWAP_WAIT_S = IN_FLIGHT_MAX_TIMEOUT_S
 #: The check that gives up on such an event runs this long after it is due,
 #: so that it finds it overdue.
 IN_FLIGHT_CHECK_SLACK_S = 0.005
@@ -1783,7 +1788,7 @@ class GlobalClickFilter:
                 _log_ignored("the permission check")
                 return True
 
-        def rearm_main() -> None:
+        def rearm_main(tap: object) -> None:
             # macOS disables a tap that takes too long, on some user input, or
             # once the app has lost its permission. Re-arm it instead of dying
             # silently, unless the permission is gone (a filtering tap left on
@@ -1795,13 +1800,19 @@ class GlobalClickFilter:
                 end_hook(KEPT_DISABLED)
                 return
             self.tap_resets += 1
-            Quartz.CGEventTapEnable(current["tap"], True)
+            Quartz.CGEventTapEnable(tap, True)
             # Whatever this app posted while the tap was off went past it and
             # never comes back: stop waiting for it, and send what waits
             # behind it, now that the tap sees it come back.
             self._give_up_all()
 
-        def make_callback(generation: int) -> Callable:
+        # Which tap decides: its generation. A tap replacing another takes
+        # over on the first event it sees (see replace_tap).
+        deciding = [0]
+
+        def make_callback(entry: dict) -> Callable:
+            generation = entry["generation"]
+
             def callback(proxy: object, event_type: int, event: object, refcon: object) -> object:
                 # An exception here would make PyObjC return nothing, which
                 # drops the event. Whatever goes wrong, the event goes through
@@ -1809,14 +1820,18 @@ class GlobalClickFilter:
                 timings = self._callback_timings
                 started = perf_counter() if timings is not None else 0.0
                 try:
-                    if generation != current["generation"]:
-                        return event  # a tap being replaced: the new one decides
+                    if generation != deciding[0]:
+                        if generation < deciding[0]:
+                            return passed_by(event_type, event)
+                        # A new tap, ahead of the one it replaces, has come
+                        # into the event stream: from this event on it decides.
+                        deciding[0] = generation
                     # The hot path: every pointer move comes here. While
                     # nothing is pending it goes straight back after this one
                     # check.
                     if event_type in MOTION and not self._motion_wanted:
                         return event
-                    return decide(event_type, event)
+                    return decide(event_type, event, entry["tap"])
                 except Exception:  # noqa: BLE001
                     _log_ignored("the event tap")
                     return event
@@ -1826,23 +1841,46 @@ class GlobalClickFilter:
 
             return callback
 
-        def decide(event_type: int, event: object) -> object:
+        def passed_by(event_type: int, event: object) -> object:
+            # A tap being replaced, behind the one that has taken over: what
+            # reaches it has passed that one, which decided it, so it goes on
+            # untouched. This app's re-sent events are noted coming back, as
+            # the deciding tap notes them, so that nothing waits for one that
+            # only this tap saw.
             if event_type in DISABLED:
-                rearm_main()
+                return event
+            mark = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventSourceUserData)
+            kind = mark_kind(mark)
+            if kind == INJECTED_MARK:
+                pair = button_of(event_type, event)
+                if pair is not None:
+                    self._injected_passed(pair[0], mark_seq(mark))
+            elif kind in INJECTED_MOTION_MARKS:
+                self._injected_passed(INJECTED_MOTION_MARKS[kind], mark_seq(mark))
+            return event
+
+        def button_of(event_type: int, event: object) -> Optional[tuple[Button, bool]]:
+            """(button, pressed) of a button event, or None: not a button
+            event, or a fifth or later button (never filtered)."""
+            entry = BUTTONS.get(event_type)
+            if entry is None or event_type not in OTHER:
+                return entry
+            button = OTHER_BUTTONS.get(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGMouseEventButtonNumber))
+            return None if button is None else (button, entry[1])
+
+        def decide(event_type: int, event: object, tap: object) -> object:
+            if event_type in DISABLED:
+                rearm_main(tap)
                 return event
             if event_type in MOTION:
                 return decide_motion(event)
             if event_type == SCROLL:
                 return decide_scroll(event)
 
-            entry = BUTTONS.get(event_type)
+            entry = button_of(event_type, event)
             if entry is None:
                 return event
             button, pressed = entry
-            if event_type in OTHER:
-                button = OTHER_BUTTONS.get(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGMouseEventButtonNumber))
-                if button is None:
-                    return event  # a fifth or later button: not filtered
             mark = Quartz.CGEventGetIntegerValueField(event, Quartz.kCGEventSourceUserData)
             if mark_kind(mark) == INJECTED_MARK:
                 self._injected_passed(button, mark_seq(mark))
@@ -1960,15 +1998,14 @@ class GlobalClickFilter:
                 mask |= Quartz.CGEventMaskBit(event_type)
             return mask
 
-        # The tap in use: its generation (a replaced tap's callback lets
-        # everything through), port, run loop source, and whether its mask
-        # has the scroll wheel.
+        # The newest tap: its generation (see `deciding`), port, run loop
+        # source, and whether its mask has the scroll wheel.
         current: dict = {"generation": 0, "tap": None, "source": None, "wheel": False, "callback": None}
 
         def open_tap(wheel: bool) -> Optional[dict]:
-            generation = current["generation"] + 1
+            entry = {"generation": current["generation"] + 1, "wheel": wheel}
             # Kept with the tap, so the callback lives as long as it does.
-            callback = make_callback(generation)
+            entry["callback"] = callback = make_callback(entry)
             tap = Quartz.CGEventTapCreate(
                 Quartz.kCGHIDEventTap,
                 Quartz.kCGHeadInsertEventTap,
@@ -1979,8 +2016,9 @@ class GlobalClickFilter:
             )
             if tap is None:
                 return None
-            source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
-            return {"generation": generation, "tap": tap, "source": source, "wheel": wheel, "callback": callback}
+            entry["tap"] = tap
+            entry["source"] = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
+            return entry
 
         def close_tap(entry: dict, remove: bool = True) -> None:
             # Out of the event stream: from here on clicks pass untouched.
@@ -2002,6 +2040,7 @@ class GlobalClickFilter:
             self._ready.set()
             return
         current.update(first)
+        deciding[0] = first["generation"]
         self._tap = current["tap"]
         self._run_loop = Quartz.CFRunLoopGetCurrent()
         Quartz.CFRunLoopAddSource(self._run_loop, current["source"], Quartz.kCFRunLoopCommonModes)
@@ -2012,14 +2051,22 @@ class GlobalClickFilter:
 
         def replace_tap(wheel: bool) -> None:
             """The wheel fix was turned on or off: a tap with the new mask
-            takes over. Held releases are settled first, while the old tap
-            still decides; then the new tap goes in ahead of the old one,
-            whose callback from then on lets everything through, and the old
-            one goes."""
-            with self._lock:
-                self._settle([button for button, click_filter in self._filters.items() if click_filter.held_id is not None])
-            self._send_outbox()
-            self._update_motion_tap()
+            takes over from the old one, which goes only once nothing it was
+            handed can be lost with it.
+
+            The new tap goes in ahead of the old one and is switched on
+            first. A tap switched on takes effect a moment later, and until
+            then events reach the old one only, so the old one goes on
+            deciding until the new one sees its first event (see
+            make_callback); from then on everything reaching the old one has
+            passed the new one, and goes on untouched. Held releases are
+            settled once the new tap is on, and reach apps through whichever
+            tap is in the stream. The run loop then answers both taps until
+            the new one has taken over and every event this app re-sent has
+            come back, for TAP_SWAP_WAIT_S at most. Then the old tap is
+            switched off, so nothing more is handed to it, what it was handed
+            is answered, and only then is its port invalidated: an event
+            still waiting at a port that goes would never be answered."""
             fresh = open_tap(wheel)
             if fresh is None:
                 refused[0] = wheel
@@ -2027,14 +2074,53 @@ class GlobalClickFilter:
                 return
             old = dict(current)
             Quartz.CFRunLoopAddSource(self._run_loop, fresh["source"], Quartz.kCFRunLoopCommonModes)
-            current.update(fresh)
             Quartz.CGEventTapEnable(fresh["tap"], True)
+            current.update(fresh)
             self._tap = fresh["tap"]
-            close_tap(old)
-            # What this app posted may have passed the old tap without being
-            # seen: stop waiting for it, and send what waits behind it.
-            self._give_up_all()
+            try:
+                with self._lock:
+                    self._settle([button for button, click_filter in self._filters.items() if click_filter.held_id is not None])
+                self._send_outbox()
+                self._update_motion_tap()
+                deadline = monotonic() + TAP_SWAP_WAIT_S + IN_FLIGHT_CHECK_SLACK_S
+                while swap_pending(fresh["generation"]) and not self._stop_event.is_set() and not ending:
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
+                        break
+                    Quartz.CFRunLoopRunInMode(Quartz.kCFRunLoopDefaultMode, min(remaining, 0.05), True)
+            finally:
+                # Whatever happened, the old tap goes: left in the stream
+                # with nothing to answer it, it would stall every event.
+                Quartz.CGEventTapEnable(old["tap"], False)
+                try:
+                    answer_pending()
+                finally:
+                    close_tap(old)
+                    deciding[0] = fresh["generation"]
+            # Re-sent events still on their way after that long were lost, or
+            # another app's tap swallowed them: what waits behind them goes.
+            with self._lock:
+                for button in Button:
+                    self._give_up(button)
+            self._send_outbox()
+            self._update_motion_tap()
             log.info("The event tap %s the scroll wheel now", "takes" if wheel else "leaves out")
+
+        def swap_pending(generation: int) -> bool:
+            """Whether the old tap must stay: the new one (`generation`) has
+            not taken over yet, or re-sent events are still on their way."""
+            if deciding[0] != generation:
+                return True
+            with self._lock:
+                return any(self._in_flight[button] or self._queued[button] for button in Button)
+
+        def answer_pending() -> None:
+            # Every event already handed to this thread's taps is answered:
+            # each run handles one, until none is waiting.
+            for _ in range(256):
+                handled = Quartz.CFRunLoopRunInMode(Quartz.kCFRunLoopDefaultMode, 0, True)
+                if handled != Quartz.kCFRunLoopRunHandledSource:
+                    return
 
         self._started = True
         self._ready.set()

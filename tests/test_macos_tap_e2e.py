@@ -31,7 +31,7 @@ import sys
 import threading
 import time
 import unittest
-from typing import Callable, NamedTuple
+from typing import Callable, NamedTuple, Optional
 from unittest import mock
 
 #: Asked for: a skip is then a failure.
@@ -229,21 +229,24 @@ class MacTapEndToEndTests(unittest.TestCase):
         Quartz.CGWarpMouseCursorPosition(P)
 
     # -- posting --------------------------------------------------------------------
-    def play(self, steps: list[Step]) -> list[Seen]:
+    def play(self, steps: list[Step], after: Optional[dict] = None) -> list[Seen]:
         """Post `steps` on schedule, each stamped with its planned time, and
-        return what applications received once things are quiet again."""
+        return what applications received once things are quiet again.
+        `after` maps a step's index to what to do as soon as it is posted."""
         Quartz = self.Quartz
         time.sleep(0.3)  # well clear of the last scenario
         self.seen.clear()
         self.log.clear()
         start = self.now_ns() + 20_000_000
-        for step in steps:
+        for index, step in enumerate(steps):
             due = start + int(step.at_ms * 1_000_000)
             while self.now_ns() < due:
                 time.sleep(0)  # lets the taps' threads take the GIL
             event = self.make(step)
             Quartz.CGEventSetTimestamp(event, due)
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+            if after and index in after:
+                after[index]()
         self.late_ms = (self.now_ns() - due) / 1e6
         self._wait_until_quiet()
         return list(self.seen)
@@ -286,11 +289,24 @@ class MacTapEndToEndTests(unittest.TestCase):
         self.fail(f"the tap didn't {'take' if wanted else 'leave out'} the scroll wheel")
 
     def _tap_has_wheel(self, tap) -> bool:
+        bit = self.Quartz.CGEventMaskBit(self.Quartz.kCGEventScrollWheel)
+        return any(entry.eventsOfInterest & bit for entry in self._filter_taps())
+
+    def _filter_taps(self) -> list:
+        """The filter's enabled taps (the observer's listens only)."""
         Quartz = self.Quartz
         error, taps, count = Quartz.CGGetEventTapList(64, None, None)
-        own = [entry for entry in (taps or [])[:count] if entry.tappingProcess == os.getpid() and entry.enabled]
-        bit = Quartz.CGEventMaskBit(Quartz.kCGEventScrollWheel)
-        return any(entry.eventsOfInterest & bit and entry.options == Quartz.kCGEventTapOptionDefault for entry in own)
+        return [
+            entry for entry in (taps or [])[:count]
+            if entry.tappingProcess == os.getpid() and entry.enabled and entry.options == Quartz.kCGEventTapOptionDefault
+        ]
+
+    def one_tap_left(self, limit_s: float = 2.0) -> None:
+        """Wait for the tap being replaced to go: one of the filter's is left."""
+        deadline = time.monotonic() + limit_s
+        while len(self._filter_taps()) != 1 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(len(self._filter_taps()), 1, "the replaced tap stayed")
 
     def _wait_until_quiet(self, quiet_s: float = 0.4, limit_s: float = 5.0) -> None:
         deadline = time.monotonic() + limit_s
@@ -487,6 +503,60 @@ class MacTapEndToEndTests(unittest.TestCase):
             self.assertEqual([item.kind for item in buttons], ["down", "up", "down", "up"], "apps saw down, down")
             self.assertEqual([item.subtype for item in buttons], [0, 0, 3, 3])
             self.assertEqual([event.pressed for event in self.log], [True, False], "only the mouse's was judged")
+
+    def test_replacing_the_tap_delivers_a_held_release_once(self) -> None:
+        # Turning the wheel fix on or off replaces the tap. A release held at
+        # that moment is settled with the new tap already in the stream and
+        # the old one still there; the old tap goes only once it is back.
+        from app.core import Button
+        from app.platform import INJECTED_MARK, mark_kind
+
+        left = self.filter._filters[Button.LEFT]
+        for wheel in (True, False):
+            with self.subTest(wheel_fix=wheel):
+                at_switch = []
+
+                def switch() -> None:
+                    deadline = time.monotonic() + 0.05
+                    while left.held_id is None and time.monotonic() < deadline:
+                        time.sleep(0)
+                    at_switch.append(left.held_id is not None)
+                    self.configure(wheel_fix=wheel)
+
+                self.play([Step(0, "down", P), Step(70, "up", P)], after={1: switch})
+                self.wheel_in_tap(wheel)
+                self.one_tap_left()
+                seen = self._settled()
+                with self.explained():
+                    self.assertEqual(at_switch, [True], "the release wasn't held when the tap was replaced")
+                    buttons = self.buttons(seen)
+                    self.assertEqual([item.kind for item in buttons], ["down", "up"], "the release was lost or doubled")
+                    self.assertEqual(mark_kind(buttons[1].mark), INJECTED_MARK, "the held release, re-sent")
+                    self.assertEqual((buttons[1].x, buttons[1].y), (300, 300))
+                    self.assertFalse(any(self.filter._in_flight[button] for button in Button), "still waited for")
+
+    def test_replacing_the_tap_as_a_release_arrives_loses_nothing(self) -> None:
+        # The wheel fix is switched the moment the release is posted, so the
+        # release may still be on its way to the old tap as the new one comes
+        # in, and its bounce 8 ms later reaches whichever decides by then.
+        for wheel in (True, False):
+            with self.subTest(wheel_fix=wheel):
+                self.play([
+                    Step(0, "down", P), Step(70, "up", P),
+                    Step(78, "down", P, clicks=2), Step(130, "up", P, clicks=2),
+                ], after={1: lambda wheel=wheel: self.configure(wheel_fix=wheel)})
+                self.wheel_in_tap(wheel)
+                self.one_tap_left()
+                seen = self._settled()
+                with self.explained():
+                    buttons = self.buttons(seen)
+                    self.assertEqual([item.kind for item in buttons], ["down", "up"])
+                    self.assertEqual([item.clicks for item in buttons], [1, 1])
+
+    def _settled(self) -> list[Seen]:
+        """What applications saw once everything after a tap swap is quiet."""
+        self._wait_until_quiet()
+        return list(self.seen)
 
     def test_the_tap_stays_cheap_with_the_wheel_in_it(self) -> None:
         """Measures (and reports) the tap callback's cost for scroll events

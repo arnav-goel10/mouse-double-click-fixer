@@ -30,6 +30,7 @@ from app.platform import (
     TELEPORT_MARK,
     TAP_DISABLE_LIMIT,
     TAP_DISABLED_MESSAGE,
+    TAP_SWAP_WAIT_S,
     WINDOWS_STAMP_ERROR_S,
     ClickCountRepair,
     FilterConfig,
@@ -2128,10 +2129,14 @@ class FakeQuartz:
     kCGEventSourceStateHIDSystemState = 1
     kCGHIDEventTap = kCGHeadInsertEventTap = kCGEventTapOptionDefault = kCGMouseButtonLeft = 0
     kCFRunLoopCommonModes, kCFRunLoopDefaultMode = "common", "default"
+    kCFRunLoopRunTimedOut, kCFRunLoopRunHandledSource = 3, 4
 
     def __init__(self) -> None:
         self.taps = []
         self.posted = []
+        # In order: ("enable", tap index, on), ("post", event kind),
+        # ("run", seconds) and ("invalidate", tap index).
+        self.calls = []
         # Whether each tap was enabled as each event was posted.
         self.taps_enabled_at_post = []
         self.pointer = (0.0, 0.0)
@@ -2151,12 +2156,14 @@ class FakeQuartz:
 
     def CGEventTapEnable(self, tap, enabled):
         tap.enabled = bool(enabled)
+        self.calls.append(("enable", self.taps.index(tap), bool(enabled)))
 
     def CGEventTapIsEnabled(self, tap):
         return tap.enabled
 
     def CFMachPortInvalidate(self, tap):
         tap.invalidated = True
+        self.calls.append(("invalidate", self.taps.index(tap)))
 
     def CFMachPortCreateRunLoopSource(self, allocator, tap, order):
         return ("source", id(tap))
@@ -2171,8 +2178,10 @@ class FakeQuartz:
         pass
 
     def CFRunLoopRunInMode(self, mode, seconds, return_after_source):
-        self._wake.wait(0.002)
+        self.calls.append(("run", seconds))
+        self._wake.wait(min(seconds, 0.002))
         self._wake.clear()
+        return self.kCFRunLoopRunTimedOut
 
     def CFRunLoopStop(self, loop):
         self._wake.set()
@@ -2200,6 +2209,7 @@ class FakeQuartz:
 
     def CGEventPost(self, where, event):
         self.posted.append(event.copy())
+        self.calls.append(("post", event.kind))
         self.taps_enabled_at_post.append([tap.enabled for tap in self.taps])
 
     def CGEventCreate(self, source):
@@ -2720,6 +2730,19 @@ class MacTapTests(unittest.TestCase):
         self.assertEqual(len(self.quartz.taps), count, "the tap was not replaced")
         return self.quartz.taps
 
+    def wait_until(self, condition, limit_s: float = 2.0) -> float:
+        """Wait for `condition()`; returns how long it took."""
+        started = monotonic()
+        while not condition() and monotonic() - started < limit_s:
+            threading.Event().wait(0.002)
+        self.assertTrue(condition(), "it never happened")
+        return monotonic() - started
+
+    def take_over(self, tap) -> None:
+        """The new tap sees its first event: a trackpad's scrolling, which
+        nothing waits behind and nothing holds."""
+        self._scroll(self.clock + 0.001, 1, 0, 1, tap=tap)
+
     def test_side_buttons_by_their_number(self) -> None:
         Q = self.Q
         self.configure(buttons=frozenset({Button.LEFT, Button.BACK}))
@@ -2763,28 +2786,120 @@ class MacTapTests(unittest.TestCase):
         self.assertTrue(fresh.mask & wheel_bit)
         self.assertEqual(fresh.mask & ~wheel_bit, old.mask, "everything else as before")
         self.assertTrue(fresh.enabled)
-        self.assertTrue(old.invalidated and not old.enabled, "the old tap is gone")
+        self.take_over(fresh)
+        self.wait_until(lambda: old.invalidated)
+        self.assertFalse(old.enabled, "the old tap is gone")
         self.assertTrue(self.filter.tap_alive())
         self.assertIs(self.filter._tap, fresh)
         self.configure(wheel_fix=False)
         self.assertFalse(self.wait_for_taps(3)[2].mask & wheel_bit)
 
-    def test_replacing_the_tap_settles_a_held_release_first(self) -> None:
+    def test_replacing_the_tap_settles_a_held_release_behind_the_new_tap(self) -> None:
         Q = self.Q
         self.button(Q.kCGEventLeftMouseDown, (0, 0), 0.000)
         self.button(Q.kCGEventLeftMouseUp, (0, 0), 0.080)           # held
         self.configure(wheel_fix=True)
         old, fresh = self.wait_for_taps(2)
+        self.wait_until(lambda: self.quartz.posted)
         (release,) = self.quartz.posted
         self.assertEqual(release.kind, Q.kCGEventLeftMouseUp)
-        self.assertEqual(self.quartz.taps_enabled_at_post[0], [True], "posted while only the old tap was there")
-        # The old tap's callback now lets everything through, and decides
-        # nothing: a bounce reaching it is not its business any more.
+        self.assertEqual(self.quartz.taps_enabled_at_post[0], [True, True],
+                         "posted with the new tap already on, ahead of the old one")
+        # The release is on its way: the old tap stays in the stream until it
+        # comes back, through whichever tap it reaches.
+        threading.Event().wait(0.05)
+        self.assertFalse(old.invalidated, "the old tap went with the release maybe still waiting at it")
+        came_back = monotonic()
+        self.assertIs(fresh.callback(None, release.kind, release, None), release)
+        self.assertIs(old.callback(None, release.kind, release, None), release, "behind the new tap: untouched")
+        self.assertLess(self.wait_until(lambda: old.invalidated), TAP_SWAP_WAIT_S / 2,
+                        "the old tap waited out the bound instead of going once the release was back")
+        self.assertLess(monotonic() - came_back, TAP_SWAP_WAIT_S)
+        self.assertEqual(len(self.quartz.posted), 1, "the release went out once")
+        self.assertEqual(len(self.filter._in_flight[Button.LEFT]), 0)
+        # In order: the new tap on, the release out, the old tap off, what was
+        # handed to it answered, and only then its port gone.
+        calls = self.quartz.calls
+        on, posted = calls.index(("enable", 1, True)), calls.index(("post", Q.kCGEventLeftMouseUp))
+        off, gone = calls.index(("enable", 0, False)), calls.index(("invalidate", 0))
+        self.assertLess(on, posted)
+        self.assertLess(posted, off)
+        self.assertIn(("run", 0), calls[off:gone], "the old tap's port went with nothing answered")
+
+    def test_the_old_tap_decides_until_the_new_one_sees_an_event(self) -> None:
+        # A tap switched on takes effect a moment later: until the new tap
+        # sees an event, events reach the old one only, and it decides them.
+        Q = self.Q
+        self.configure(wheel_fix=True)
+        old, fresh = self.wait_for_taps(2)
+        down = self.event(Q.kCGEventLeftMouseDown, 0.000)
+        self.assertIs(old.callback(None, down.kind, down, None), down)
+        up = self.event(Q.kCGEventLeftMouseUp, 0.080)
+        self.assertIsNone(old.callback(None, up.kind, up, None), "held")
+        self.assertEqual(len(self.events), 2, "the old tap judged them")
+        self.assertFalse(old.invalidated)
+        # The new tap's first event: from it on, the new tap decides.
         bounce = self.event(Q.kCGEventLeftMouseDown, 0.085)
-        self.assertIs(old.callback(None, bounce.kind, bounce, None), bounce)
-        self.assertEqual(len(self.events), 2)
-        self.assertEqual(self.filter._in_flight[Button.LEFT], type(self.filter._in_flight[Button.LEFT])(),
-                         "nothing waits for what may have passed the old tap")
+        self.assertIsNone(fresh.callback(None, bounce.kind, bounce, None), "the dropout, judged by the new tap")
+        self.assertEqual(len(self.events), 3)
+        # What reaches the old tap now has passed the new one: untouched.
+        later = self.event(Q.kCGEventLeftMouseUp, 0.150)
+        self.assertIs(old.callback(None, later.kind, later, None), later)
+        self.assertEqual(len(self.events), 3, "judged twice")
+        self.wait_until(lambda: old.invalidated)
+
+    def test_a_re_sent_release_seen_by_the_old_tap_only_is_not_waited_for(self) -> None:
+        Q = self.Q
+        self.button(Q.kCGEventLeftMouseDown, (0, 0), 0.000)
+        self.button(Q.kCGEventLeftMouseUp, (0, 0), 0.080)           # held
+        self.configure(wheel_fix=True)
+        old, fresh = self.wait_for_taps(2)
+        self.wait_until(lambda: self.quartz.posted)
+        (release,) = self.quartz.posted
+        self.take_over(fresh)
+        self.assertEqual(len(self.filter._in_flight[Button.LEFT]), 1)
+        # The release had been handed to the old tap before the new one came
+        # into the stream, and is answered only now.
+        self.assertIs(old.callback(None, release.kind, release, None), release)
+        self.assertEqual(len(self.filter._in_flight[Button.LEFT]), 0, "its mark was noted")
+        self.assertLess(self.wait_until(lambda: old.invalidated), TAP_SWAP_WAIT_S / 2)
+
+    def test_the_old_tap_goes_after_the_bound_if_nothing_comes_back(self) -> None:
+        Q = self.Q
+        self.button(Q.kCGEventLeftMouseDown, (0, 0), 0.000)
+        self.button(Q.kCGEventLeftMouseUp, (0, 0), 0.080)           # held
+        started = monotonic()
+        self.configure(wheel_fix=True)
+        old, fresh = self.wait_for_taps(2)
+        self.wait_until(lambda: self.quartz.posted)
+        self.take_over(fresh)
+        # Another app's tap swallows the release: it never comes back.
+        self.wait_until(lambda: old.invalidated, limit_s=TAP_SWAP_WAIT_S + 1)
+        self.assertGreaterEqual(monotonic() - started, TAP_SWAP_WAIT_S)
+        self.wait_until(lambda: not self.filter._in_flight[Button.LEFT], limit_s=0.5)  # given up on
+        self.assertEqual(len(self.quartz.posted), 1)
+
+    def test_a_failure_during_the_swap_leaves_no_tap_in_the_stream(self) -> None:
+        # Left enabled with nothing answering it, a tap stalls every event:
+        # whatever goes wrong while the old one waits, neither stays.
+        Q = self.Q
+        self.button(Q.kCGEventLeftMouseDown, (0, 0), 0.000)
+        self.button(Q.kCGEventLeftMouseUp, (0, 0), 0.080)           # held: the swap waits for it
+        broken = RuntimeError("the run loop broke")
+        original = self.quartz.CFRunLoopRunInMode
+
+        def run(mode, seconds, return_after_source):
+            if len(self.quartz.taps) > 1:
+                raise broken
+            return original(mode, seconds, return_after_source)
+
+        self.quartz.CFRunLoopRunInMode = run
+        self.configure(wheel_fix=True)
+        old, fresh = self.wait_for_taps(2)
+        self.wait_until(lambda: not self.filter.running)
+        self.assertTrue(old.invalidated and not old.enabled)
+        self.assertTrue(fresh.invalidated and not fresh.enabled)
+        self.assertEqual(self.errors, ["the run loop broke"])
 
     def test_a_refused_new_tap_keeps_the_old_one(self) -> None:
         self.quartz.refuse_taps = True
