@@ -244,9 +244,8 @@
 - **Copy Diagnostics** (Windows: **Copy diagnostics**) in General copies
   the version, OS, the filter's state, the settings, the pointing devices
   the app has seen (by name) and the end of the app's log, for a bug report.
-  The log records start-up, the filter
-  starting and stopping, failures and updates, never clicks; hard crashes
-  go to crash.log beside it.
+  The log records start-up, the filter starting and stopping, failures and
+  updates, never clicks; hard crashes go to crash.log beside it.
 - Your "on" survives failures. A filter that can't start at login, or stops
   on its own, used to switch itself off for good. Now the menu's status line
   says what happened, a start the app makes itself retries at 1, 3, 8 and
