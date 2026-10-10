@@ -152,6 +152,9 @@ class HistoryPage(LivePage):
         totals = wear.totals(self.button)
         trend = wear.trend(self.button)
         self.trend_value.setText(trend.words)
+        # The row's title is beside the value, not tied to it: a screen reader
+        # on the value alone would say "Getting worse" and not of what.
+        self.trend_value.setAccessibleName(f"Trend: {trend.words}")
         note = TREND_NOTES[trend.key]
         if trend.window_changed and trend.key in ("worse", "better"):
             note += " The window changed in this time, which moves the count too."

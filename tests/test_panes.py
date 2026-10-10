@@ -385,6 +385,17 @@ class HistoryPaneTests(PaneTestCase):
         self.assertIn("1.8 bounces per 100 clicks", page.rate_chart.accessibleDescription())
         self.window.grab()
 
+    def test_the_trend_is_read_out_with_its_value(self) -> None:
+        from PySide6.QtGui import QAccessible
+
+        self.show("history")
+        page = self.window.history
+        name = lambda: QAccessible.queryAccessibleInterface(page.trend_value).text(QAccessible.Text.Name)
+        self.assertEqual(name(), "Trend: Not enough clicks yet")
+        self.seed()
+        page.refresh()
+        self.assertEqual(name(), "Trend: Getting worse", "a screen reader hears the value, not the title alone")
+
     def test_the_picker_shows_buttons_with_history(self) -> None:
         from app.core import Button
 
