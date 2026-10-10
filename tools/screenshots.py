@@ -8,9 +8,24 @@ captures it from the screen, so native materials (Mica, vibrancy) show; CI
 uses it on the Windows runner. Settings are isolated in a temporary folder,
 so this never touches a real configuration.
 
-`--docs` captures only the Bounce Filter pane for the README, in the same state
-and at the same window size as docs/images/macos.png (filter on, 46 ms,
-calibrated, the same counts), so the two screenshots match side by side.
+`--docs` captures only the Bounce Filter pane for the README, in the same
+state on both platforms (the filter on, three buttons with windows of their own,
+the wheel fix on) so the two screenshots match side by side. Nothing is
+scrolled or cut through: a pane the window can't show whole ends below the last
+section that fits.
+
+    docs/images/windows.png  CI's `--live --docs` run on Windows (the
+                             windows-screenshots artifact's docs-filter.png): a
+                             real window, title bar included, as tall as the
+                             runner's 1024 x 768 screen allows.
+    docs/images/macos.png    `--docs --size=WIDTHxHEIGHT` on a Mac, with the
+                             Windows picture's size so the two match: an
+                             offscreen render of the window, drawn dark with
+                             its corners and window buttons, since there is no
+                             window server to capture one from.
+
+Without `--size` the window is as tall as the pane needs (a live window is held
+to what the screen shows).
 
 `--social` draws docs/images/social-preview.png, the 1280 x 640 card GitHub
 shows for links to the repository (upload it under Settings › General ›
@@ -112,6 +127,115 @@ def social_preview():
     return image
 
 
+DOCS_WIDTH = 860
+#: A Windows window's title bar, which the live capture includes.
+WINDOWS_TITLE_BAR = 31
+
+
+def docs_state(controller) -> None:
+    """The Filter pane as the README shows it: on, with three buttons
+    filtered, each with a window of its own, the wheel fix on and the counts a
+    few months of use leaves."""
+    from app.core import Button
+
+    controller.set_buttons([Button.LEFT, Button.RIGHT, Button.BACK])
+    controller.set_threshold(Button.LEFT, 46)
+    controller.set_calibrated(Button.LEFT)
+    controller.set_threshold(Button.BACK, 30)
+    controller.set_wheel_fix(True)
+    controller.settings["filtered_total"] = 8324
+    controller.session_filtered = 945
+
+
+def parse_size(argv) -> tuple[int, int] | None:
+    for argument in argv:
+        if argument.startswith("--size="):
+            width, _, height = argument[len("--size="):].partition("x")
+            return int(width), int(height)
+    return None
+
+
+def fit_pane(app, window, room: int | None = None) -> tuple[int, int | None]:
+    """The window height that shows the current pane whole, no scrolling, and
+    the index of the last item of the page to keep (None: all of them).
+
+    Squeezed to its shortest the pane is as tall as its content, so the
+    difference to the viewport is what the rest of the window adds. With
+    `room` (the most the screen can show) and a pane taller than that, the
+    height ends below the last section or note that fits, never through a
+    row and never between a heading and what it heads.
+    """
+    from PySide6.QtCore import QPoint
+
+    window.resize(window.width(), window.minimumHeight())
+    app.processEvents()
+    area = window.stack.currentWidget()
+    page = area.widget()
+    chrome = window.height() - area.viewport().height()
+    full = chrome + page.height()
+    if room is None or full <= room:
+        return full, None
+    pad = 14
+    fits = []
+    for index in range(page.body.count()):
+        item = page.body.itemAt(index).widget()
+        if item is None or getattr(item, "role", "") in ("headline", "title"):
+            continue
+        bottom = chrome + item.mapTo(page, QPoint(0, item.height())).y() + pad
+        if bottom <= room:
+            fits.append((bottom, index))
+    return max(fits)
+
+
+def dark_palette():
+    """What macOS's Dark appearance gives the native controls."""
+    from PySide6.QtGui import QColor, QPalette
+
+    palette = QPalette()
+    Role, Group = QPalette.ColorRole, QPalette.ColorGroup
+    for role, colour in (
+        (Role.Window, "#1e1e1e"), (Role.WindowText, "#ececec"), (Role.Base, "#3b3b3b"),
+        (Role.AlternateBase, "#2a2a2a"), (Role.Text, "#ececec"), (Role.Button, "#3b3b3b"),
+        (Role.ButtonText, "#ececec"), (Role.ToolTipBase, "#2a2a2a"), (Role.ToolTipText, "#ececec"),
+        (Role.PlaceholderText, "#8a8a8a"), (Role.Highlight, "#0a84ff"),
+        (Role.Accent, "#0a84ff"), (Role.HighlightedText, "#ffffff"), (Role.Light, "#5a5a5a"), (Role.Mid, "#2d2d2d"),
+        (Role.Dark, "#151515"), (Role.Midlight, "#4a4a4a"), (Role.Shadow, "#000000"),
+    ):
+        palette.setColor(role, QColor(colour))
+    for role in (Role.WindowText, Role.Text, Role.ButtonText):
+        palette.setColor(Group.Disabled, role, QColor("#6e6e6e"))
+    palette.setColor(Group.Disabled, Role.Base, QColor("#2c2c2c"))
+    palette.setColor(Group.Disabled, Role.Button, QColor("#2c2c2c"))
+    return palette
+
+
+def mac_frame(grabbed, width: int, height: int):
+    """A window grab drawn as a Mac window, since offscreen there is no window
+    server to supply one: rounded corners, a hairline edge and the three window
+    buttons over the sidebar."""
+    from PySide6.QtCore import QRectF, Qt
+    from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen
+
+    image = QImage(width, height, QImage.Format.Format_ARGB32)
+    image.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(image)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    outline = QRectF(0.5, 0.5, width - 1, height - 1)
+    clip = QPainterPath()
+    clip.addRoundedRect(outline, 20, 20)
+    painter.setClipPath(clip)
+    painter.drawImage(0, 0, grabbed)
+    painter.setClipping(False)
+    painter.setPen(QPen(QColor(255, 255, 255, 46), 1))
+    painter.drawPath(clip)
+    painter.setPen(Qt.PenStyle.NoPen)
+    for index, colour in enumerate(("#ff5f57", "#febc2e", "#28c840")):
+        painter.setBrush(QColor(colour))
+        painter.drawEllipse(QRectF(20 + index * 20, 20, 13, 13))
+    painter.end()
+    return image
+
+
 def sample_state(controller) -> None:
     """Something to show on every pane: a few buttons with their own windows,
     the wheel fix, an excluded app, the devices a Mac usually has, and a
@@ -153,6 +277,49 @@ def sample_state(controller) -> None:
     wear._clock = clock
 
 
+def capture_docs(app, main_window, target: Path, size: tuple[int, int] | None) -> None:
+    """The Filter pane into `target`: whole if the window can show it whole."""
+    from PySide6.QtCore import Qt
+
+    main_window._show_page(0)
+    main_window.refresh()
+    # What is cut off is not worth a scroll bar in a picture.
+    main_window.stack.currentWidget().setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    app.processEvents()
+    if not LIVE:
+        # Offscreen, the picture is the window as the Mac draws one: the
+        # whole window, so `size` counts the title bar's room too.
+        width, height = size or (DOCS_WIDTH, 0)
+        wanted, last = fit_pane(app, main_window, height or None)
+        height = height or wanted
+        page = main_window.stack.currentWidget().widget()
+        for index in range(page.body.count() if last is not None else 0):
+            if index > last and page.body.itemAt(index).widget() is not None:
+                page.body.itemAt(index).widget().hide()
+        main_window.resize(width, height)
+        app.processEvents()
+        wait(app, 50)
+        mac_frame(main_window.grab().toImage(), width, height).save(str(target))
+        return
+    # A live window is a real one, held to what the screen can show.
+    screen = main_window.screen()
+    available = screen.availableGeometry()
+    print(f"Screen {screen.geometry().width()} x {screen.geometry().height()}, "
+          f"available {available.width()} x {available.height()}, scale {screen.devicePixelRatio()}")
+    main_window.move(available.x(), available.y())
+    wait(app, 300)
+    room = available.height() - WINDOWS_TITLE_BAR - 8
+    wanted = size[1] - WINDOWS_TITLE_BAR if size else fit_pane(app, main_window, room)[0]
+    print(f"The pane shows {wanted} px of the {room} the screen leaves")
+    main_window.resize(size[0] if size else DOCS_WIDTH, min(wanted, room))
+    main_window.move(available.x(), available.y())
+    app.processEvents()
+    wait(app, 800)
+    frame = main_window.frameGeometry()
+    print(f"Window frame {frame.width()} x {frame.height()}")
+    main_window.screen().grabWindow(0, frame.x(), frame.y(), frame.width(), frame.height()).save(str(target))
+
+
 def main() -> None:
     positional = [argument for argument in sys.argv[1:] if not argument.startswith("--")]
     out = Path(positional[0] if positional else "screenshots")
@@ -181,6 +348,11 @@ def main() -> None:
     from PySide6.QtWidgets import QApplication
 
     app = QApplication([])
+    if docs and not LIVE and not as_windows:
+        # The README's Mac picture is dark, like the Windows one. Offscreen
+        # there is no system appearance, so the native controls (the spin
+        # boxes) get a dark palette by hand.
+        app.setPalette(dark_palette())
     from app import permissions
     from app.controller import AppController
     from app.ui import widgets, window as window_module
@@ -201,16 +373,14 @@ def main() -> None:
         AppController.active = property(lambda self: True)  # type: ignore[assignment]
     controller = AppController()
     if docs:
-        controller._store(thresholds={**controller.settings["thresholds"], "left": 46},
-                          calibrated_buttons=["left"], fix_enabled=True)
-        controller.settings["filtered_total"] = 8324
-        controller.session_filtered = 945
+        docs_state(controller)
     else:
         sample_state(controller)
         controller.settings["filtered_total"] = 1284
         controller.session_filtered = 37
     main_window = window_module.MainWindow(controller)
-    main_window.resize(*((1010, 680) if docs else (780, 660)))
+    size = parse_size(sys.argv)
+    main_window.resize(*((size[0] if size else DOCS_WIDTH, 700) if docs else (780, 660)))
     main_window.show()
     main_window.raise_()
     main_window.activateWindow()
@@ -219,17 +389,7 @@ def main() -> None:
         wait(app, 1500)
 
     if docs:
-        main_window._show_page(0)
-        main_window.refresh()
-        app.processEvents()
-        wait(app, 800 if LIVE else 50)
-        if LIVE:
-            frame = main_window.frameGeometry()
-            main_window.screen().grabWindow(0, frame.x(), frame.y(), frame.width(), frame.height()).save(
-                str(out / "docs-filter.png")
-            )
-        else:
-            main_window.grab().save(str(out / "docs-filter.png"))
+        capture_docs(app, main_window, out / "docs-filter.png", size)
         print(f"Wrote {out / 'docs-filter.png'}")
         return
 
