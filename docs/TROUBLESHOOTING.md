@@ -26,7 +26,8 @@ Then check what is switched on:
 - The app in front may be on the **Apps** list, which filters nothing while it
   is in front (see [Apps](#apps-and-where-the-filter-stops)).
 - The mouse may be switched off under **Devices**. Trackpads, touchscreens and
-  pens are never filtered.
+  pens are not filtered (on Windows, precision touchpads; see
+  [Devices](#devices) for the exceptions).
 - Back and forward presses use the click rule only. A scroll wheel that
   jumps a notch the wrong way has a fix of its own (see
   [The scroll wheel](#the-scroll-wheel)).
@@ -62,8 +63,16 @@ Vertical and horizontal scrolling are judged separately. If a quick, deliberate
 reversal loses notches, lower the window; if stray notches still get through,
 raise it. **History** shows how many reversals it dropped.
 
-Smooth scrolling is never touched: a trackpad's, a Magic Mouse's, a
-touchpad's. On macOS, with the fix off, scroll events never reach the app.
+Smooth scrolling is never touched: a Mac trackpad's, a Magic Mouse's, and on
+Windows a precision touchpad's. On macOS, with the fix off, scroll events never
+reach the app.
+
+On Windows the fix judges only a notch that a mouse itself reports to Windows
+(through Raw Input). Scrolling no mouse reported, such as a precision
+touchpad's, passes. A touchpad that isn't a precision one reports as a mouse,
+so its scrolling is judged like a wheel's. If **Copy Diagnostics** shows
+`device lookup: raw input unavailable`, no notch has a mouse's report to go by
+and the fix drops nothing.
 
 ## Apps and where the filter stops
 
@@ -81,15 +90,31 @@ through ApplicationFrameHost; if the app can't be found, nothing matches.
 ## Devices
 
 **Devices** lists the pointing devices the app has seen since it started. A
-mouse shows up once you click with it while the filter is on. Switching a
-mouse off there is remembered, and applies whenever it is connected.
+mouse shows up once you click with it while the filter is on; on Windows,
+moving it is enough. Switching a mouse off there is remembered, and applies
+whenever it is connected. On Windows the app can apply it only once it has
+read the mouse's name from the device, a moment after the mouse first reports
+(when it is connected, or after the app starts), so a click made in that
+moment is still filtered.
 
 A device is known by its connection, its vendor and product IDs, and its serial
 number or, if it has none, its name. Two mice of the same model with no serial
 number look the same to the app, so switching one off switches both off.
 
-Trackpads, touchscreens and pens are listed as never filtered and have no
-switch.
+Trackpads, touchscreens and pens are listed separately and have no switch.
+On Windows, only precision touchpads are told apart from mice. Three things
+can still get a touchpad's click filtered there:
+
+- A tap within about a second of using a mouse is taken for that mouse's
+  click. It is held for the filter window like a mouse's, and a second tap that
+  follows within the window is dropped as bounce.
+- A touchpad that isn't a precision one reports to Windows as a mouse. It is
+  listed with the mice, filtered like one, and has a switch.
+- If **Copy Diagnostics** shows `device lookup: raw input unavailable`, the app
+  can't tell touchpads from mice, so it filters every touchpad click.
+
+Touchscreens and pens always pass, because Windows marks the clicks it makes
+from them.
 
 ## History
 
@@ -174,25 +199,28 @@ next click or by a timer, wherever the pointer is then.
 The app doesn't add clicks of its own, but it re-sends some input: a release
 held back for the filter window, whatever comes while that release is on its
 way (a press, another button's click, pointer movement), so that games see
-them in the order they happened, and a move that puts the pointer back after a
-drag let go while moving. Games receive these as software input; on Windows
-they are marked as injected, and games that read raw input see them as
-injected input rather than as coming from your mouse. The app's hook is also
-in the input path whenever the filter is on. Some anti-cheat systems can
-object to software input or to input hooks, and the app can't know what yours
-accepts. Turn the filter off, or quit the app, before playing a game that uses
-one.
+them in the order they happened, and, after a drag let go while moving, the
+moves that go with its release: on Windows a move to where the button came up
+first, and on both systems a move back to where your hand has taken the
+pointer. Games receive these as software input; on Windows they are marked as
+injected, and games that read raw input see them as injected input rather than
+as coming from your mouse. The app's hook is also in the input path whenever
+the filter is on. Some anti-cheat systems can object to software input or to
+input hooks, and the app can't know what yours accepts. Turn the filter off,
+or quit the app, before playing a game that uses one.
 
 To keep the filter on for everything else, add the game under **Apps**. While
 it is in front nothing is filtered and nothing new is held back, and a
 release held when you switch to it goes out first. That doesn't take the hook
 out of the input path, so it isn't a way to make a game with anti-cheat safe.
 
-On Windows, while the pointer is hidden (a game's mouse-look), the app never
-holds back or re-sends pointer movement. A held release goes out once the
-filter window has passed, with your next click or by a timer, wherever the
-pointer is then; the pointer is never moved. Touchpads, touchscreens and pens
-are never filtered.
+On Windows, while the pointer is hidden (as it is in most games' mouse-look),
+the app never holds back or re-sends pointer movement. A held release goes out
+once the filter window has passed, with your next click or by a timer,
+wherever the pointer is then; the pointer is never moved. A game that keeps
+the pointer showing, even drawn invisible, doesn't count as hidden: the app
+treats it as an ordinary pointer, and may hold back and re-send its movement
+for a moment after a click.
 
 ## Open at login doesn't open the app
 
@@ -248,9 +276,9 @@ The app keeps its files in one folder:
 | --- | --- |
 | `settings.json` | Your settings. Quit the app and delete it to start from defaults. |
 | `settings.json.bak` | The previous good settings, used if `settings.json` is damaged. |
-| `wear.json` | The History: daily counts for each button, kept for a year. Quit the app and delete it to clear the History. |
+| `wear.json` | The History: daily counts for each button and for the scroll wheel, kept for a year. Quit the app and delete it to clear the History. |
 | `wear.json.bak` | The previous good history, used if `wear.json` is damaged. |
-| `DoubleClickFixer.log` | Start-up, the filter starting and stopping, failures and updates; never clicks. Older lines move to `DoubleClickFixer.log.1` and `.2`. |
+| `DoubleClickFixer.log` | Start-up, the filter starting and stopping, permission changes, waking from sleep and switching users, the TLS library in use, failures and updates; never clicks. Older lines move to `DoubleClickFixer.log.1` and `.2`. |
 | `crash.log` | A line per launch, and the details of any hard crash. |
 
 On macOS, system crash reports are in

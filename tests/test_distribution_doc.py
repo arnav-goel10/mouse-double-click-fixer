@@ -37,6 +37,7 @@ API = {
     "SendInput": "platform.py",
     "RegisterRawInputDevices": "devices_win.py",
     "RIDEV_INPUTSINK": "devices_win.py",
+    "RIDEV_DEVNOTIFY": "devices_win.py",
     "SetWinEventHook": "frontmost.py",
     "EVENT_SYSTEM_FOREGROUND": "frontmost.py",
     "wear.json": "wear.py",
@@ -92,6 +93,19 @@ class DistributionDocTests(unittest.TestCase):
         self.assertIn('WEAR_NAME = "wear.json"', source("wear.py"))
         self.assertIn("EVENT_SYSTEM_FOREGROUND, self.EVENT_SYSTEM_FOREGROUND", source("frontmost.py"))
         self.assertIn("RIDEV_INPUTSINK", source("devices_win.py"))
+        self.assertIn("RIDEV_DEVNOTIFY", source("devices_win.py"))
+
+    def test_what_they_say_about_wheel_ticks_and_touchpad_taps_is_what_the_app_does(self) -> None:
+        # "judged only if a mouse's Raw Input report carries a wheel notch for
+        # that axis": with no report to go by (Raw Input unavailable here), a
+        # tick is nobody's, and the wheel fix leaves it alone.
+        self.assertEqual(devices_win.WHEEL_FLAGS, (devices_win.RI_MOUSE_WHEEL, devices_win.RI_MOUSE_HWHEEL))
+        nothing = devices_win.RawInputDevices(None, unavailable="test")
+        for axis in (1, 2):
+            self.assertIsNone(nothing.attribute(devices_win.wheel_flag(axis)))
+        # "a touchpad tap within a second of a mouse's report is taken for
+        # that mouse's click"
+        self.assertEqual(devices_win.MOUSE_QUIET_S, 1.0)
 
 
 if __name__ == "__main__":

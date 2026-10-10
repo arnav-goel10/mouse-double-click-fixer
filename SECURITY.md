@@ -15,9 +15,14 @@ low-level mouse hook on Windows.
 - **Windows:** a low-level mouse hook is given every mouse event and nothing
   from the keyboard. The app acts on button events, looks at wheel notches
   only while the scroll-wheel fix is on, and looks at pointer movement only
-  while it is holding a release back or re-sending input. It also uses Raw
-  Input to learn which device a click came from. It needs no special
-  permission and runs with your account's rights.
+  while it is holding a release back or re-sending input. To learn which
+  device a click or wheel notch came from, it also takes Raw Input from mice,
+  precision touchpads and touchscreens, never keyboards. Windows hands the app
+  every report from those devices, pointer movement included, whether or not
+  the app is in front. The app notes only which device sent each report, when,
+  and for a mouse which buttons or wheel it names. It reads no positions or
+  finger contacts. It needs no special permission and runs with your
+  account's rights.
 
 The app uses which button went up or down, when, and where the pointer was.
 To apply the Apps list it reads which app is in front (its bundle identifier on
@@ -27,12 +32,15 @@ name, vendor and product IDs and serial number, on macOS through IOKit.
 
 It stores settings, which include the apps you listed and the devices you
 chose not to filter; a count of the bounces it blocked; a history of daily
-counts for each button (presses, bounces, repaired dropouts, how long after a
-release each bounce came), in `wear.json`, never the time or place of a click;
-and a log of start-up, the filter starting and stopping, failures and updates,
-never clicks. It sends no telemetry. Its only network use is the update check
-to this repository's GitHub releases and downloading an update from there;
-turning off **Check for updates automatically** stops the background checks.
+counts, in `wear.json`, never the time or place of a click: for each button
+the presses, bounces, repaired dropouts, how long after a release each bounce
+came and the filter window in use, and for the scroll wheel the notches judged
+and reversals dropped; and a log of start-up, the filter starting and
+stopping, permission changes, waking from sleep and switching users, the TLS
+library in use, failures and updates, never clicks. It sends no telemetry. Its
+only network use is the update check to this repository's GitHub releases and
+downloading an update from there; turning off **Check for updates
+automatically** stops the background checks.
 
 ## How updates are verified
 

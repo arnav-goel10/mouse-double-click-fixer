@@ -19,16 +19,17 @@
   way. A notch that goes against the one before it, within the wheel window,
   is dropped. The window is 50 ms unless you change it, and can be 10 to 150
   ms. Vertical and horizontal scrolling are judged separately, no notch is
-  held back for the window, and smooth scrolling from a trackpad, a Magic
-  Mouse or a touchpad is never touched. Off by default.
+  held back for the window, and smooth scrolling from a Mac trackpad, a Magic
+  Mouse or (on Windows) a precision touchpad is never touched. Off by default.
 - **Apps:** a list of apps in which nothing is filtered while they are in
   front. The active app counts, not the window under the pointer.
 - **Devices:** the mice the app has seen, each of which can be left
-  unfiltered. Trackpads, touchscreens and pens are never filtered.
+  unfiltered. Trackpads, touchscreens and pens are not filtered and have no
+  switch (on Windows, precision touchpads only; see Windows below).
 - **History:** for each button, bounces per 100 clicks over the last 30 days,
   a trend, and how long after a release each bounce came. The wheel fix's
   count is there too. It is kept in wear.json beside the settings, as daily
-  counts only, for a year.
+  counts only (with the filter window in use that day), for a year.
 - Requires macOS 13 or later on Apple silicon, or 64-bit Windows 10 version
   1809 or later, or Windows 11.
 
@@ -39,8 +40,10 @@
   press used to go straight through, so a contact that bounced twice as it
   closed could turn the start of a drag into a click. Very short taps now wait
   like any other click. The price is that a release reaches apps later than it
-  would unfiltered: by at least the filter window, and on a still mouse by the
-  window plus the allowance below, which is 5 ms or more.
+  would unfiltered. A click made in place goes out as soon as the pointer
+  leaves the spot; any other release goes out once the filter window has
+  passed, and on a still mouse after the window plus the allowance below,
+  which is 5 ms or more.
 - **A small movement no longer ends a drag.** Since 0.5.1 on macOS, a release
   held in place was settled by any pointer motion, even a hand resting on the
   mouse, and a dropout's comeback could make a drag look like a click made in
@@ -58,20 +61,15 @@
 - A held release that comes due while the app is still re-sending other input
   now waits behind it, so apps can never see a button come up before it went
   down.
-- **Everything the app re-sends stays in order.** Each input it re-sends is
-  numbered, and goes out in the order it was decided, one at a time, whichever
-  thread decided it. The filter notes the numbers as the inputs come back
-  through its hook, so it knows exactly which have arrived. A click of one
-  button also no longer overtakes another button's release that is still on
-  its way, which could show apps two buttons down together when they never
-  were.
-- The app waits for input it re-sent to come back through the filter for twice
-  the worst delay of any button or pointer-move event it timed in the last two
-  seconds, but not less than 150 ms or more than half a second. On a slow
-  machine a later click can't overtake a re-sent release; before, the app
-  stopped waiting after 150 ms. Input that never comes back, because another
-  program's hook swallowed it, is given up on after that wait, and what was
-  queued behind it goes out.
+- **Input the app re-sends stays in order.** A click of one button no longer
+  overtakes another button's release that is still on its way, which could
+  show apps two buttons down together when they never were.
+- On a slow computer a later click can no longer overtake a release the app
+  re-sent. The app waits for it to come back for twice the worst delay it saw
+  in the last two seconds, but not less than 150 ms or more than half a
+  second; it used to stop waiting after 150 ms. If another program's hook
+  swallows it, the app gives up after that wait and sends what was queued
+  behind it.
 - A click that passes untouched (from a trackpad, touchscreen or pen, from a
   device you left unfiltered, or while an app on your Apps list is in front)
   is never half filtered: its release goes the way its press went, and a
@@ -92,14 +90,14 @@
   the filter started could have put every later click 41.67 times too close
   together, so clicks seconds apart were dropped as bounce. Each event's
   timestamp is now read in whichever unit it carries.
-- **A pointer move can no longer reach apps ahead of a click's release.**
-  Clicks and pointer motion now come through one event tap, which macOS
-  hands over strictly in order. The separate motion tap 0.5.1 added took
-  effect too late, so the first moves after a click could overtake it. The
-  app now receives every pointer move, but looks at one only while it holds
-  back a release or has input to re-send (where the pointer is, when it
-  moved, and whether the hardware made it); every other move goes straight
-  through.
+- **A move that takes the pointer off the spot of a click can no longer reach
+  apps ahead of the click's release.** Clicks and pointer motion now come
+  through one event tap, which macOS hands over strictly in order. The
+  separate motion tap 0.5.1 added took effect too late, so the first moves
+  after a click could overtake it. The app now receives every pointer move,
+  but looks at one only while it holds back a release or has input to re-send
+  (where the pointer is, when it moved, and whether the hardware made it);
+  every other move goes straight through.
 - The scroll wheel is in the event tap only while the wheel fix is on, so with
   it off scroll events never reach the app. Turning the fix on or off replaces
   the tap: held releases are settled first, and the old tap stays until the
@@ -149,12 +147,18 @@
   This is the Windows fix 0.5.1 promised. While a release is held, the first
   move off the spot waits, the release goes out where you clicked, and the
   move follows. A drag let go while moving drops where the button came up.
-  While the pointer is hidden (a game's mouse-look) the app never holds back
-  or re-sends pointer movement. In that case and in a remote session, a held
-  release goes out once the filter window has passed, with your next click or
-  by a timer, wherever the pointer is then.
-- Touchpads, touchscreens and pens are told apart from mice, through Raw Input
-  and the marker Windows puts on pen and touch input, and are never filtered.
+  While the pointer is hidden (as it is in most games' mouse-look) the app
+  never holds back or re-sends pointer movement. In that case and in a remote
+  session, a held release goes out once the filter window has passed, with
+  your next click or by a timer, wherever the pointer is then.
+- Precision touchpads, touchscreens and pens are told apart from mice, through
+  Raw Input and the marker Windows puts on pen and touch input, and are not
+  filtered. Touchpads have three exceptions: a tap within about a second of
+  using a mouse counts as that mouse's click; a touchpad that isn't a
+  precision one reports itself to Windows as a mouse; and without Raw Input
+  every touchpad click is filtered. Touchscreens and pens always pass.
+- On Windows the wheel fix judges only a notch that a mouse reported through
+  Raw Input, so a precision touchpad's scrolling is left alone.
 - Clicks are timed on the precise clock as they arrive, not by Windows'
   15.6 ms tick, which was coarser than the gaps being judged. A bounce at
   the start of a drag is told apart again, a calibrated window near 30 ms no
@@ -244,8 +248,9 @@
 - **Copy Diagnostics** (Windows: **Copy diagnostics**) in General copies
   the version, OS, the filter's state, the settings, the pointing devices
   the app has seen (by name) and the end of the app's log, for a bug report.
-  The log records start-up, the filter starting and stopping, failures and
-  updates, never clicks; hard crashes go to crash.log beside it.
+  The log records start-up, the filter starting and stopping, permission
+  changes, waking from sleep and switching users, the TLS library in use,
+  failures and updates, never clicks; hard crashes go to crash.log beside it.
 - Your "on" survives failures. A filter that can't start at login, or stops
   on its own, used to switch itself off for good. Now the menu's status line
   says what happened, a start the app makes itself retries at 1, 3, 8 and

@@ -60,16 +60,21 @@ says so and how to turn it back on.
 - **Scroll wheel**, on **Bounce Filter**: for a wheel that now and then jumps
   one notch the wrong way. Off by default. With it on, a notch that goes
   against the one before it within the wheel window (50 ms by default) is
-  dropped. Smooth scrolling from a trackpad or touchpad is never touched.
+  dropped. Smooth scrolling is never touched: a Mac trackpad's, and on Windows
+  a precision touchpad's.
 - **History** shows, for each button, bounces per 100 clicks over the last 30
   days, a trend, and how long after a release each bounce came. A rising line
-  is a switch wearing out. The trend needs a couple of weeks of clicks.
+  is a switch wearing out. The trend needs at least 200 clicks in each 15-day
+  half of the 30 days, so it can't appear before you have used the app for 16
+  days.
 - **Apps** lists the apps in which nothing is filtered while they are in
   front, such as a game. In front means the active app, the one with the
   keyboard focus, not the window under the pointer.
 - **Devices** lists the mice the app has seen, each with a switch, for a
   second mouse you don't want filtered. Trackpads, touchscreens and pens are
-  never filtered and are listed as such.
+  listed separately, with no switch. On Windows that means precision
+  touchpads; see [Troubleshooting](TROUBLESHOOTING.md#devices) for the
+  exceptions.
 
 ## Choosing a filter window
 
@@ -84,10 +89,11 @@ window before apps see it, a little longer on a still mouse, and a click made
 in place goes out as soon as you move the pointer off it. So a shorter window
 also means a quicker click. Presses go straight through; one waits only
 behind a release still on its way to apps, usually for a millisecond or two.
-Back and forward, and the scroll wheel, hold nothing back.
+Back and forward releases aren't held for the window, though like a press
+they can wait a millisecond or two behind a release still on its way. The
+scroll wheel is never held.
 
 On Windows there is one exception to the pointer-off rule. While the pointer is
-hidden (a game's mouse-look), and in a remote session, moving the pointer
-doesn't release a click: it goes out once the window has passed, with your
-next click or by a timer, wherever the pointer is then. Touchpads,
-touchscreens and pens are never filtered.
+hidden (as it is in most games' mouse-look), and in a remote session, moving
+the pointer doesn't release a click: it goes out once the window has passed,
+with your next click or by a timer, wherever the pointer is then.

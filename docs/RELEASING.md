@@ -144,11 +144,16 @@ when every one of its jobs passes:
   checks that quitting works and an unsigned update is refused, and
   uninstalls. The installed app's self-test must report its TLS going through
   Schannel and a supported OpenSSL, and its folder must hold no Qt OpenSSL
-  plugin, no OpenSSL library files and no copy of the Universal C Runtime. The
-  old installers come from a cache keyed by `tools/old_installers.json`, each
-  checked against its SHA-256, so a run doesn't add to the Releases' download
-  numbers. The leg that installs a signed update needs a build that trusts
-  CI's key, so it runs in `ci.yml` only.
+  plugin, none of the OpenSSL files Qt's backend would load
+  (`libcrypto-3-x64.dll` and `libssl-3-x64.dll`; Python's own `libcrypto-3.dll`
+  and `libssl-3.dll` ship) and no copy of the Universal C Runtime. The old
+  installers come from a cache keyed by `tools/old_installers.json`, each
+  checked against its SHA-256, so a run that finds the cache doesn't add to the
+  Releases' download numbers. Actions caches are scoped to a branch: a run
+  restores its own branch's cache and the default branch's, so a run on any
+  other branch or tag downloads the installers until `main` has a run that
+  saved the cache. The leg that installs a signed update needs a build that
+  trusts CI's key, so it runs in `ci.yml` only.
 - **macOS build**, on a macOS 26 runner, loads the signing certificate from
   the `release` environment and refuses to build without it. The build
   script checks the signed app (see
@@ -289,15 +294,18 @@ the app asks for another Python. The unit tests still run on Python 3.11 to
 
 ### SIP and the injection check
 
-`tools/macos_injection_check.sh` runs the app's self-test with canary
-libraries and programs named in its environment (`DYLD_INSERT_LIBRARIES`,
-`OPENSSL_CONF`, `PATH` and others) and fails if any canary is loaded or run.
-The dyld leg means something only with System Integrity Protection on: with it
-off, dyld loads `DYLD_INSERT_LIBRARIES` into any app, hardened runtime or not.
-SIP is off on GitHub's macOS runners, so the build there skips only the dyld
-leg, with a warning, and runs the others. `publish` runs the check with
-`--require-sip` on the release's own app, which runs every leg and fails
-unless SIP is on.
+`tools/macos_injection_check.sh` runs the app's self-test four times, each
+with canary libraries and programs named in its environment, and fails if any
+canary is loaded or run. The legs are `dyld` (`DYLD_INSERT_LIBRARIES`), `cwd`
+(a folder holding a canary under each bare name Qt's OpenSSL backend asks the
+loader for), `openssl` (`OPENSSL_CONF`) and `path` (`PATH`, `BASH_ENV`, `ENV`
+and an exported function). The dyld and cwd legs mean something only with
+System Integrity Protection on: with it off, dyld loads
+`DYLD_INSERT_LIBRARIES` into any app, hardened runtime or not, and need not
+refuse a library by relative path. SIP is off on GitHub's macOS runners, so
+the build there skips those two legs, with a warning, and runs the openssl and
+path legs. `publish` runs the check with `--require-sip` on the release's own
+app, which runs every leg and fails unless SIP is on.
 
 ### CI's update key
 

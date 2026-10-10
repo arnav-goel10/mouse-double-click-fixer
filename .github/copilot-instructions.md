@@ -19,7 +19,9 @@
   buttons, the wheel fix, the excluded apps and the ignored devices). Back and
   forward use the drop rule only and never hold a release back. Clicks from
   trackpads, touchscreens and pens, from an ignored device, or while an
-  excluded app is in front pass untouched.
+  excluded app is in front pass untouched (on Windows, only precision
+  touchpads count, and a tap within a second of any mouse report is that
+  mouse's click).
 - The hook callback runs on a hook thread and must stay fast: no disk writes,
   no UI calls. Windows silently drops a low-level hook that takes too long, and
   macOS disables a slow tap. Log through `logging` (written from a queue),

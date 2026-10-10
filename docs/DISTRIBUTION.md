@@ -106,7 +106,7 @@ installer and the installed exe's self-test.
 
 | Condition | This project |
 | --- | --- |
-| **Reputation.** Under "Common misunderstandings" the terms say SignPath won't sign binaries built from code nobody knows, and that for programs people download and run on the strength of its signature, "we require a certain verifiable reputation" (libraries are exempt) | **Not yet, and the condition most likely to stop the application.** The repository was created on 2026-09-17. On 2026-10-10 it had 0 stars, 0 forks, no issues, and pull requests only from you and Dependabot. Its release files show 146 downloads in all, but 112 of them are of the 0.2.6 and 0.5.3 installers, which CI's install tests fetched on every run until they were cached (`tools/old_installers.py`), and the rest look like one installed copy updating itself (a macOS update archive and a `SHA256SUMS.txt` per release). Nothing yet shows use by anyone else |
+| **Reputation.** Under "Common misunderstandings" the terms say SignPath won't sign binaries built from code nobody knows, and that for programs people download and run on the strength of its signature, "we require a certain verifiable reputation" (libraries are exempt) | **Not yet, and the condition most likely to stop the application.** The repository was created on 2026-09-17. On 2026-10-10 it had 0 stars, 0 forks, no issues, and pull requests only from you and Dependabot. Its release files showed 187 downloads in all, but 152 of them were of the 0.2.6 and 0.5.3 installers, which CI's install tests fetched on every run until they were cached (`tools/old_installers.py`). Runs on branches still fetch them, because Actions caches are scoped to a branch and `main` had no run that saved the cache yet. The rest look like one installed copy updating itself (a macOS update archive and a `SHA256SUMS.txt` per release). Nothing yet shows use by anyone else |
 | **OSS license.** The terms: the project "must use an OSI-approved Open Source license without commercial dual-licensing for all components." | MIT. The app bundles Qt through PySide6 (LGPL-3.0), which The Qt Company also sells under a commercial licence. The sentence says "for all components" and doesn't say whether a bundled library's dual licence counts, so it could be read against the project; mention it in the application. SignPath's [project list](https://signpath.org/projects) includes Qt applications, Flameshot and Stellarium among them |
 | No malware or potentially unwanted programs | None. The app filters mouse input and never invents a click |
 | No proprietary components, though System Libraries (as section 1 of the GPL v3 defines them) may be included | Python, Qt/PySide6 and the other bundled packages are open source. The exception is Microsoft's Visual C++ runtime (`VCRUNTIME140.dll`, `VCRUNTIME140_1.dll` and the `MSVCP140*.dll` files), the runtime of the compiler Python and Qt are built with. It is proprietary, shipped unmodified as Microsoft's Distributable Code, and `THIRD_PARTY_NOTICES-windows.md` says so. Python's two copies are signed by Microsoft, and the copies inside PySide6 and shiboken6 by The Qt Company. It fits GPL v3 section 1's System Libraries, which come with a Major Component, and a Major Component includes "a compiler used to produce the work". Name it in the application |
@@ -118,7 +118,7 @@ installer and the installed exe's self-test.
 | Manual approval of every release | Two requests per release, both approved by you |
 | Product name and version enforced by metadata restrictions | Both artifact configurations require product name "Mouse Double-Click Fixer" and the release's version |
 | Only your own code signed | Only the three files built here. The Python and Qt libraries beside the installed exe are never sent to SignPath |
-| Privacy: software that collects user data and transfers it to systems the user didn't name must describe this in a privacy policy, show that policy during installation, and offer an option at install time to turn it off | No telemetry, and nothing about the user is collected. What the app learns on the computer stays there: the executable name of the app in front (kept in memory, to compare with the user's exclusion list), the keys of the mice the user chooses to ignore (in `settings.json`) and the daily counts in `wear.json`. The only network use is the update check and download from the project's GitHub Releases. The check is on by default; it asks GitHub for the latest release, with the app's version in its User-Agent and nothing else beyond what any web request carries (the IP address). **General › Check for updates automatically** turns it off (README, [Privacy](../README.md#privacy)). Be ready to argue that this isn't user data. If SignPath disagrees, the installer must show the privacy policy and offer a checkbox that turns the automatic check off; that isn't built |
+| Privacy: software that collects user data and transfers it to systems the user didn't name must describe this in a privacy policy, show that policy during installation, and offer an option at install time to turn it off | No telemetry, and nothing about the user is collected. What the app learns on the computer stays there: the executable name of the app in front (kept in memory, to compare with the user's list of excluded apps), the executable names of the apps the user adds to that list and the keys of the mice the user chooses to ignore (both in `settings.json`), the daily counts in `wear.json`, and which device sent each Raw Input report and when (kept in memory; no position is read). The only network use is the update check and download from the project's GitHub Releases. The check is on by default; it asks GitHub for the latest release, with the app's version in its User-Agent and nothing else beyond what any web request carries (the IP address). **General › Check for updates automatically** turns it off (README, [Privacy](../README.md#privacy)). Be ready to argue that this isn't user data. If SignPath disagrees, the installer must show the privacy policy and offer a checkbox that turns the automatic check off; that isn't built |
 | System changes announced; an uninstaller | Start at login is off unless chosen. The installer registers an uninstaller; the portable exe is one file to delete |
 | A "Code signing policy" on the home page | **To do once accepted:** add [the section below](#the-code-signing-policy-section) to the README and the release page |
 
@@ -132,10 +132,11 @@ show it:
 - posts, reviews or forum answers elsewhere that recommend it;
 - a winget listing, which Microsoft's moderators reviewed and scanned
   ([winget](#2-winget));
-- download counts, once CI's own are taken out. Until it cached them, CI's
-  install tests downloaded the 0.2.6 and 0.5.3 installers from their release
-  pages on every run, so those two releases' counts overstate use, and always
-  will.
+- download counts, once CI's own are taken out. CI's install tests
+  downloaded the 0.2.6 and 0.5.3 installers from their release pages on every
+  run until they were cached, and a run on a branch downloads them again until
+  `main` has a run that saved the cache, so those two releases' counts
+  overstate use, and always will.
 
 Count again before applying:
 
@@ -188,12 +189,22 @@ condition most likely to stop the application.
 > - optionally (off by default) drops a scroll-wheel tick that reverses
 >   direction within a short window (50 ms by default), the stray notch of a
 >   worn wheel encoder, vertical and horizontal ticks each judged on their
->   own. The same hook sees the ticks; nothing is held back or re-sent;
-> - tells which device a click came from with Raw Input: a hidden window of
->   its own registers (`RegisterRawInputDevices`, `RIDEV_INPUTSINK`) for
->   mice, precision touchpads and touchscreens, never keyboards. Clicks from
->   touchpads, touchscreens and pens pass untouched, and the user can put
->   any mouse on a per-device ignore list;
+>   own. The same hook sees the ticks; nothing is held back or re-sent. A
+>   tick is judged only if a mouse's Raw Input report carries a wheel notch
+>   for that axis, so a precision touchpad's scrolling, which no mouse
+>   reports, is left alone;
+> - tells which device a click or wheel tick came from with Raw Input: a
+>   hidden window of its own registers (`RegisterRawInputDevices`,
+>   `RIDEV_INPUTSINK`, `RIDEV_DEVNOTIFY`) for mice, precision touchpads and
+>   touchscreens, never keyboards. Windows delivers every report from them to
+>   that window, pointer movement included, whether or not the app is in
+>   front. The app notes only which device sent each report, when, and for a
+>   mouse which buttons or wheel it names; it reads no positions.
+>   `RIDEV_DEVNOTIFY` tells it when a device is connected or removed. Clicks
+>   from precision touchpads, touchscreens and pens pass untouched, except
+>   that a touchpad tap within a second of any mouse's report is taken for
+>   that mouse's click, and the user can put any mouse on a per-device ignore
+>   list;
 > - watches which app is in front (`SetWinEventHook`,
 >   `EVENT_SYSTEM_FOREGROUND`), so clicks pass untouched while an app on the
 >   user's exclusion list (a game, say) is in front. It reads the executable
@@ -523,24 +534,28 @@ The listing needs:
 - screenshots (`docs/images/windows.png` and others at the Store's sizes);
 - the category Utilities & tools;
 - the age-rating questionnaire;
-- Notes for certification, such as: "A tray utility. After install it starts
-  in the notification area; open it from the Start menu. It filters mouse
-  switch bounce with a low-level mouse hook (SetWindowsHookEx, WH_MOUSE_LL)
-  on the left, right, middle and side buttons, and can drop a scroll-wheel
-  tick that reverses within a short window (off by default). A button
+- Notes for certification, such as: "A tray utility. After install it
+  starts in the notification area; open it from the Start menu. It filters
+  mouse switch bounce with a low-level mouse hook (SetWindowsHookEx,
+  WH_MOUSE_LL) on the left, right, middle and side buttons, and can drop a
+  scroll-wheel tick that reverses within a short window (off by default;
+  it judges only a tick that a mouse's Raw Input report carries). A button
   release it held back for that window, and the input that came meanwhile,
   are re-sent with SendInput, as injected input; it never makes a click of
-  its own. To tell which device a click came from, a hidden
-  window registers for Raw Input (RegisterRawInputDevices, RIDEV_INPUTSINK)
-  from mice, precision touchpads and touchscreens only. Clicks from
-  touchpads, touchscreens and pens pass untouched, and the user can ignore a
-  chosen mouse. So that the user can exclude apps such as games, it watches
-  which app is in front (SetWinEventHook, EVENT_SYSTEM_FOREGROUND) and
-  compares that program's executable name with the user's list; the name is
-  kept in memory only. It keeps daily counts of presses and bounces in
-  wear.json in its settings folder, which is never sent anywhere. It reads
-  no keyboard input and needs no account or network access to work; its
-  update check, which can be turned off, is its only network use."
+  its own. To tell which device a click or wheel tick came from, a hidden
+  window registers for Raw Input (RegisterRawInputDevices,
+  RIDEV_INPUTSINK, RIDEV_DEVNOTIFY) from mice, precision touchpads and
+  touchscreens only. It notes which device sent each report and reads no
+  positions. Clicks from precision touchpads, touchscreens and pens pass
+  untouched (a touchpad tap within a second of a mouse's report is taken
+  for that mouse's click), and the user can ignore a chosen mouse. So that
+  the user can exclude apps such as games, it watches which app is in
+  front (SetWinEventHook, EVENT_SYSTEM_FOREGROUND) and compares that
+  program's executable name with the user's list; the name is kept in
+  memory only. It keeps daily counts of presses, bounces and wheel ticks
+  in wear.json in its settings folder, which is never sent anywhere. It
+  reads no keyboard input and needs no account or network access to work;
+  its update check, which can be turned off, is its only network use."
 
 Copies installed from the Store update themselves through the app's own
 updater, like any installed copy. Each new release also needs a Partner
