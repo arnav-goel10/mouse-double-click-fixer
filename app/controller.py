@@ -8,7 +8,7 @@ import sys
 import threading
 from typing import Any, Optional
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, QTimer, Signal
 
 from . import DISPLAY_NAME, permissions
 from . import settings as settings_store
@@ -19,6 +19,11 @@ from .platform import DeviceInfo, FilterConfig, GlobalClickFilter, HookError, is
 from .wear import WearHistory
 
 log = logging.getLogger(__name__)
+
+#: How long after the last change to a window box its settings are written.
+#: Every write is flushed to disk, and a held arrow key steps the box many
+#: times a second.
+SAVE_DELAY_MS = 300
 
 #: The settings the updater keeps, through store_update_state().
 UPDATE_STATE_KEYS = frozenset({"auto_check", "update_attempt_version", "update_attempt_count"})
@@ -60,6 +65,10 @@ class AppController(QObject):
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
         self.settings = settings_store.load()
+        # Changes held in `settings` that wait for their write (_store_later),
+        # and the timer that ends the wait. Made when first needed.
+        self._unsaved = False
+        self._save_timer: Optional[QTimer] = None
         self.login_item_state = startup.ON if self.settings["start_at_login"] else startup.OFF
         if startup.is_supported():
             self.refresh_login_item()
@@ -397,6 +406,7 @@ class AppController(QObject):
     def shutdown(self) -> None:
         self._shut_down = True
         self._stop_filter()
+        self.flush_settings()
         self.flush_stats()
         self.wear.save()
 
@@ -448,22 +458,27 @@ class AppController(QObject):
         return ", ".join(f"{button.value} {self.threshold_for(button)} ms" for button in chosen)
 
     # -- settings ----------------------------------------------------------
-    def _apply(self, **values: object) -> None:
+    def _apply(self, *, deferred: bool = False, **values: object) -> None:
         """Save filter settings, hand the new configuration to a running
-        filter (it takes effect at once), and tell the UI."""
-        self._store(**values)
+        filter (it takes effect at once), and tell the UI. `deferred` holds
+        the write back until the changes stop (_store_later)."""
+        if deferred:
+            self._store_later(**values)
+        else:
+            self._store(**values)
         self._sync_watched()
         if self._filter is not None:
             self._filter.update(self.filter_config())
         self.settings_changed.emit()
 
-    def set_threshold(self, button: Any, value: int) -> None:
-        """Set one button's window."""
+    def set_threshold(self, button: Any, value: int, *, deferred: bool = False) -> None:
+        """Set one button's window. A window box passes `deferred`: the filter
+        has the new window at once, the file gets it when the steps stop."""
         button = as_button(button)
         threshold = clamp_threshold(value)
         if threshold == self.threshold_for(button):
             return
-        self._apply(thresholds={**self.settings["thresholds"], button.value: threshold})
+        self._apply(deferred=deferred, thresholds={**self.settings["thresholds"], button.value: threshold})
 
     def set_buttons(self, buttons: list[Button]) -> None:
         """Choose the buttons to filter, side buttons included. One always
@@ -495,7 +510,7 @@ class AppController(QObject):
             self._store(calibrated_buttons=names)
             self.settings_changed.emit()
 
-    def set_wheel_fix(self, enabled: bool, window_ms: Optional[int] = None) -> None:
+    def set_wheel_fix(self, enabled: bool, window_ms: Optional[int] = None, *, deferred: bool = False) -> None:
         values: dict[str, object] = {"wheel_fix": bool(enabled)}
         if window_ms is not None:
             values["wheel_window_ms"] = settings_store.milliseconds(
@@ -503,7 +518,7 @@ class AppController(QObject):
             )
         if all(self.settings.get(key) == value for key, value in values.items()):
             return
-        self._apply(**values)
+        self._apply(deferred=deferred, **values)
 
     def add_excluded_app(self, key: str, name: str = "") -> None:
         """Let everything through while this app is in front."""
@@ -656,6 +671,29 @@ class AppController(QObject):
             # The disk is full or the file is locked (a sync tool, antivirus).
             # Keep running on the new values; the next write tries again.
             self.settings = settings_store.merge(values, self.settings)
+        else:
+            # Whatever was held back went out with this write.
+            self._unsaved = False
+            if self._save_timer is not None:
+                self._save_timer.stop()
+
+    def _store_later(self, **values: object) -> None:
+        """_store, with the write left until the changes stop for
+        SAVE_DELAY_MS (any other write, flush_settings and shutdown take
+        what is held too). The values are in `settings` at once."""
+        self.settings = settings_store.merge(values, self.settings)
+        self._unsaved = True
+        if self._save_timer is None:
+            self._save_timer = QTimer(self)
+            self._save_timer.setSingleShot(True)
+            self._save_timer.setInterval(SAVE_DELAY_MS)
+            self._save_timer.timeout.connect(self.flush_settings)
+        self._save_timer.start()
+
+    def flush_settings(self) -> None:
+        """Write the changes _store_later is holding, if there are any."""
+        if self._unsaved:
+            self._store()
 
     def flush_stats(self) -> None:
         """Write the running count to disk, and the wear history when it is

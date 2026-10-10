@@ -6,6 +6,7 @@ try:
 except ImportError:  # run as tests.<module> from the repository root
     from tests import _isolation  # noqa: F401
 
+import json
 import logging
 import os
 import plistlib
@@ -236,6 +237,116 @@ class FilterPaneTests(PaneTestCase):
         self.wheel(box, -1)
         self.assertEqual(box.value(), 45)
         self.assertEqual(self.controller.threshold_for(Button.LEFT), 45, "chosen on purpose, so saved")
+
+    def writes(self):
+        """Count the writes of settings.json, which really happen."""
+        from app import settings
+
+        return mock.patch.object(settings, "write_json", wraps=settings.write_json)
+
+    def stored(self) -> dict:
+        return json.loads((self.directory / "settings.json").read_text())
+
+    def test_a_run_of_steps_is_one_write_and_the_filter_has_each_step(self) -> None:
+        from PySide6.QtTest import QTest
+
+        from app.controller import SAVE_DELAY_MS
+        from app.core import Button
+
+        hook = self.hook()
+        box = self.window.filter_page.window_boxes[Button.LEFT]
+        before = len(hook.updates)
+        with self.writes() as write:
+            for _ in range(10):
+                box.stepUp()
+            self.assertEqual(box.value(), 56)
+            self.assertEqual(self.controller.threshold_for(Button.LEFT), 56)
+            self.assertEqual(len(hook.updates) - before, 10, "the filter follows every step at once")
+            self.assertEqual(hook.updates[-1].thresholds[Button.LEFT], 56)
+            write.assert_not_called()
+            self.assertEqual(self.stored()["thresholds"]["left"], 46, "the file waits")
+            QTest.qWait(SAVE_DELAY_MS + 400)
+            write.assert_called_once()
+        self.assertEqual(self.stored()["thresholds"]["left"], 56, "the last step is what is saved")
+        self.assertEqual(SAVE_DELAY_MS, 300)
+
+    def test_a_run_of_steps_in_the_wheel_box_is_one_write_too(self) -> None:
+        from PySide6.QtTest import QTest
+
+        from app.controller import SAVE_DELAY_MS
+        from app.settings import WHEEL_MAX_MS
+
+        box = self.window.filter_page.wheel_box
+        start = box.value()
+        with self.writes() as write:
+            for _ in range(10):
+                box.stepUp()
+            self.assertEqual(self.controller.wheel_window_ms, min(start + 10, WHEEL_MAX_MS))
+            write.assert_not_called()
+            QTest.qWait(SAVE_DELAY_MS + 400)
+            write.assert_called_once()
+        self.assertEqual(self.stored()["wheel_window_ms"], start + 10)
+
+    def test_a_pause_between_steps_writes_each_run(self) -> None:
+        from app.core import Button
+
+        box = self.window.filter_page.window_boxes[Button.LEFT]
+        with self.writes() as write:
+            box.stepUp()
+            self.controller.flush_settings()  # the wait is over
+            box.stepUp()
+            self.controller.flush_settings()
+            self.controller.flush_settings()  # nothing held: nothing written
+            self.assertEqual(write.call_count, 2)
+        self.assertEqual(self.stored()["thresholds"]["left"], 48)
+
+    def test_closing_the_window_writes_what_is_waiting(self) -> None:
+        from PySide6.QtCore import QEvent
+        from PySide6.QtTest import QTest
+
+        from app.controller import SAVE_DELAY_MS
+        from app.core import Button
+
+        self.window.save_geometry()  # closing then has nothing else to write
+        box = self.window.filter_page.window_boxes[Button.LEFT]
+        with self.writes() as write:
+            for _ in range(3):
+                box.stepUp()
+            write.assert_not_called()
+            self.window.closeEvent(QEvent(QEvent.Type.Close))
+            write.assert_called_once()
+            self.assertEqual(self.stored()["thresholds"]["left"], 49)
+            QTest.qWait(SAVE_DELAY_MS + 400)
+            write.assert_called_once()  # the wait was ended, not repeated
+
+    def test_quitting_and_other_changes_write_what_is_waiting(self) -> None:
+        from app.core import Button
+
+        box = self.window.filter_page.window_boxes[Button.LEFT]
+        with self.writes() as write:
+            box.stepUp()
+            self.window.filter_page.button_switches[Button.BACK].click()  # an immediate change
+            write.assert_called_once()
+            self.assertEqual(self.stored()["thresholds"]["left"], 47, "it went out with the other change")
+            self.assertIn("back", self.stored()["buttons"])
+            self.assertFalse(self.controller._save_timer.isActive())
+        with self.writes() as write:
+            box.stepUp()
+            self.controller.shutdown()
+            write.assert_called_once()
+        self.assertEqual(self.stored()["thresholds"]["left"], 48)
+
+    def test_a_write_that_fails_is_held_for_the_next(self) -> None:
+        from app import settings
+        from app.core import Button
+
+        box = self.window.filter_page.window_boxes[Button.LEFT]
+        with mock.patch.object(settings, "write_json", side_effect=OSError("disk full")):
+            box.stepUp()
+            self.controller.flush_settings()
+        self.assertEqual(self.controller.threshold_for(Button.LEFT), 47, "still takes effect")
+        self.controller.flush_settings()  # still unsaved, so it tries again
+        self.assertEqual(self.stored()["thresholds"]["left"], 47)
 
     def test_scrolling_over_a_button_picker_keeps_the_button(self) -> None:
         from app.core import Button

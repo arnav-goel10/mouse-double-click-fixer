@@ -247,8 +247,10 @@ class FilterPage(Page):
             self.session_value.setText(f"{self.controller.session_filtered:,}")
 
     def _on_window(self, button: Button, value: int) -> None:
+        # Each step reaches the filter at once; the file is written once the
+        # steps stop, not on every one.
         if not self._loading:
-            self.controller.set_threshold(button, value)
+            self.controller.set_threshold(button, value, deferred=True)
 
     def _on_buttons(self, _checked: bool) -> None:
         if self._loading:
@@ -266,7 +268,7 @@ class FilterPage(Page):
 
     def _on_wheel_window(self, value: int) -> None:
         if not self._loading:
-            self.controller.set_wheel_fix(self.controller.wheel_fix, value)
+            self.controller.set_wheel_fix(self.controller.wheel_fix, value, deferred=True)
 
 
 class TestPage(Page):
@@ -1418,6 +1420,7 @@ class MainWindow(QWidget):
         if self.calibrate.phase != "intro":
             self.calibrate.restart()
         self.save_geometry()
+        self.controller.flush_settings()
         self.controller.flush_stats()
         self.hide()
         self._sync_pause()
