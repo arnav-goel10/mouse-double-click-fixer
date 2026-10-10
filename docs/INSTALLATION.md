@@ -89,6 +89,11 @@ To update by hand, turn off **Install updates automatically** and use
 **Check Now** (Windows: **Check now**), or choose **Check for Updates…**
 (Windows: **Check for updates…**) in the menu bar or notification area menu.
 
+Going back to 0.5.3 works, with two losses. It has one window for every button
+and takes the left button's. It doesn't know the back and forward buttons, so
+it drops them from the filtered buttons the next time it saves. 1.0 reads the
+rest of its settings again.
+
 ## Uninstall
 
 - **macOS:** turn off **General › Open at login**, quit the app from its menu
@@ -96,16 +101,17 @@ To update by hand, turn off **Install updates automatically** and use
   0.5.3 or earlier may still be called DoubleClick Fixer there). Remove **Mouse
   Double-Click Fixer** from **Privacy & Security › Device Control and Data
   Access** (**Accessibility** on macOS 26 and earlier) with the **−** button.
-  Its settings and log stay in
+  Its settings, history and log stay in
   `~/Library/Application Support/DoubleClickFixer` until you delete that
   folder. Or run `bash installer/uninstall_macos.sh` from a checkout of this
   repository: it quits the app and waits until it has exited, then removes
-  the app, under either name, its login item, settings and permission.
+  the app, under either name, its login item, settings, history and
+  permission.
 - **Windows:** **Settings › Apps › Installed apps › Mouse Double-Click Fixer ›
   Uninstall**. This closes the app if it is running, then removes it, its
-  shortcuts, the startup entry, its settings and its log. For the portable
-  exe, turn off **General › Open at login** if you turned it on, then choose
-  **Exit** from its notification area icon, then delete the file and
+  shortcuts, the startup entry, its settings, history and log. For the
+  portable exe, turn off **General › Open at login** if you turned it on, then
+  choose **Exit** from its notification area icon, then delete the file and
   `%APPDATA%\DoubleClickFixer`.
 
 ## From source
