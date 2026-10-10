@@ -2116,10 +2116,12 @@ class GlobalClickFilter:
 
         def answer_pending() -> None:
             # Every event already handed to this thread's taps is answered:
-            # each run handles one, until none is waiting.
+            # each run handles one, until none is waiting. A run that a
+            # request to stop or look again cut short (CFRunLoopStop, from
+            # another thread) handled nothing, and is run again.
             for _ in range(256):
-                handled = Quartz.CFRunLoopRunInMode(Quartz.kCFRunLoopDefaultMode, 0, True)
-                if handled != Quartz.kCFRunLoopRunHandledSource:
+                result = Quartz.CFRunLoopRunInMode(Quartz.kCFRunLoopDefaultMode, 0, True)
+                if result not in (Quartz.kCFRunLoopRunHandledSource, Quartz.kCFRunLoopRunStopped):
                     return
 
         self._started = True

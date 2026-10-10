@@ -2129,7 +2129,7 @@ class FakeQuartz:
     kCGEventSourceStateHIDSystemState = 1
     kCGHIDEventTap = kCGHeadInsertEventTap = kCGEventTapOptionDefault = kCGMouseButtonLeft = 0
     kCFRunLoopCommonModes, kCFRunLoopDefaultMode = "common", "default"
-    kCFRunLoopRunTimedOut, kCFRunLoopRunHandledSource = 3, 4
+    kCFRunLoopRunStopped, kCFRunLoopRunTimedOut, kCFRunLoopRunHandledSource = 2, 3, 4
 
     def __init__(self) -> None:
         self.taps = []
@@ -2137,6 +2137,9 @@ class FakeQuartz:
         # In order: ("enable", tap index, on), ("post", event kind),
         # ("run", seconds) and ("invalidate", tap index).
         self.calls = []
+        # What runs that wait for nothing (seconds 0) return, in turn: one
+        # per event waiting at a port, or a stop requested meanwhile.
+        self.waiting = []
         # Whether each tap was enabled as each event was posted.
         self.taps_enabled_at_post = []
         self.pointer = (0.0, 0.0)
@@ -2179,6 +2182,8 @@ class FakeQuartz:
 
     def CFRunLoopRunInMode(self, mode, seconds, return_after_source):
         self.calls.append(("run", seconds))
+        if seconds == 0 and self.waiting:
+            return self.waiting.pop(0)
         self._wake.wait(min(seconds, 0.002))
         self._wake.clear()
         return self.kCFRunLoopRunTimedOut
@@ -2825,6 +2830,20 @@ class MacTapTests(unittest.TestCase):
         self.assertLess(on, posted)
         self.assertLess(posted, off)
         self.assertIn(("run", 0), calls[off:gone], "the old tap's port went with nothing answered")
+
+    def test_everything_handed_to_the_old_tap_is_answered_before_it_goes(self) -> None:
+        Q = self.Q
+        # Two events wait at the taps' ports as the old one is switched off,
+        # and a request to look again cuts one run short.
+        self.quartz.waiting = [Q.kCFRunLoopRunHandledSource, Q.kCFRunLoopRunStopped, Q.kCFRunLoopRunHandledSource]
+        self.configure(wheel_fix=True)
+        old, fresh = self.wait_for_taps(2)
+        self.take_over(fresh)
+        self.wait_until(lambda: old.invalidated)
+        calls = self.quartz.calls
+        between = calls[calls.index(("enable", 0, False)):calls.index(("invalidate", 0))]
+        self.assertEqual(between.count(("run", 0)), 4, "each waiting event answered, then one run that found none")
+        self.assertEqual(self.quartz.waiting, [])
 
     def test_the_old_tap_decides_until_the_new_one_sees_an_event(self) -> None:
         # A tap switched on takes effect a moment later: until the new tap
