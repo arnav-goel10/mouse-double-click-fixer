@@ -150,10 +150,14 @@ jobs:
           }
           python tools/screenshots.py screenshots/dark --live --scheme=dark
           if ($LASTEXITCODE -ne 0) { throw "the dark capture failed" }
-      - name: Capture the README screenshot (dark mode, as on macOS)
-        if: runner.os == 'Windows'
+      - name: Capture the README screenshot (dark, the two platforms the same size)
         shell: pwsh
-        run: python tools/screenshots.py screenshots --live --docs
+        run: |
+          # Windows' window is as tall as the runner's screen allows; the Mac's
+          # is made the size of the current Windows picture, so the two match.
+          if ($IsWindows) { python tools/screenshots.py screenshots --live --docs --scheme=dark }
+          else { python tools/screenshots.py screenshots --live --docs --scheme=dark --size=860x621 }
+          if ($LASTEXITCODE -ne 0) { throw "the README capture failed" }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:

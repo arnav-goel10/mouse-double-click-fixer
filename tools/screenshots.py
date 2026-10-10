@@ -28,11 +28,12 @@ section that fits.
                              windows-screenshots artifact's docs-filter.png): a
                              real window, title bar included, as tall as the
                              runner's 1024 x 768 screen allows.
-    docs/images/macos.png    `--docs --size=WIDTHxHEIGHT` on a Mac, with the
-                             Windows picture's size so the two match: an
-                             offscreen render of the window, drawn dark with
-                             its corners and window buttons, since there is no
-                             window server to capture one from.
+    docs/images/macos.png    CI's `--live --docs --size=WIDTHxHEIGHT` run on
+                             macOS (the macos-screenshots artifact's
+                             docs-filter.png), dark, with the Windows picture's
+                             size so the two match. Offscreen, `--docs` draws
+                             the window with its corners and window buttons
+                             instead, but Qt draws no native control there.
 
 Without `--size` the window is as tall as the pane needs (a live window is held
 to what the screen shows).
@@ -324,16 +325,17 @@ def capture_docs(app, main_window, target: Path, size: tuple[int, int] | None) -
           f"available {available.width()} x {available.height()}, scale {screen.devicePixelRatio()}")
     main_window.move(available.x(), available.y())
     wait(app, 300)
-    room = available.height() - WINDOWS_TITLE_BAR - 8
-    wanted = size[1] - WINDOWS_TITLE_BAR if size else fit_pane(app, main_window, room)[0]
+    # A Mac window draws its title bar inside itself; Windows adds one.
+    title_bar = 0 if sys.platform == "darwin" else WINDOWS_TITLE_BAR
+    room = available.height() - title_bar - 8
+    wanted = size[1] - title_bar if size else fit_pane(app, main_window, room)[0]
     print(f"The pane shows {wanted} px of the {room} the screen leaves")
     main_window.resize(size[0] if size else DOCS_WIDTH, min(wanted, room))
     main_window.move(available.x(), available.y())
     app.processEvents()
     wait(app, 800)
     frame = main_window.frameGeometry()
-    print(f"Window frame {frame.width()} x {frame.height()}")
-    main_window.screen().grabWindow(0, frame.x(), frame.y(), frame.width(), frame.height()).save(str(target))
+    print(f"Window frame {frame.width()} x {frame.height()}: {grab_window_live(app, main_window, target)}")
 
 
 def parse_scheme(argv) -> str | None:
@@ -682,8 +684,11 @@ def main() -> None:
         symbols.IS_MAC, symbols.IS_WINDOWS = False, False
 
     if docs:
-        # Shown as on, without installing a real mouse hook.
+        # Shown as on, without installing a real mouse hook, and allowed, as
+        # it is once set up (a CI Mac may not have granted Accessibility).
         AppController.active = property(lambda self: True)  # type: ignore[assignment]
+        permissions.has_accessibility = lambda: True  # type: ignore[assignment]
+        permissions.event_tap_allowed = lambda: True  # type: ignore[assignment]
     controller = AppController()
     if docs:
         docs_state(controller)
