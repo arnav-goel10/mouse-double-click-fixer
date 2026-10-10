@@ -174,8 +174,8 @@ class HistoryPage(LivePage):
 
 APPS_NOTE = (
     "Nothing is filtered while one of these apps is in front: the app you are using, "
-    "not the one under the pointer. Useful for games whose anti-cheat objects to "
-    "filtered input."
+    "not the one under the pointer. Useful for games, or any app where you would "
+    "rather have every click exactly as the mouse sends it."
 )
 
 
