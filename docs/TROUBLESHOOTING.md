@@ -56,6 +56,10 @@ and the app then puts it back where your hand has taken it.
 
 ## The scroll wheel
 
+If another mouse utility (Mac Mouse Fix, for example) smooths the scroll wheel or remaps the back and forward
+buttons, it takes those events over and replaces them with its own, so the wheel fix and the side-button
+filter may see nothing to act on. Turn that feature off in the other utility to let this app handle them.
+
 The wheel fix is off until you turn it on under **Bounce Filter › Scroll
 wheel**. It drops a notch that goes the opposite way to the one before it and
 arrives within the wheel window, 50 ms by default (10 to 150 ms can be set).
