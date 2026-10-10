@@ -358,6 +358,25 @@ class WheelAndDeviceReportTests(unittest.TestCase):
         self.assertEqual(click_filter.seen_devices()[0].kind, "trackpad")
         self.assertFalse(click_filter.seen_devices()[0].filtered)
 
+    def test_the_device_lookup_says_whether_devices_can_be_told_apart(self) -> None:
+        from unittest import mock
+
+        from app import devices_mac
+
+        click_filter = self.rig.filter
+        with mock.patch("app.platform.platform.system", return_value="Windows"):
+            self.assertEqual(click_filter.device_lookup, "not started")
+            click_filter._device_lookup = "raw input unavailable: RegisterRawInputDevices failed (error 5)"
+            self.assertEqual(click_filter.device_lookup, "raw input unavailable: RegisterRawInputDevices failed (error 5)")
+        with mock.patch("app.platform.platform.system", return_value="Darwin"), \
+                mock.patch.object(devices_mac, "lookup_status", return_value="iokit ok"):
+            self.assertEqual(click_filter.device_lookup, "iokit ok")
+        with mock.patch.object(devices_mac, "_shared_registry", [None]), \
+                mock.patch.object(devices_mac, "_registry_failure", ["OSError: no IOKit"]):
+            self.assertEqual(devices_mac.lookup_status(), "iokit unavailable: OSError: no IOKit")
+        with mock.patch.object(devices_mac, "_shared_registry", [object()]):
+            self.assertEqual(devices_mac.lookup_status(), "iokit ok")
+
 
 if __name__ == "__main__":
     unittest.main()

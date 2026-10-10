@@ -19,7 +19,7 @@ import threading
 import time
 from collections import deque
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from time import monotonic, perf_counter
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, NamedTuple, Optional
@@ -36,6 +36,7 @@ from .core import (
     WheelFilter,
     clamp_threshold,
 )
+from .devices_win import button_flag, wheel_flag
 
 log = logging.getLogger(__name__)
 
@@ -277,6 +278,14 @@ _logged_sites: set[str] = set()
 _logged_sites_lock = threading.Lock()
 
 
+def _amend(event: ClickEvent, **fields: Any) -> None:
+    """Set fields of an event the filter made a moment ago, which no one
+    else holds yet: on the hook's path, so not dataclasses.replace, which
+    copies the event through its fields() at several times the cost."""
+    for name, value in fields.items():
+        object.__setattr__(event, name, value)
+
+
 def _log_ignored(site: str) -> None:
     """Call from an `except` block that carries on regardless."""
     try:
@@ -372,6 +381,9 @@ class GlobalClickFilter:
         # Input (see devices_win), while it runs.
         self._hook_window = None
         self._raw_input = None
+        # Whether Windows' Raw Input works (see device_lookup), once the
+        # hook has started.
+        self._device_lookup = "not started"
         # The macOS tap's device lookups (devices_mac.SenderCache), while it runs.
         self._senders = None
         self._use_os_time: Optional[bool] = None
@@ -600,6 +612,18 @@ class GlobalClickFilter:
     @property
     def config(self) -> FilterConfig:
         return self._config
+
+    @property
+    def device_lookup(self) -> str:
+        """Whether the hook can tell which device a click came from, for the
+        diagnostics. Windows: "raw input ok", or "raw input unavailable:
+        <why>", as the hook found it when it started. macOS: "iokit ok", or
+        "iokit unavailable: <why>" (see devices_mac.lookup_status)."""
+        if platform.system() == "Darwin":
+            from . import devices_mac
+
+            return devices_mac.lookup_status()
+        return self._device_lookup
 
     def update(self, config: FilterConfig) -> None:
         """Take a new configuration while the hook keeps running. It applies
@@ -867,7 +891,7 @@ class GlobalClickFilter:
             held_at = click_filter.held_at
             event = click_filter.press(timestamp) if pressed else click_filter.release(timestamp, allow_hold and hold)
             if device is not None:
-                event = replace(event, device=device)
+                _amend(event, device=device)
             if event.is_bounce:
                 self.filtered_count += 1
             if event.held:
@@ -903,7 +927,7 @@ class GlobalClickFilter:
             if event.accepted and self._route_accepted(
                 button, pressed, template, timestamp, settled, behind, allow_hold
             ):
-                event = replace(event, accepted=False, deferred=True)
+                _amend(event, accepted=False, deferred=True)
             if pressed and not event.is_bounce:
                 # Where apps saw the button go down. A press they never see (a
                 # bounce, or the contact coming back mid-drag) must not move
@@ -1044,6 +1068,7 @@ class GlobalClickFilter:
         template: object,
         location: Optional[tuple[float, float]] = None,
         timestamp: Optional[float] = None,
+        placeless: Optional[Callable[[], bool]] = None,
     ) -> bool:
         """The pointer moved (`template` is a copy of the motion event,
         `location` where it took the pointer, and `timestamp` when it
@@ -1068,7 +1093,13 @@ class GlobalClickFilter:
         the last of them waits if any had to wait in a queue (see _settle).
         Otherwise it waits behind events still waiting to be re-sent, or else
         behind events re-sent a moment ago that may still be on their way, so
-        apps never see the pointer leave before a click is over.
+        apps never see the pointer leave before a click is over. Unless
+        `placeless`, asked only then, says the pointer's place means nothing
+        now (Windows: a hidden pointer, a remote session): then it never
+        waits, and so is never re-sent. A re-sent move is absolute, and in a
+        game's mouse-look it would jerk the view; where the pointer is no
+        one sees, a release reaching apps after the hand's motion changes
+        nothing. Buttons still keep their order among themselves.
 
         Returns True to let the event through unchanged, False when the
         platform must drop it because it was queued to be re-sent.
@@ -1098,6 +1129,8 @@ class GlobalClickFilter:
                 waiting = [button for button in Button if self._queued[button]]
                 waiting = waiting or [button for button in Button if self._in_flight[button]]
                 queue = waiting[0] if waiting else None
+            if queue is not None and placeless is not None and placeless():
+                queue = None
             if queue is not None:
                 self._enqueue(queue, None, template)
         self._send_outbox()
@@ -1584,17 +1617,19 @@ class GlobalClickFilter:
         # devices_win); its names are read on a thread of their own, which
         # posts WM_DEVICE here when they are in.
         WM_DEVICE = 0x8000 + 0x45
+        unavailable = ""
         try:
             raw_api = Win32RawInput()
-        except Exception:  # noqa: BLE001 - devices then go unknown and are filtered
+        except Exception as error:  # noqa: BLE001 - devices then go unknown and are filtered
             _log_ignored("setting up Raw Input")
-            raw_api = None
+            raw_api, unavailable = None, f"{type(error).__name__}: {error}"
         devices = RawInputDevices(
             raw_api,
             wake=lambda: user32.PostThreadMessageW(thread_id, WM_DEVICE, 0, 0),
             seen=lambda info: self._device_seen(info.key, info.name, info.kind),
+            unavailable=unavailable,
         )
-        hook_logic.device = devices.current
+        hook_logic.device = devices.attribute
         self._raw_input = devices
 
         def on_input(lparam: int) -> None:
@@ -1606,14 +1641,19 @@ class GlobalClickFilter:
 
         try:
             window = SessionWindow(
-                api, lambda: user32.PostThreadMessageW(thread_id, WM_REARM, REARM_SESSION, 0), on_input=on_input
+                api,
+                lambda: user32.PostThreadMessageW(thread_id, WM_REARM, REARM_SESSION, 0),
+                on_input=on_input,
+                on_device_change=devices.device_changed,
             )
         except Exception:  # noqa: BLE001 - the periodic re-arm still covers it
             _log_ignored("creating the session window")
             window = None
         self._hook_window = window.hwnd if window is not None else None
-        if window is not None and window.hwnd:
-            devices.register(window.hwnd)
+        devices.register(self._hook_window)
+        self._device_lookup = devices.status
+        if devices.status != "raw input ok":
+            log.warning("Devices can't be told apart: %s", devices.status)
         # The app in front, followed from this thread, whose message loop
         # delivers the foreground notices.
         self._front_changed(frontmost.current_app_key())
@@ -2255,9 +2295,10 @@ class WindowsHook:
         # in order. The hook runs with an InputSender (see there); by
         # default, at once.
         self._send = send or (lambda batch: send_batch(api, batch, owner._resend_lost))
-        # The device that reported last (devices_win.RawInputDevices.current),
-        # set by the runner; None while unknown.
-        self.device: Callable[[], Any] = lambda: None
+        # Which device the event being decided came from, given the bit a
+        # mouse reports for it (devices_win.RawInputDevices.attribute), set
+        # by the runner; None while unknown.
+        self.device: Callable[[int], Any] = lambda _flag: None
         # Whether motion is being watched: read on every move, without a lock.
         self.watch = [False]
         self.basis = (0, 0)
@@ -2265,6 +2306,10 @@ class WindowsHook:
         # False when Windows couldn't say where the pointer was as watching
         # began (another desktop had the input); the next real move sets both.
         self.known = False
+        # Whether the pointer's place means nothing now (see button): the
+        # hand's motion then never waits to be re-sent (see
+        # GlobalClickFilter._motion). Asked only when it would.
+        self._placeless = lambda: not api.relocation_allowed()
 
     # -- watching motion ----------------------------------------------------
     def set_watch(self, wanted: bool) -> None:
@@ -2323,7 +2368,7 @@ class WindowsHook:
         # Pen and touch, and clicks from a touchpad, a touchscreen or an
         # ignored device, pass untouched (see GlobalClickFilter._passes).
         pen = (extra & PEN_SIGNATURE_MASK) == PEN_SIGNATURE
-        kind, key = self._device_of_event(owner)
+        kind, key = self._device_of_event(owner, button_flag(button, pressed, self._api.buttons_swapped()))
         passes = owner._passes(pen, kind, key)
         # A release is only held back if it can be re-sent to the window that
         # will receive it.
@@ -2357,7 +2402,7 @@ class WindowsHook:
         if (extra & PEN_SIGNATURE_MASK) == PEN_SIGNATURE:
             return False
         owner = self._owner
-        kind, key = self._device_of_event(owner)
+        kind, key = self._device_of_event(owner, wheel_flag(axis))
         if owner._passes(False, kind, key):
             return False
         delta = (int(mouse_data) >> 16) & 0xFFFF
@@ -2365,9 +2410,10 @@ class WindowsHook:
             delta -= 0x10000
         return not owner._wheel_tick(axis, delta, windows_event_time(arrival, tick_now, tick))
 
-    def _device_of_event(self, owner: "GlobalClickFilter") -> tuple[Optional[str], Optional[str]]:
-        """(kind, key) of the device that reported last, as far as known."""
-        info = self.device()
+    def _device_of_event(self, owner: "GlobalClickFilter", flag: int) -> tuple[Optional[str], Optional[str]]:
+        """(kind, key) of the device the event came from, as far as known;
+        `flag` is the bit a mouse reports for it (see devices_win)."""
+        info = self.device(flag)
         if info is None:
             return None, None
         if info.key:
@@ -2415,7 +2461,7 @@ class WindowsHook:
         stamp = None
         if tick is not None and arrival is not None and tick_now is not None:
             stamp = windows_event_time(arrival, tick_now, tick)
-        if not self._owner._motion(target, target, stamp):
+        if not self._owner._motion(target, target, stamp, self._placeless):
             self.virtual = target
             return True
         self.basis = self.virtual = (x, y)
@@ -2780,10 +2826,14 @@ class SessionWindow:
     RESUME_EVENTS = (0x7, 0x12)
     _names = itertools.count(1)
 
-    WM_INPUT = 0x00FF
+    WM_INPUT, WM_INPUT_DEVICE_CHANGE = 0x00FF, 0x00FE
 
     def __init__(
-        self, api: WindowsApi, on_change: Callable[[], object], on_input: Optional[Callable[[int], object]] = None
+        self,
+        api: WindowsApi,
+        on_change: Callable[[], object],
+        on_input: Optional[Callable[[int], object]] = None,
+        on_device_change: Optional[Callable[[int, int], object]] = None,
     ) -> None:
         import ctypes
         from ctypes import wintypes
@@ -2829,7 +2879,7 @@ class SessionWindow:
 
         session_events, resume_events = self.SESSION_EVENTS, self.RESUME_EVENTS
         session_change, power, close = self.WM_WTSSESSION_CHANGE, self.WM_POWERBROADCAST, self.WM_CLOSE
-        raw_input = self.WM_INPUT
+        raw_input, device_change = self.WM_INPUT, self.WM_INPUT_DEVICE_CHANGE
 
         @WNDPROC
         def window_proc(hwnd, message, wparam, lparam):
@@ -2842,6 +2892,15 @@ class SessionWindow:
                     except Exception:  # noqa: BLE001 - never break the hook's thread
                         _log_ignored("reading Raw Input")
                 return user32.DefWindowProcW(hwnd, message, wparam, lparam)
+            if message == device_change:
+                # A device came or went (GIDC_ARRIVAL, GIDC_REMOVAL; lparam
+                # is its handle): see devices_win.RawInputDevices.device_changed.
+                if on_device_change is not None:
+                    try:
+                        on_device_change(int(wparam), int(lparam or 0))
+                    except Exception:  # noqa: BLE001 - never break the hook's thread
+                        _log_ignored("a device coming or going")
+                return 0
             if message == close:
                 # Restart Manager, and taskkill without /F, close every
                 # top-level window of the app. The default would destroy this

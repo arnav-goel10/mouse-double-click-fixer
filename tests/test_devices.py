@@ -12,6 +12,7 @@ import platform
 import threading
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 from app import devices_mac, devices_win, frontmost
 from app.devices_mac import MacDevice, SenderCache
@@ -66,15 +67,55 @@ class WindowsDevicePathTests(unittest.TestCase):
         self.assertEqual(devices_win.USAGES, ((0x01, 0x02), (0x0D, 0x05), (0x0D, 0x04)))
         self.assertEqual(devices_win.RIDEV_INPUTSINK, 0x100)
 
+    def test_registration_asks_to_hear_devices_come_and_go(self) -> None:
+        # RegisterRawInputDevices is handed every usage with RIDEV_INPUTSINK
+        # and RIDEV_DEVNOTIFY, and with RIDEV_REMOVE (and no window) to stop.
+        import ctypes
+
+        class RAWINPUTDEVICE(ctypes.Structure):
+            _fields_ = [("usUsagePage", ctypes.c_ushort), ("usUsage", ctypes.c_ushort),
+                        ("dwFlags", ctypes.c_uint32), ("hwndTarget", ctypes.c_void_p)]
+
+        calls = []
+
+        def register(devices, count, size):
+            calls.append([(entry.usUsagePage, entry.usUsage, entry.dwFlags, entry.hwndTarget) for entry in devices[:count]])
+            return 1
+
+        api = devices_win.Win32RawInput.__new__(devices_win.Win32RawInput)
+        api._ctypes, api.RAWINPUTDEVICE = ctypes, RAWINPUTDEVICE
+        api.user32 = SimpleNamespace(RegisterRawInputDevices=register)
+        self.assertTrue(api.register(0xABC))
+        self.assertTrue(api.register(None, remove=True))
+        self.assertEqual(calls[0], [(page, usage, 0x2100, 0xABC) for page, usage in devices_win.USAGES])
+        self.assertEqual(calls[1], [(page, usage, 0x1, None) for page, usage in devices_win.USAGES])
+        self.assertEqual(devices_win.RIDEV_DEVNOTIFY, 0x2000)
+
+    def test_the_bits_a_mouse_reports_for_each_button(self) -> None:
+        # RAWMOUSE numbers buttons as the hand presses them; the hook sees
+        # them after the user's swap, which only ever swaps left and right.
+        from app.core import Button
+
+        flag = devices_win.button_flag
+        self.assertEqual([flag(button, True) for button in Button], [0x0001, 0x0004, 0x0010, 0x0040, 0x0100])
+        self.assertEqual([flag(button, False) for button in Button], [0x0002, 0x0008, 0x0020, 0x0080, 0x0200])
+        self.assertEqual([flag(button, True, swapped=True) for button in Button], [0x0004, 0x0001, 0x0010, 0x0040, 0x0100])
+        self.assertEqual((devices_win.wheel_flag(1), devices_win.wheel_flag(2)), (0x0400, 0x0800))
+
 
 class FakeRawInput:
-    """Win32RawInput's stand-in: a WM_INPUT's lparam is the device handle.
+    """Win32RawInput's stand-in: a WM_INPUT's lparam is the device handle,
+    or (handle, RAWMOUSE.usButtonFlags) for a report of a mouse's buttons or
+    wheel.
 
     Each device is (Raw Input type, whether its reports carry absolute
     positions, HID usage, path, (product, serial)). Whether a mouse reports
     absolute positions is what Windows would say of it; nothing may take it
     for a sign of a touch surface (see devices_win's notes), so no call here
-    gives it out: a test only says what the device is."""
+    gives it out: a test only says what the device is.
+
+    `queued` holds WM_INPUT still waiting in the hook thread's queue: drain()
+    hands each to `dispatch`, as DispatchMessage hands it to the window."""
 
     def __init__(self) -> None:
         self.devices = {
@@ -87,15 +128,31 @@ class FakeRawInput:
         }
         self.registered: list = []
         self.string_reads: list = []
+        self.queued: list = []
+        self.dispatch = lambda _lparam: None
+        self.refuse = False
+        self.error = 0
 
     def register(self, hwnd, remove=False):
         self.registered.append((hwnd, remove))
+        if self.refuse and not remove:
+            self.error = 5  # ERROR_ACCESS_DENIED
+            return False
         return True
 
-    def handle_of(self, lparam):
-        if lparam == 0:
-            return 0, RIM_TYPEMOUSE  # SendInput, or a touchpad's gestures turned into mouse input
-        return lparam, self.devices[lparam][0]
+    def read(self, lparam):
+        handle, buttons = lparam if isinstance(lparam, tuple) else (lparam, 0)
+        if handle == 0:
+            return 0, RIM_TYPEMOUSE, buttons  # SendInput, or a touchpad's gestures turned into mouse input
+        raw_type = self.devices[handle][0]
+        return handle, raw_type, buttons if raw_type == RIM_TYPEMOUSE else 0
+
+    def drain(self, hwnd):
+        count = 0
+        while self.queued:
+            self.dispatch(self.queued.pop(0))
+            count += 1
+        return count
 
     def hid_usage(self, handle):
         return self.devices[handle][2]
@@ -190,10 +247,127 @@ class RawInputDevicesTests(unittest.TestCase):
         self.assertFalse(self.devices.registered)
 
     def test_without_raw_input_nothing_is_known(self) -> None:
-        devices = RawInputDevices(None)
+        devices = RawInputDevices(None, unavailable="OSError: no user32")
         self.assertFalse(devices.register(0xABC))
         devices.on_input(0x10)
         self.assertIsNone(devices.current())
+        self.assertIsNone(devices.attribute(devices_win.RI_MOUSE_BUTTON_DOWN[1]))
+        self.assertEqual(devices.status, "raw input unavailable: OSError: no user32")
+
+    def test_the_status_says_whether_raw_input_works(self) -> None:
+        self.assertEqual(self.devices.status, "raw input unavailable: not registered yet")
+        self.assertTrue(self.devices.register(0xABC))
+        self.assertEqual(self.devices.status, "raw input ok")
+        no_window = RawInputDevices(FakeRawInput())
+        self.assertFalse(no_window.register(None))
+        self.assertEqual(no_window.status, "raw input unavailable: the hook's window couldn't be created")
+        api = FakeRawInput()
+        api.refuse = True
+        refused = RawInputDevices(api)
+        self.assertFalse(refused.register(0xABC))
+        self.assertEqual(refused.status, "raw input unavailable: RegisterRawInputDevices failed (error 5)")
+
+    # -- which device a click came from (devices_win's module notes) ------------
+    LEFT_DOWN, LEFT_UP, RIGHT_DOWN = 0x0001, 0x0002, 0x0004
+
+    def clock(self, start: float = 1000.0) -> list:
+        """devices_win's clock, moved by the test: now[0] seconds."""
+        now = [start]
+        patch = mock.patch("app.devices_win.monotonic", lambda: now[0])
+        patch.start()
+        self.addCleanup(patch.stop)
+        return now
+
+    def test_a_mouses_own_report_of_the_transition_wins_over_a_resting_palm(self) -> None:
+        now = self.clock()
+        for _ in range(200):                                         # a palm on the touchpad, mice still
+            self.devices.on_input(0x20)
+            now[0] += 0.008
+        self.devices.on_input((0x10, self.LEFT_DOWN))                # the external mouse's press ...
+        self.devices.on_input(0x20)                                  # ... the palm reporting again
+        self.assertEqual(self.devices.current().kind, "trackpad", "the touchpad reported last")
+        self.assertEqual(self.devices.attribute(self.LEFT_DOWN).key, "usb:046d:c08b:G502 HERO", "the mouse's press")
+
+    def test_a_report_counts_for_one_event(self) -> None:
+        now = self.clock()
+        self.devices.on_input((0x10, self.LEFT_DOWN))                # the G502's press
+        self.devices.on_input(0x40)                                  # another mouse moves
+        now[0] += 0.002
+        self.assertEqual(self.devices.attribute(self.LEFT_DOWN).key, "usb:046d:c08b:G502 HERO")
+        self.assertEqual(self.devices.attribute(self.LEFT_DOWN).key, "usb:0e0f:0003:VMware Pointing Device",
+                         "a second left press with no report of its own: the mouse that reported last (rule 3)")
+
+    def test_evidence_is_only_for_its_own_transition_and_only_for_a_while(self) -> None:
+        now = self.clock()
+        self.devices.on_input(0x20)
+        now[0] += 2.0                                                # mice still, the touchpad too, for long
+        self.devices.on_input((0x10, self.RIGHT_DOWN))
+        self.devices.on_input(0x20)
+        self.assertEqual(self.devices.attribute(self.LEFT_DOWN).kind, "mouse",
+                         "a right press is no evidence for a left one, but the mouse just reported (rule 3)")
+        now[0] += devices_win.MOUSE_QUIET_S + 0.1
+        self.devices.on_input(0x20)
+        self.assertEqual(self.devices.attribute(self.RIGHT_DOWN).kind, "trackpad", "stale evidence counts for nothing")
+
+    def test_a_touch_device_counts_only_while_the_mice_are_still(self) -> None:
+        now = self.clock()
+        self.devices.on_input(0x10)                                  # the mouse moves ...
+        now[0] += 0.3
+        self.devices.on_input(0x20)                                  # ... and the touchpad is tapped
+        self.assertEqual(self.devices.attribute(self.LEFT_DOWN).key, "usb:046d:c08b:G502 HERO",
+                         "within MOUSE_QUIET_S of the mouse moving, a click with no evidence is the mouse's")
+        now[0] += devices_win.MOUSE_QUIET_S
+        self.devices.on_input(0x20)
+        self.assertEqual(self.devices.attribute(self.LEFT_DOWN).kind, "trackpad")
+        now[0] += devices_win.TOUCH_QUIET_S + 0.1
+        self.assertIsNone(self.devices.attribute(self.LEFT_DOWN), "nothing reported lately: an unknown device")
+
+    def test_reports_still_waiting_in_the_queue_are_read_first(self) -> None:
+        # The hook's call can be handled before a WM_INPUT already posted
+        # for the same click (a sent message goes first): attribute() reads
+        # the waiting ones out of the queue before it decides.
+        self.clock()
+        self.devices.register(0xABC)
+        self.api.dispatch = self.devices.on_input
+        self.devices.on_input(0x20)
+        self.api.queued.append((0x10, self.LEFT_DOWN))
+        self.assertEqual(self.devices.attribute(self.LEFT_DOWN).kind, "mouse")
+        self.assertEqual((self.api.queued, self.devices.drained), ([], 1))
+        unregistered = RawInputDevices(self.api, threaded=False)
+        self.api.queued.append((0x10, self.LEFT_DOWN))
+        unregistered.attribute(self.LEFT_DOWN)
+        self.assertEqual(len(self.api.queued), 1, "no window of its own: nothing to read")
+
+    def test_a_removed_devices_handle_is_looked_at_afresh(self) -> None:
+        # Windows reuses a removed device's handle: the next device to get
+        # it must not inherit the old one's kind, key or evidence.
+        self.clock()
+        self.devices.on_input((0x10, self.LEFT_DOWN))
+        self.assertEqual(self.devices.current().kind, "mouse")
+        self.devices.device_changed(devices_win.GIDC_ARRIVAL, 0x10)
+        self.assertEqual(self.devices.current().kind, "mouse", "an arrival changes nothing")
+        self.devices.device_changed(devices_win.GIDC_REMOVAL, 0x10)
+        self.assertIsNone(self.devices.current())
+        self.assertIsNone(self.devices.attribute(self.LEFT_DOWN), "its evidence went with it")
+        self.api.devices[0x10] = self.api.devices[0x20]              # the touchpad now has handle 0x10
+        self.devices.on_input(0x10)
+        self.assertEqual(self.devices.current(), HandleInfo("trackpad", "hid:0000:0000:ELAN Touchpad", "ELAN Touchpad"))
+        self.assertEqual(self.api.string_reads, [USB_MOUSE, I2C_TOUCHPAD], "named afresh")
+        self.assertEqual((self.devices.arrivals, self.devices.removals), (1, 1))
+
+    def test_names_read_for_a_handle_since_reused_are_dropped(self) -> None:
+        results = threading.Semaphore(0)
+        devices = RawInputDevices(self.api, wake=results.release, seen=self.seen.append)
+        self.api.devices[0x11] = self.api.devices[0x10]              # (the fake finds names by path)
+        devices.on_input(0x10)                                       # the mouse's names are being read ...
+        devices.device_changed(devices_win.GIDC_REMOVAL, 0x10)       # ... as it is unplugged,
+        self.api.devices[0x10] = self.api.devices[0x20]              # and the touchpad gets its handle
+        devices.on_input(0x10)
+        self.assertTrue(results.acquire(timeout=2) and results.acquire(timeout=2))
+        devices.resolved()
+        self.assertEqual(devices.current().key, "hid:0000:0000:ELAN Touchpad")
+        self.assertEqual([info.key for info in self.seen], ["hid:0000:0000:ELAN Touchpad"], "the mouse's names went nowhere")
+        devices.close()
 
 
 @unittest.skipUnless(platform.system() == "Windows", "Windows Raw Input")
@@ -203,7 +377,13 @@ class RealRawInputTests(unittest.TestCase):
 
         api = devices_win.Win32RawInput()
         self.assertEqual(ctypes.sizeof(api.RID_DEVICE_INFO), 32)
-        self.assertEqual(ctypes.sizeof(api.RAWINPUTHEADER), 24 if ctypes.sizeof(ctypes.c_void_p) == 8 else 16)
+        header = 24 if ctypes.sizeof(ctypes.c_void_p) == 8 else 16
+        self.assertEqual(ctypes.sizeof(api.RAWINPUTHEADER), header)
+        # RAWINPUT with RAWMOUSE: the header, then usFlags, the ULONG-aligned
+        # button union (usButtonFlags first), and four more ULONG/LONGs.
+        self.assertEqual(ctypes.sizeof(api.RAWINPUTMOUSE), header + 24)
+        self.assertEqual(api.RAWINPUTMOUSE.usButtonFlags.offset, header + 4)
+        self.assertEqual(api.RAWINPUTMOUSE.ulExtraInformation.offset, header + 20)
 
     def test_every_pointing_device_here_can_be_named(self) -> None:
         import ctypes

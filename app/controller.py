@@ -441,6 +441,9 @@ class AppController(QObject):
             "excluded apps": len(self.settings["excluded_apps"]),
             "ignored devices": ", ".join(entry["name"] for entry in self.settings["ignored_devices"]) or "none",
             "seen devices": ", ".join(f"{device.name} ({device.kind})" for device in self.seen_devices()) or "none",
+            # Whether the hook can tell devices apart at all (Raw Input on
+            # Windows, IOKit on macOS): without it, every click is filtered.
+            "device lookup": getattr(current, "device_lookup", "-"),
         }
 
     def diagnostic_settings(self) -> dict:
