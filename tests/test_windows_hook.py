@@ -29,6 +29,7 @@ from unittest import mock
 from app.core import Button
 from app.platform import (
     INJECTED_MARK,
+    INJECTED_MOTION_MARKS,
     MOTION_MARK_FOR,
     TELEPORT_MARK,
     WINDOWS_STAMP_ERROR_S,
@@ -140,6 +141,7 @@ class FakeWindows:
         self.seen: list = []
         self.hidden = self.remote = self.swapped = False
         self.cursor_known = True
+        self.relocation_checks = 0
         self.now_ms = 10_000.0
         self.hook = WindowsHook(click_filter, self, accepts_injection=lambda _x, _y: True)
         click_filter._use_os_time = True
@@ -157,7 +159,11 @@ class FakeWindows:
         return self.cursor if self.cursor_known else None
 
     def relocation_allowed(self) -> bool:
+        self.relocation_checks += 1
         return not self.hidden and not self.remote
+
+    def buttons_swapped(self) -> bool:
+        return self.swapped
 
     def within_drag_rect(self, point, location) -> bool:
         if point is None or location is None:
@@ -497,6 +503,56 @@ class WindowsHookLogicTests(unittest.TestCase):
         self.fire_timers()
         self.assertEqual(self.win.buttons()[1][:3], ("up", Button.LEFT, (250, 200)))
         self.assertEqual([entry[0] for entry in self.win.seen], ["down", "move", "up"])
+
+    def hidden_pointer_stream(self) -> None:
+        """A game's mouse-look, left and right filtered: the left's up is
+        held with no place, the right goes down meanwhile, the left's up is
+        re-sent by its timer while the hand keeps moving, and the right
+        comes up behind it."""
+        self.configure(buttons=frozenset({Button.LEFT, Button.RIGHT}))
+        self.win.hidden = True
+        self.win.press()
+        self.win.wait(80)
+        self.win.release()                                           # held, with no place
+        self.win.wait(5)
+        self.win.press(Button.RIGHT)
+        self.win.wait(5)
+        for _ in range(3):
+            self.win.move(7, 0)
+        self.win.run()
+        for _ in range(5):
+            self.win.move(7, 0)                                      # still to be handled ...
+        for timer in list(FakeTimer.created):
+            timer.fire()                                             # ... as the left's up is re-sent
+        FakeTimer.created.clear()
+        self.win.release(Button.RIGHT)                               # behind the left's up, still on its way
+        for _ in range(5):
+            self.win.move(7, 0)
+        self.win.run()
+        self.fire_timers()
+
+    def test_a_hidden_pointer_never_has_the_hands_motion_re_sent(self) -> None:
+        # A re-sent move is absolute: in a game's mouse-look it would jerk
+        # the view. Buttons still keep their order across buttons; motion
+        # waits for none of them.
+        self.hidden_pointer_stream()
+        moves = [entry for entry in self.win.seen if entry[0] == "move"]
+        resent = [entry for entry in moves if mark_kind(entry[2]) in INJECTED_MOTION_MARKS or entry[2] == TELEPORT_MARK]
+        self.assertEqual(resent, [], "no move was re-sent")
+        self.assertEqual(len(moves), 13, "every move of the hand's went through, once")
+        self.assertEqual(self.win.cursor, (291, 200))
+        self.assertEqual(
+            [entry[:2] for entry in self.win.buttons()],
+            [("down", Button.LEFT), ("down", Button.RIGHT), ("up", Button.LEFT), ("up", Button.RIGHT)],
+        )
+        self.assertEqual([mark_kind(entry[4]) for entry in self.win.buttons()[2:]], [INJECTED_MARK] * 2,
+                         "the left's up re-sent by its timer, the right's up re-sent behind it")
+        self.assertFalse(self.win.hook.watch[0])
+
+    def test_a_remote_session_never_has_the_hands_motion_re_sent(self) -> None:
+        self.win.remote = True
+        self.hidden_pointer_stream()
+        self.assertEqual([entry for entry in self.win.seen if entry[0] == "move" and entry[2]], [])
 
     def test_a_hidden_pointer_never_holds_motion_back_past_the_window(self) -> None:
         # A re-sent move is absolute: in a game's mouse-look it would jump

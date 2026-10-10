@@ -1044,6 +1044,7 @@ class GlobalClickFilter:
         template: object,
         location: Optional[tuple[float, float]] = None,
         timestamp: Optional[float] = None,
+        placeless: Optional[Callable[[], bool]] = None,
     ) -> bool:
         """The pointer moved (`template` is a copy of the motion event,
         `location` where it took the pointer, and `timestamp` when it
@@ -1068,7 +1069,13 @@ class GlobalClickFilter:
         the last of them waits if any had to wait in a queue (see _settle).
         Otherwise it waits behind events still waiting to be re-sent, or else
         behind events re-sent a moment ago that may still be on their way, so
-        apps never see the pointer leave before a click is over.
+        apps never see the pointer leave before a click is over. Unless
+        `placeless`, asked only then, says the pointer's place means nothing
+        now (Windows: a hidden pointer, a remote session): then it never
+        waits, and so is never re-sent. A re-sent move is absolute, and in a
+        game's mouse-look it would jerk the view; where the pointer is no
+        one sees, a release reaching apps after the hand's motion changes
+        nothing. Buttons still keep their order among themselves.
 
         Returns True to let the event through unchanged, False when the
         platform must drop it because it was queued to be re-sent.
@@ -1098,6 +1105,8 @@ class GlobalClickFilter:
                 waiting = [button for button in Button if self._queued[button]]
                 waiting = waiting or [button for button in Button if self._in_flight[button]]
                 queue = waiting[0] if waiting else None
+            if queue is not None and placeless is not None and placeless():
+                queue = None
             if queue is not None:
                 self._enqueue(queue, None, template)
         self._send_outbox()
@@ -2265,6 +2274,10 @@ class WindowsHook:
         # False when Windows couldn't say where the pointer was as watching
         # began (another desktop had the input); the next real move sets both.
         self.known = False
+        # Whether the pointer's place means nothing now (see button): the
+        # hand's motion then never waits to be re-sent (see
+        # GlobalClickFilter._motion). Asked only when it would.
+        self._placeless = lambda: not api.relocation_allowed()
 
     # -- watching motion ----------------------------------------------------
     def set_watch(self, wanted: bool) -> None:
@@ -2415,7 +2428,7 @@ class WindowsHook:
         stamp = None
         if tick is not None and arrival is not None and tick_now is not None:
             stamp = windows_event_time(arrival, tick_now, tick)
-        if not self._owner._motion(target, target, stamp):
+        if not self._owner._motion(target, target, stamp, self._placeless):
             self.virtual = target
             return True
         self.basis = self.virtual = (x, y)
