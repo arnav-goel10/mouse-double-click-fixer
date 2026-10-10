@@ -38,9 +38,7 @@ touchpad tap, which carries no mouse report, passes as a touch when the
 mice are still. A tap within MOUSE_QUIET_S of moving a mouse is filtered as
 a mouse's click (rule 3): it reaches apps a window late, and of a
 double-tap whose second tap comes within the window, the second is taken
-for bounce. Rule 2's wait for the mice to be still is what that costs; it
-keeps a mouse click whose report were late (rule 1 finding nothing) from
-passing as a touch while a palm rests on the touchpad.
+for bounce. That is what rule 2's wait for the mice to be still costs.
 
 Rule 1 rests on the order Windows delivers in, which CI measures
 (tests/test_windows_hook.py, WindowsRawInputOrderTests): on the hook's own
@@ -51,6 +49,15 @@ can still be waiting in its queue as the callback runs (the hook's call is a
 sent message, which the thread handles first), so the callback reads it out
 first (Win32RawInput.drain). Nothing ever waits for evidence: a press is
 decided at once.
+
+The design rests on this order, not on rule 2: a click's WM_INPUT comes
+before the hook's call, and what the thread had not yet handled is read out by
+the drain. Rule 2's wait keeps a mouse click that came without a report of its
+own from passing as a touch while a palm rests on the touchpad only if that
+mouse reported in the previous second (MOUSE_QUIET_S; any report counts,
+motion included): rule 3 then takes the click for that mouse's. A mouse that
+has been still for longer, whose press report was missing, would pass as the
+palm's touch.
 
 A device's kind: Raw Input of type HID is a digitizer (a touchpad, a
 touchscreen or a pen, by its usage); Raw Input of type mouse is a mouse,

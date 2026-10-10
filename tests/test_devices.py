@@ -383,6 +383,31 @@ class RawInputDevicesTests(unittest.TestCase):
         devices.on_input((0x10, self.WHEEL))
         self.assertIsNone(devices.attribute(self.WHEEL))
 
+    def test_a_late_mouse_report_stands_in_only_for_a_mouse_that_reported_in_the_last_second(self) -> None:
+        # The module notes: rule 2's wait for the mice to be still covers a
+        # mouse click whose own report is missing (rule 1 finding nothing)
+        # only when that mouse reported in the previous second.
+        now = self.clock()
+        self.devices.on_input(0x10)
+        for _ in range(200):                                         # a palm rests on the touchpad
+            self.devices.on_input(0x20)
+            now[0] += 0.004
+        self.assertLess(now[0] - 1000.0, devices_win.MOUSE_QUIET_S)  # (the mouse reported 0.8 s ago)
+        self.assertEqual(self.devices.attribute(self.LEFT_DOWN).kind, "mouse", "its press, unreported: the mouse's")
+        for _ in range(100):
+            self.devices.on_input(0x20)
+            now[0] += 0.004
+        self.assertEqual(self.devices.attribute(self.LEFT_DOWN).kind, "trackpad",
+                         "a mouse still for over a second, with its press unreported, is taken for the palm")
+
+    def test_the_modules_notes_say_when_the_mouse_still_wait_holds(self) -> None:
+        notes = " ".join(devices_win.__doc__.split())
+        self.assertNotIn("whose report were late", notes)
+        self.assertIn("only if that mouse reported in the previous second", notes)
+        self.assertIn("The design rests on this order, not on rule 2", notes)
+        self.assertIn("a click's WM_INPUT comes before the hook's call", notes)
+        self.assertIn("read out by the drain", notes)
+
     def test_reports_still_waiting_in_the_queue_are_read_first(self) -> None:
         # The hook's call can be handled before a WM_INPUT already posted
         # for the same click (a sent message goes first): attribute() reads
