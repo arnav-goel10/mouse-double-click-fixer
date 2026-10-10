@@ -716,6 +716,38 @@ class WindowsHookLogicTests(unittest.TestCase):
         self.assertEqual([entry[0] for entry in self.win.buttons()], ["down"])
         self.assertEqual({event.device for event in events}, {"usb:046d:c08b:G502"})
 
+    def test_a_pointer_with_absolute_positions_is_filtered_as_a_mouse(self) -> None:
+        # A virtual machine's pointer (here VMware's) reports absolute
+        # positions through Raw Input. Its clicks carry no pen or touch
+        # signature, and its bounces are a mouse's: they are filtered, and the
+        # user may still let it through by name.
+        try:
+            from test_devices import FakeRawInput
+        except ImportError:  # run as tests.<module> from the repository root
+            from tests.test_devices import FakeRawInput
+        from app.devices_win import RawInputDevices
+
+        devices, events = [], []
+        self.filter._on_device = devices.append
+        self.filter._on_event = events.append
+        raw = RawInputDevices(FakeRawInput(), threaded=False)
+        self.win.hook.device = raw.current
+        raw.on_input(0x40)                                           # it moved
+        self.win.press()
+        self.win.wait(40)
+        self.win.release()
+        self.win.wait(5)
+        self.win.press()                                             # a dropout: cancels the held up
+        self.win.run()
+        self.assertEqual([entry[0] for entry in self.win.buttons()], ["down"])
+        self.assertEqual(self.filter.passed_counts, {}, "nothing passed as a touch")
+        self.assertEqual({event.device for event in events}, {"usb:0e0f:0003:VMware Pointing Device"})
+        (device,) = devices
+        self.assertEqual((device.kind, device.filtered), ("mouse", True))
+        # Ignored by name, it passes like any ignored device.
+        self.configure(ignored_devices=frozenset({device.key}))
+        self.assertEqual([(info.key, info.filtered) for info in self.filter.seen_devices()], [(device.key, False)])
+
     def test_a_pen_tap_while_the_mouses_release_is_held_goes_out_behind_it(self) -> None:
         self.click()                                                 # the mouse's up is held
         self.win.press(extra=PEN)

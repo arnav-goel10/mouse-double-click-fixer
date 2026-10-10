@@ -19,8 +19,16 @@ clicked without being moved first may not have reported yet when its click
 reaches the hook, and must not pass as a touch.
 
 A device's kind: Raw Input of type HID is a digitizer (a touchpad, a
-touchscreen or a pen, by its usage); of type mouse with absolute positions,
-a touchscreen; otherwise a mouse. Its key (see device_key) comes from its
+touchscreen or a pen, by its usage); Raw Input of type mouse is a mouse,
+whether it reports relative motion or absolute positions. A pointer with
+absolute positions is no sign of a touch surface: virtual machines' pointers
+(Hyper-V, VMware, VirtualBox, Parallels), the Remote Desktop mouse and IP-KVMs
+report that way, and their buttons bounce like any other's. Touchscreens and
+pens already pass on their own: their clicks carry the pen and touch
+signature (MI_WP_SIGNATURE), and they report as digitizers (0x0D). Taken for
+touchscreens, those mice would pass unfiltered with nothing to undo it, since
+the user's list can only let a device through, never make one filtered. Its
+key (see device_key) comes from its
 device path (vendor and product IDs, and the bus) and its HID product and
 serial strings. Reading those strings asks the device itself, which can
 block, so it is done on a thread of its own and the result handed back to
@@ -47,7 +55,6 @@ RIM_TYPEMOUSE, RIM_TYPEKEYBOARD, RIM_TYPEHID = 0, 1, 2
 RID_HEADER, RID_INPUT = 0x10000005, 0x10000003
 RIDI_DEVICENAME, RIDI_DEVICEINFO = 0x20000007, 0x2000000B
 RIDEV_REMOVE, RIDEV_INPUTSINK = 0x00000001, 0x00000100
-MOUSE_MOVE_ABSOLUTE = 0x0001
 #: What the hook's window registers for: mice, touchpads, touchscreens.
 USAGES = ((0x01, 0x02), (0x0D, 0x05), (0x0D, 0x04))
 #: Digitizer usages (page 0x0D) and the kind of device they are.
@@ -112,13 +119,15 @@ def device_key(info: PathInfo, serial: str = "", product: str = "") -> str:
     return f"{info.bus}:{info.vendor:04x}:{info.product:04x}:{ident}"
 
 
-def kind_of(raw_type: int, mouse_flags: int = 0, usage_page: int = 0, usage: int = 0) -> str:
+def kind_of(raw_type: int, usage_page: int = 0, usage: int = 0) -> str:
+    """A device's kind from its Raw Input type and, for HID, its usage (see
+    the module notes: a mouse is a mouse, absolute positions or not)."""
     if raw_type == RIM_TYPEHID:
         if usage_page == 0x0D:
             return DIGITIZER_KINDS.get(usage, "trackpad")
         return "unknown"
     if raw_type == RIM_TYPEMOUSE:
-        return "touchscreen" if mouse_flags & MOUSE_MOVE_ABSOLUTE else "mouse"
+        return "mouse"
     return "unknown"
 
 
@@ -219,20 +228,6 @@ class Win32RawInput:
         if self._get_data(lparam, RID_HEADER, self._ctypes.byref(header), self._ctypes.byref(size), self._header_size) == 0xFFFFFFFF:
             return 0, -1
         return int(header.hDevice or 0), int(header.dwType)
-
-    def mouse_flags(self, lparam) -> int:
-        """RAWMOUSE.usFlags of a WM_INPUT of type mouse: it follows the header."""
-        ctypes = self._ctypes
-        size = self._wintypes.UINT(0)
-        self._get_data(lparam, RID_INPUT, None, ctypes.byref(size), self._header_size)
-        if not size.value or size.value > 4096:
-            return 0
-        buffer = ctypes.create_string_buffer(size.value)
-        if self._get_data(lparam, RID_INPUT, buffer, ctypes.byref(size), self._header_size) == 0xFFFFFFFF:
-            return 0
-        if size.value < self._header_size + 2:
-            return 0
-        return int.from_bytes(buffer.raw[self._header_size:self._header_size + 2], "little")
 
     # -- what a device is ------------------------------------------------------
     def device_path(self, handle: int) -> str:
@@ -357,17 +352,16 @@ class RawInputDevices:
         info = self._handles.get(handle)
         path = None
         if info is None:
-            info, path = self._first_sight(handle, raw_type, lparam)
+            info, path = self._first_sight(handle, raw_type)
         self._current_handle = handle
         self._current = info
         if path:
             self._ask_names(handle, path)
 
-    def _first_sight(self, handle: int, raw_type: int, lparam) -> tuple[HandleInfo, str]:
+    def _first_sight(self, handle: int, raw_type: int) -> tuple[HandleInfo, str]:
         api = self._api
-        flags = api.mouse_flags(lparam) if raw_type == RIM_TYPEMOUSE else 0
         page, usage = api.hid_usage(handle) if raw_type == RIM_TYPEHID else (0, 0)
-        kind = kind_of(raw_type, flags, page, usage)
+        kind = kind_of(raw_type, page, usage)
         path = api.device_path(handle)
         path_info = parse_path(path)
         info = HandleInfo(kind, None, fallback_name(kind, path_info))

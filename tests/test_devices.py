@@ -22,6 +22,11 @@ BT_MOUSE = r"\\?\HID#{00001124-0000-1000-8000-00805f9b34fb}_VID&0002046d_PID&b01
 BLE_MOUSE = r"\\?\HID#{00001812-0000-1000-8000-00805f9b34fb}&Dev&VID_045e&PID_0b13&REV_0517&e1a0c1b2c3d4&Col01#9&1&0000#{378de44c-56ef-11d1-bc8c-00a0c91405dd}"
 PS2_MOUSE = r"\\?\ACPI#PNP0F13#4&1d4a2f&0#{378de44c-56ef-11d1-bc8c-00a0c91405dd}"
 I2C_TOUCHPAD = r"\\?\HID#ELAN0001&Col02#5&3a1b2c&0&0001#{4d1e55b2-f16f-11cf-88cb-001111000030}"
+#: Pointers that report absolute positions: a virtual machine's (VMware's,
+#: with its tools; Hyper-V's synthetic mouse) and the Remote Desktop mouse.
+VMWARE_POINTER = r"\\?\HID#VID_0E0F&PID_0003&MI_01#7&2a3b4c&0&0000#{378de44c-56ef-11d1-bc8c-00a0c91405dd}"
+HYPERV_POINTER = r"\\?\HID#{cfa8b69e-5b4a-4cc0-b98b-8ba1a1f3f95a}#5&1a8c06af&0&0000#{378de44c-56ef-11d1-bc8c-00a0c91405dd}"
+RDP_POINTER = r"\\?\TERMINPUT_BUS#UMB#2&1f5b2c&0&RDP_MOU&0000#{378de44c-56ef-11d1-bc8c-00a0c91405dd}"
 
 
 class WindowsDevicePathTests(unittest.TestCase):
@@ -51,12 +56,11 @@ class WindowsDevicePathTests(unittest.TestCase):
 
     def test_kinds(self) -> None:
         kind_of = devices_win.kind_of
-        self.assertEqual(kind_of(RIM_TYPEHID, 0, 0x0D, 0x05), "trackpad")
-        self.assertEqual(kind_of(RIM_TYPEHID, 0, 0x0D, 0x04), "touchscreen")
-        self.assertEqual(kind_of(RIM_TYPEHID, 0, 0x0D, 0x02), "pen")
-        self.assertEqual(kind_of(RIM_TYPEHID, 0, 0x01, 0x05), "unknown")
-        self.assertEqual(kind_of(RIM_TYPEMOUSE, 0), "mouse")
-        self.assertEqual(kind_of(RIM_TYPEMOUSE, devices_win.MOUSE_MOVE_ABSOLUTE), "touchscreen")
+        self.assertEqual(kind_of(RIM_TYPEHID, 0x0D, 0x05), "trackpad")
+        self.assertEqual(kind_of(RIM_TYPEHID, 0x0D, 0x04), "touchscreen")
+        self.assertEqual(kind_of(RIM_TYPEHID, 0x0D, 0x02), "pen")
+        self.assertEqual(kind_of(RIM_TYPEHID, 0x01, 0x05), "unknown")
+        self.assertEqual(kind_of(RIM_TYPEMOUSE), "mouse")
 
     def test_registers_for_mice_touchpads_and_touchscreens(self) -> None:
         self.assertEqual(devices_win.USAGES, ((0x01, 0x02), (0x0D, 0x05), (0x0D, 0x04)))
@@ -64,17 +68,25 @@ class WindowsDevicePathTests(unittest.TestCase):
 
 
 class FakeRawInput:
-    """Win32RawInput's stand-in: a WM_INPUT's lparam is the device handle."""
+    """Win32RawInput's stand-in: a WM_INPUT's lparam is the device handle.
+
+    Each device is (Raw Input type, whether its reports carry absolute
+    positions, HID usage, path, (product, serial)). Whether a mouse reports
+    absolute positions is what Windows would say of it; nothing may take it
+    for a sign of a touch surface (see devices_win's notes), so no call here
+    gives it out: a test only says what the device is."""
 
     def __init__(self) -> None:
         self.devices = {
-            0x10: (RIM_TYPEMOUSE, 0, (0, 0), USB_MOUSE, ("G502 HERO", "")),
-            0x20: (RIM_TYPEHID, 0, (0x0D, 0x05), I2C_TOUCHPAD, ("ELAN Touchpad", "")),
-            0x30: (RIM_TYPEMOUSE, devices_win.MOUSE_MOVE_ABSOLUTE, (0, 0), "", ("", "")),
+            0x10: (RIM_TYPEMOUSE, False, (0, 0), USB_MOUSE, ("G502 HERO", "")),
+            0x20: (RIM_TYPEHID, False, (0x0D, 0x05), I2C_TOUCHPAD, ("ELAN Touchpad", "")),
+            0x30: (RIM_TYPEHID, True, (0x0D, 0x04), "", ("", "")),
+            0x40: (RIM_TYPEMOUSE, True, (0, 0), VMWARE_POINTER, ("VMware Pointing Device", "")),
+            0x50: (RIM_TYPEMOUSE, True, (0, 0), HYPERV_POINTER, ("", "")),
+            0x60: (RIM_TYPEMOUSE, True, (0, 0), RDP_POINTER, ("", "")),
         }
         self.registered: list = []
         self.string_reads: list = []
-        self.read_flags: list = []
 
     def register(self, hwnd, remove=False):
         self.registered.append((hwnd, remove))
@@ -84,10 +96,6 @@ class FakeRawInput:
         if lparam == 0:
             return 0, RIM_TYPEMOUSE  # SendInput, or a touchpad's gestures turned into mouse input
         return lparam, self.devices[lparam][0]
-
-    def mouse_flags(self, lparam):
-        self.read_flags.append(lparam)
-        return self.devices[lparam][1]
 
     def hid_usage(self, handle):
         return self.devices[handle][2]
@@ -132,7 +140,6 @@ class RawInputDevicesTests(unittest.TestCase):
         for handle in (0x10, 0x10, 0x20, 0x10, 0x20):
             self.devices.on_input(handle)
         self.assertEqual(self.api.string_reads, [USB_MOUSE, I2C_TOUCHPAD])
-        self.assertEqual(self.api.read_flags, [0x10], "a mouse's flags are read once")
         self.assertEqual([info.key for info in self.seen], ["usb:046d:c08b:G502 HERO", "hid:0000:0000:ELAN Touchpad"])
 
     def test_a_device_with_no_path_keeps_its_kind_and_no_key(self) -> None:
@@ -140,6 +147,19 @@ class RawInputDevicesTests(unittest.TestCase):
         self.assertEqual(self.devices.current().kind, "touchscreen")
         self.assertIsNone(self.devices.current().key)
         self.assertEqual(self.seen, [])
+
+    def test_pointers_with_absolute_positions_are_mice(self) -> None:
+        # A virtual machine's pointer, Hyper-V's and the Remote Desktop
+        # mouse report absolute positions. Their buttons are a mouse's, and
+        # bounce like one's: they are filtered, as 0.5.3 filtered them.
+        for handle, key in ((0x40, "usb:0e0f:0003:VMware Pointing Device"),
+                            (0x50, "hid:0000:0000:{cfa8b69e-5b4a-4cc0-b98b-8ba1a1f3f95a}"),
+                            (0x60, "hid:0000:0000:UMB")):
+            with self.subTest(path=self.api.devices[handle][3]):
+                self.devices.on_input(handle)
+                info = self.devices.current()
+                self.assertEqual((info.kind, info.key), ("mouse", key))
+                self.assertNotIn(info.kind, devices_win.TOUCH_KINDS)
 
     def test_names_are_read_off_the_hook_thread_and_handed_back(self) -> None:
         woken = threading.Event()
