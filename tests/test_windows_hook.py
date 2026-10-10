@@ -714,7 +714,10 @@ class WindowsHookLogicTests(unittest.TestCase):
         self.assertEqual(mark_kind(self.win.buttons()[2][4]), INJECTED_MARK, "re-sent, with XBUTTON2 (FakeWindows checks)")
 
     def test_a_reversing_wheel_notch_is_dropped_on_its_own_axis(self) -> None:
+        from app.devices_win import HandleInfo
+
         self.configure(wheel_fix=True, wheel_window_ms=50)
+        self.win.hook.device = lambda _flag: HandleInfo("mouse", "usb:046d:c08b:G502", "G502 HERO")  # a mouse reported each
         heard = []
         self.filter._on_wheel = lambda axis, dropped: heard.append((axis, dropped))
         # (delta, axis, ms until the next): the vertical wheel's stray up
@@ -727,6 +730,20 @@ class WindowsHookLogicTests(unittest.TestCase):
         self.assertEqual(self.win.wheel(), [(1, -120), (1, -120), (2, 120), (1, 120)])
         self.assertEqual(heard, [(1, False), (1, True), (1, False), (2, False), (2, True), (1, False)])
         self.assertEqual(self.win.buttons(), [])
+
+    def test_a_notch_no_mouse_reported_is_not_judged(self) -> None:
+        # Nothing answers for the notch (the stand-in's device lookup says
+        # None, as Raw Input does for input Windows makes itself): it passes
+        # however it reverses.
+        self.configure(wheel_fix=True, wheel_window_ms=50)
+        heard = []
+        self.filter._on_wheel = lambda axis, dropped: heard.append((axis, dropped))
+        for delta in (-120, 120, -120):
+            self.win.scroll(delta)
+            self.win.wait(5)
+        self.win.run()
+        self.assertEqual(self.win.wheel(), [(1, -120), (1, 120), (1, -120)])
+        self.assertEqual((heard, self.filter.wheel_dropped), ([], 0), "not even counted as judged")
 
     def test_the_wheel_is_left_alone_while_the_fix_is_off(self) -> None:
         for delta in (-120, 120, -120):
@@ -872,6 +889,61 @@ class WindowsHookLogicTests(unittest.TestCase):
         self.assertEqual([entry[0] for entry in self.win.buttons()], ["down", "up"])
         self.assertEqual(self.filter.filtered_count, 1)
         self.assertEqual(self.win.devices.drained, 4, "each of the mouse's reports was read out by the hook")
+
+    WHEEL_REPORT = 0x0400                                            # RI_MOUSE_WHEEL
+
+    def test_a_touchpads_scroll_just_after_a_mouse_moved_is_not_the_mouses(self) -> None:
+        # The mouse moves; 0.3 s later two fingers scroll the touchpad, +30
+        # three times, then -30 three times (a fast flick back). Windows makes
+        # the wheel input from the gesture: no mouse reports a notch for it,
+        # so the wheel fix has nobody's wheel to judge.
+        self.raw_input()
+        self.configure(wheel_fix=True, wheel_window_ms=50)
+        self.win.report(self.MOUSE)
+        self.win.wait(300)
+        for delta in (30, 30, 30, -30, -30, -30):
+            self.win.report(self.TOUCHPAD)
+            self.win.scroll(delta)
+            self.win.wait(8)
+        self.win.run()
+        self.assertEqual(self.win.wheel(), [(1, 30)] * 3 + [(1, -30)] * 3, "none dropped")
+        self.assertEqual(self.filter.wheel_dropped, 0)
+        self.assertEqual(self.filter.passed_counts, {}, "(nor counted as a touch click: it is not a click)")
+
+    def mouses_reversal(self, queued: bool) -> None:
+        self.raw_input()
+        self.configure(wheel_fix=True, wheel_window_ms=50)
+        self.palm(100)                                               # a palm rests on the touchpad meanwhile
+        for delta in (-120, -120, 120, -120):
+            self.win.report((self.MOUSE, self.WHEEL_REPORT), queued)
+            self.win.report(self.TOUCHPAD)
+            self.win.scroll(delta)
+            self.win.wait(10)
+        self.win.run()
+        self.assertEqual(self.win.wheel(), [(1, -120)] * 3, "the stray up notch went")
+        self.assertEqual(self.filter.wheel_dropped, 1)
+
+    def test_a_mouses_reversal_with_its_own_wheel_report_is_still_dropped(self) -> None:
+        self.mouses_reversal(queued=False)
+
+    def test_a_mouses_wheel_report_still_in_the_queue_is_read_before_judging(self) -> None:
+        self.mouses_reversal(queued=True)
+        self.assertEqual(self.win.devices.drained, 4, "each of the mouse's wheel reports was read out by the hook")
+
+    def test_a_mouses_wheel_stays_judged_when_a_touchpad_scrolls_between_its_notches(self) -> None:
+        self.raw_input()
+        self.configure(wheel_fix=True, wheel_window_ms=50)
+        self.win.report((self.MOUSE, self.WHEEL_REPORT))
+        self.win.scroll(-120)                                        # the mouse
+        self.win.wait(10)
+        self.win.report(self.TOUCHPAD)
+        self.win.scroll(30)                                          # the touchpad, no report of a notch: passes
+        self.win.wait(10)
+        self.win.report((self.MOUSE, self.WHEEL_REPORT))
+        self.win.scroll(120)                                         # the mouse reverses within its window: dropped
+        self.win.run()
+        self.assertEqual(self.win.wheel(), [(1, -120), (1, 30)])
+        self.assertEqual(self.filter.wheel_dropped, 1)
 
     def touchpad_double_tap(self, gap_ms: float = 0) -> None:
         """A finger taps the touchpad twice: it reports while touching, and
@@ -1512,7 +1584,25 @@ class WindowsInputFeatureTests(RealWindows):
                          [(WM_LBUTTONDOWN, 0), (WM_LBUTTONUP, 0), (WM_XBUTTONDOWN, 2), (WM_XBUTTONUP, 2)])
         self.assertEqual([entry[2] for entry in order[1:3]], [INJECTED_MARK] * 2, "the left up held, the press re-sent")
 
+    def wheel_from_a_mouse(self) -> None:
+        """SendInput's reports name no device, so its notches come with no
+        mouse's wheel report, and the hook leaves such notches alone (see
+        devices_win). For the tests of what the wheel fix does to a mouse's
+        notches: say each notch is a G502's. Before start_filter."""
+        from app.devices_win import RI_MOUSE_HWHEEL, RI_MOUSE_WHEEL, HandleInfo, RawInputDevices
+
+        real = RawInputDevices.attribute
+        mouse = HandleInfo("mouse", "usb:046d:c08b:G502", "G502 HERO")
+
+        def attribute(devices, flag, now=None):
+            return real(devices, flag, now) or (mouse if flag in (RI_MOUSE_WHEEL, RI_MOUSE_HWHEEL) else None)
+
+        patch = mock.patch.object(RawInputDevices, "attribute", attribute)
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def test_a_reversing_wheel_notch_is_dropped(self) -> None:
+        self.wheel_from_a_mouse()
         self.start_filter(wheel_fix=True, wheel_window_ms=50)
         self.observed.clear()
         for delta, pause in ((-120, 0.02), (-120, 0.01), (120, 0.01), (-120, 0.2), (120, 0.05)):
@@ -1524,6 +1614,23 @@ class WindowsInputFeatureTests(RealWindows):
         self.assertEqual(wheel, [(WM_MOUSEWHEEL, -120), (WM_MOUSEWHEEL, -120), (WM_MOUSEWHEEL, -120),
                                  (WM_MOUSEWHEEL, 120), (WM_MOUSEHWHEEL, 120)])
         self.assertEqual(self.filter.wheel_dropped, 1)
+
+    def test_a_notch_no_mouse_reported_is_not_judged(self) -> None:
+        # Input made by software, as a precision touchpad's scrolling is,
+        # names no device and comes with no mouse's wheel report: nobody's
+        # wheel, so it passes however it reverses.
+        self.start_filter(wheel_fix=True, wheel_window_ms=50)
+        self.observed.clear()
+        for delta, pause in ((-120, 0.01), (-120, 0.01), (120, 0.01), (-120, 0.01), (120, 0.05)):
+            self.notch(delta)
+            time.sleep(pause)
+        self.notch(-120, horizontal=True)
+        self.notch(120, horizontal=True)
+        time.sleep(0.3)
+        wheel = [(entry[0], self.high_word(entry[5])) for entry in self.observed if entry[0] in (WM_MOUSEWHEEL, WM_MOUSEHWHEEL)]
+        self.assertEqual(wheel, [(WM_MOUSEWHEEL, -120), (WM_MOUSEWHEEL, -120), (WM_MOUSEWHEEL, 120), (WM_MOUSEWHEEL, -120),
+                                 (WM_MOUSEWHEEL, 120), (WM_MOUSEHWHEEL, -120), (WM_MOUSEHWHEEL, 120)])
+        self.assertEqual(self.filter.wheel_dropped, 0)
 
     def test_the_wheel_passes_while_the_fix_is_off(self) -> None:
         self.start_filter()
@@ -1591,6 +1698,7 @@ class WindowsInputFeatureTests(RealWindows):
         self.assertEqual(devices.removals, 1)
 
     def test_the_wheel_side_buttons_and_raw_input_stay_cheap(self) -> None:
+        self.wheel_from_a_mouse()                                     # so every notch is judged: the dearer path
         self.start_filter(buttons=(Button.LEFT, Button.BACK), wheel_fix=True)
         self.filter._callback_timings = timings = []
         for index in range(2000):

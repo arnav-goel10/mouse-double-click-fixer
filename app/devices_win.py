@@ -24,6 +24,14 @@ this order, prefers a mouse's own evidence:
 3. Otherwise a mouse: the one that reported last, if it did within
    MOUSE_QUIET_S, or an unknown one. Unknown devices are filtered.
 
+A wheel notch is judged by rule 1 alone: it is a mouse's only if a mouse's
+report carries RI_MOUSE_WHEEL (vertical) or RI_MOUSE_HWHEEL (horizontal) for
+that axis, within MOUSE_EVIDENCE_S. Otherwise attribute() says None, and the
+wheel fix leaves the notch alone. Rules 2 and 3 would take it for the last
+mouse's, and so judge a precision touchpad's two-finger scroll as that mouse's
+wheel and drop its reversals: Windows makes that scroll from the gesture, as
+wheel input that no mouse reported.
+
 So a palm resting on a precision touchpad, which keeps it reporting, can't
 take over an external mouse's clicks: the mouse's own reports win. A
 touchpad tap, which carries no mouse report, passes as a touch when the
@@ -100,6 +108,8 @@ RI_MOUSE_BUTTON_UP = {1: 0x0002, 2: 0x0008, 3: 0x0020, 4: 0x0080, 5: 0x0200}
 RI_MOUSE_WHEEL, RI_MOUSE_HWHEEL = 0x0400, 0x0800
 #: Each of them on its own: a report's evidence (see the module notes).
 TRANSITION_FLAGS = tuple(1 << bit for bit in range(12))
+#: The reports whose evidence alone makes a notch a mouse's (see the module notes).
+WHEEL_FLAGS = (RI_MOUSE_WHEEL, RI_MOUSE_HWHEEL)
 #: Which physical button each of the app's buttons is when nothing is swapped.
 PHYSICAL_BUTTONS = {Button.LEFT: 1, Button.RIGHT: 2, Button.MIDDLE: 3, Button.BACK: 4, Button.FORWARD: 5}
 #: How recent a mouse's report of a transition must be to say a click is that
@@ -515,7 +525,8 @@ class RawInputDevices:
         """The device a press, release or wheel notch the hook is deciding
         now came from, by the rules in the module notes; `flag` is the bit
         a mouse reports for it (button_flag, wheel_flag). None for an
-        unknown device, which is filtered. Never waits."""
+        unknown device, which is filtered; for a wheel notch, None is a notch
+        no mouse reported, which is not judged at all. Never waits."""
         self.drain()
         now = monotonic() if now is None else now
         evidence = self._evidence.pop(flag, None)
@@ -523,6 +534,8 @@ class RawInputDevices:
             info = self._handles.get(evidence[1])
             if info is not None:
                 return info
+        if flag in WHEEL_FLAGS:
+            return None
         mouse_recent = now - self._mouse_at <= MOUSE_QUIET_S
         if not mouse_recent and now - self._touch_at <= TOUCH_QUIET_S:
             info = self._handles.get(self._touch_handle)

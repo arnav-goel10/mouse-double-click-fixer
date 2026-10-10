@@ -322,6 +322,54 @@ class RawInputDevicesTests(unittest.TestCase):
         now[0] += devices_win.TOUCH_QUIET_S + 0.1
         self.assertIsNone(self.devices.attribute(self.LEFT_DOWN), "nothing reported lately: an unknown device")
 
+    WHEEL, HWHEEL = devices_win.RI_MOUSE_WHEEL, devices_win.RI_MOUSE_HWHEEL
+
+    def test_a_touchpads_scroll_near_a_mouse_is_nobodys_notch(self) -> None:
+        # A precision touchpad's two-finger scroll reaches the hook as wheel
+        # input Windows makes from the gesture: no mouse reports a notch for
+        # it. However lately a mouse moved, it is not that mouse's.
+        now = self.clock()
+        self.devices.on_input(0x10)                                  # the mouse moves ...
+        now[0] += 0.3
+        for _ in range(6):
+            self.devices.on_input(0x20)                              # ... the touchpad scrolls
+            self.assertIsNone(self.devices.attribute(self.WHEEL), "no mouse reported a notch: not judged")
+            now[0] += 0.008
+        now[0] += devices_win.MOUSE_QUIET_S + 0.1
+        self.devices.on_input(0x20)
+        self.assertIsNone(self.devices.attribute(self.WHEEL), "mice still: the touchpad's, but not judged either")
+        self.assertEqual(self.devices.attribute(self.LEFT_DOWN).kind, "trackpad", "a click is judged as before")
+
+    def test_a_wheel_notch_is_a_mouses_on_its_own_report_for_its_own_axis_alone(self) -> None:
+        now = self.clock()
+        for _ in range(100):                                         # a palm on the touchpad
+            self.devices.on_input(0x20)
+            now[0] += 0.008
+        self.devices.on_input((0x10, self.WHEEL))                    # the G502's wheel turns
+        self.devices.on_input(0x20)
+        self.assertIsNone(self.devices.attribute(self.HWHEEL), "a vertical notch is no evidence for a horizontal one")
+        self.assertEqual(self.devices.attribute(self.WHEEL).key, "usb:046d:c08b:G502 HERO")
+        self.assertIsNone(self.devices.attribute(self.WHEEL), "a report counts for one notch")
+        self.devices.on_input((0x10, self.HWHEEL))
+        self.assertEqual(self.devices.attribute(self.HWHEEL).key, "usb:046d:c08b:G502 HERO")
+        self.devices.on_input((0x10, self.WHEEL))
+        now[0] += devices_win.MOUSE_EVIDENCE_S + 0.05
+        self.assertIsNone(self.devices.attribute(self.WHEEL), "a report from too long ago is no evidence")
+
+    def test_a_wheel_notch_is_a_mouses_when_its_report_is_still_in_the_queue(self) -> None:
+        self.clock()
+        self.devices.register(0xABC)
+        self.api.dispatch = self.devices.on_input
+        self.devices.on_input(0x20)
+        self.api.queued.append((0x10, self.WHEEL))
+        self.assertEqual(self.devices.attribute(self.WHEEL).kind, "mouse")
+        self.assertEqual((self.api.queued, self.devices.drained), ([], 1))
+
+    def test_without_raw_input_no_notch_is_judged(self) -> None:
+        devices = RawInputDevices(None, unavailable="OSError: no user32")
+        devices.on_input((0x10, self.WHEEL))
+        self.assertIsNone(devices.attribute(self.WHEEL))
+
     def test_reports_still_waiting_in_the_queue_are_read_first(self) -> None:
         # The hook's call can be handled before a WM_INPUT already posted
         # for the same click (a sent message goes first): attribute() reads

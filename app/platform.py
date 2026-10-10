@@ -2396,13 +2396,20 @@ class WindowsHook:
         """A wheel notch on `axis` (1 vertical, 2 horizontal), its signed
         delta in HIWORD(mouse_data), seen while the wheel fix is on. Returns
         True when the hook must drop it. It is never re-sent: a stray
-        reversing notch is simply dropped."""
+        reversing notch is simply dropped. Only a notch a mouse reported
+        (RI_MOUSE_WHEEL or RI_MOUSE_HWHEEL, see devices_win) is judged."""
         if flags & self.LLMHF_INJECTED and not self._filter_injected:
             return False  # another program's scrolling
         if (extra & PEN_SIGNATURE_MASK) == PEN_SIGNATURE:
             return False
         owner = self._owner
         kind, key = self._device_of_event(owner, wheel_flag(axis))
+        if kind is None:
+            # No mouse reported this notch (see devices_win): a precision
+            # touchpad's scroll, which Windows makes from the gesture, comes
+            # like that, and so does anything else with no mouse to answer
+            # for it. Only a mouse's own notches are judged.
+            return False
         if owner._passes(False, kind, key):
             return False
         delta = (int(mouse_data) >> 16) & 0xFFFF
