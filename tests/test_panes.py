@@ -346,6 +346,31 @@ class CalibrateEachButtonTests(PaneTestCase):
         self.assertEqual([bounce for _gap, bounce in page.timeline._gaps], [False, True])
         self.assertTrue(page.last_value.text().endswith("ms"))
 
+    def test_the_test_pane_draws_the_window_of_the_button_it_shows(self) -> None:
+        from app.core import Button
+        from app.core import ClickEvent
+
+        self.controller.set_threshold(Button.BACK, 20)
+        self.controller.set_threshold(Button.RIGHT, 33)
+        page = self.window.test_page
+        self.show("test")
+        self.assertEqual(page.timeline._threshold, 46, "the left button's, before any press")
+        self.assertNotIn("button’s window", page.chart_note.text())
+        page._on_pad_press(30.0, 90.0, Button.BACK)
+        self.assertEqual(page.timeline._threshold, 20, "judged against 20, so the line is at 20")
+        self.assertIn("back button’s window", page.chart_note.text())
+        page._on_pad_press(30.0, 90.0, Button.LEFT)
+        self.assertEqual(page.timeline._threshold, 46)
+        self.assertNotIn("button’s window", page.chart_note.text())
+        # A bounce the filter blocked is that button's too.
+        page.note_global_event(ClickEvent(Button.RIGHT, True, False, 9.0, None))
+        self.assertEqual(page.timeline._threshold, 33)
+        # And the line follows its window being changed.
+        self.controller.set_threshold(Button.RIGHT, 38)
+        self.assertEqual(page.timeline._threshold, 38)
+        page.reset()
+        self.assertEqual(page.timeline._threshold, 46, "clearing starts from the left button again")
+
 
 class HistoryPaneTests(PaneTestCase):
     def seed(self, button=None, days=30, clicks=500, bounces=(3, 9)) -> None:

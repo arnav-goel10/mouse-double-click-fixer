@@ -275,6 +275,9 @@ class TestPage(Page):
         self.controller = controller
         self.clicks = 0
         self.shortest_gap: Optional[float] = None
+        # The button whose window the chart's line marks: the one last pressed
+        # (its press is what "Last gap" names), the left until one is.
+        self.shown_button: Button = Button.LEFT
 
         self.pad = ClickPad()
         self.pad.setMaximumHeight(320)
@@ -313,19 +316,30 @@ class TestPage(Page):
         self.pad.pressed_with_gap.connect(self._on_pad_press)
 
     def refresh(self) -> None:
-        self.timeline.set_threshold(self.controller.threshold_ms)
+        # Each press is judged by its own button's window, so the line is
+        # that button's, and the note says whose when it isn't the left's.
+        self.timeline.set_threshold(self.controller.threshold_for(self.shown_button))
         # With the filter on, bounces are removed before this pad sees them,
         # so an all-green chart would otherwise read as a healthy mouse.
-        self.chart_note.setText(
+        note = (
             "Bounce Filter is on: red bars are bounces it blocked."
             if self.controller.active
             else "Red bars fall within the filter window."
         )
+        if self.shown_button is not Button.LEFT:
+            note += f" The line is the {button_name(self.shown_button).lower()} button’s window."
+        self.chart_note.setText(note)
+
+    def _show_button(self, button: Button) -> None:
+        if button is not self.shown_button:
+            self.shown_button = button
+            self.refresh()
 
     def note_global_event(self, event: ClickEvent) -> None:
         """A bounce the system-wide filter blocked. With the filter on, this
         pad never receives it, so show it here: proof the filter works."""
         if self.isVisible() and event.is_bounce and event.gap_ms is not None:
+            self._show_button(as_button(event.button))
             self.timeline.add(event.gap_ms, True)
             self.pad.flash(True)
 
@@ -333,6 +347,7 @@ class TestPage(Page):
         self.clicks = 0
         self.shortest_gap = None
         self.timeline.clear()
+        self._show_button(Button.LEFT)
         self.pad.reset()
         self.last_value.setText("—")
         self.shortest_value.setText("—")
@@ -346,10 +361,12 @@ class TestPage(Page):
         if gap_ms is None:
             self.pad.flash(False)
             return
+        button = as_button(button)
+        self._show_button(button)
         bounce = gap_ms <= self.controller.threshold_for(button)
         self.timeline.add(gap_ms, bounce)
         # Each button is timed against its own release; say which one.
-        which = "" if as_button(button) is Button.LEFT else f" ({button_name(button).lower()})"
+        which = "" if button is Button.LEFT else f" ({button_name(button).lower()})"
         self.last_value.setText(f"{gap_ms:.0f} ms{which}")
         if self.shortest_gap is None or gap_ms < self.shortest_gap:
             self.shortest_gap = gap_ms
