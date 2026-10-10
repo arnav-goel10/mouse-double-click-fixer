@@ -70,8 +70,10 @@ until then the device has no key, and only its kind counts.
 
 Windows hands out device handles per connection and reuses them, so the
 window also registers with RIDEV_DEVNOTIFY: on WM_INPUT_DEVICE_CHANGE with
-GIDC_REMOVAL, what is known of that handle is forgotten, and a device that
-later gets the same handle is looked at afresh.
+GIDC_REMOVAL or GIDC_ARRIVAL, what is known of that handle is forgotten, and
+a device that later gets the same handle is looked at afresh. A removed
+device's last WM_INPUT can still be read after its GIDC_REMOVAL; its handle
+then names no path, and a handle with no path is never remembered.
 """
 
 from __future__ import annotations
@@ -560,7 +562,9 @@ class RawInputDevices:
         if not handle:
             return
         now = self._current_at = monotonic()
-        if handle == self._current_handle:
+        # A handle with no path isn't remembered (see _first_sight), so it
+        # is looked at again at each of its reports until it has one.
+        if handle == self._current_handle and handle in self._handles:
             info = self._current
         else:
             info = self._handles.get(handle)
@@ -583,14 +587,20 @@ class RawInputDevices:
     def device_changed(self, change: int, handle: int) -> None:
         """WM_INPUT_DEVICE_CHANGE, on the hook's thread. A removed device's
         handle may be given to the next device connected: everything known
-        of it is forgotten, so that one is looked at afresh."""
+        of it is forgotten when the device goes and again when one arrives,
+        so that one is looked at afresh. (The removed device's last report
+        can be read after its removal; the arrival is what ends whatever
+        that left behind.)"""
         if change == GIDC_ARRIVAL:
             self.arrivals += 1
+        elif change == GIDC_REMOVAL and handle:
+            self.removals += 1
+        else:
             return
-        if change != GIDC_REMOVAL or not handle:
-            return
-        self.removals += 1
-        handle = int(handle)
+        if handle:
+            self._forget(int(handle))
+
+    def _forget(self, handle: int) -> None:
         self._handles.pop(handle, None)
         self._paths.pop(handle, None)
         if self._current_handle == handle:
@@ -609,6 +619,13 @@ class RawInputDevices:
         path = api.device_path(handle)
         path_info = parse_path(path)
         info = HandleInfo(kind, None, fallback_name(kind, path_info))
+        if not path:
+            # A removed device's last report can still be read after its
+            # GIDC_REMOVAL, and its handle then names no path (nor anything
+            # else): it must not be remembered, or the next device to be
+            # given the handle would be taken for it. (A read that failed
+            # for a moment is asked again at the next report.)
+            return info, ""
         if len(self._handles) > 128:  # handles of devices long gone
             self._handles.clear()
             self._paths.clear()

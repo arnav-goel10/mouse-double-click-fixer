@@ -115,7 +115,9 @@ class FakeRawInput:
     gives it out: a test only says what the device is.
 
     `queued` holds WM_INPUT still waiting in the hook thread's queue: drain()
-    hands each to `dispatch`, as DispatchMessage hands it to the window."""
+    hands each to `dispatch`, as DispatchMessage hands it to the window.
+    `gone` holds the handles of unplugged devices: Windows can still hand
+    out a report they made, but the handle no longer names a path or a usage."""
 
     def __init__(self) -> None:
         self.devices = {
@@ -129,6 +131,7 @@ class FakeRawInput:
         self.registered: list = []
         self.string_reads: list = []
         self.queued: list = []
+        self.gone: set = set()
         self.dispatch = lambda _lparam: None
         self.refuse = False
         self.error = 0
@@ -155,10 +158,10 @@ class FakeRawInput:
         return count
 
     def hid_usage(self, handle):
-        return self.devices[handle][2]
+        return (0, 0) if handle in self.gone else self.devices[handle][2]
 
     def device_path(self, handle):
-        return self.devices[handle][3]
+        return "" if handle in self.gone else self.devices[handle][3]
 
     def strings(self, path):
         self.string_reads.append(path)
@@ -204,6 +207,16 @@ class RawInputDevicesTests(unittest.TestCase):
         self.assertEqual(self.devices.current().kind, "touchscreen")
         self.assertIsNone(self.devices.current().key)
         self.assertEqual(self.seen, [])
+
+    def test_a_handle_with_no_path_is_asked_again_when_it_reports_next(self) -> None:
+        # An unreadable path is a dead handle's, or a read that failed for a
+        # moment: either way, not something to remember.
+        self.devices.on_input(0x30)
+        self.devices.on_input(0x30)
+        self.api.devices[0x30] = (RIM_TYPEHID, False, (0x0D, 0x05), I2C_TOUCHPAD, ("ELAN Touchpad", ""))
+        self.devices.on_input(0x30)
+        self.assertEqual(self.devices.current(), HandleInfo("trackpad", "hid:0000:0000:ELAN Touchpad", "ELAN Touchpad"))
+        self.assertEqual(self.api.string_reads, [I2C_TOUCHPAD])
 
     def test_pointers_with_absolute_positions_are_mice(self) -> None:
         # A virtual machine's pointer, Hyper-V's and the Remote Desktop
@@ -392,8 +405,8 @@ class RawInputDevicesTests(unittest.TestCase):
         self.clock()
         self.devices.on_input((0x10, self.LEFT_DOWN))
         self.assertEqual(self.devices.current().kind, "mouse")
-        self.devices.device_changed(devices_win.GIDC_ARRIVAL, 0x10)
-        self.assertEqual(self.devices.current().kind, "mouse", "an arrival changes nothing")
+        self.devices.device_changed(devices_win.GIDC_ARRIVAL, 0x20)
+        self.assertEqual(self.devices.current().kind, "mouse", "an arrival changes nothing for other handles")
         self.devices.device_changed(devices_win.GIDC_REMOVAL, 0x10)
         self.assertIsNone(self.devices.current())
         self.assertIsNone(self.devices.attribute(self.LEFT_DOWN), "its evidence went with it")
@@ -402,6 +415,53 @@ class RawInputDevicesTests(unittest.TestCase):
         self.assertEqual(self.devices.current(), HandleInfo("trackpad", "hid:0000:0000:ELAN Touchpad", "ELAN Touchpad"))
         self.assertEqual(self.api.string_reads, [USB_MOUSE, I2C_TOUCHPAD], "named afresh")
         self.assertEqual((self.devices.arrivals, self.devices.removals), (1, 1))
+
+    def test_a_late_report_of_a_removed_device_is_not_remembered(self) -> None:
+        # The last WM_INPUT of an unplugged mouse can be read after its
+        # GIDC_REMOVAL; its handle then names no path. That must not put the
+        # dead handle back in the cache.
+        self.clock()
+        self.devices.on_input(0x10)
+        self.devices.device_changed(devices_win.GIDC_REMOVAL, 0x10)
+        self.api.gone.add(0x10)
+        self.devices.on_input((0x10, self.LEFT_DOWN))                # read after the removal
+        self.assertEqual(len(self.seen), 1, "no new device came of it")
+        self.devices.on_input(0x20)                                  # ... and the touchpad reports
+        self.api.gone.discard(0x10)
+        self.api.devices[0x10] = self.api.devices[0x20]              # then the touchpad gets the handle
+        self.devices.on_input(0x10)
+        self.assertEqual(self.devices.current(), HandleInfo("trackpad", "hid:0000:0000:ELAN Touchpad", "ELAN Touchpad"))
+
+    def test_a_handle_given_to_a_new_device_is_forgotten_on_its_arrival_too(self) -> None:
+        # Whatever order Windows' messages come in, GIDC_ARRIVAL means the
+        # handle is a new device's: nothing known of an earlier one stays.
+        self.clock()
+        self.devices.on_input((0x10, self.LEFT_DOWN))                # the G502, known, its press the evidence
+        self.api.devices[0x10] = self.api.devices[0x20]              # its handle is the touchpad's now ...
+        self.devices.device_changed(devices_win.GIDC_ARRIVAL, 0x10)  # ... and no removal was ever heard of
+        self.assertIsNone(self.devices.current(), "the old device is not the one that reported last")
+        self.assertIsNone(self.devices.attribute(self.LEFT_DOWN), "its evidence went with it")
+        self.devices.on_input(0x10)
+        self.assertEqual(self.devices.current().kind, "trackpad")
+        self.assertEqual(self.api.string_reads, [USB_MOUSE, I2C_TOUCHPAD], "named afresh")
+        self.assertEqual(self.devices.arrivals, 1)
+
+    def test_a_touchpad_reusing_the_handle_of_a_removed_mouse_is_a_touchpad(self) -> None:
+        # The whole sequence: removal, the dead mouse's last report, the
+        # arrival of the touchpad that is given its handle.
+        now = self.clock()
+        self.devices.on_input(0x10)
+        self.devices.device_changed(devices_win.GIDC_REMOVAL, 0x10)
+        self.api.gone.add(0x10)
+        self.devices.on_input((0x10, self.LEFT_DOWN))
+        self.api.gone.discard(0x10)
+        self.api.devices[0x10] = self.api.devices[0x20]
+        self.devices.device_changed(devices_win.GIDC_ARRIVAL, 0x10)
+        self.devices.on_input(0x10)
+        self.assertEqual(self.devices.current().kind, "trackpad")
+        now[0] += devices_win.MOUSE_QUIET_S + 0.1                    # the dead mouse's report is long past
+        self.devices.on_input(0x10)
+        self.assertEqual(self.devices.attribute(self.LEFT_DOWN).kind, "trackpad", "and its taps are a touch's")
 
     def test_names_read_for_a_handle_since_reused_are_dropped(self) -> None:
         results = threading.Semaphore(0)
