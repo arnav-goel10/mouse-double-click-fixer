@@ -665,15 +665,17 @@ class CalibratePage(Page):
             )
             self.double_value.setText(f"{suggestion.fastest_double_click_ms:.0f} ms")
             # Only speak up when the result needs a caveat or an explanation.
+            # About this button alone: it may not be filtered until Apply, and
+            # a side button is repeated, not double-clicked.
             if not suggestion.confident:
                 note = (
-                    "Little margin between bounce and your double-clicks. "
+                    f"Little margin between bounce and your {'quick repeats' if side else 'double-clicks'}. "
                     "Raise the window if bounce still gets through."
                 )
             elif suggestion.worst_bounce_ms is None:
                 note = (
-                    "Your mouse didn’t bounce this time. Bounce comes and goes, so a light "
-                    "filter is kept on; the Test pane shows bounce when it happens."
+                    f"The {name} button didn’t bounce this time. Bounce comes and goes, so this is a "
+                    "light window, to catch it when it does; the Test pane shows bounce when it happens."
                 )
             else:
                 note = ""

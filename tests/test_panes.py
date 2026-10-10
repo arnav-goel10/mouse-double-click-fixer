@@ -295,6 +295,51 @@ class CalibrateEachButtonTests(PaneTestCase):
         self.assertIn(Button.BACK, self.controller.buttons, "it was worth measuring, so it is filtered")
         self.assertIs(page.button, Button.BACK, "the choice stays for next time")
 
+    def measure(self, button, bounce_ms=None, double_ms=150.0):
+        """A whole calibration of `button`, stopping at its result."""
+        from app.core import REQUIRED_DOUBLE_CLICKS, REQUIRED_SINGLE_CLICKS
+
+        page = self.window.calibrate
+        self.window.show_calibration(button)
+        page._advance()
+        for _ in range(REQUIRED_SINGLE_CLICKS):
+            page._on_pad_press(900.0, 960.0, button)
+        if bounce_ms is not None:
+            page._on_pad_press(bounce_ms, 40.0, button)
+        for _ in range(REQUIRED_DOUBLE_CLICKS):
+            page._on_pad_press(900.0, 960.0, button)
+            page._on_pad_press(double_ms, 210.0, button)
+        self.assertEqual(page.phase, "done")
+        return page
+
+    def test_the_result_notes_speak_of_the_button_measured(self) -> None:
+        from app.core import Button
+
+        # No bounce: said of the button, claiming nothing of a filter that
+        # isn't on for it until Apply (the back button) or that Apply keeps.
+        page = self.measure(Button.BACK)
+        note = page.summary.text()
+        self.assertIn("back button didn’t bounce", note)
+        self.assertNotIn("Your mouse", note)
+        self.assertNotIn("kept on", note, "the back button isn't filtered until Apply")
+        self.assertIn("starts filtering it", page.step_row.detail.text())
+        page.restart()
+        page = self.measure(Button.LEFT)
+        self.assertIn("left button didn’t bounce", page.summary.text())
+        self.assertNotIn("kept on", page.summary.text())
+        self.assertNotIn("starts filtering", page.step_row.detail.text(), "the left button is filtered already")
+
+    def test_a_tight_result_says_repeats_for_the_side_buttons(self) -> None:
+        from app.core import Button
+
+        page = self.measure(Button.FORWARD, bounce_ms=28.0, double_ms=60.0)
+        self.assertFalse(page.suggestion.confident)
+        self.assertIn("quick repeats", page.summary.text())
+        self.assertNotIn("double-click", page.summary.text())
+        page.restart()
+        page = self.measure(Button.RIGHT, bounce_ms=28.0, double_ms=60.0)
+        self.assertIn("your double-clicks", page.summary.text())
+
     def test_the_picker_chooses_and_locks_while_measuring(self) -> None:
         from app.core import Button
 
