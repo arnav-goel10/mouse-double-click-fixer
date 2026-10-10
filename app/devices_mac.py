@@ -6,7 +6,11 @@ AppleMultitouchDevice of a trackpad (verified on a MacBook's own trackpad).
 The ID changes whenever the device reconnects, so it is only ever a cache
 key: IOKit turns it into the IOHIDDevice above it, whose VendorID,
 ProductID, Product, Transport and SerialNumber make the stable device key
-(see device_key) and whose usages say what kind of device it is.
+(see device_key) and whose usages say what kind of device it is: its primary
+usage first (a keyboard that also lists a pointer collection is a keyboard,
+not a mouse), the rest of its usages only when that says nothing, and a
+trackpad driver below it trumps both (the internal trackpad's primary usage is
+the mouse; see kind_from_usages).
 
 Field 7 (kCGMouseEventSubtype) says whether a click came from a tablet (1,
 2) or a touch surface (3): those are never filtered, whatever the device.
