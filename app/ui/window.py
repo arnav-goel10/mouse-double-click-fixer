@@ -339,6 +339,8 @@ class TestPage(Page):
 
         self.pad = ClickPad()
         self.pad.setMaximumHeight(320)
+        # In the platform's case, as Calibrate's pad words are.
+        self.pad.set_text(label("Click Here"), "")
         self.body.addWidget(self.pad, 1)
         self.gap(12)
 

@@ -328,9 +328,16 @@ def capture_docs(app, main_window, target: Path, size: tuple[int, int] | None) -
     # A Mac window draws its title bar inside itself; Windows adds one.
     title_bar = 0 if sys.platform == "darwin" else WINDOWS_TITLE_BAR
     room = available.height() - title_bar - 8
-    wanted = size[1] - title_bar if size else fit_pane(app, main_window, room)[0]
-    print(f"The pane shows {wanted} px of the {room} the screen leaves")
-    main_window.resize(size[0] if size else DOCS_WIDTH, min(wanted, room))
+    height = min(size[1] - title_bar, room) if size else room
+    wanted, last = fit_pane(app, main_window, height)
+    # As offscreen: end below the last section that fits, never through a row.
+    page = main_window.stack.currentWidget().widget()
+    for index in range(page.body.count() if last is not None else 0):
+        if index > last and page.body.itemAt(index).widget() is not None:
+            page.body.itemAt(index).widget().hide()
+    height = height if size else min(wanted, room)
+    print(f"The pane shows {wanted} px of the {room} the screen leaves; the window is {height} tall")
+    main_window.resize(size[0] if size else DOCS_WIDTH, height)
     main_window.move(available.x(), available.y())
     app.processEvents()
     wait(app, 800)

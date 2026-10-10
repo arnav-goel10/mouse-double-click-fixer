@@ -946,6 +946,17 @@ class LookTests(PaneTestCase):
         titles = [self.window.sidebar.item(row).text() for row in range(self.window.sidebar.count())]
         self.assertEqual(titles, ["Bounce Filter", "Test", "Calibrate", "History", "Apps", "Devices", "General"])
 
+    def test_the_test_pad_speaks_in_the_platforms_case(self) -> None:
+        # Title Case on macOS, sentence case on Windows, as Calibrate's pad.
+        from app.ui import base
+        from app.ui.window import TestPage
+
+        for mac, text in ((True, "Click Here"), (False, "Click here")):
+            with mock.patch.object(base, "IS_MAC", mac):
+                page = TestPage(self.controller)
+            self.addCleanup(page.deleteLater)
+            self.assertEqual(page.pad._headline, text)
+
     def test_pop_up_buttons_open_the_system_menu_on_macos(self) -> None:
         from PySide6.QtWidgets import QComboBox, QStyle
 
