@@ -371,7 +371,7 @@ class DevicesPage(LivePage):
             self.mouse_rows[key] = self.mice.add(Row(name, _mouse_detail(key, kind, last_seen), switch, card_icon("mouse")))
             self.switches[key] = switch
         for key, name, kind, _last_seen in touch:
-            value = ValueLabel("Never filtered")
+            value = ValueLabel("Not filtered")
             self.touch.add(Row(name, KIND_NAMES.get(kind, ""), value, card_icon("devices")))
         self.header_touch.setVisible(bool(touch))
         self.touch.setVisible(bool(touch))

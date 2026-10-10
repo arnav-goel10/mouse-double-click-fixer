@@ -20,7 +20,7 @@ low-level mouse hook on Windows.
   precision touchpads and touchscreens, never keyboards. Windows hands the app
   every report from those devices, pointer movement included, whether or not
   the app is in front. The app notes only which device sent each report, when,
-  and for a mouse which buttons or wheel it names. It reads no positions or
+  and for a mouse which buttons or wheel it names. It uses no positions or
   finger contacts. It needs no special permission and runs with your
   account's rights.
 

@@ -744,7 +744,7 @@ class DevicesPaneTests(PaneTestCase):
         self.assertEqual([row.title.text() for row in page.mice.rows], ["HP 2.4G wireless and BT Mouse"])
         self.assertIn("USB", page.mice.rows[0].detail.text())
         self.assertFalse(page.touch.isHidden())
-        self.assertEqual(page.touch.rows[0].trailing.text(), "Never filtered")
+        self.assertEqual(page.touch.rows[0].trailing.text(), "Not filtered")
 
     def test_the_note_and_the_empty_list_say_what_each_system_does(self) -> None:
         from PySide6.QtWidgets import QLabel

@@ -150,9 +150,9 @@ when every one of its jobs passes:
   installers come from a cache keyed by `tools/old_installers.json`, each
   checked against its SHA-256, so a run that finds the cache doesn't add to the
   Releases' download numbers. Actions caches are scoped to a branch: a run
-  restores its own branch's cache and the default branch's, so a run on any
-  other branch or tag downloads the installers until `main` has a run that
-  saved the cache. The leg that installs a signed update needs a build that
+  restores its own branch's cache and the default branch's, so the first run on
+  each branch or tag downloads the installers (later runs there use their own
+  cache) until `main` has a run that saved it. The leg that installs a signed update needs a build that
   trusts CI's key, so it runs in `ci.yml` only.
 - **macOS build**, on a macOS 26 runner, loads the signing certificate from
   the `release` environment and refuses to build without it. The build

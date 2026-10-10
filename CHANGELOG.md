@@ -40,9 +40,9 @@
   press used to go straight through, so a contact that bounced twice as it
   closed could turn the start of a drag into a click. Very short taps now wait
   like any other click. The price is that a release reaches apps later than it
-  would unfiltered. A click made in place goes out as soon as the pointer
-  leaves the spot; any other release goes out once the filter window has
-  passed, and on a still mouse after the window plus the allowance below,
+  would unfiltered. A click made in place goes out sooner if the pointer
+  leaves the spot first; otherwise a release goes out once the filter window
+  has passed, and on a still mouse after the window plus the allowance below,
   which is 5 ms or more.
 - **A small movement no longer ends a drag.** Since 0.5.1 on macOS, a release
   held in place was settled by any pointer motion, even a hand resting on the

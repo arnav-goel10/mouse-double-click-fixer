@@ -110,7 +110,7 @@ WINDOW_NOTE = (
     "bounce within 30 ms. Back and forward presses are never held back: a repeat within "
     "the window is dropped."
 )
-WHEEL_DETAIL = "Drops a notch that jumps the wrong way. Trackpads and smooth scrolling are never touched."
+WHEEL_DETAIL = "Drops a notch that jumps the wrong way. Smooth scrolling from trackpads and precision touchpads is left alone."
 
 
 def window_box(low: int, high: int, accessible_name: str) -> QSpinBox:

@@ -70,7 +70,7 @@ reach the app.
 On Windows the fix judges only a notch that a mouse itself reports to Windows
 (through Raw Input). Scrolling no mouse reported, such as a precision
 touchpad's, passes. A touchpad that isn't a precision one reports as a mouse,
-so its scrolling is judged like a wheel's. If **Copy Diagnostics** shows
+so its scrolling can be judged like a wheel's. If **Copy Diagnostics** shows
 `device lookup: raw input unavailable`, no notch has a mouse's report to go by
 and the fix drops nothing.
 

@@ -85,7 +85,7 @@ any input of its own. Where the permission isn't there, they skip.
 | --- | --- |
 | `app/core.py` | Click classification, the scroll-wheel rule and calibration. Platform-neutral and fully unit-tested. |
 | `app/platform.py` | The system-wide hooks (Windows and macOS). Keep the hook callback fast: no disk or UI work. |
-| `app/devices_mac.py`, `app/devices_win.py` | Which device a click (on Windows, a wheel notch too) came from: IOKit on macOS, Raw Input on Windows. |
+| `app/devices_mac.py`, `app/devices_win.py` | Which device a click or wheel notch came from: IOKit on macOS, Raw Input on Windows. |
 | `app/frontmost.py`, `app/app_keys.py` | Which app is in front, and how the Apps list names an app. |
 | `app/controller.py` | App state; the UI talks to this, never to the hook directly. |
 | `app/wear.py` | The History's daily counts, and `wear.json`. |
