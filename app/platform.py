@@ -36,6 +36,7 @@ from .core import (
     WheelFilter,
     clamp_threshold,
 )
+from .devices_win import button_flag, wheel_flag
 
 log = logging.getLogger(__name__)
 
@@ -1616,17 +1617,19 @@ class GlobalClickFilter:
         # devices_win); its names are read on a thread of their own, which
         # posts WM_DEVICE here when they are in.
         WM_DEVICE = 0x8000 + 0x45
+        unavailable = ""
         try:
             raw_api = Win32RawInput()
-        except Exception:  # noqa: BLE001 - devices then go unknown and are filtered
+        except Exception as error:  # noqa: BLE001 - devices then go unknown and are filtered
             _log_ignored("setting up Raw Input")
-            raw_api = None
+            raw_api, unavailable = None, f"{type(error).__name__}: {error}"
         devices = RawInputDevices(
             raw_api,
             wake=lambda: user32.PostThreadMessageW(thread_id, WM_DEVICE, 0, 0),
             seen=lambda info: self._device_seen(info.key, info.name, info.kind),
+            unavailable=unavailable,
         )
-        hook_logic.device = devices.current
+        hook_logic.device = devices.attribute
         self._raw_input = devices
 
         def on_input(lparam: int) -> None:
@@ -1638,14 +1641,19 @@ class GlobalClickFilter:
 
         try:
             window = SessionWindow(
-                api, lambda: user32.PostThreadMessageW(thread_id, WM_REARM, REARM_SESSION, 0), on_input=on_input
+                api,
+                lambda: user32.PostThreadMessageW(thread_id, WM_REARM, REARM_SESSION, 0),
+                on_input=on_input,
+                on_device_change=devices.device_changed,
             )
         except Exception:  # noqa: BLE001 - the periodic re-arm still covers it
             _log_ignored("creating the session window")
             window = None
         self._hook_window = window.hwnd if window is not None else None
-        if window is not None and window.hwnd:
-            devices.register(window.hwnd)
+        devices.register(self._hook_window)
+        self._device_lookup = devices.status
+        if devices.status != "raw input ok":
+            log.warning("Devices can't be told apart: %s", devices.status)
         # The app in front, followed from this thread, whose message loop
         # delivers the foreground notices.
         self._front_changed(frontmost.current_app_key())
@@ -2287,9 +2295,10 @@ class WindowsHook:
         # in order. The hook runs with an InputSender (see there); by
         # default, at once.
         self._send = send or (lambda batch: send_batch(api, batch, owner._resend_lost))
-        # The device that reported last (devices_win.RawInputDevices.current),
-        # set by the runner; None while unknown.
-        self.device: Callable[[], Any] = lambda: None
+        # Which device the event being decided came from, given the bit a
+        # mouse reports for it (devices_win.RawInputDevices.attribute), set
+        # by the runner; None while unknown.
+        self.device: Callable[[int], Any] = lambda _flag: None
         # Whether motion is being watched: read on every move, without a lock.
         self.watch = [False]
         self.basis = (0, 0)
@@ -2359,7 +2368,7 @@ class WindowsHook:
         # Pen and touch, and clicks from a touchpad, a touchscreen or an
         # ignored device, pass untouched (see GlobalClickFilter._passes).
         pen = (extra & PEN_SIGNATURE_MASK) == PEN_SIGNATURE
-        kind, key = self._device_of_event(owner)
+        kind, key = self._device_of_event(owner, button_flag(button, pressed, self._api.buttons_swapped()))
         passes = owner._passes(pen, kind, key)
         # A release is only held back if it can be re-sent to the window that
         # will receive it.
@@ -2393,7 +2402,7 @@ class WindowsHook:
         if (extra & PEN_SIGNATURE_MASK) == PEN_SIGNATURE:
             return False
         owner = self._owner
-        kind, key = self._device_of_event(owner)
+        kind, key = self._device_of_event(owner, wheel_flag(axis))
         if owner._passes(False, kind, key):
             return False
         delta = (int(mouse_data) >> 16) & 0xFFFF
@@ -2401,9 +2410,10 @@ class WindowsHook:
             delta -= 0x10000
         return not owner._wheel_tick(axis, delta, windows_event_time(arrival, tick_now, tick))
 
-    def _device_of_event(self, owner: "GlobalClickFilter") -> tuple[Optional[str], Optional[str]]:
-        """(kind, key) of the device that reported last, as far as known."""
-        info = self.device()
+    def _device_of_event(self, owner: "GlobalClickFilter", flag: int) -> tuple[Optional[str], Optional[str]]:
+        """(kind, key) of the device the event came from, as far as known;
+        `flag` is the bit a mouse reports for it (see devices_win)."""
+        info = self.device(flag)
         if info is None:
             return None, None
         if info.key:
@@ -2816,10 +2826,14 @@ class SessionWindow:
     RESUME_EVENTS = (0x7, 0x12)
     _names = itertools.count(1)
 
-    WM_INPUT = 0x00FF
+    WM_INPUT, WM_INPUT_DEVICE_CHANGE = 0x00FF, 0x00FE
 
     def __init__(
-        self, api: WindowsApi, on_change: Callable[[], object], on_input: Optional[Callable[[int], object]] = None
+        self,
+        api: WindowsApi,
+        on_change: Callable[[], object],
+        on_input: Optional[Callable[[int], object]] = None,
+        on_device_change: Optional[Callable[[int, int], object]] = None,
     ) -> None:
         import ctypes
         from ctypes import wintypes
@@ -2865,7 +2879,7 @@ class SessionWindow:
 
         session_events, resume_events = self.SESSION_EVENTS, self.RESUME_EVENTS
         session_change, power, close = self.WM_WTSSESSION_CHANGE, self.WM_POWERBROADCAST, self.WM_CLOSE
-        raw_input = self.WM_INPUT
+        raw_input, device_change = self.WM_INPUT, self.WM_INPUT_DEVICE_CHANGE
 
         @WNDPROC
         def window_proc(hwnd, message, wparam, lparam):
@@ -2878,6 +2892,15 @@ class SessionWindow:
                     except Exception:  # noqa: BLE001 - never break the hook's thread
                         _log_ignored("reading Raw Input")
                 return user32.DefWindowProcW(hwnd, message, wparam, lparam)
+            if message == device_change:
+                # A device came or went (GIDC_ARRIVAL, GIDC_REMOVAL; lparam
+                # is its handle): see devices_win.RawInputDevices.device_changed.
+                if on_device_change is not None:
+                    try:
+                        on_device_change(int(wparam), int(lparam or 0))
+                    except Exception:  # noqa: BLE001 - never break the hook's thread
+                        _log_ignored("a device coming or going")
+                return 0
             if message == close:
                 # Restart Manager, and taskkill without /F, close every
                 # top-level window of the app. The default would destroy this

@@ -209,6 +209,14 @@ class FakeWindows:
         """A wheel notch: WM_MOUSEWHEEL (axis 1) or WM_MOUSEHWHEEL (2)."""
         self.queue.append(("hand-wheel", axis, delta, extra, flags))
 
+    def report(self, lparam, queued: bool = False) -> None:
+        """A device's Raw Input report (lparam as test_devices.FakeRawInput
+        takes it), handled by the hook's window before the next event
+        reaches the hook, as CI measured; or, with `queued`, still waiting in
+        the hook thread's queue when it does (see devices_win). Needs
+        `raw`, the FakeRawInput, and `devices`, the RawInputDevices."""
+        self.queue.append(("raw", lparam, queued))
+
     def wait(self, ms: float) -> None:
         self.run()
         self.now_ms += ms
@@ -232,6 +240,12 @@ class FakeWindows:
         elif kind == "hand-button":
             _, (button, pressed), extra = item
             self._button(self._swap(button), pressed, 0, extra, int(self.now_ms))
+        elif kind == "raw":
+            _, lparam, queued = item
+            if queued:
+                self.raw.queued.append(lparam)
+            else:
+                self.devices.on_input(lparam)
         elif kind == "hand-wheel":
             _, axis, delta, extra, flags = item
             data = (delta & 0xFFFF) << 16
@@ -729,7 +743,7 @@ class WindowsHookLogicTests(unittest.TestCase):
         self.win.wait(5)
         self.win.scroll(120, flags=self.win.INJECTED)                 # another program's
         self.win.scroll(120, extra=PEN)
-        self.win.hook.device = lambda: HandleInfo("trackpad", "hid:04f3:3087:ELAN", "ELAN Touchpad")
+        self.win.hook.device = lambda _flag: HandleInfo("trackpad", "hid:04f3:3087:ELAN", "ELAN Touchpad")
         self.win.scroll(120)
         self.win.run()
         self.assertEqual(len(self.win.wheel()), 4)
@@ -742,7 +756,7 @@ class WindowsHookLogicTests(unittest.TestCase):
         self.configure(ignored_devices=frozenset({"usb:046d:c08b:G502"}))
         for info in (HandleInfo("trackpad", "hid:04f3:3087:ELAN", "ELAN Touchpad"),
                      HandleInfo("mouse", "usb:046d:c08b:G502", "G502 HERO")):
-            self.win.hook.device = lambda info=info: info
+            self.win.hook.device = lambda _flag, info=info: info
             self.win.seen.clear()
             self.win.press()
             self.win.wait(40)
@@ -763,7 +777,7 @@ class WindowsHookLogicTests(unittest.TestCase):
 
         events = []
         self.filter._on_event = events.append
-        self.win.hook.device = lambda: HandleInfo("mouse", "usb:046d:c08b:G502", "G502 HERO")
+        self.win.hook.device = lambda _flag: HandleInfo("mouse", "usb:046d:c08b:G502", "G502 HERO")
         self.win.press()
         self.win.wait(40)
         self.win.release()
@@ -788,7 +802,7 @@ class WindowsHookLogicTests(unittest.TestCase):
         self.filter._on_device = devices.append
         self.filter._on_event = events.append
         raw = RawInputDevices(FakeRawInput(), threaded=False)
-        self.win.hook.device = raw.current
+        self.win.hook.device = raw.attribute
         raw.on_input(0x40)                                           # it moved
         self.win.press()
         self.win.wait(40)
@@ -804,6 +818,114 @@ class WindowsHookLogicTests(unittest.TestCase):
         # Ignored by name, it passes like any ignored device.
         self.configure(ignored_devices=frozenset({device.key}))
         self.assertEqual([(info.key, info.filtered) for info in self.filter.seen_devices()], [(device.key, False)])
+
+    # -- which device a click came from, with Raw Input (devices_win) -------------
+    MOUSE, TOUCHPAD = 0x10, 0x20                                     # test_devices.FakeRawInput's handles
+
+    def raw_input(self):
+        """Raw Input as the hook's thread has it (devices_win.RawInputDevices
+        on test_devices.FakeRawInput), on the stand-in's clock."""
+        try:
+            from test_devices import FakeRawInput
+        except ImportError:  # run as tests.<module> from the repository root
+            from tests.test_devices import FakeRawInput
+        from app.devices_win import RawInputDevices
+
+        self.win.raw = FakeRawInput()
+        self.win.devices = RawInputDevices(self.win.raw, threaded=False)
+        self.win.devices.register(0xABC)
+        self.win.raw.dispatch = self.win.devices.on_input
+        self.win.hook.device = self.win.devices.attribute
+        patch = mock.patch("app.devices_win.monotonic", lambda: self.win.now_ms / 1000)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def palm(self, ms: float) -> None:
+        """A palm resting on the touchpad: it reports every 8 ms."""
+        for _ in range(int(ms // 8)):
+            self.win.report(self.TOUCHPAD)
+            self.win.wait(8)
+
+    def mouse_click_with_a_bounce(self, queued: bool = False) -> None:
+        """The external mouse, still for long, clicks, and its contact bounces
+        6 ms after letting go. Each transition is a report of the mouse's,
+        then the hook's call; the palm reports in between."""
+        self.palm(1500)
+        for pressed, ms in ((True, 60), (False, 6), (True, 15), (False, 0)):
+            self.win.report((self.MOUSE, 0x0001 if pressed else 0x0002), queued)
+            self.win.report(self.TOUCHPAD)
+            (self.win.press if pressed else self.win.release)()
+            self.win.wait(ms)
+        self.palm(200)
+        self.fire_timers()
+
+    def test_a_palm_on_the_touchpad_doesnt_let_a_mouses_bounce_through(self) -> None:
+        self.raw_input()
+        self.mouse_click_with_a_bounce()
+        self.assertEqual([entry[0] for entry in self.win.buttons()], ["down", "up"], "the bounce was dropped")
+        self.assertEqual(self.filter.filtered_count, 1)
+        self.assertEqual(self.filter.passed_counts, {}, "nothing passed as a touch")
+
+    def test_a_mouses_report_still_in_the_queue_is_read_before_deciding(self) -> None:
+        self.raw_input()
+        self.mouse_click_with_a_bounce(queued=True)
+        self.assertEqual([entry[0] for entry in self.win.buttons()], ["down", "up"])
+        self.assertEqual(self.filter.filtered_count, 1)
+        self.assertEqual(self.win.devices.drained, 4, "each of the mouse's reports was read out by the hook")
+
+    def touchpad_double_tap(self, gap_ms: float = 0) -> None:
+        """A finger taps the touchpad twice: it reports while touching, and
+        Windows makes each tap's down and up as it lifts, the second tap's
+        down `gap_ms` after the first's up."""
+        for _ in range(2):
+            for _ in range(3):
+                self.win.report(self.TOUCHPAD)
+                self.win.wait(8)
+            self.win.press()
+            self.win.wait(1)
+            self.win.release()
+            self.win.wait(gap_ms)
+        self.win.run()
+
+    def test_a_touchpad_tap_passes_while_the_mice_are_still(self) -> None:
+        self.raw_input()
+        self.win.report(self.MOUSE)                                  # the mouse last moved 2 s ago
+        self.win.wait(2000)
+        for _ in range(3):
+            self.win.report(self.TOUCHPAD)
+            self.win.wait(8)
+        self.win.press()
+        self.win.wait(1)
+        self.win.release()
+        self.win.run()
+        self.assertEqual([(entry[0], entry[4]) for entry in self.win.buttons()], [("down", 0), ("up", 0)], "not held")
+        self.assertEqual(FakeTimer.created, [])
+        self.assertEqual(self.filter.passed_counts, {"touch": 1})
+
+    def test_a_touchpad_double_tap_with_no_gap_reaches_apps_whole(self) -> None:
+        self.raw_input()
+        self.win.wait(2000)
+        self.touchpad_double_tap(gap_ms=0)
+        self.assertEqual([entry[0] for entry in self.win.buttons()], ["down", "up", "down", "up"])
+        self.assertEqual({entry[4] for entry in self.win.buttons()}, {0}, "nothing held or re-sent")
+        self.assertEqual(self.filter.passed_counts, {"touch": 2})
+        self.assertEqual(self.filter.filtered_count, 0)
+
+    def test_a_touchpad_double_tap_right_after_moving_the_mouse_is_filtered(self) -> None:
+        # Documented in devices_win: within MOUSE_QUIET_S of a mouse's last
+        # report, a click with no mouse's report of its own is still taken
+        # for a mouse's (rule 3). The taps are filtered: the first's up
+        # waits out the window, and the second tap, 0 ms on, is taken for
+        # bounce. Apps see one click. Once the mouse has been still that
+        # long, the same double-tap passes whole (above).
+        self.raw_input()
+        self.win.report(self.MOUSE)                                  # the hand moves the mouse ...
+        self.win.wait(300)                                           # ... and taps 0.3 s later
+        self.touchpad_double_tap(gap_ms=0)
+        self.fire_timers()
+        self.assertEqual([entry[0] for entry in self.win.buttons()], ["down", "up"])
+        self.assertEqual(self.filter.filtered_count, 1)
+        self.assertEqual(self.filter.passed_counts, {})
 
     def test_a_pen_tap_while_the_mouses_release_is_held_goes_out_behind_it(self) -> None:
         self.click()                                                 # the mouse's up is held
@@ -1433,9 +1555,39 @@ class WindowsInputFeatureTests(RealWindows):
             self.move_by(-1, 0)
         time.sleep(0.3)
         raw = [seconds for message, _watched, seconds in timings if message == 0x00FF]
-        self.report(f"[raw input] {len(raw)} WM_INPUT; current device {devices.current()}")
+        self.report(f"[raw input] {len(raw)} WM_INPUT; current device {devices.current()}; "
+                    f"{devices.arrivals} devices announced on registering")
         self.assertGreater(len(raw), 0, "no WM_INPUT reached the hook's window")
         self.assertIsNone(devices.current(), "SendInput names no device")
+        self.assertEqual(self.filter.device_lookup, "raw input ok")
+        # Clicks: each is attributed as it is decided, reading the queue out
+        # first; SendInput's reports name no device, so they stay unknown,
+        # and are filtered.
+        drained = devices.drained
+        reads = []
+        read = devices._api.read
+        devices._api.read = lambda lparam: reads.append(read(lparam)) or reads[-1]
+        self.addCleanup(vars(devices._api).pop, "read", None)
+        for _ in range(5):
+            self.button(0x0002)
+            time.sleep(0.03)
+            self.button(0x0004)
+            time.sleep(0.1)
+        time.sleep(0.2)
+        self.report(f"[raw input] {devices.drained - drained} WM_INPUT read out of the queue by 10 hook calls")
+        self.assertEqual(self.filter.passed_counts, {})
+        # Each report's RAWMOUSE is read whole: the left's transitions are
+        # there (RI_MOUSE_LEFT_BUTTON_DOWN, _UP; the held ups re-sent make
+        # more of those), from no device.
+        flags = [flags for _handle, _type, flags in reads if flags]
+        self.report(f"[raw input] button flags read: {[hex(flag) for flag in flags]}")
+        self.assertEqual(flags.count(0x0001), 5)
+        self.assertGreaterEqual(flags.count(0x0002), 5)
+        self.assertEqual({(handle, raw_type) for handle, raw_type, _flags in reads}, {(0, 0)})
+        # A device unplugged: its handle is forgotten (WM_INPUT_DEVICE_CHANGE,
+        # GIDC_REMOVAL, reaches the window registered with RIDEV_DEVNOTIFY).
+        self.user32.SendMessageW(self.filter._hook_window, 0x00FE, 2, 0x7FFF0)
+        self.assertEqual(devices.removals, 1)
 
     def test_the_wheel_side_buttons_and_raw_input_stay_cheap(self) -> None:
         self.start_filter(buttons=(Button.LEFT, Button.BACK), wheel_fix=True)
@@ -1469,22 +1621,30 @@ class WindowsInputFeatureTests(RealWindows):
 
 @unittest.skipUnless(_run_e2e(), "needs Windows and DCF_E2E=1 (it injects real input)")
 class WindowsRawInputOrderTests(RealWindows):
-    """A measurement the device attribution rests on (see devices_win): on
+    """What the device attribution rests on (see devices_win), measured: on
     one thread that has both a low-level mouse hook and a window registered
     for Raw Input, as the filter's hook thread has, does the hook's callback
     for a click run before or after that click's WM_INPUT; is the WM_INPUT
     already in the thread's queue while the callback runs, so that the
-    callback could read it; and does a click the hook drops still produce
-    one? SendInput's input stands in for a mouse's: its WM_INPUT names no
-    device, but it goes through the same queue."""
+    callback can read it out (as RawInputDevices.drain does); does a click
+    the hook drops still produce one; and does Raw Input name buttons before
+    the user's swap? SendInput's input stands in for a mouse's: its WM_INPUT
+    names no device, but it goes through the same queue."""
 
     QS_RAWINPUT = 0x0400
     PM_REMOVE = 0x0001
     PM_QS_INPUT = 0x1C07 << 16  # QS_INPUT: input only, no sent messages (no hook re-entry)
     RID_INPUT = 0x10000003
     WM_INPUT = 0x00FF
+    WM_BUSY = 0x8000 + 0x50
+    LEFT = ((WM_LBUTTONDOWN, 0x0001), (WM_LBUTTONUP, 0x0002))
 
-    def probe(self, drop: bool, drain: bool, clicks: int = 12) -> dict:
+    def probe(self, drop: bool = False, drain: bool = False, busy: bool = False, pairs=LEFT, clicks: int = 12) -> dict:
+        """Clicks the left button `clicks` times through SendInput and pairs
+        each hook call (message) with the WM_INPUT carrying its transition
+        (flag), the k-th with the k-th. `busy` keeps the thread busy for
+        30 ms just as each press and release is sent, as a thread with
+        other work would be."""
         import ctypes
         from ctypes import wintypes
 
@@ -1493,7 +1653,8 @@ class WindowsRawInputOrderTests(RealWindows):
 
         events: list = []
         ready, done = threading.Event(), threading.Event()
-        state = {"in_hook": False, "thread": None, "registered": False}
+        state = {"in_hook": False, "depth": 0, "nested": 0, "thread": None, "registered": False}
+        messages = {message for message, _flag in pairs}
         LRESULT = ctypes.c_ssize_t
         HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
 
@@ -1539,19 +1700,25 @@ class WindowsRawInputOrderTests(RealWindows):
 
             @HOOKPROC
             def callback(code: int, wparam: int, lparam: int) -> int:
-                if code >= 0 and wparam in (WM_LBUTTONDOWN, WM_LBUTTONUP):
-                    queued = bool((user32.GetQueueStatus(self.QS_RAWINPUT) >> 16) & self.QS_RAWINPUT)
-                    events.append(("hook", time.perf_counter(), int(wparam), queued))
-                    if drain:
-                        state["in_hook"] = True
-                        try:
-                            while user32.PeekMessageW(
-                                ctypes.byref(peeked), window.hwnd, self.WM_INPUT, self.WM_INPUT,
-                                self.PM_REMOVE | self.PM_QS_INPUT,
-                            ):
-                                user32.DispatchMessageW(ctypes.byref(peeked))
-                        finally:
-                            state["in_hook"] = False
+                if code >= 0 and wparam in messages:
+                    if state["depth"]:
+                        state["nested"] += 1
+                    state["depth"] += 1
+                    try:
+                        queued = bool((user32.GetQueueStatus(self.QS_RAWINPUT) >> 16) & self.QS_RAWINPUT)
+                        events.append(("hook", time.perf_counter(), int(wparam), queued))
+                        if drain:
+                            state["in_hook"] = True
+                            try:
+                                while user32.PeekMessageW(
+                                    ctypes.byref(peeked), window.hwnd, self.WM_INPUT, self.WM_INPUT,
+                                    self.PM_REMOVE | self.PM_QS_INPUT,
+                                ):
+                                    user32.DispatchMessageW(ctypes.byref(peeked))
+                            finally:
+                                state["in_hook"] = False
+                    finally:
+                        state["depth"] -= 1
                     if drop:
                         return 1
                 return user32.CallNextHookEx(None, code, wparam, lparam)
@@ -1562,6 +1729,9 @@ class WindowsRawInputOrderTests(RealWindows):
                 while not done.is_set():
                     if user32.GetMessageW(ctypes.byref(message), None, 0, 0) <= 0:
                         break
+                    if message.message == self.WM_BUSY and not message.hWnd:
+                        time.sleep(0.03)
+                        continue
                     user32.TranslateMessage(ctypes.byref(message))
                     user32.DispatchMessageW(ctypes.byref(message))
             finally:
@@ -1575,19 +1745,19 @@ class WindowsRawInputOrderTests(RealWindows):
         self.assertTrue(state["registered"], "Raw Input registration failed")
         time.sleep(0.2)
         for _ in range(clicks):
-            self.button(0x0002)
-            time.sleep(0.05)
-            self.button(0x0004)
-            time.sleep(0.1)
+            for flags, pause in ((0x0002, 0.05), (0x0004, 0.1)):
+                if busy:
+                    self.user32.PostThreadMessageW(state["thread"], self.WM_BUSY, 0, 0)
+                    time.sleep(0.005)
+                self.button(flags)
+                time.sleep(pause)
         time.sleep(0.3)
         done.set()
         self.user32.PostThreadMessageW(state["thread"], 0x0012, 0, 0)
         thread.join(3)
-        # Pair each hook call with the WM_INPUT carrying the same transition
-        # (the k-th left down with the k-th RI_MOUSE_LEFT_BUTTON_DOWN).
         result = {"hook first": 0, "input first": 0, "queued at hook": 0, "read in hook": 0, "unpaired": 0,
-                  "inputs": 0, "hooks": 0, "lag_ms": []}
-        for message, flag in ((WM_LBUTTONDOWN, 0x0001), (WM_LBUTTONUP, 0x0002)):
+                  "inputs": 0, "hooks": 0, "nested hook calls": state["nested"], "lag_ms": []}
+        for message, flag in pairs:
             hooks = [(index, entry) for index, entry in enumerate(events) if entry[0] == "hook" and entry[2] == message]
             inputs = [(index, entry) for index, entry in enumerate(events) if entry[0] == "input" and entry[2] & flag]
             result["hooks"] += len(hooks)
@@ -1601,19 +1771,43 @@ class WindowsRawInputOrderTests(RealWindows):
                 result["read in hook"] += raw[3]
                 result["hook first" if hook_index < input_index else "input first"] += 1
                 result["lag_ms"].append(round((raw[1] - hook[1]) * 1000, 3))
+        lags = sorted(result.pop("lag_ms"))
+        result["WM_INPUT minus hook call, ms"] = (lags[0], statistics.median(lags), lags[-1]) if lags else None
         return result
 
-    def test_the_order_of_a_clicks_hook_call_and_its_raw_input(self) -> None:
+    def test_a_clicks_raw_input_is_handled_by_the_time_its_hook_call_decides(self) -> None:
         self.place(300, 300)
-        passed = self.probe(drop=False, drain=False)
-        drained = self.probe(drop=False, drain=True)
-        dropped = self.probe(drop=True, drain=False)
-        for name, result in (("passed", passed), ("passed, read in the hook", drained), ("dropped", dropped)):
-            lags = sorted(result.pop("lag_ms"))
-            spread = f"lag ms min={lags[0]} median={statistics.median(lags)} max={lags[-1]}" if lags else "no pairs"
-            self.report(f"[raw order] {name}: {result}; WM_INPUT minus hook call: {spread}")
-        self.assertEqual(passed["hooks"], 24)
-        self.assertEqual(passed["inputs"], 24, "every injected press and release produced a WM_INPUT")
+        runs = {
+            "passed": self.probe(),
+            "passed, read in the hook": self.probe(drain=True),
+            "dropped": self.probe(drop=True),
+            "thread busy": self.probe(busy=True),
+            "thread busy, read in the hook": self.probe(busy=True, drain=True),
+        }
+        for name, result in runs.items():
+            self.report(f"[raw order] {name}: {result}")
+        for name, result in runs.items():
+            with self.subTest(name):
+                self.assertEqual((result["hooks"], result["inputs"], result["unpaired"]), (24, 24, 0),
+                                 "every press and release, dropped or not, produced its WM_INPUT")
+                if "read in the hook" in name:
+                    # What RawInputDevices.attribute relies on: as the hook
+                    # decides, after reading the queue out, the click's own
+                    # report has been handled.
+                    self.assertEqual(result["input first"] + result["read in hook"], 24)
+                    self.assertEqual(result["nested hook calls"], 0, "reading the queue ran no hook call")
+
+    def test_raw_input_names_buttons_as_the_hand_pressed_them(self) -> None:
+        # Swapped for a left-handed user, the hook sees a right press where
+        # the hand pressed the left button; Raw Input still says left
+        # (devices_win.button_flag matches them up).
+        previous = self.user32.SwapMouseButton(True)
+        self.addCleanup(self.user32.SwapMouseButton, previous)
+        self.place(300, 300)
+        # Dropped: a right click would open the desktop's menu.
+        result = self.probe(drop=True, drain=True, pairs=((WM_RBUTTONDOWN, 0x0001), (WM_RBUTTONUP, 0x0002)), clicks=6)
+        self.report(f"[raw order] swapped: {result}")
+        self.assertEqual((result["hooks"], result["inputs"], result["unpaired"]), (12, 12, 0))
 
 
 @unittest.skipUnless(_run_e2e(), "needs Windows and DCF_E2E=1 (it installs real hooks)")
