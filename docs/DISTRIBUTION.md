@@ -70,11 +70,12 @@ person to approve each one. The job waits up to 30 minutes for each
 approval. A request that is denied or times out fails the Windows job, so
 no draft goes up. Approving a request after its wait has ended does
 nothing: the job that would have collected the signed file has already
-failed. Re-run the failed jobs instead. The re-run submits two new requests,
-and you approve each within its 30 minutes. SignPath evaluates build
-policies (GitHub-hosted runners only, say) for at most 3 re-runs of a build,
-and later re-runs fail while any such policy is active; a policy set to
-`disallow_reruns` refuses re-runs altogether
+failed. Re-run the failed jobs instead. The re-run uploads the two
+`unsigned-*` artifacts again over the first run's (`overwrite: true`),
+submits two new requests, and you approve each within its 30 minutes.
+SignPath evaluates build policies (GitHub-hosted runners only, say) for at
+most 3 re-runs of a build, and later re-runs fail while any such policy is
+active; a policy set to `disallow_reruns` refuses re-runs altogether
 ([SignPath with GitHub](https://docs.signpath.io/trusted-build-systems/github)).
 Past either, delete the tag and push it again, which starts a new run rather
 than a re-run.
@@ -105,8 +106,8 @@ installer and the installed exe's self-test.
 
 | Condition | This project |
 | --- | --- |
-| **Reputation.** Under "Common misunderstandings" the terms say SignPath won't sign binaries built from code nobody knows, and that for programs people download and run on the strength of its signature, "we require a certain verifiable reputation" (libraries are exempt) | **Not yet, and the condition most likely to stop the application.** The repository was created on 2026-09-17. On 2026-10-10 it had 0 stars, 0 forks, no issues, and pull requests only from you and Dependabot. Its release files show 146 downloads in all, but 112 of them are of the 0.2.6 and 0.5.3 installers, which CI's install tests fetch on every run, and the rest look like one installed copy updating itself (a macOS update archive and a `SHA256SUMS.txt` per release). Nothing yet shows use by anyone else |
-| OSI-approved licence, no commercial dual-licensing | MIT. The app bundles Qt through PySide6 (LGPL-3.0), which The Qt Company also sells under a commercial licence. The terms don't say whether that counts; mention it in the application. SignPath's [project list](https://signpath.org/projects) includes Qt applications, Flameshot and Stellarium among them |
+| **Reputation.** Under "Common misunderstandings" the terms say SignPath won't sign binaries built from code nobody knows, and that for programs people download and run on the strength of its signature, "we require a certain verifiable reputation" (libraries are exempt) | **Not yet, and the condition most likely to stop the application.** The repository was created on 2026-09-17. On 2026-10-10 it had 0 stars, 0 forks, no issues, and pull requests only from you and Dependabot. Its release files show 146 downloads in all, but 112 of them are of the 0.2.6 and 0.5.3 installers, which CI's install tests fetched on every run until they were cached (`tools/old_installers.py`), and the rest look like one installed copy updating itself (a macOS update archive and a `SHA256SUMS.txt` per release). Nothing yet shows use by anyone else |
+| **OSS license.** The terms: the project "must use an OSI-approved Open Source license without commercial dual-licensing for all components." | MIT. The app bundles Qt through PySide6 (LGPL-3.0), which The Qt Company also sells under a commercial licence. The sentence says "for all components" and doesn't say whether a bundled library's dual licence counts, so it could be read against the project; mention it in the application. SignPath's [project list](https://signpath.org/projects) includes Qt applications, Flameshot and Stellarium among them |
 | No malware or potentially unwanted programs | None. The app filters mouse input and never invents a click |
 | No proprietary components, though System Libraries (as section 1 of the GPL v3 defines them) may be included | Python, Qt/PySide6 and the other bundled packages are open source. The exception is Microsoft's Visual C++ runtime (`VCRUNTIME140.dll`, `VCRUNTIME140_1.dll` and the `MSVCP140*.dll` files), the runtime of the compiler Python and Qt are built with. It is proprietary, shipped unmodified as Microsoft's Distributable Code, and `THIRD_PARTY_NOTICES-windows.md` says so. Python's two copies are signed by Microsoft, and the copies inside PySide6 and shiboken6 by The Qt Company. It fits GPL v3 section 1's System Libraries, which come with a Major Component, and a Major Component includes "a compiler used to produce the work". Name it in the application |
 | Actively maintained, already released in the form to be signed | Releases since 0.2.0 (2026-09-19). Each ships `DoubleClickFixer-Setup.exe` and `DoubleClickFixer.exe` |
@@ -117,7 +118,7 @@ installer and the installed exe's self-test.
 | Manual approval of every release | Two requests per release, both approved by you |
 | Product name and version enforced by metadata restrictions | Both artifact configurations require product name "Mouse Double-Click Fixer" and the release's version |
 | Only your own code signed | Only the three files built here. The Python and Qt libraries beside the installed exe are never sent to SignPath |
-| Privacy: software that collects user data and transfers it to systems the user didn't name must describe this in a privacy policy, show that policy during installation, and offer an option at install time to turn it off | No telemetry, and nothing about the user is collected. The only network use is the update check and download from the project's GitHub Releases. The check is on by default; it asks GitHub for the latest release, with the app's version in its User-Agent and nothing else beyond what any web request carries (the IP address). **General › Check for updates automatically** turns it off (README, [Privacy](../README.md#privacy)). Be ready to argue that this isn't user data. If SignPath disagrees, the installer must show the privacy policy and offer a checkbox that turns the automatic check off; that isn't built |
+| Privacy: software that collects user data and transfers it to systems the user didn't name must describe this in a privacy policy, show that policy during installation, and offer an option at install time to turn it off | No telemetry, and nothing about the user is collected. What the app learns on the computer stays there: the executable name of the app in front (kept in memory, to compare with the user's exclusion list), the keys of the mice the user chooses to ignore (in `settings.json`) and the daily counts in `wear.json`. The only network use is the update check and download from the project's GitHub Releases. The check is on by default; it asks GitHub for the latest release, with the app's version in its User-Agent and nothing else beyond what any web request carries (the IP address). **General › Check for updates automatically** turns it off (README, [Privacy](../README.md#privacy)). Be ready to argue that this isn't user data. If SignPath disagrees, the installer must show the privacy policy and offer a checkbox that turns the automatic check off; that isn't built |
 | System changes announced; an uninstaller | Start at login is off unless chosen. The installer registers an uninstaller; the portable exe is one file to delete |
 | A "Code signing policy" on the home page | **To do once accepted:** add [the section below](#the-code-signing-policy-section) to the README and the release page |
 
@@ -131,9 +132,10 @@ show it:
 - posts, reviews or forum answers elsewhere that recommend it;
 - a winget listing, which Microsoft's moderators reviewed and scanned
   ([winget](#2-winget));
-- download counts, once CI's own are taken out. CI's install tests download
-  the 0.2.6 and 0.5.3 installers from their release pages on every run, so
-  the raw counts overstate use.
+- download counts, once CI's own are taken out. Until it cached them, CI's
+  install tests downloaded the 0.2.6 and 0.5.3 installers from their release
+  pages on every run, so those two releases' counts overstate use, and always
+  will.
 
 Count again before applying:
 
@@ -177,9 +179,38 @@ condition most likely to stop the application.
 >
 > **What it does:** a tray app for Windows 10 1809+/11 and macOS 13+ that
 > fixes mice whose worn switches send two clicks for one ("switch bounce"
-> or "chatter"). It filters the extra clicks with a low-level mouse hook and
-> leaves real double-clicks alone. No telemetry. Its only network use is the
-> update check and download from the project's GitHub Releases, verified
+> or "chatter"). On Windows it:
+>
+> - filters the extra clicks with a low-level mouse hook (`SetWindowsHookEx`,
+>   `WH_MOUSE_LL`) and leaves real double-clicks alone. The left button is
+>   filtered by default; the right, middle and side buttons (back and
+>   forward) are the user's choice;
+> - optionally (off by default) drops a scroll-wheel tick that reverses
+>   direction within a short window (50 ms by default), the stray notch of a
+>   worn wheel encoder, vertical and horizontal ticks each judged on their
+>   own. The same hook sees the ticks; nothing is held back or re-sent;
+> - tells which device a click came from with Raw Input: a hidden window of
+>   its own registers (`RegisterRawInputDevices`, `RIDEV_INPUTSINK`) for
+>   mice, precision touchpads and touchscreens, never keyboards. Clicks from
+>   touchpads, touchscreens and pens pass untouched, and the user can put
+>   any mouse on a per-device ignore list;
+> - watches which app is in front (`SetWinEventHook`,
+>   `EVENT_SYSTEM_FOREGROUND`), so clicks pass untouched while an app on the
+>   user's exclusion list (a game, say) is in front. It reads the executable
+>   name of the foreground window's process and compares it with that list;
+>   the name is kept in memory only. The picker for that list shows the
+>   programs that have a window open;
+> - keeps a local wear history, `wear.json` beside the settings: for each
+>   button and day, the presses it saw, the bounces it dropped and a
+>   histogram of the bounces' gaps, plus the wheel ticks seen and
+>   reversals dropped. It records no time or place of a click, and the file
+>   is never sent anywhere.
+>
+> It never invents a click. To keep events in order it re-sends, with
+> `SendInput`, a release it held back for the filter window and the input
+> that came meanwhile; apps see these as injected input (README,
+> "Will it get me flagged in games?"). No telemetry. Its only network use is
+> the update check and download from the project's GitHub Releases, verified
 > with a minisign signature and switchable off.
 >
 > **What we'd sign, Windows only:**
@@ -323,9 +354,17 @@ provided by SignPath.io, certificate by SignPath Foundation. See the
   that is a third signing request per release (for the copy: compile once
   to write it, have SignPath sign it, compile again), and a third approval.
   Neither is built.
-- **SmartScreen.** A signature lets reputation build up for the
-  certificate, not separately for each file. It doesn't by itself stop the
-  first-run warning.
+- **SmartScreen.** A signature doesn't by itself stop the first-run
+  warning. Microsoft's
+  [SmartScreen reputation for Windows app developers](https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/smartscreen-reputation)
+  says SmartScreen weighs two things, the reputation of the file's own hash
+  and that of the publisher's signing certificate, and that a signed file
+  can still be flagged as unrecognized until one of them has built up. It
+  gives no threshold, only that this can take several weeks and hundreds of
+  clean installs from a wide audience. What signing buys is that the
+  certificate's reputation can carry over to later versions signed with it;
+  an unsigned file starts at zero with every version. The publisher shown is
+  SignPath Foundation.
 - **macOS.** Unchanged. The app stays signed with its own certificate
   (see [Releasing](RELEASING.md#macos-signing-and-why-it-matters-for-updates)).
 
@@ -358,9 +397,13 @@ What the manifests say, and why:
   debounce and chatter, and `ReleaseNotesUrl` pointing at the release page.
 - **The installer only, `InstallerType: inno`, `Scope: user`, x64.**
   winget runs an Inno Setup installer silently with its own switches,
-  `/SP- /VERYSILENT /SUPPRESSMSGBOXES /NORESTART`. That is what CI's
-  install test runs, over running copies, so the manifest names no
-  switches.
+  `/SP- /VERYSILENT /SUPPRESSMSGBOXES /NORESTART`, so the manifest names
+  none. CI's install test (`tools/windows_install_e2e.ps1`) runs
+  `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /LOG=...` over running copies:
+  the same, less `/SP-` (which skips Inno Setup's opening "This will
+  install..." prompt, [help](https://jrsoftware.org/ishelp/topic_setupcmdline.htm))
+  and plus a log file. So CI doesn't run winget's exact command line;
+  `winget install --manifest` under "Submitting the first version" does.
 - **`ProductCode` is Inno Setup's uninstall key**,
   `{6B0E2F4C-3D7A-4E51-9A0B-DC1F1C5E7A21}_is1`. Through it winget finds
   the installed copy and reads its version, so updates the app installs
@@ -447,7 +490,7 @@ and the
 | An `.exe` or `.msi` installer | `DoubleClickFixer-Setup.exe` |
 | The installer **and all of its PE files** signed with a certificate from a CA in the Microsoft Trusted Root Program | **Blocked.** SignPath would sign our exe and the installer, but the uninstaller stays unsigned. The libraries are already signed by their publishers (49 of 50 files; see [What signing doesn't cover](#what-signing-doesnt-cover)) |
 | A versioned HTTPS URL whose file never changes | `https://github.com/arnav-goel10/mouse-double-click-fixer/releases/download/v1.0.0/DoubleClickFixer-Setup.exe` |
-| Silent install with no UI (UAC is allowed) | `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART`, as CI's install test runs it. Per-user, no UAC |
+| Silent install with no UI (UAC is allowed) | `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART`, which CI's install test runs (with a `/LOG=` added). Per-user, no UAC |
 | A standalone installer, not a downloader | Yes |
 | PC only | Yes |
 | A privacy policy URL. Policy 10.5.1 requires one when a product accesses, collects or transmits personal information, and always for Win32 products, which it counts among those that "inherently have access to Personal Information" | `https://github.com/arnav-goel10/mouse-double-click-fixer#privacy` |
@@ -482,8 +525,22 @@ The listing needs:
 - the age-rating questionnaire;
 - Notes for certification, such as: "A tray utility. After install it starts
   in the notification area; open it from the Start menu. It filters mouse
-  switch bounce with a low-level mouse hook (SetWindowsHookEx, WH_MOUSE_LL),
-  reads no keyboard input, and needs no account or network access to work."
+  switch bounce with a low-level mouse hook (SetWindowsHookEx, WH_MOUSE_LL)
+  on the left, right, middle and side buttons, and can drop a scroll-wheel
+  tick that reverses within a short window (off by default). A button
+  release it held back for that window, and the input that came meanwhile,
+  are re-sent with SendInput, as injected input; it never makes a click of
+  its own. To tell which device a click came from, a hidden
+  window registers for Raw Input (RegisterRawInputDevices, RIDEV_INPUTSINK)
+  from mice, precision touchpads and touchscreens only. Clicks from
+  touchpads, touchscreens and pens pass untouched, and the user can ignore a
+  chosen mouse. So that the user can exclude apps such as games, it watches
+  which app is in front (SetWinEventHook, EVENT_SYSTEM_FOREGROUND) and
+  compares that program's executable name with the user's list; the name is
+  kept in memory only. It keeps daily counts of presses and bounces in
+  wear.json in its settings folder, which is never sent anywhere. It reads
+  no keyboard input and needs no account or network access to work; its
+  update check, which can be turned off, is its only network use."
 
 Copies installed from the Store update themselves through the app's own
 updater, like any installed copy. Each new release also needs a Partner
@@ -508,8 +565,9 @@ unproven here. This is a separate project, not a release step.
 
 Checked on 2026-10-10.
 
-- SignPath Foundation terms (the reputation condition is under "Common
-  misunderstandings"): <https://signpath.org/terms>; application:
+- SignPath Foundation terms (the license condition is under "Conditions for
+  free OSS SignPath.io subscriptions", the reputation condition under
+  "Common misunderstandings"): <https://signpath.org/terms>; application:
   <https://signpath.org/apply>; projects it signs:
   <https://signpath.org/projects>
 - SignPath GitHub action, `v3.0` = commit
@@ -527,6 +585,13 @@ Checked on 2026-10-10.
 - winget manifest schema 1.12.0 and its documentation:
   <https://github.com/microsoft/winget-cli/tree/master/schemas/JSON/manifests/v1.12.0>,
   <https://github.com/microsoft/winget-pkgs/tree/master/doc/manifest/schema/1.12.0>
+- SmartScreen: <https://learn.microsoft.com/en-us/windows/apps/package-and-deploy/smartscreen-reputation>
+  (the page's own date is 2026-05-04), and its overview at
+  <https://learn.microsoft.com/en-us/windows/security/operating-system-security/virus-and-threat-protection/microsoft-defender-smartscreen/>
+- `actions/upload-artifact` `v7.0.2` = commit
+  `cf430e030ddbb5b0abf93d22962f4752f3646cd9`, its `overwrite` input in
+  `action.yml` and "Overwriting an Artifact" in its README:
+  <https://github.com/actions/upload-artifact>
 - winget's default Inno Setup switches:
   `src/AppInstallerCommonCore/Manifest/ManifestCommon.cpp` in
   <https://github.com/microsoft/winget-cli>
@@ -541,7 +606,8 @@ Checked on 2026-10-10.
   <https://learn.microsoft.com/en-us/windows/apps/publish/publish-your-app/msi/app-package-requirements>;
   package fields:
   <https://learn.microsoft.com/en-us/windows/apps/publish/publish-your-app/msi/upload-app-packages>
-- Inno Setup: exit codes
+- Inno Setup: command line switches (`/SP-`)
+  <https://jrsoftware.org/ishelp/topic_setupcmdline.htm>; exit codes
   <https://jrsoftware.org/ishelp/topic_setupexitcodes.htm>; signing the
   uninstaller, `SignedUninstaller`:
   <https://jrsoftware.org/ishelp/topic_setup_signeduninstaller.htm>; the version
