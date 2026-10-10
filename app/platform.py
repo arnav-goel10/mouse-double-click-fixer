@@ -19,7 +19,7 @@ import threading
 import time
 from collections import deque
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from time import monotonic, perf_counter
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, NamedTuple, Optional
@@ -275,6 +275,14 @@ def _filter_injected() -> bool:
 # safe from the hook thread and timer threads alike.
 _logged_sites: set[str] = set()
 _logged_sites_lock = threading.Lock()
+
+
+def _amend(event: ClickEvent, **fields: Any) -> None:
+    """Set fields of an event the filter made a moment ago, which no one
+    else holds yet: on the hook's path, so not dataclasses.replace, which
+    copies the event through its fields() at several times the cost."""
+    for name, value in fields.items():
+        object.__setattr__(event, name, value)
 
 
 def _log_ignored(site: str) -> None:
@@ -867,7 +875,7 @@ class GlobalClickFilter:
             held_at = click_filter.held_at
             event = click_filter.press(timestamp) if pressed else click_filter.release(timestamp, allow_hold and hold)
             if device is not None:
-                event = replace(event, device=device)
+                _amend(event, device=device)
             if event.is_bounce:
                 self.filtered_count += 1
             if event.held:
@@ -903,7 +911,7 @@ class GlobalClickFilter:
             if event.accepted and self._route_accepted(
                 button, pressed, template, timestamp, settled, behind, allow_hold
             ):
-                event = replace(event, accepted=False, deferred=True)
+                _amend(event, accepted=False, deferred=True)
             if pressed and not event.is_bounce:
                 # Where apps saw the button go down. A press they never see (a
                 # bounce, or the contact coming back mid-drag) must not move
