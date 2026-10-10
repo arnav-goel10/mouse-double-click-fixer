@@ -16,6 +16,11 @@ Events are posted on a schedule, each stamped with its planned time. A
 background process on these runners oversleeps short waits by tens of
 milliseconds (the system coalesces its timers), which would turn a bounce
 into a slow re-press, so the schedule is kept by spinning on the clock.
+
+The same slowness is why nothing here waits a fixed time for the filter: the
+scenarios wait for what they need to have happened (the tap for the wheel
+setting to be the only one, a tap to have seen an event) and fail only when
+a generous limit passes.
 """
 
 try:
@@ -126,6 +131,8 @@ class MacTapEndToEndTests(unittest.TestCase):
         cls.environment.start()
         cls.seen: list[Seen] = []
         cls.log: list = []
+        #: (axis, dropped) of each wheel tick the filter judged, in order.
+        cls.judged: list = []
         cls.stopping = threading.Event()
         cls._start_observer()
         cls.addClassCleanup(cls._stop_observer)
@@ -138,10 +145,17 @@ class MacTapEndToEndTests(unittest.TestCase):
         cls._require_posting_reaches_taps()
 
         cls.config = FilterConfig.uniform(THRESHOLD_MS, [Button.LEFT, Button.BACK, Button.FORWARD])
-        cls.filter = GlobalClickFilter(cls.config, on_event=cls.log.append)
+        cls.filter = GlobalClickFilter(
+            cls.config, on_event=cls.log.append, on_wheel=lambda axis, dropped: cls.judged.append((axis, dropped))
+        )
         cls.filter.start()
         cls.addClassCleanup(cls.filter.stop)
-        time.sleep(0.3)
+        cls._require_tap_sees_events()
+
+    def setUp(self) -> None:
+        # Every scenario starts with the tap settled for the default setting,
+        # whatever the one before it left behind.
+        self.wheel_in_tap(self.config.wheel_fix)
 
     def skipTest(self, reason: str) -> None:
         if E2E:
@@ -228,6 +242,31 @@ class MacTapEndToEndTests(unittest.TestCase):
             raise AssertionError("an event posted at kCGHIDEventTap never reached the session: can't test here")
         Quartz.CGWarpMouseCursorPosition(P)
 
+    @classmethod
+    def _require_tap_sees_events(cls, limit_s: float = 10.0) -> None:
+        """A new tap takes effect some time after it is switched on. Post
+        pointer motion until the filter's tap has handled some, so the first
+        scenario never posts into the gap."""
+        Quartz = cls.Quartz
+        handled: list = []
+        cls.filter._callback_timings = handled
+        try:
+            deadline = time.monotonic() + limit_s
+            while not handled and time.monotonic() < deadline:
+                event = Quartz.CGEventCreateMouseEvent(
+                    None, Quartz.kCGEventMouseMoved, (P[0] + 1, P[1]), Quartz.kCGMouseButtonLeft
+                )
+                Quartz.CGEventSetIntegerValueField(event, Quartz.kCGEventSourceUserData, PROBE_MARK)
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+                wait_until = time.monotonic() + 0.25
+                while not handled and time.monotonic() < wait_until:
+                    time.sleep(0.01)
+        finally:
+            cls.filter._callback_timings = None
+        Quartz.CGWarpMouseCursorPosition(P)
+        if not handled:
+            raise AssertionError("the filter's event tap handled no event in %.0f s: can't test here" % limit_s)
+
     # -- posting --------------------------------------------------------------------
     def play(self, steps: list[Step], after: Optional[dict] = None) -> list[Seen]:
         """Post `steps` on schedule, each stamped with its planned time, and
@@ -237,6 +276,7 @@ class MacTapEndToEndTests(unittest.TestCase):
         time.sleep(0.3)  # well clear of the last scenario
         self.seen.clear()
         self.log.clear()
+        self.judged.clear()
         start = self.now_ns() + 20_000_000
         for index, step in enumerate(steps):
             due = start + int(step.at_ms * 1_000_000)
@@ -270,27 +310,47 @@ class MacTapEndToEndTests(unittest.TestCase):
         return event
 
     def configure(self, **changes) -> None:
-        """Hand the running filter a new configuration, as the app does."""
+        """Hand the running filter a new configuration, as the app does. The
+        scenario ends with the default one back, and the tap settled for it."""
         from dataclasses import replace
 
         self.filter.update(replace(self.filter.config, **changes))
-        self.addCleanup(self.filter.update, self.config)
+        self.addCleanup(self.restore_configuration)
 
-    def wheel_in_tap(self, wanted: bool, limit_s: float = 3.0) -> None:
-        """Wait for the filter to re-create its tap with the scroll wheel in
-        its mask, or out of it."""
+    def restore_configuration(self) -> None:
+        self.filter.update(self.config)
+        self.wheel_in_tap(self.config.wheel_fix)
+
+    def wheel_in_tap(self, wanted: bool, limit_s: float = 10.0) -> None:
+        """Wait for the filter to finish re-creating its tap with the scroll
+        wheel in its mask, or out of it: for the tap to be the one for the
+        setting, and the only one.
+
+        A tap being replaced stays in the stream, behind the new one, until the
+        new one has seen an event or half a second has passed, and the hook
+        looks at the setting again only when it is woken or a quarter of a
+        second is up (see GlobalClickFilter._run_macos). So a tap with the
+        wanted mask is not enough: the old one may be just about to go, and
+        the new one with the wheel in it may still be a swap away. Scrolling
+        posted in that gap goes by unfiltered."""
         deadline = time.monotonic() + limit_s
         while time.monotonic() < deadline:
-            tap = self.filter._tap
-            if tap is not None and self.filter._wheel_on == wanted and self._tap_has_wheel(tap) == wanted:
-                time.sleep(0.1)
+            if self._tap_is(wanted):
                 return
             time.sleep(0.02)
         self.fail(f"the tap didn't {'take' if wanted else 'leave out'} the scroll wheel ({self._tap_state()})")
 
-    def _tap_has_wheel(self, tap) -> bool:
+    def _tap_is(self, wheel: bool) -> bool:
+        """Whether the filter's only tap is the one for the wheel setting
+        `wheel`, which is also the setting it was given."""
         bit = self.Quartz.CGEventMaskBit(self.Quartz.kCGEventScrollWheel)
-        return any(entry.eventsOfInterest & bit for entry in self._filter_taps())
+        taps = self._filter_taps()
+        return (
+            self.filter._tap is not None
+            and self.filter._wheel_on == wheel
+            and len(taps) == 1
+            and bool(taps[0].eventsOfInterest & bit) == wheel
+        )
 
     def _filter_taps(self) -> list:
         """The filter's enabled taps (the observer's listens only)."""
@@ -301,7 +361,7 @@ class MacTapEndToEndTests(unittest.TestCase):
             if entry.tappingProcess == os.getpid() and entry.enabled and entry.options == Quartz.kCGEventTapOptionDefault
         ]
 
-    def one_tap_left(self, limit_s: float = 2.0) -> None:
+    def one_tap_left(self, limit_s: float = 10.0) -> None:
         """Wait for the tap being replaced to go: one of the filter's is left."""
         deadline = time.monotonic() + limit_s
         while len(self._filter_taps()) != 1 and time.monotonic() < deadline:
@@ -341,6 +401,9 @@ class MacTapEndToEndTests(unittest.TestCase):
                 )
                 gap = "" if event.gap_ms is None else f" (gap {event.gap_ms:.1f} ms)"
                 lines.append(f"    {'down' if event.pressed else 'up'}: {verdict}{gap}")
+            lines.append("the filter judged these wheel ticks:")
+            lines += [f"    axis {axis}: {'dropped' if dropped else 'delivered'}" for axis, dropped in self.judged]
+            lines.append(f"the filter's taps: {self._tap_state()}")
             raise AssertionError("\n".join(lines)) from None
 
     @staticmethod
@@ -471,6 +534,9 @@ class MacTapEndToEndTests(unittest.TestCase):
             scrolls = [(item.delta, item.continuous) for item in seen if item.kind == "scroll"]
             self.assertEqual(scrolls, [(-1, 0), (-1, 0), (-1, 0), (3, 1), (1, 0)])
             self.assertEqual(self.filter.wheel_dropped - dropped, 1)
+            # Five discrete ticks were judged (the trackpad's never is), and
+            # the one that went the wrong way, third, was dropped.
+            self.assertEqual(self.judged, [(1, False), (1, False), (1, True), (1, False), (1, False)])
 
     def test_with_the_wheel_fix_off_the_wheel_is_not_in_the_tap(self) -> None:
         self.configure(wheel_fix=True)
