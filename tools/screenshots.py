@@ -9,13 +9,14 @@ style, so only a live capture shows what users see.
 
 `--live` opens a real window on the real window server and captures every
 pane from the screen, so native controls, materials (Mica, vibrancy) and the
-title bar show as they do for users (`NN-pane-SCHEME.png`), each pane whole as
-Qt draws the window with the platform's style (`-full.png`), the pop-ups and
-menus open (`popup-*.png`) and the narrowest window. `--scheme` asks for the
-light or dark appearance. CI's `screenshots` job runs it on macOS and Windows,
-in both (the macos-screenshots and windows-screenshots artifacts). It opens a
-window, so run it on a machine where that is welcome. Settings are isolated in
-a temporary folder, so this never touches a real configuration.
+title bar show as they do for users (`NN-pane-SCHEME.png`, and `-2.png` on
+for the rest of a pane taller than the window), then the pop-ups and menus
+open (`popup-*.png`) and the narrowest window. `--scheme` asks for the light
+or dark appearance. CI's `screenshots` job runs it on macOS and Windows, in
+both (the macos-screenshots and windows-screenshots artifacts). It opens a
+window and, on macOS, presses Escape to close each menu, so run it on a
+machine where that is welcome. Settings are isolated in a temporary folder,
+so this never touches a real configuration.
 
 `--docs` captures only the Bounce Filter pane for the README, in the same
 state on both platforms (the filter on, three buttons with windows of their own,
@@ -246,16 +247,17 @@ def mac_frame(grabbed, width: int, height: int):
 
 
 def sample_state(controller) -> None:
-    """Something to show on every pane: a few buttons with their own windows,
-    the wheel fix, an excluded app, the devices a Mac usually has, and a
-    month of wear on a switch that is getting worse."""
+    """Something to show on every pane: a few buttons with their own windows
+    (the left one calibrated to a window none of the presets has), the wheel
+    fix, excluded apps, the devices a Mac usually has, and a month of wear on
+    a switch that is getting worse."""
     import time
 
     from app.core import Button, ClickEvent
     from app.platform import DeviceInfo
 
     controller.set_buttons([Button.LEFT, Button.RIGHT, Button.BACK])
-    controller.set_threshold(Button.LEFT, 46)
+    controller.set_threshold(Button.LEFT, 59)
     controller.set_calibrated(Button.LEFT)
     controller.set_threshold(Button.BACK, 30)
     controller.set_wheel_fix(True)
@@ -486,9 +488,12 @@ def dismiss_popups(app) -> None:
 
 
 def capture_popup(app, main_window, open_popup, target: Path) -> None:
-    """Open a pop-up (which on macOS can run its own event loop until it
-    closes), photograph the screen around the window, then close it."""
+    """Open a pop-up (an AppKit menu on macOS runs its own event loop until
+    it closes), photograph the screen around the window, then close it."""
     from PySide6.QtCore import QMargins, QTimer
+    from PySide6.QtWidgets import QApplication
+
+    returned = []
 
     def photograph() -> None:
         area = main_window.frameGeometry().marginsAdded(QMargins(40, 40, 40, 360))
@@ -496,39 +501,32 @@ def capture_popup(app, main_window, open_popup, target: Path) -> None:
         print(f"{target.name}: {how}")
         dismiss_popups(app)
 
-    QTimer.singleShot(1200, photograph)
-    # Should the first Escape miss, never wait for ever.
-    QTimer.singleShot(4000, lambda: dismiss_popups(app))
-    QTimer.singleShot(7000, lambda: dismiss_popups(app))
+    def still_open() -> None:
+        # Should the first Escape miss, never wait for ever; but a stray
+        # Escape would reach the window and show up in the next picture.
+        if not returned or QApplication.activePopupWidget() is not None:
+            print(f"{target.name}: closing it again")
+            dismiss_popups(app)
+
+    timers = []
+    for delay, run in ((1200, photograph), (4000, still_open), (7000, still_open)):
+        timer = QTimer(main_window)
+        timer.setSingleShot(True)
+        timer.timeout.connect(run)
+        timer.start(delay)
+        timers.append(timer)
     open_popup()
-    wait(app, 7500)
-
-
-def whole_pane(main_window):
-    """The current pane top to bottom, however much of it the window shows,
-    drawn by Qt with the platform's style on the pane's colour. (A window
-    can't be made taller than the screen, and the window's own grab leaves
-    out the materials, which only the window server draws.)"""
-    from PySide6.QtCore import QPoint
-    from PySide6.QtGui import QImage, QPainter
-
-    from app.ui.widgets import look
-
-    page = main_window.stack.currentWidget().widget()
-    ratio = main_window.devicePixelRatioF()
-    image = QImage(round(page.width() * ratio), round(page.height() * ratio), QImage.Format.Format_ARGB32)
-    image.setDevicePixelRatio(ratio)
-    image.fill(look().pane)
-    painter = QPainter(image)
-    page.render(painter, QPoint(0, 0))
-    painter.end()
-    return image
+    returned.append(True)
+    wait(app, 1500)
+    for timer in timers:  # this pop-up's, not the next one's
+        timer.stop()
+        timer.deleteLater()
 
 
 def capture_live(app, main_window, out: Path, scheme: str) -> None:
-    """Every pane in a real window, as the screen shows it (`NN-pane-scheme.png`)
-    and whole, however long (`-full.png`); then the pop-ups and menus, and
-    the narrowest window."""
+    """Every pane in a real window, as the screen shows it (`NN-pane-scheme.png`,
+    then `-2.png` and on for the rest of a long one); then the pop-ups and
+    menus, and the narrowest window."""
     from PySide6.QtCore import QPoint
 
     from app.ui import window as window_module
@@ -543,11 +541,22 @@ def capture_live(app, main_window, out: Path, scheme: str) -> None:
     wait(app, 800)
 
     def shoot(name: str) -> None:
+        area = main_window.stack.currentWidget()
+        bar = area.verticalScrollBar()
+        bar.setValue(0)
         settle(app, main_window)
         wait(app, 500)
         how = grab_window_live(app, main_window, out / f"{name}-{scheme}.png")
-        whole_pane(main_window).save(str(out / f"{name}-{scheme}-full.png"))
-        print(f"{name}-{scheme}: {how}")
+        # The rest of a pane taller than the window, a screen at a time.
+        part = 2
+        while bar.value() < bar.maximum():
+            bar.setValue(min(bar.maximum(), bar.value() + area.viewport().height() - 80))
+            settle(app, main_window)
+            wait(app, 300)
+            grab_window_live(app, main_window, out / f"{name}-{scheme}-{part}.png")
+            part += 1
+        bar.setValue(0)
+        print(f"{name}-{scheme}: {how}, {part - 1} part(s)")
 
     for index, (key, _title) in enumerate(window_module.PAGES):
         main_window._show_page(index)
