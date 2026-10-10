@@ -8,16 +8,24 @@ captures it from the screen, so native materials (Mica, vibrancy) show; CI
 uses it on the Windows runner. Settings are isolated in a temporary folder,
 so this never touches a real configuration.
 
-`--docs` captures only the Bounce Filter pane for the README, whole (every
-button's row, the wheel fix and the counts, nothing scrolled off), in the same
-state on both platforms so the two screenshots match side by side:
-docs/images/macos.png comes from an offscreen run on a Mac (the window drawn
-dark, with its corners and window buttons, since nothing is on screen to
-capture), docs/images/windows.png from CI's `--live --docs` run on Windows
-(a real window, the title bar included). `--size WIDTHxHEIGHT` sets the picture's
-size; without it the window is as tall as the pane needs (a live window is
-held to what the screen shows). The Mac picture has the Windows one's size
-when both are given the same `--size`, the Windows title bar counted.
+`--docs` captures only the Bounce Filter pane for the README, in the same
+state on both platforms (the filter on, three buttons with windows of their own,
+the wheel fix on) so the two screenshots match side by side. Nothing is
+scrolled or cut through: a pane the window can't show whole ends below the last
+section that fits.
+
+    docs/images/windows.png  CI's `--live --docs` run on Windows (the
+                             windows-screenshots artifact's docs-filter.png): a
+                             real window, title bar included, as tall as the
+                             runner's 1024 x 768 screen allows.
+    docs/images/macos.png    `--docs --size=WIDTHxHEIGHT` on a Mac, with the
+                             Windows picture's size so the two match: an
+                             offscreen render of the window, drawn dark with
+                             its corners and window buttons, since there is no
+                             window server to capture one from.
+
+Without `--size` the window is as tall as the pane needs (a live window is held
+to what the screen shows).
 
 `--social` draws docs/images/social-preview.png, the 1280 x 640 card GitHub
 shows for links to the repository (upload it under Settings › General ›
