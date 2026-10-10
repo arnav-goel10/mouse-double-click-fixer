@@ -31,7 +31,7 @@ from unittest import mock
 
 import app
 from app.update_signature import parse_claim, parse_public_key, verify
-from tools import ci_update_key, release_notes, sign_release
+from tools import ci_update_key, old_installers, release_notes, sign_release
 from tools.sign_release import (
     APP_REQUIREMENT,
     ARTIFACTS,
@@ -420,6 +420,32 @@ class WorkflowTests(unittest.TestCase):
         # hashes; see requirements-build.in), so it isn't asked to.
         config = (ROOT / ".github" / "dependabot.yml").read_text(encoding="utf-8")
         self.assertEqual(re.findall(r"package-ecosystem: (\S+)", config), ["github-actions"])
+
+    def test_the_old_installers_are_cached_and_checked_not_downloaded_on_every_run(self) -> None:
+        # Each download of a release file counts in the public download
+        # numbers. The install tests (ci.yml's windows-install and release.yml's
+        # windows-e2e) restore them from actions/cache, keyed on the file
+        # that lists their URLs and SHA-256s, and tools/old_installers.py
+        # downloads only what is missing and checks every one.
+        for path in sorted((ROOT / ".github" / "workflows").glob("*.yml")):
+            self.assertNotIn("gh release download", path.read_text(encoding="utf-8"), path.name)
+        paths = ",".join(f"old\\{installer.version}\\{old_installers.INSTALLER}" for installer in old_installers.load())
+        pins = set()
+        for name, job_name in (("ci.yml", "windows-install"), ("release.yml", "windows-e2e")):
+            text = job(self.workflow(name), job_name)
+            restore = step(text, "Restore the old installers")
+            match = re.search(r"\n        uses: (actions/cache@[0-9a-f]{40}) # v\d+\.\d+\.\d+\n", restore)
+            self.assertIsNotNone(match, f"{name}: the cache action must be pinned to a commit")
+            pins.add(match.group(1))
+            self.assertIn("          path: old\n", restore)
+            self.assertIn("          key: old-installers-${{ hashFiles('tools/old_installers.json') }}\n", restore)
+            fetch = step(text, "Fetch the old installers")
+            self.assertIn("        run: python tools/old_installers.py fetch old\n", fetch)
+            self.assertIn(f"-OldSetup {paths} ", text, f"{name}: the install test gets the installers the manifest lists")
+            order = [text.index(marker) for marker in (
+                "actions/setup-python@", "Restore the old installers", "Fetch the old installers", "tools\\windows_install_e2e.ps1")]
+            self.assertEqual(order, sorted(order), name)
+        self.assertEqual(len(pins), 1, "both jobs use the same commit of the cache action")
 
     def test_ci_and_releases_use_the_same_inno_setup(self) -> None:
         versions = {re.search(r'INNO_SETUP_VERSION: "([\d.]+)"', self.workflow(name)).group(1) for name in ("ci.yml", "release.yml")}

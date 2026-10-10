@@ -315,15 +315,18 @@ jobs:
         with:
           name: windows-build-reference
           path: .
-      - name: Download the old installers to upgrade from
+      - name: Restore the old installers to upgrade from
+        # 0.2.6: the oldest still in use, before --quit (taskkill closes it).
+        # 0.5.3: the last one-file release; its own --quit closes it. Cached,
+        # as in ci.yml, so a release doesn't add to the Releases' download
+        # numbers.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: old
+          key: old-installers-${{ hashFiles('tools/old_installers.json') }}
+      - name: Fetch the old installers the cache lacks, and check each one's SHA-256
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # 0.2.6: the oldest still in use, before --quit (taskkill closes it).
-          # 0.5.3: the last one-file release; its own --quit closes it.
-          gh release download v0.2.6 -p DoubleClickFixer-Setup.exe -D old\0.2.6
-          gh release download v0.5.3 -p DoubleClickFixer-Setup.exe -D old\0.5.3
+        run: python tools/old_installers.py fetch old
       - name: Install over running copies, quit, refuse an unsigned update, uninstall
         # The release trusts the release keys only, so the leg that installs
         # a signed update runs in ci.yml, on a build made to trust CI's key.

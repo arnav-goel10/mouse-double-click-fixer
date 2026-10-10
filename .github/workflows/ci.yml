@@ -180,16 +180,23 @@ jobs:
               ForEach-Object { "on PATH: $(Join-Path $_ $name)" }
           }
           Select-String -Path build\notices\THIRD_PARTY_NOTICES.md -Pattern '^\| ' | ForEach-Object { $_.Line }
-      - name: Download the old installers to upgrade from
+      - name: Restore the old installers to upgrade from
+        # 0.2.6: the oldest still in use, before --quit (taskkill closes it).
+        # 0.5.3: the last one-file release, the upgrade every current user
+        # takes; its own --quit closes the running copy. Downloading them from
+        # the project's Releases on every run would count in its public
+        # download numbers, so they are cached. The key is a hash of the file
+        # that lists their URLs and SHA-256s, so a change to either starts a
+        # new cache.
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: old
+          key: old-installers-${{ hashFiles('tools/old_installers.json') }}
+      - name: Fetch the old installers the cache lacks, and check each one's SHA-256
+        # Downloads only on a cache miss; a cached file is checked all the
+        # same, and one that doesn't match is fetched again.
         shell: pwsh
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # 0.2.6: the oldest still in use, before --quit (taskkill closes it).
-          # 0.5.3: the last one-file release, the upgrade every current user
-          # takes; its own --quit closes the running copy.
-          gh release download v0.2.6 -p DoubleClickFixer-Setup.exe -D old\0.2.6
-          gh release download v0.5.3 -p DoubleClickFixer-Setup.exe -D old\0.5.3
+        run: python tools/old_installers.py fetch old
       - name: Install over running copies, quit, update, uninstall
         shell: pwsh
         run: .\tools\windows_install_e2e.ps1 -OldSetup old\0.2.6\DoubleClickFixer-Setup.exe,old\0.5.3\DoubleClickFixer-Setup.exe -NewSetup installer\Output\DoubleClickFixer-Setup.exe -SigningKey "$env:RUNNER_TEMP\dcf-ci-key\dcf-ci-update-key.key"

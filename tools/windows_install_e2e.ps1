@@ -7,6 +7,8 @@
 # Each old installer is installed in turn, left running and upgraded from
 # (the app is uninstalled between them). Run it from the folder the build was
 # made in: it compares the installed files with dist\onedir and build\notices.
+# CI gets the old installers from tools\old_installers.py, which caches them
+# and checks each against its SHA-256: they are not downloaded on every run.
 #
 # The app installs only signed updates, so the update leg needs a build that
 # trusts a key this run made: CI builds with DCF_CI_UPDATE_KEY and passes the
