@@ -2140,6 +2140,10 @@ class FakeQuartz:
         # What runs that wait for nothing (seconds 0) return, in turn: one
         # per event waiting at a port, or a stop requested meanwhile.
         self.waiting = []
+        # Taps switched off whose callbacks are yet to be told so: macOS
+        # sends kCGEventTapDisabledByUserInput to a tap's callback when the
+        # tap is switched off, on the next run of the run loop serving it.
+        self.notices = []
         # Whether each tap was enabled as each event was posted.
         self.taps_enabled_at_post = []
         self.pointer = (0.0, 0.0)
@@ -2158,6 +2162,8 @@ class FakeQuartz:
         return tap
 
     def CGEventTapEnable(self, tap, enabled):
+        if tap.enabled and not enabled and not tap.invalidated:
+            self.notices.append(tap)
         tap.enabled = bool(enabled)
         self.calls.append(("enable", self.taps.index(tap), bool(enabled)))
 
@@ -2182,6 +2188,12 @@ class FakeQuartz:
 
     def CFRunLoopRunInMode(self, mode, seconds, return_after_source):
         self.calls.append(("run", seconds))
+        if self.notices:
+            tap = self.notices.pop(0)
+            if not tap.invalidated:
+                kind = self.kCGEventTapDisabledByUserInput
+                tap.callback(None, kind, FakeCGEvent(kind), None)
+            return self.kCFRunLoopRunHandledSource
         if seconds == 0 and self.waiting:
             return self.waiting.pop(0)
         self._wake.wait(min(seconds, 0.002))
@@ -2842,8 +2854,23 @@ class MacTapTests(unittest.TestCase):
         self.wait_until(lambda: old.invalidated)
         calls = self.quartz.calls
         between = calls[calls.index(("enable", 0, False)):calls.index(("invalidate", 0))]
-        self.assertEqual(between.count(("run", 0)), 4, "each waiting event answered, then one run that found none")
+        self.assertEqual(between.count(("run", 0)), 5,
+                         "the switch-off notice and each waiting event answered, then one run that found none")
         self.assertEqual(self.quartz.waiting, [])
+
+    def test_switching_the_old_tap_off_is_not_taken_for_macos_disabling_it(self) -> None:
+        # Nothing happens while the wheel fix is turned on: the new tap sees
+        # no event, so the old one still decides when it is switched off, and
+        # its callback hears of that. It must not re-arm the tap it is closing,
+        # nor count it towards giving up on a tap macOS keeps disabling.
+        for swaps, wheel in enumerate((True, False, True), start=1):
+            self.configure(wheel_fix=wheel)
+            old = self.wait_for_taps(1 + swaps)[-2]
+            self.wait_until(lambda: old.invalidated, limit_s=TAP_SWAP_WAIT_S + 1)
+            self.assertFalse(old.enabled, "re-armed the tap it was closing")
+        self.assertEqual(self.filter.tap_resets, 0)
+        self.assertTrue(self.filter.running, "three swaps were taken for macOS disabling the tap")
+        self.assertTrue(self.quartz.taps[-1].enabled)
 
     def test_the_old_tap_decides_until_the_new_one_sees_an_event(self) -> None:
         # A tap switched on takes effect a moment later: until the new tap

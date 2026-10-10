@@ -286,7 +286,7 @@ class MacTapEndToEndTests(unittest.TestCase):
                 time.sleep(0.1)
                 return
             time.sleep(0.02)
-        self.fail(f"the tap didn't {'take' if wanted else 'leave out'} the scroll wheel")
+        self.fail(f"the tap didn't {'take' if wanted else 'leave out'} the scroll wheel ({self._tap_state()})")
 
     def _tap_has_wheel(self, tap) -> bool:
         bit = self.Quartz.CGEventMaskBit(self.Quartz.kCGEventScrollWheel)
@@ -306,7 +306,14 @@ class MacTapEndToEndTests(unittest.TestCase):
         deadline = time.monotonic() + limit_s
         while len(self._filter_taps()) != 1 and time.monotonic() < deadline:
             time.sleep(0.02)
-        self.assertEqual(len(self._filter_taps()), 1, "the replaced tap stayed")
+        self.assertEqual(len(self._filter_taps()), 1, f"the replaced tap stayed ({self._tap_state()})")
+
+    def _tap_state(self) -> str:
+        """What a failure about the filter's taps needs to say."""
+        bit = self.Quartz.CGEventMaskBit(self.Quartz.kCGEventScrollWheel)
+        taps = [f"wheel={bool(entry.eventsOfInterest & bit)}" for entry in self._filter_taps()]
+        return (f"filter running={self.filter.running}, ended: {self.filter._end_reason}, "
+                f"tap resets={self.filter.tap_resets}, wheel fix={self.filter._wheel_on}, enabled taps: {taps}")
 
     def _wait_until_quiet(self, quiet_s: float = 0.4, limit_s: float = 5.0) -> None:
         deadline = time.monotonic() + limit_s

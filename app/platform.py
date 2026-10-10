@@ -1810,8 +1810,9 @@ class GlobalClickFilter:
         # over on the first event it sees (see replace_tap).
         deciding = [0]
 
-        def make_callback(entry: dict) -> Callable:
-            generation = entry["generation"]
+        def make_callback(generation: int, own: dict) -> Callable:
+            # `own` is this tap's port and whether it is being closed (see
+            # open_tap); it holds nothing that holds the callback.
 
             def callback(proxy: object, event_type: int, event: object, refcon: object) -> object:
                 # An exception here would make PyObjC return nothing, which
@@ -1831,7 +1832,7 @@ class GlobalClickFilter:
                     # check.
                     if event_type in MOTION and not self._motion_wanted:
                         return event
-                    return decide(event_type, event, entry["tap"])
+                    return decide(event_type, event, own)
                 except Exception:  # noqa: BLE001
                     _log_ignored("the event tap")
                     return event
@@ -1868,9 +1869,12 @@ class GlobalClickFilter:
             button = OTHER_BUTTONS.get(Quartz.CGEventGetIntegerValueField(event, Quartz.kCGMouseEventButtonNumber))
             return None if button is None else (button, entry[1])
 
-        def decide(event_type: int, event: object, tap: object) -> object:
+        def decide(event_type: int, event: object, own: dict) -> object:
             if event_type in DISABLED:
-                rearm_main(tap)
+                # Switching a tap off tells its callback so, as macOS does
+                # when it switches one off: a tap being closed is not re-armed.
+                if not own["closing"]:
+                    rearm_main(own["tap"])
                 return event
             if event_type in MOTION:
                 return decide_motion(event)
@@ -2000,12 +2004,12 @@ class GlobalClickFilter:
 
         # The newest tap: its generation (see `deciding`), port, run loop
         # source, and whether its mask has the scroll wheel.
-        current: dict = {"generation": 0, "tap": None, "source": None, "wheel": False, "callback": None}
+        current: dict = {"generation": 0, "tap": None, "source": None, "wheel": False, "callback": None, "own": None}
 
         def open_tap(wheel: bool) -> Optional[dict]:
-            entry = {"generation": current["generation"] + 1, "wheel": wheel}
-            # Kept with the tap, so the callback lives as long as it does.
-            entry["callback"] = callback = make_callback(entry)
+            generation = current["generation"] + 1
+            own = {"tap": None, "closing": False}
+            callback = make_callback(generation, own)
             tap = Quartz.CGEventTapCreate(
                 Quartz.kCGHIDEventTap,
                 Quartz.kCGHeadInsertEventTap,
@@ -2016,9 +2020,10 @@ class GlobalClickFilter:
             )
             if tap is None:
                 return None
-            entry["tap"] = tap
-            entry["source"] = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
-            return entry
+            own["tap"] = tap
+            source = Quartz.CFMachPortCreateRunLoopSource(None, tap, 0)
+            # The callback is kept with the tap, so it lives as long as it does.
+            return {"generation": generation, "tap": tap, "source": source, "wheel": wheel, "callback": callback, "own": own}
 
         def close_tap(entry: dict, remove: bool = True) -> None:
             # Out of the event stream: from here on clicks pass untouched.
@@ -2091,6 +2096,7 @@ class GlobalClickFilter:
             finally:
                 # Whatever happened, the old tap goes: left in the stream
                 # with nothing to answer it, it would stall every event.
+                old["own"]["closing"] = True
                 Quartz.CGEventTapEnable(old["tap"], False)
                 try:
                     answer_pending()
