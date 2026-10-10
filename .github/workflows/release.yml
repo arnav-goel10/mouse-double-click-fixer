@@ -154,6 +154,11 @@ jobs:
           if-no-files-found: error
           # Only SignPath reads it, while the job waits.
           retention-days: 1
+          # A re-run of this job (a denied or timed-out request is re-run;
+          # docs/DISTRIBUTION.md) finds the name taken by its first run's
+          # upload, and without this the upload fails. The new upload gets a
+          # new artifact ID, which the signing step reads from this step.
+          overwrite: true
       - name: Sign the executables (SignPath artifact configuration windows-executables)
         if: steps.signpath.outputs.sign == 'true'
         uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0
@@ -213,6 +218,11 @@ jobs:
           if-no-files-found: error
           # Only SignPath reads it, while the job waits.
           retention-days: 1
+          # A re-run of this job (a denied or timed-out request is re-run;
+          # docs/DISTRIBUTION.md) finds the name taken by its first run's
+          # upload, and without this the upload fails. The new upload gets a
+          # new artifact ID, which the signing step reads from this step.
+          overwrite: true
       - name: Sign the installer (SignPath artifact configuration windows-installer)
         if: steps.signpath.outputs.sign == 'true'
         uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092 # v3.0

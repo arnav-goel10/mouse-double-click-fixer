@@ -554,6 +554,20 @@ class SignPathWorkflowTests(unittest.TestCase):
             self.assertFalse(fnmatch.fnmatch(name, "DoubleClickFixer-*"))
             self.assertNotIn(name, ARTIFACTS)
 
+    def test_a_rerun_replaces_the_files_it_sent_for_signing(self) -> None:
+        # Re-running the failed Windows job (the way past a denied or timed-out
+        # request) uploads the same artifact names again, which upload-artifact
+        # refuses unless `overwrite: true` (an input since v4.2.0; see "Overwriting
+        # an Artifact" in https://github.com/actions/upload-artifact). The
+        # signing step reads the new upload's artifact ID from the step's outputs.
+        for upload in ("Hand the executables to SignPath", "Hand the installer to SignPath"):
+            text = step(self.windows, upload)
+            self.assertIn("          overwrite: true\n", text, upload)
+            match = re.search(r"uses: actions/upload-artifact@[0-9a-f]{40} # v(\d+)\.(\d+)\.\d+\n", text)
+            self.assertIsNotNone(match, upload)
+            self.assertGreaterEqual((int(match.group(1)), int(match.group(2))), (4, 2), "overwrite needs upload-artifact 4.2 or later")
+        self.assertEqual(self.windows.count("          overwrite: true\n"), 2, "only the files sent for signing are replaced")
+
     def test_each_request_names_an_artifact_configuration_kept_here(self) -> None:
         slugs = re.findall(r"artifact-configuration-slug: ([\w-]+)\n", self.windows)
         self.assertEqual(slugs, ["windows-executables", "windows-installer"])
