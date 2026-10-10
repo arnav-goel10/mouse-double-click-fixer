@@ -63,8 +63,8 @@ from .widgets import (
     TextLabel,
     ValueLabel,
     look,
+    pop_up_button,
     set_look,
-    wheel_needs_focus,
 )
 
 # Older name, kept for callers.
@@ -138,7 +138,7 @@ class WindowPicker(QComboBox):
         self._fill(self._presets)
         self.currentIndexChanged.connect(self._follow)
         # The Filter pane scrolls, and these sit where the pointer passes.
-        wheel_needs_focus(self)
+        pop_up_button(self)
 
     def _fill(self, values) -> None:
         self.blockSignals(True)
@@ -460,7 +460,7 @@ class CalibratePage(Page):
         self.button_picker.setAccessibleName("Button to calibrate")
         # A wheel turn on the way down the pane would pick another button and
         # throw away a measurement under way.
-        wheel_needs_focus(self.button_picker)
+        pop_up_button(self.button_picker)
         # activated, not currentIndexChanged: only the user's own choice.
         self.button_picker.activated.connect(lambda index: self.set_button(list(Button)[index]))
         self.picker_row = picker.add(Row("Button", "", self.button_picker, card_icon("mouse")))

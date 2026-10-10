@@ -772,6 +772,28 @@ class AppsPaneTests(PaneTestCase):
         self.assertEqual(at.x(), corner.x(), "lined up with the button")
         self.assertGreater(at.y(), corner.y(), "under it")
 
+    def test_the_mac_menu_is_built_from_the_same_entries(self) -> None:
+        import sys
+
+        if sys.platform != "darwin":
+            self.skipTest("AppKit")
+        from app.app_keys import AppChoice
+        from app.ui import popup_mac
+
+        page = self.window.apps
+        with mock.patch("app.app_keys.running_apps", return_value=[AppChoice("cs2.exe", "CS2")]):
+            entries = page.menu_entries()
+        menu, target = popup_mac.build(entries)
+        titles = [menu.itemAtIndex_(index).title() for index in range(menu.numberOfItems())]
+        self.assertEqual(titles, ["Running Apps", "CS2", "", "Choose App…"])
+        self.assertTrue(menu.itemAtIndex_(2).isSeparatorItem())
+        self.assertFalse(menu.itemAtIndex_(0).isEnabled() and menu.itemAtIndex_(0).action(), "a heading does nothing")
+        self.assertEqual(menu.itemAtIndex_(1).toolTip(), "cs2.exe")
+        target.choose_(menu.itemAtIndex_(1))
+        self.application.processEvents()  # run after the menu closes
+        self.assertIn({"key": "cs2.exe", "name": "CS2"}, self.controller.excluded_apps)
+        self.assertFalse(popup_mac.available(), "offscreen: Qt's menu instead")
+
     def test_an_app_chosen_from_a_file(self) -> None:
         bundle = Path(tempfile.mkdtemp()) / "Game.app"
         (bundle / "Contents").mkdir(parents=True)
@@ -923,6 +945,38 @@ class LookTests(PaneTestCase):
     def test_the_sidebar_lists_the_new_panes(self) -> None:
         titles = [self.window.sidebar.item(row).text() for row in range(self.window.sidebar.count())]
         self.assertEqual(titles, ["Bounce Filter", "Test", "Calibrate", "History", "Apps", "Devices", "General"])
+
+    def test_pop_up_buttons_open_the_system_menu_on_macos(self) -> None:
+        from PySide6.QtWidgets import QComboBox, QStyle
+
+        from app.ui import widgets
+
+        hint = QStyle.StyleHint.SH_ComboBox_UseNativePopup
+        plain = QComboBox()
+        self.assertIs(widgets.native_popup(plain), plain)
+        self.assertFalse(plain.style().styleHint(hint), "offscreen: nothing native to open")
+        saved = list(widgets._NATIVE_POPUP_STYLE)
+        self.addCleanup(lambda: widgets._NATIVE_POPUP_STYLE.__setitem__(slice(None), saved))
+        widgets._NATIVE_POPUP_STYLE.clear()
+        with mock.patch.object(widgets.QGuiApplication, "platformName", return_value="cocoa"):
+            pickers = [QComboBox(), QComboBox()]
+            for picker in pickers:
+                widgets.pop_up_button(picker)
+        self.assertTrue(pickers[0].style().styleHint(hint))
+        self.assertIs(pickers[0].style(), pickers[1].style(), "one style for all of them")
+        self.assertEqual(pickers[0].style().styleHint(QStyle.StyleHint.SH_ComboBox_Popup),
+                         QApplication.style().styleHint(QStyle.StyleHint.SH_ComboBox_Popup), "the rest is the platform's")
+        self.assertNotEqual(pickers[0].focusPolicy(), Qt.FocusPolicy.WheelFocus)
+        # Every pop-up button in the panes goes through pop_up_button.
+        from app.ui.window import WindowPicker
+
+        with mock.patch.object(widgets, "native_popup", wraps=widgets.native_popup) as native:
+            from app.ui.window import MainWindow
+
+            built = MainWindow(self.controller)
+            self.addCleanup(built.deleteLater)
+        self.assertEqual(native.call_count, len(built.findChildren(QComboBox)))
+        self.assertTrue(built.findChildren(WindowPicker))
 
     def test_no_style_sheet_reaches_a_native_control(self) -> None:
         """A style sheet on any widget sends it and everything inside it
