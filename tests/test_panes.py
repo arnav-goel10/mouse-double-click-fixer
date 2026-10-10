@@ -746,6 +746,35 @@ class DevicesPaneTests(PaneTestCase):
         self.assertFalse(page.touch.isHidden())
         self.assertEqual(page.touch.rows[0].trailing.text(), "Never filtered")
 
+    def test_the_note_and_the_empty_list_say_what_each_system_does(self) -> None:
+        from PySide6.QtWidgets import QLabel
+
+        from app.ui import panes
+
+        with mock.patch("app.ui.panes.platform.system", return_value="Windows"):
+            note, empty = panes.devices_note(), panes.no_mouse_detail()
+        # Only precision touchpads are told from mice there (devices_win), a
+        # tap soon after a mouse's report is that mouse's click, and a mouse
+        # is listed by any report, a move included.
+        self.assertIn("Precision touchpads, touchscreens and pens are not filtered", note)
+        self.assertIn("within about a second of using a mouse is filtered as that mouse's click", note)
+        self.assertIn("isn't a precision one reports as a mouse", note)
+        self.assertIn("move or click", empty)
+        with mock.patch("app.ui.panes.platform.system", return_value="Darwin"):
+            note, empty = panes.devices_note(), panes.no_mouse_detail()
+        self.assertTrue(note.startswith("Trackpads, touchscreens and pens are not filtered."))
+        self.assertNotIn("precision", note.lower())
+        self.assertIn("click with it", empty)
+        self.assertNotIn("move", empty)
+        for text in (panes.DEVICES_NOTE, panes.DEVICES_NOTE_WINDOWS):
+            self.assertNotIn("never filtered", text)
+            self.assertNotIn("wear out", text)
+        # The pane shows them for the system it runs on.
+        self.window.refresh()
+        page = self.window.devices
+        self.assertEqual(page.mice.rows[0].detail.text(), panes.no_mouse_detail())
+        self.assertIn(panes.devices_note(), [each.text() for each in page.findChildren(QLabel)])
+
     def test_a_mouse_can_be_left_unfiltered_and_stays_listed(self) -> None:
         page = self.window.devices
         hook = self.hook()

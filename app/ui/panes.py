@@ -260,9 +260,30 @@ class AppsPage(Page):
 
 KIND_NAMES = {"trackpad": "Trackpad", "touchscreen": "Touchscreen", "pen": "Pen", "mouse": "Mouse", "unknown": "Pointing device"}
 DEVICES_NOTE = (
-    "Trackpads, touchscreens and pens are never filtered: taps have no switch to wear out. "
+    "Trackpads, touchscreens and pens are not filtered. "
     "A mouse you stop filtering stays that way whenever it is connected."
 )
+#: Windows tells a touchpad from a mouse only when it is a precision touchpad
+#: (see devices_win), and takes a tap soon after a mouse's report for that
+#: mouse's click.
+DEVICES_NOTE_WINDOWS = (
+    "Precision touchpads, touchscreens and pens are not filtered, but a touchpad tap within about a second "
+    "of using a mouse is filtered as that mouse's click. A touchpad that isn't a precision one reports as a mouse "
+    "and is listed with the mice. A mouse you stop filtering stays that way whenever it is connected."
+)
+#: What lists a mouse: macOS, a click from it; Windows, any report from it.
+NO_MOUSE_DETAIL = "Each mouse shows up here once you click with it while the filter is on."
+NO_MOUSE_DETAIL_WINDOWS = "Each mouse shows up here once you move or click it while the filter is on."
+
+
+def devices_note() -> str:
+    """The note under the Devices lists."""
+    return DEVICES_NOTE_WINDOWS if platform.system() == "Windows" else DEVICES_NOTE
+
+
+def no_mouse_detail() -> str:
+    """What the empty Mice list says lists a mouse."""
+    return NO_MOUSE_DETAIL_WINDOWS if platform.system() == "Windows" else NO_MOUSE_DETAIL
 
 
 def _transport(key: str) -> str:
@@ -301,7 +322,7 @@ class DevicesPage(LivePage):
         self.mice = self.section()
         self.header_touch = self.header("Trackpads, touchscreens and pens")
         self.touch = self.section()
-        self.footnote(DEVICES_NOTE)
+        self.footnote(devices_note())
         self.body.addStretch(1)
         self.switches: dict[str, Switch] = {}
         self.mouse_rows: dict[str, Row] = {}
@@ -336,7 +357,7 @@ class DevicesPage(LivePage):
             self.mice.add(
                 Row(
                     "No mouse seen yet",
-                    "Each mouse shows up here once you click with it while the filter is on.",
+                    no_mouse_detail(),
                     None,
                     card_icon("mouse"),
                 )
