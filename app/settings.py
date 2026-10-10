@@ -70,6 +70,11 @@ READ_ATTEMPTS = 3
 
 LEGACY_PATH = Path.home() / ".doubleclick-fixer.json"
 
+#: Settings files that stayed unreadable at launch (locked through every try,
+#: and no usable spare). The app then runs on defaults that aren't the
+#: user's, and save() must not write them over what the file holds.
+_unread: set[Path] = set()
+
 
 def config_dir() -> Path:
     system = platform.system()
@@ -245,20 +250,22 @@ def read_json(path: Path, backup: Path) -> dict[str, Any]:
     return read_json_checked(path, backup)[0]
 
 
-def read_json_checked(path: Path, backup: Path) -> tuple[dict[str, Any], bool]:
+def read_json_checked(path: Path, backup: Path, attempts: int = READ_ATTEMPTS) -> tuple[dict[str, Any], bool]:
     """read_json, and whether its answer stands for what is stored. That is
     False only when the file stayed unreadable through every try (a backup
     tool or virus scanner holding it) and its copy couldn't stand in: the
     empty answer then means "couldn't read", not "nothing stored", and
-    writing over the file would replace what it holds."""
+    writing over the file would replace what it holds. `attempts` is how
+    often a locked file is tried, 0.1 s apart."""
     locked = False
-    for _attempt in range(READ_ATTEMPTS):
+    for attempt in range(attempts):
         try:
             values = _read(path)
         except OSError:
             # A backup tool or virus scanner has it open; it lets go quickly.
             locked = True
-            sleep(0.1)
+            if attempt + 1 < attempts:
+                sleep(0.1)
             continue
         if values or not path.exists():
             return values, True
@@ -309,7 +316,14 @@ def load_raw() -> dict[str, Any]:
 
 
 def load() -> dict[str, Any]:
-    values = _stored()
+    path = settings_path()
+    values, readable = read_json_checked(path, backup_path())
+    if not readable:
+        # "Couldn't read" is not "nothing stored": run on the defaults, and
+        # leave the file alone until it can be read (see save()).
+        _unread.add(path)
+        return coerce({})
+    _unread.discard(path)
     if values:
         return coerce(values)
 
@@ -357,17 +371,69 @@ def merge(values: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
     return coerce({**current, **values})
 
 
+def _laid_over(base: Any, ours: Any, theirs: Any) -> Any:
+    """`theirs` with the changes from `base` to `ours` made to it: three-way
+    merge. Dicts are merged key by key, lists by the items added to or taken
+    out of them, and anything else is `ours` where it changed. A setting put
+    back to what `base` had counts as unchanged, and `theirs` keeps its value.
+    """
+    if ours == base:
+        return theirs
+    if isinstance(base, dict) and isinstance(ours, dict) and isinstance(theirs, dict):
+        merged = dict(theirs)
+        for key, value in ours.items():
+            if key not in base:
+                merged[key] = value
+            elif value != base[key]:
+                merged[key] = _laid_over(base[key], value, theirs.get(key, base[key]))
+        return merged
+    if isinstance(base, list) and isinstance(ours, list) and isinstance(theirs, list):
+        removed = [item for item in base if item not in ours]
+        added = [item for item in ours if item not in base]
+        return [item for item in theirs if item not in removed] + [item for item in added if item not in theirs]
+    return ours
+
+
+def _save_unread(values: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+    """save() for a file that couldn't be read at launch, whose settings the
+    app doesn't hold: `current` is defaults plus whatever was changed since.
+
+    While the file stays unreadable nothing is written (OSError, which the
+    caller keeps running through, as for a locked file). Once it reads, what
+    it holds is the base and the changes made since launch are laid over it,
+    so neither the user's settings nor their changes are lost; the count of
+    blocked bounces adds to the stored one instead of replacing it.
+    """
+    path = settings_path()
+    ours = merge(values, current)
+    # One try: this runs on every change, and the next one tries again.
+    stored, readable = read_json_checked(path, backup_path(), attempts=1)
+    if not readable:
+        raise OSError(f"{path.name} couldn't be read, so it is left as it is")
+    defaults = coerce({})
+    theirs = coerce(stored) if stored else defaults
+    merged = coerce(_laid_over(defaults, ours, theirs))
+    merged["filtered_total"] = theirs["filtered_total"] + max(0, ours["filtered_total"] - defaults["filtered_total"])
+    write_json(path, backup_path(), merged)
+    _unread.discard(path)
+    return merged
+
+
 def save(values: dict[str, Any], current: dict[str, Any] | None = None) -> dict[str, Any]:
     """Merge `values` into the settings and write them safely (write_json).
 
     `current` is what the app already holds in memory, normally the whole
     picture, so nothing has to be read back first. Without it the file is
     read, and a file that can't be read raises OSError rather than being
-    taken as empty, which would reset everything else to defaults.
+    taken as empty, which would reset everything else to defaults. Likewise
+    when load() could not read the file: see _save_unread.
     """
+    if current is not None and settings_path() in _unread:
+        return _save_unread(values, current)
     base = _read(settings_path()) if current is None else current
     merged = merge(values, base)
     write_json(settings_path(), backup_path(), merged)
+    _unread.discard(settings_path())
     return merged
 
 

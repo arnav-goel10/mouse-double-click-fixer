@@ -324,6 +324,90 @@ class DurabilityTests(unittest.TestCase):
         self.assertTrue(controller.settings["calibrated"])
         self.assertEqual(settings.load()["threshold_ms"], 120)
 
+    def locked(self, *names: str):
+        """Make the files called `names` unreadable, as a backup tool or a
+        virus scanner holding them would."""
+        real = Path.read_bytes
+
+        def read_bytes(file):
+            if file.name in names:
+                raise PermissionError(32, "locked")
+            return real(file)
+
+        return mock.patch.object(Path, "read_bytes", read_bytes)
+
+    def test_a_file_locked_at_launch_is_never_written_over_with_defaults(self) -> None:
+        # What the user has stored beyond setUp's: a count and two lists.
+        settings.save({"filtered_total": 100, "thresholds": {**settings.load()["thresholds"], "right": 30},
+                       "excluded_apps": [{"key": "stored.app", "name": "Stored"}]}, current=settings.load())
+        path = self.directory / "settings.json"
+        stored = path.read_text()
+        (self.directory / "settings.json.bak").unlink()  # the save above made one
+
+        with self.locked("settings.json"), mock.patch.object(settings, "sleep"):
+            held = settings.load()  # locked through every try, and no spare
+            self.assertEqual(held["threshold_ms"], DEFAULT_THRESHOLD_MS, "the defaults stand in")
+            changes = {"thresholds": {**held["thresholds"], "back": 25},
+                       "excluded_apps": [{"key": "new.app", "name": "New"}], "filtered_total": 4}
+            with self.assertRaises(OSError):
+                settings.save(changes, current=held)
+            self.assertEqual(path.read_text(), stored, "not replaced by the defaults")
+            self.assertFalse((self.directory / "settings.json.bak").exists())
+            held = settings.merge(changes, held)  # what the controller keeps meanwhile
+            with self.assertRaises(OSError):
+                settings.save({"window_geometry": "g"}, current=held)
+            self.assertEqual(path.read_text(), stored, "still locked: still not written")
+
+        # The lock lifts: the next save starts from what the file holds, and
+        # lays what changed since launch over it.
+        saved = settings.save({"window_geometry": "g"}, current=held)
+        written = json.loads(path.read_text())
+        self.assertEqual(written["threshold_ms"], 120)
+        self.assertTrue(written["fix_enabled"])
+        self.assertTrue(written["calibrated"])
+        self.assertEqual(written["buttons"], ["left", "right"])
+        self.assertEqual(written["thresholds"]["right"], 30, "stored, untouched")
+        self.assertEqual(written["thresholds"]["back"], 25, "changed since launch")
+        self.assertEqual([entry["key"] for entry in written["excluded_apps"]], ["stored.app", "new.app"])
+        self.assertEqual(written["filtered_total"], 104, "the count adds to the stored one")
+        self.assertEqual(written["window_geometry"], "g")
+        self.assertEqual(saved["thresholds"], written["thresholds"])
+        self.assertEqual(json.loads((self.directory / "settings.json.bak").read_text())["filtered_total"], 100,
+                         "the file as it was stands as the spare")
+        # Settled: from here a save is the plain merge onto what the app holds.
+        again = settings.save({"filtered_total": saved["filtered_total"] + 1}, current=saved)
+        self.assertEqual(again["filtered_total"], 105)
+
+    def test_controller_leaves_a_file_it_could_not_read_until_it_can(self) -> None:
+        from app.controller import AppController
+        from app.core import Button
+
+        path = self.directory / "settings.json"
+        stored = path.read_text()
+        self.assertFalse((self.directory / "settings.json.bak").exists(), "nothing to stand in")
+        with self.locked("settings.json"), mock.patch.object(settings, "sleep"):
+            controller = AppController()
+            controller._store(fix_enabled=False, window_geometry="g")
+            controller.set_threshold(Button.BACK, 25)
+            self.assertEqual(controller.threshold_for(Button.BACK), 25, "it still takes effect")
+            self.assertEqual(path.read_text(), stored)
+        controller._store(filtered_total=3)
+        written = json.loads(path.read_text())
+        self.assertTrue(written["fix_enabled"], "the user's own setting, not the default")
+        self.assertEqual(written["threshold_ms"], 120)
+        self.assertEqual(written["thresholds"]["back"], 25)
+        self.assertEqual(written["window_geometry"], "g")
+        self.assertEqual(controller.threshold_for(Button.LEFT), 120, "and the app holds what the file did")
+
+    def test_a_good_spare_is_enough_to_run_and_save_on(self) -> None:
+        settings.save({"threshold_ms": 90}, current=settings.load())  # the 120 file is the spare
+        with self.locked("settings.json"), mock.patch.object(settings, "sleep"):
+            held = settings.load()
+        self.assertEqual(held["threshold_ms"], 120, "the spare stands in")
+        saved = settings.save({"filtered_total": 2}, current=held)
+        self.assertEqual(saved["threshold_ms"], 120)
+        self.assertEqual(json.loads((self.directory / "settings.json").read_text())["filtered_total"], 2)
+
     def test_the_new_file_is_flushed_to_disk_before_it_replaces_the_old(self) -> None:
         order = []
         real_fsync, real_replace = settings.os.fsync, Path.replace
