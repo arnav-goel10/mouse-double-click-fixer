@@ -26,7 +26,7 @@ from run import _unhide_qt_plugins
 _unhide_qt_plugins()
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QWidget
 
 
 class StandInFilter:
@@ -194,6 +194,49 @@ class FilterPaneTests(PaneTestCase):
                                  "Calibrate the back button", "Calibrate the forward button"])
         self.assertEqual(self.window.filter_page.button_rows[Button.LEFT].detail.accessibleDescription(), "Not calibrated.")
 
+    def test_each_window_is_a_pop_up_of_windows_across_the_allowed_range(self) -> None:
+        from PySide6.QtWidgets import QComboBox
+
+        from app import settings
+        from app.core import DEFAULT_THRESHOLD_MS, MAX_THRESHOLD_MS, MIN_THRESHOLD_MS
+        from app.platform import WHEEL_DEFAULT_MS
+
+        page = self.window.filter_page
+        for box, low, high, default in [
+            *((box, MIN_THRESHOLD_MS, MAX_THRESHOLD_MS, DEFAULT_THRESHOLD_MS) for box in page.window_boxes.values()),
+            (page.wheel_box, settings.WHEEL_MIN_MS, settings.WHEEL_MAX_MS, WHEEL_DEFAULT_MS),
+        ]:
+            name = box.accessibleName()
+            self.assertIsInstance(box, QComboBox, name)
+            self.assertFalse(box.isEditable(), f"{name}: a pop-up button, not a field to type in")
+            values = box.values()
+            self.assertEqual(values, sorted(set(values)), name)
+            self.assertTrue(all(low <= value <= high for value in values), name)
+            self.assertEqual(values[-1], high, f"{name}: up to the longest window allowed")
+            self.assertLessEqual(values[0], 10, f"{name}: down to the shortest worth choosing")
+            self.assertIn(default, values, name)
+            self.assertEqual([box.itemText(index) for index in range(box.count())], [f"{value} ms" for value in values])
+
+    def test_a_window_that_is_not_in_the_list_is_shown_in_its_place(self) -> None:
+        from app.core import Button
+        from app.ui.window import BUTTON_WINDOWS
+
+        hook = self.hook()
+        page = self.window.filter_page
+        self.controller.set_threshold(Button.LEFT, 59)  # as calibration sets it
+        box = page.window_boxes[Button.LEFT]
+        self.assertEqual(box.currentText(), "59 ms")
+        self.assertEqual(box.values(), sorted({*BUTTON_WINDOWS, 59}), "in order among the others")
+        self.assertEqual(page.window_boxes[Button.RIGHT].values(), list(BUTTON_WINDOWS), "only where it is chosen")
+        box.setCurrentIndex(box.findData(60))  # the user picks 60 ms
+        self.assertEqual(self.controller.threshold_for(Button.LEFT), 60)
+        self.assertEqual(hook.updates[-1].thresholds[Button.LEFT], 60)
+        self.assertEqual(box.currentText(), "60 ms")
+        box.setCurrentIndex(box.findData(59))  # and back to the measured one
+        self.assertEqual(self.controller.threshold_for(Button.LEFT), 59)
+        self.controller.set_wheel_fix(True, 35)
+        self.assertEqual(page.wheel_box.currentText(), "35 ms")
+
     def test_the_wheel_fix_row(self) -> None:
         hook = self.hook()
         page = self.window.filter_page
@@ -258,17 +301,28 @@ class FilterPaneTests(PaneTestCase):
         self.assertEqual(len(hook.updates), updates, "nothing reached the filter")
 
     def test_the_wheel_still_changes_a_window_box_with_focus(self) -> None:
+        from PySide6.QtWidgets import QStyle, QStyleOptionComboBox
+
         from app.core import Button
 
         self.scrolling_pane("filter")
         box = self.window.filter_page.window_boxes[Button.LEFT]
+        option = QStyleOptionComboBox()
+        box.initStyleOption(option)
+        if not box.style().styleHint(QStyle.StyleHint.SH_ComboBox_AllowWheelScrolling, option, box):
+            self.skipTest("this style's pop-up buttons ignore the wheel (macOS's own)")
         self.window.activateWindow()
         box.setFocus(Qt.FocusReason.MouseFocusReason)
         self.application.processEvents()
         self.assertTrue(box.hasFocus())
         self.wheel(box, -1)
-        self.assertEqual(box.value(), 45)
-        self.assertEqual(self.controller.threshold_for(Button.LEFT), 45, "chosen on purpose, so saved")
+        self.assertEqual(box.value(), 50, "the next window in the list")
+        self.assertEqual(self.controller.threshold_for(Button.LEFT), 50, "chosen on purpose, so saved")
+
+    @staticmethod
+    def step(box) -> None:
+        """One step down the list, as an arrow key or a wheel notch takes it."""
+        box.setCurrentIndex(box.currentIndex() + 1)
 
     def writes(self):
         """Count the writes of settings.json, which really happen."""
@@ -288,49 +342,50 @@ class FilterPaneTests(PaneTestCase):
         hook = self.hook()
         box = self.window.filter_page.window_boxes[Button.LEFT]
         before = len(hook.updates)
+        last = box.values()[box.currentIndex() + 10]
         with self.writes() as write:
             for _ in range(10):
-                box.stepUp()
-            self.assertEqual(box.value(), 56)
-            self.assertEqual(self.controller.threshold_for(Button.LEFT), 56)
+                self.step(box)
+            self.assertEqual(box.value(), last)
+            self.assertEqual(self.controller.threshold_for(Button.LEFT), last)
             self.assertEqual(len(hook.updates) - before, 10, "the filter follows every step at once")
-            self.assertEqual(hook.updates[-1].thresholds[Button.LEFT], 56)
+            self.assertEqual(hook.updates[-1].thresholds[Button.LEFT], last)
             write.assert_not_called()
             self.assertEqual(self.stored()["thresholds"]["left"], 46, "the file waits")
             QTest.qWait(SAVE_DELAY_MS + 400)
             write.assert_called_once()
-        self.assertEqual(self.stored()["thresholds"]["left"], 56, "the last step is what is saved")
+        self.assertEqual(self.stored()["thresholds"]["left"], last, "the last step is what is saved")
         self.assertEqual(SAVE_DELAY_MS, 300)
 
     def test_a_run_of_steps_in_the_wheel_box_is_one_write_too(self) -> None:
         from PySide6.QtTest import QTest
 
         from app.controller import SAVE_DELAY_MS
-        from app.settings import WHEEL_MAX_MS
 
         box = self.window.filter_page.wheel_box
-        start = box.value()
+        steps = 4
+        last = box.values()[box.currentIndex() + steps]
         with self.writes() as write:
-            for _ in range(10):
-                box.stepUp()
-            self.assertEqual(self.controller.wheel_window_ms, min(start + 10, WHEEL_MAX_MS))
+            for _ in range(steps):
+                self.step(box)
+            self.assertEqual(self.controller.wheel_window_ms, last)
             write.assert_not_called()
             QTest.qWait(SAVE_DELAY_MS + 400)
             write.assert_called_once()
-        self.assertEqual(self.stored()["wheel_window_ms"], start + 10)
+        self.assertEqual(self.stored()["wheel_window_ms"], last)
 
     def test_a_pause_between_steps_writes_each_run(self) -> None:
         from app.core import Button
 
         box = self.window.filter_page.window_boxes[Button.LEFT]
         with self.writes() as write:
-            box.stepUp()
+            self.step(box)
             self.controller.flush_settings()  # the wait is over
-            box.stepUp()
+            self.step(box)
             self.controller.flush_settings()
             self.controller.flush_settings()  # nothing held: nothing written
             self.assertEqual(write.call_count, 2)
-        self.assertEqual(self.stored()["thresholds"]["left"], 48)
+        self.assertEqual(self.stored()["thresholds"]["left"], 55, "46, then 50, then 55")
 
     def test_closing_the_window_writes_what_is_waiting(self) -> None:
         from PySide6.QtCore import QEvent
@@ -343,11 +398,11 @@ class FilterPaneTests(PaneTestCase):
         box = self.window.filter_page.window_boxes[Button.LEFT]
         with self.writes() as write:
             for _ in range(3):
-                box.stepUp()
+                self.step(box)
             write.assert_not_called()
             self.window.closeEvent(QEvent(QEvent.Type.Close))
             write.assert_called_once()
-            self.assertEqual(self.stored()["thresholds"]["left"], 49)
+            self.assertEqual(self.stored()["thresholds"]["left"], 60, "46, then 50, 55 and 60")
             QTest.qWait(SAVE_DELAY_MS + 400)
             write.assert_called_once()  # the wait was ended, not repeated
 
@@ -356,17 +411,17 @@ class FilterPaneTests(PaneTestCase):
 
         box = self.window.filter_page.window_boxes[Button.LEFT]
         with self.writes() as write:
-            box.stepUp()
+            self.step(box)
             self.window.filter_page.button_switches[Button.BACK].click()  # an immediate change
             write.assert_called_once()
-            self.assertEqual(self.stored()["thresholds"]["left"], 47, "it went out with the other change")
+            self.assertEqual(self.stored()["thresholds"]["left"], 50, "it went out with the other change")
             self.assertIn("back", self.stored()["buttons"])
             self.assertFalse(self.controller._save_timer.isActive())
         with self.writes() as write:
-            box.stepUp()
+            self.step(box)
             self.controller.shutdown()
             write.assert_called_once()
-        self.assertEqual(self.stored()["thresholds"]["left"], 48)
+        self.assertEqual(self.stored()["thresholds"]["left"], 55)
 
     def test_a_write_that_fails_is_held_for_the_next(self) -> None:
         from app import settings
@@ -374,11 +429,11 @@ class FilterPaneTests(PaneTestCase):
 
         box = self.window.filter_page.window_boxes[Button.LEFT]
         with mock.patch.object(settings, "write_json", side_effect=OSError("disk full")):
-            box.stepUp()
+            self.step(box)
             self.controller.flush_settings()
-        self.assertEqual(self.controller.threshold_for(Button.LEFT), 47, "still takes effect")
+        self.assertEqual(self.controller.threshold_for(Button.LEFT), 50, "still takes effect")
         self.controller.flush_settings()  # still unsaved, so it tries again
-        self.assertEqual(self.stored()["thresholds"]["left"], 47)
+        self.assertEqual(self.stored()["thresholds"]["left"], 50)
 
     def test_scrolling_over_a_button_picker_keeps_the_button(self) -> None:
         from app.core import Button
@@ -701,6 +756,44 @@ class AppsPaneTests(PaneTestCase):
         next(action for action in page.add_menu.actions() if action.text() == "CS2").trigger()
         self.assertIn({"key": "cs2.exe", "name": "CS2"}, self.controller.excluded_apps)
 
+    def test_add_app_is_a_plain_button_that_opens_the_menu(self) -> None:
+        from app.ui.base import label
+
+        page = self.window.apps
+        # setMenu would make it a pull-down button, with a chevron and a
+        # shape no other button in the app has.
+        self.assertIsNone(page.add_button.menu())
+        self.assertEqual(page.add_button.text(), label("Add App…"))
+        self.assertEqual(page.add_button.accessibleName(), "Add an app")
+        with mock.patch.object(page.add_menu, "popup") as popup:
+            page.add_button.click()
+        popup.assert_called_once()
+        at, corner = popup.call_args.args[0], page.add_button.mapToGlobal(page.add_button.rect().bottomLeft())
+        self.assertEqual(at.x(), corner.x(), "lined up with the button")
+        self.assertGreater(at.y(), corner.y(), "under it")
+
+    def test_the_mac_menu_is_built_from_the_same_entries(self) -> None:
+        import sys
+
+        if sys.platform != "darwin":
+            self.skipTest("AppKit")
+        from app.app_keys import AppChoice
+        from app.ui import popup_mac
+
+        page = self.window.apps
+        with mock.patch("app.app_keys.running_apps", return_value=[AppChoice("cs2.exe", "CS2")]):
+            entries = page.menu_entries()
+        menu, target = popup_mac.build(entries)
+        titles = [menu.itemAtIndex_(index).title() for index in range(menu.numberOfItems())]
+        self.assertEqual(titles, ["Running Apps", "CS2", "", "Choose App…"])
+        self.assertTrue(menu.itemAtIndex_(2).isSeparatorItem())
+        self.assertFalse(menu.itemAtIndex_(0).isEnabled() and menu.itemAtIndex_(0).action(), "a heading does nothing")
+        self.assertEqual(menu.itemAtIndex_(1).toolTip(), "cs2.exe")
+        target.choose_(menu.itemAtIndex_(1))
+        self.application.processEvents()  # run after the menu closes
+        self.assertIn({"key": "cs2.exe", "name": "CS2"}, self.controller.excluded_apps)
+        self.assertFalse(popup_mac.available(), "offscreen: Qt's menu instead")
+
     def test_an_app_chosen_from_a_file(self) -> None:
         bundle = Path(tempfile.mkdtemp()) / "Game.app"
         (bundle / "Contents").mkdir(parents=True)
@@ -820,13 +913,13 @@ class DevicesPaneTests(PaneTestCase):
 
 class LookTests(PaneTestCase):
     def test_every_new_control_has_an_accessible_name(self) -> None:
-        from PySide6.QtWidgets import QComboBox, QPushButton, QSpinBox
+        from PySide6.QtWidgets import QComboBox, QPushButton
 
         from app.ui.charts import DailyRateChart, GapHistogram
 
         self.controller.add_excluded_app("cs2.exe", "CS2")
         self.window.refresh()
-        for kind in (QSpinBox, QComboBox, DailyRateChart, GapHistogram):
+        for kind in (QComboBox, DailyRateChart, GapHistogram):
             widgets = self.window.findChildren(kind)
             self.assertTrue(widgets, kind.__name__)
             for widget in widgets:
@@ -852,6 +945,124 @@ class LookTests(PaneTestCase):
     def test_the_sidebar_lists_the_new_panes(self) -> None:
         titles = [self.window.sidebar.item(row).text() for row in range(self.window.sidebar.count())]
         self.assertEqual(titles, ["Bounce Filter", "Test", "Calibrate", "History", "Apps", "Devices", "General"])
+
+    def test_the_test_pad_speaks_in_the_platforms_case(self) -> None:
+        # Title Case on macOS, sentence case on Windows, as Calibrate's pad.
+        from app.ui import base
+        from app.ui.window import TestPage
+
+        for mac, text in ((True, "Click Here"), (False, "Click here")):
+            with mock.patch.object(base, "IS_MAC", mac):
+                page = TestPage(self.controller)
+            self.addCleanup(page.deleteLater)
+            self.assertEqual(page.pad._headline, text)
+
+    def test_pop_up_buttons_open_the_system_menu_on_macos(self) -> None:
+        from PySide6.QtWidgets import QComboBox, QStyle
+
+        from app.ui import widgets
+
+        hint = QStyle.StyleHint.SH_ComboBox_UseNativePopup
+        plain = QComboBox()
+        self.assertIs(widgets.native_popup(plain), plain)
+        self.assertFalse(plain.style().styleHint(hint), "offscreen: nothing native to open")
+        saved = list(widgets._NATIVE_POPUP_STYLE)
+        self.addCleanup(lambda: widgets._NATIVE_POPUP_STYLE.__setitem__(slice(None), saved))
+        widgets._NATIVE_POPUP_STYLE.clear()
+        with mock.patch.object(widgets.QGuiApplication, "platformName", return_value="cocoa"):
+            pickers = [QComboBox(), QComboBox()]
+            for picker in pickers:
+                widgets.pop_up_button(picker)
+        self.assertTrue(pickers[0].style().styleHint(hint))
+        self.assertIs(pickers[0].style(), pickers[1].style(), "one style for all of them")
+        self.assertEqual(pickers[0].style().styleHint(QStyle.StyleHint.SH_ComboBox_Popup),
+                         QApplication.style().styleHint(QStyle.StyleHint.SH_ComboBox_Popup), "the rest is the platform's")
+        self.assertNotEqual(pickers[0].focusPolicy(), Qt.FocusPolicy.WheelFocus)
+        # Every pop-up button in the panes goes through pop_up_button.
+        from app.ui.window import WindowPicker
+
+        with mock.patch.object(widgets, "native_popup", wraps=widgets.native_popup) as native:
+            from app.ui.window import MainWindow
+
+            built = MainWindow(self.controller)
+            self.addCleanup(built.deleteLater)
+        self.assertEqual(native.call_count, len(built.findChildren(QComboBox)))
+        self.assertTrue(built.findChildren(WindowPicker))
+
+    def test_no_style_sheet_reaches_a_native_control(self) -> None:
+        """A style sheet on any widget sends it and everything inside it
+        through Qt's style-sheet style, which on macOS draws pop-up buttons,
+        spin boxes and menu buttons as boxes of its own (1.0's panes did,
+        from one on each pane's scroll area). Native controls keep the
+        platform's style; the only style sheet a native control may carry is
+        Windows' accent fill on its own default button (base.set_primary)."""
+        from PySide6.QtWidgets import (
+            QAbstractButton,
+            QAbstractSlider,
+            QAbstractSpinBox,
+            QComboBox,
+            QLineEdit,
+            QProgressBar,
+            QPushButton,
+        )
+
+        from app.ui import base, panes, widgets, window
+        from app.ui.window import MainWindow
+
+        native = (QComboBox, QAbstractSpinBox, QLineEdit, QAbstractButton, QProgressBar, QAbstractSlider)
+        self.assertEqual(QApplication.instance().styleSheet(), "", "an application-wide style sheet reaches everything")
+        # Every pane with the controls its states add: rows of apps and
+        # devices with their buttons and switches, a calibration result and
+        # its Apply.
+        self.controller.add_excluded_app("cs2.exe", "CS2")
+        self.controller.set_device_ignored("usb:046D:C08B:y", "G502 HERO", True)
+
+        def describe(widget) -> str:
+            return f"{type(widget).__name__} {widget.accessibleName() or getattr(widget, 'text', lambda: '')() or widget.objectName()!r}"
+
+        for mac in (True, False):
+            with mock.patch.object(base, "IS_MAC", mac), mock.patch.object(panes, "IS_MAC", mac), \
+                    mock.patch.object(window, "IS_MAC", mac), mock.patch.object(widgets, "IS_MAC", mac):
+                built = MainWindow(self.controller)
+                self.addCleanup(built.deleteLater)
+                calibrate = built.calibrate
+                calibrate._advance()
+                for _ in range(20):
+                    calibrate._on_pad_press(900.0, 960.0)
+                for _ in range(10):
+                    calibrate._on_pad_press(900.0, 960.0)
+                    calibrate._on_pad_press(150.0, 210.0)
+                self.assertEqual(calibrate.phase, "done")
+                built.refresh()
+                found = set()
+                for control in built.findChildren(QWidget):
+                    if not isinstance(control, native) or isinstance(control, widgets.Switch):
+                        continue
+                    found.add(type(control).__mro__[1] if type(control).__module__.startswith("app.") else type(control))
+                    ancestor = control.parentWidget()
+                    while ancestor is not None:
+                        self.assertEqual(ancestor.styleSheet(), "",
+                                         f"{'macOS' if mac else 'Windows'}: {describe(ancestor)} has a style sheet, "
+                                         f"which reaches {describe(control)}")
+                        ancestor = ancestor.parentWidget()
+                    own = control.styleSheet()
+                    accent = not mac and isinstance(control, QPushButton) and control.isDefault()
+                    if own:
+                        self.assertTrue(accent, f"{describe(control)} styles itself: {own!r}")
+                    else:
+                        self.assertNotEqual(control.style().metaObject().className(), "QStyleSheetStyle", describe(control))
+                self.assertTrue({QComboBox, QPushButton, QProgressBar} <= found, found)
+                if not mac:
+                    defaults = [button for button in built.findChildren(QPushButton) if button.isDefault()]
+                    self.assertTrue(defaults and all(button.styleSheet() for button in defaults), "the Windows accent case ran")
+                # Each pane lets the window's colour show through, without
+                # a style sheet to say so.
+                for page in built.pages:
+                    area = page.parentWidget().parentWidget()
+                    self.assertFalse(page.autoFillBackground(), page.page_title)
+                    self.assertFalse(area.viewport().autoFillBackground(), page.page_title)
+                for timer in built.findChildren(__import__("PySide6.QtCore", fromlist=["QTimer"]).QTimer):
+                    timer.stop()
 
     def test_every_pane_renders_in_both_looks_and_both_platform_styles(self) -> None:
         from app.ui import base, panes, theme, widgets, window

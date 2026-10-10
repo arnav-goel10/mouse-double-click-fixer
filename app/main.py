@@ -10,7 +10,7 @@ from time import monotonic, sleep
 from typing import Optional
 
 from PySide6.QtCore import QTimer, Qt
-from PySide6.QtGui import QAction, QFont, QKeySequence
+from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QMenuBar, QMessageBox, QSystemTrayIcon
 
@@ -19,6 +19,7 @@ from .controller import AppController
 from .updater import Updater
 from .ui import dock, icons
 from .ui import tray as tray_module
+from .ui.theme import application_font
 from .ui.window import MainWindow
 
 # A suffix only the test suite sets (tests/_isolation.py), so tests can never
@@ -251,11 +252,8 @@ class Application:
         self.qt.setApplicationVersion(__version__)
         self.qt.setOrganizationName(DISPLAY_NAME)
         self.qt.setWindowIcon(icons.app_icon())
-        if platform.system() == "Windows":
-            # Windows 11's own UI font and body size (14 px).
-            body = QFont()
-            body.setFamilies(["Segoe UI Variable Text", "Segoe UI"])
-            body.setPixelSize(14)
+        body = application_font()
+        if body is not None:
             self.qt.setFont(body)
         # Closing the window leaves the filter running in the tray.
         self.qt.setQuitOnLastWindowClosed(False)

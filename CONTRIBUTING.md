@@ -24,6 +24,13 @@ python -m unittest discover -s tests
 ```
 
 UI tests run offscreen (`QT_QPA_PLATFORM=offscreen`, set by the tests).
+Offscreen, Qt draws no native control, so after a change to a pane, look at
+the real thing: CI's screenshots job captures every pane, light and dark, on
+macOS and Windows, with its pop-ups open (the macos-screenshots and
+windows-screenshots artifacts; run just that job by dispatching CI with
+`screenshots_only`). Never give a pane, or anything that holds controls, a
+style sheet: it reaches every control inside and draws them in Qt's own style
+instead of the system's (a test fails if one does).
 Builds of the app are another matter: they need python.org's Python 3.14,
 for the OpenSSL it ships ([Packaging locally](docs/RELEASING.md#packaging-locally)).
 

@@ -22,18 +22,22 @@ from PySide6.QtCore import (
     Qt,
     Signal,
 )
-from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QAbstractButton,
     QAbstractItemView,
+    QApplication,
+    QComboBox,
     QFrame,
     QHBoxLayout,
     QLabel,
     QListWidget,
     QListWidgetItem,
+    QProxyStyle,
     QSizePolicy,
     QStyle,
     QStyledItemDelegate,
+    QStyleFactory,
     QVBoxLayout,
     QWidget,
 )
@@ -267,6 +271,42 @@ def wheel_needs_focus(control: QWidget) -> QWidget:
         control.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
     control.installEventFilter(_WheelNeedsFocus(control))
     return control
+
+
+class _NativePopupStyle(QProxyStyle):
+    """The platform's style, except that a pop-up button opens AppKit's own
+    menu (Qt's QComboBoxPrivate::showNativePopup), as an NSPopUpButton does,
+    instead of Qt's drawing of one."""
+
+    def styleHint(self, hint, option=None, widget=None, returnData=None):  # noqa: N802 - Qt naming
+        if hint == QStyle.StyleHint.SH_ComboBox_UseNativePopup:
+            return 1
+        return super().styleHint(hint, option, widget, returnData)
+
+
+_NATIVE_POPUP_STYLE: list[QProxyStyle] = []
+
+
+def native_popup(combo: QComboBox) -> QComboBox:
+    """Let a pop-up button open the system's own menu on macOS. Qt draws its
+    own there by default: square, with a hard edge and a highlighted row,
+    unlike every other menu on the Mac. Windows 11's ComboBox list is Qt's
+    windows11 style's own drawing, and stays."""
+    if QGuiApplication.platformName() != "cocoa":
+        return combo
+    if not _NATIVE_POPUP_STYLE:
+        application = QApplication.instance()
+        style = _NativePopupStyle(QStyleFactory.create(application.style().name()))
+        style.setParent(application)  # lives as long as the app's own style
+        _NATIVE_POPUP_STYLE.append(style)
+    combo.setStyle(_NATIVE_POPUP_STYLE[0])
+    return combo
+
+
+def pop_up_button(combo: QComboBox) -> QComboBox:
+    """A pop-up button as the platform has one: its own menu on macOS, and
+    the wheel turning it only once it has focus (wheel_needs_focus)."""
+    return wheel_needs_focus(native_popup(combo))
 
 
 class Section(QWidget):

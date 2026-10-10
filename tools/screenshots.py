@@ -1,11 +1,21 @@
 """Render every pane in light and dark, offscreen, for review and the docs.
 
-    python tools/screenshots.py OUTPUT_DIR [--as-windows | --live] [--docs | --social]
+    python tools/screenshots.py OUTPUT_DIR [--as-windows | --live [--scheme=light|dark]] [--docs | --social]
 
 `--as-windows` previews the Windows layout on another platform (fonts and
-icons fall back, so use it for layout only). `--live` opens a real window and
-captures it from the screen, so native materials (Mica, vibrancy) show; CI
-uses it on the Windows runner. Settings are isolated in a temporary folder,
+icons fall back, so use it for layout only). Offscreen, Qt draws no native
+control: buttons, pop-up buttons and the rest come out in Qt's own Fusion
+style, so only a live capture shows what users see.
+
+`--live` opens a real window on the real window server and captures every
+pane from the screen, so native controls, materials (Mica, vibrancy) and the
+title bar show as they do for users (`NN-pane-SCHEME.png`, and `-2.png` on
+for the rest of a pane taller than the window), then the pop-ups and menus
+open (`popup-*.png`) and the narrowest window. `--scheme` asks for the light
+or dark appearance. CI's `screenshots` job runs it on macOS and Windows, in
+both (the macos-screenshots and windows-screenshots artifacts). It opens a
+window and, on macOS, presses Escape to close each menu, so run it on a
+machine where that is welcome. Settings are isolated in a temporary folder,
 so this never touches a real configuration.
 
 `--docs` captures only the Bounce Filter pane for the README, in the same
@@ -18,11 +28,12 @@ section that fits.
                              windows-screenshots artifact's docs-filter.png): a
                              real window, title bar included, as tall as the
                              runner's 1024 x 768 screen allows.
-    docs/images/macos.png    `--docs --size=WIDTHxHEIGHT` on a Mac, with the
-                             Windows picture's size so the two match: an
-                             offscreen render of the window, drawn dark with
-                             its corners and window buttons, since there is no
-                             window server to capture one from.
+    docs/images/macos.png    CI's `--live --docs --size=WIDTHxHEIGHT` run on
+                             macOS (the macos-screenshots artifact's
+                             docs-filter.png), dark, with the Windows picture's
+                             size so the two match. Offscreen, `--docs` draws
+                             the window with its corners and window buttons
+                             instead, but Qt draws no native control there.
 
 Without `--size` the window is as tall as the pane needs (a live window is held
 to what the screen shows).
@@ -237,22 +248,28 @@ def mac_frame(grabbed, width: int, height: int):
 
 
 def sample_state(controller) -> None:
-    """Something to show on every pane: a few buttons with their own windows,
-    the wheel fix, an excluded app, the devices a Mac usually has, and a
-    month of wear on a switch that is getting worse."""
+    """Something to show on every pane: a few buttons with their own windows
+    (the left one calibrated to a window none of the presets has), the wheel
+    fix, excluded apps, the devices a Mac usually has, and a month of wear on
+    a switch that is getting worse."""
     import time
 
     from app.core import Button, ClickEvent
     from app.platform import DeviceInfo
 
     controller.set_buttons([Button.LEFT, Button.RIGHT, Button.BACK])
-    controller.set_threshold(Button.LEFT, 46)
+    controller.set_threshold(Button.LEFT, 59)
     controller.set_calibrated(Button.LEFT)
     controller.set_threshold(Button.BACK, 30)
     controller.set_wheel_fix(True)
     controller.add_excluded_app("com.valvesoftware.steam", "Steam")
     controller.add_excluded_app("cs2.exe", "Counter-Strike 2")
     controller.set_device_ignored("usb:046D:C08B:0F3A1B", "Logitech G502 HERO", True)
+    # The Apps pane's menu offers these as running, whatever this computer runs.
+    from app import app_keys
+
+    running = [("com.apple.Safari", "Safari"), ("com.apple.mail", "Mail"), ("com.spotify.client", "Spotify")]
+    app_keys.running_apps = lambda: [app_keys.AppChoice(key, name) for key, name in running]
     now = time.time()
     controller._devices = {
         "usb:03F0:1F4A:HP": DeviceInfo("usb:03F0:1F4A:HP", "HP 2.4G Wireless and BT Mouse", "mouse", True, now - 30),
@@ -275,6 +292,29 @@ def sample_state(controller) -> None:
         for index in range(400):
             wear.note_wheel(1, index % 97 == 0)
     wear._clock = clock
+
+
+def trim_to_viewport(app, main_window, pad: int = 14) -> None:
+    """Hide what the window shows only part of, so the pane ends below the
+    last section or note that fits, never through a row or under a heading.
+    Measured on the window as laid out (a real window resizes later than
+    an offscreen one, so fit_pane's arithmetic can't be trusted there)."""
+    from PySide6.QtCore import QPoint
+
+    area = main_window.stack.currentWidget()
+    page, viewport = area.widget(), area.viewport()
+    items = [page.body.itemAt(index).widget() for index in range(page.body.count())]
+    items = [item for item in items if item is not None and item.isVisible()]
+    for position, item in enumerate(items):
+        if item.mapTo(viewport, QPoint(0, item.height())).y() + pad <= viewport.height():
+            continue
+        cut = position
+        while cut > 0 and getattr(items[cut - 1], "role", "") == "headline":
+            cut -= 1  # a heading goes with what it heads
+        for hidden in items[cut:]:
+            hidden.hide()
+        break
+    app.processEvents()
 
 
 def capture_docs(app, main_window, target: Path, size: tuple[int, int] | None) -> None:
@@ -308,150 +348,302 @@ def capture_docs(app, main_window, target: Path, size: tuple[int, int] | None) -
           f"available {available.width()} x {available.height()}, scale {screen.devicePixelRatio()}")
     main_window.move(available.x(), available.y())
     wait(app, 300)
-    room = available.height() - WINDOWS_TITLE_BAR - 8
-    wanted = size[1] - WINDOWS_TITLE_BAR if size else fit_pane(app, main_window, room)[0]
-    print(f"The pane shows {wanted} px of the {room} the screen leaves")
-    main_window.resize(size[0] if size else DOCS_WIDTH, min(wanted, room))
+    # A Mac window draws its title bar inside itself; Windows adds one.
+    title_bar = 0 if sys.platform == "darwin" else WINDOWS_TITLE_BAR
+    room = available.height() - title_bar - 8
+    if size:
+        height = min(size[1] - title_bar, room)
+    else:
+        wanted = fit_pane(app, main_window, room)[0]
+        height = min(wanted, room)
+        print(f"The pane shows {wanted} px of the {room} the screen leaves")
+    main_window.resize(size[0] if size else DOCS_WIDTH, height)
     main_window.move(available.x(), available.y())
     app.processEvents()
     wait(app, 800)
+    trim_to_viewport(app, main_window)
+    wait(app, 300)
     frame = main_window.frameGeometry()
-    print(f"Window frame {frame.width()} x {frame.height()}")
-    main_window.screen().grabWindow(0, frame.x(), frame.y(), frame.width(), frame.height()).save(str(target))
+    print(f"Window frame {frame.width()} x {frame.height()}: {grab_window_live(app, main_window, target)}")
 
 
-def main() -> None:
-    positional = [argument for argument in sys.argv[1:] if not argument.startswith("--")]
-    out = Path(positional[0] if positional else "screenshots")
-    out.mkdir(parents=True, exist_ok=True)
-    if "--social" in sys.argv:
-        from PySide6.QtGui import QGuiApplication
+def parse_scheme(argv) -> str | None:
+    """`--scheme=light` or `--scheme=dark`: the appearance a live capture
+    asks the system for (Qt's QStyleHints.setColorScheme, which sets the
+    app's own appearance on macOS and the app's theme on Windows)."""
+    for argument in argv:
+        if argument.startswith("--scheme="):
+            scheme = argument[len("--scheme="):]
+            if scheme not in ("light", "dark"):
+                raise SystemExit(f"--scheme must be light or dark, not {scheme!r}")
+            return scheme
+    return None
 
-        _app = QGuiApplication([])
-        social_preview().save(str(out / "social-preview.png"))
-        print(f"Wrote {out / 'social-preview.png'}")
-        return
-    as_windows = "--as-windows" in sys.argv
-    docs = "--docs" in sys.argv
 
-    from app import settings
+def sample_updater(controller):
+    """An updater that says the app is up to date, so General shows its
+    Software update rows as an installed copy does. It never starts, so it
+    never goes online."""
+    from app.updater import Updater
 
-    folder = Path(tempfile.mkdtemp())
-    settings.config_dir = lambda: folder  # type: ignore[assignment]
-    settings.LEGACY_PATH = folder / "none.json"
+    updater = Updater(controller)
+    updater.kind = "installed"
+    updater.state = updater.CURRENT
+    updater.message = "Up to date"
+    return updater
 
-    if as_windows:
-        from app.ui import theme
 
-        theme.IS_MAC, theme.IS_WINDOWS = False, True
+def settle(app, main_window) -> None:
+    """Stop animations (offscreen they never advance) and clear the pads' flash."""
+    from PySide6.QtCore import QPropertyAnimation
 
+    from app.ui.widgets import Switch
+
+    app.processEvents()
+    for animation in main_window.findChildren(QPropertyAnimation):
+        animation.stop()
+    for pad in (main_window.test_page.pad, main_window.calibrate.pad):
+        pad.set_flash_level(0.0)
+    for switch in main_window.findChildren(Switch):
+        switch.set_position(1.0 if switch.isChecked() else 0.0)
+    app.processEvents()
+
+
+def measuring_state(page) -> None:
+    """Calibrate part-way through its single clicks."""
+    page.restart()
+    page._advance()
+    for _ in range(5):
+        page._on_pad_press(900.0, 960.0)
+
+
+def result_state(page) -> None:
+    """Calibrate finished, with a result and the note it adds."""
+    from app.core import REQUIRED_DOUBLE_CLICKS, REQUIRED_SINGLE_CLICKS
+
+    page.restart()
+    page._advance()
+    for _ in range(REQUIRED_SINGLE_CLICKS):
+        page._on_pad_press(900.0, 960.0)
+    for _ in range(REQUIRED_DOUBLE_CLICKS):
+        page._on_pad_press(900.0, 960.0)
+        page._on_pad_press(150.0, 210.0)
+
+
+def _on_real_screen() -> bool:
+    """True with the real window system. Offscreen (a dry run of `--live`)
+    nothing may reach this computer's screen or keyboard."""
+    from PySide6.QtGui import QGuiApplication
+
+    return QGuiApplication.platformName() in ("cocoa", "windows")
+
+
+def _uniform(image) -> bool:
+    """Whether `image` is one colour throughout (a capture that saw nothing)."""
+    if image.isNull() or image.width() < 4 or image.height() < 4:
+        return True
+    first = image.pixel(0, 0)
+    step_x, step_y = max(1, image.width() // 23), max(1, image.height() // 19)
+    return all(
+        image.pixel(x, y) == first for x in range(0, image.width(), step_x) for y in range(0, image.height(), step_y)
+    )
+
+
+def _screencapture(arguments: list[str], target: Path) -> bool:
+    import subprocess
+
+    target.unlink(missing_ok=True)
+    result = subprocess.run(["screencapture", "-x", *arguments, str(target)], capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"screencapture {' '.join(arguments)}: {result.stderr.strip() or result.returncode}")
+    return target.exists() and target.stat().st_size > 0
+
+
+def _mac_window_number(widget) -> int | None:
+    try:
+        import objc
+
+        view = objc.objc_object(c_void_p=int(widget.winId()))
+        return int(view.window().windowNumber())
+    except Exception as error:  # noqa: BLE001 - a fallback follows
+        print(f"No window number: {error}")
+        return None
+
+
+def grab_screen(app, rect, target: Path) -> str:
+    """What the screen shows inside `rect` (global coordinates), menus and
+    pop-ups included. Returns how it was captured."""
+    screen = app.primaryScreen()
+    rect = rect.intersected(screen.geometry())
+    pixmap = screen.grabWindow(0, rect.x(), rect.y(), rect.width(), rect.height())
+    if not pixmap.isNull() and not _uniform(pixmap.toImage()):
+        pixmap.save(str(target))
+        return "QScreen"
+    if sys.platform == "darwin" and _on_real_screen():
+        region = f"-R{rect.x()},{rect.y()},{rect.width()},{rect.height()}"
+        if _screencapture([region], target):
+            return "screencapture"
+    if not pixmap.isNull():
+        pixmap.save(str(target))
+        return "QScreen (uniform)"
+    return "nothing"
+
+
+def grab_window_live(app, main_window, target: Path) -> str:
+    """The real window as the screen shows it: title bar, materials and
+    native controls as the window server composites them."""
+    if sys.platform == "darwin" and _on_real_screen():
+        number = _mac_window_number(main_window)
+        if number is not None and _screencapture(["-o", f"-l{number}"], target):
+            return "screencapture -l"
+    return grab_screen(app, main_window.frameGeometry(), target)
+
+
+def dismiss_popups(app) -> None:
+    """Close whatever pop-up or menu is open: Qt's own, and on macOS a native
+    menu (NSMenu tracking), with the Escape key."""
     from PySide6.QtWidgets import QApplication
 
-    app = QApplication([])
-    if docs and not LIVE and not as_windows:
-        # The README's Mac picture is dark, like the Windows one. Offscreen
-        # there is no system appearance, so the native controls (the spin
-        # boxes) get a dark palette by hand.
-        app.setPalette(dark_palette())
-    from app import permissions
-    from app.controller import AppController
-    from app.ui import widgets, window as window_module
-    from app.ui.theme import current_look
+    popup = QApplication.activePopupWidget()
+    if popup is not None:
+        popup.close()
+    if sys.platform == "darwin" and _on_real_screen():
+        try:
+            import Quartz
 
-    if as_windows:
-        from app.ui import base, panes
+            for down in (True, False):
+                event = Quartz.CGEventCreateKeyboardEvent(None, 53, down)  # Escape
+                Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+        except Exception as error:  # noqa: BLE001
+            print(f"Couldn't post Escape: {error}")
 
-        for module in (widgets, window_module, base, panes):
-            module.IS_MAC = False
-        permissions.needs_accessibility = lambda: False  # type: ignore[assignment]
-        from app.ui import symbols
 
-        symbols.IS_MAC, symbols.IS_WINDOWS = False, False
+def capture_popup(app, main_window, open_popup, target: Path) -> None:
+    """Open a pop-up (an AppKit menu on macOS runs its own event loop until
+    it closes), photograph the screen around the window, then close it."""
+    from PySide6.QtCore import QMargins, QTimer
+    from PySide6.QtWidgets import QApplication
 
-    if docs:
-        # Shown as on, without installing a real mouse hook.
-        AppController.active = property(lambda self: True)  # type: ignore[assignment]
-    controller = AppController()
-    if docs:
-        docs_state(controller)
-    else:
-        sample_state(controller)
-        controller.settings["filtered_total"] = 1284
-        controller.session_filtered = 37
-    main_window = window_module.MainWindow(controller)
-    size = parse_size(sys.argv)
-    main_window.resize(*((size[0] if size else DOCS_WIDTH, 700) if docs else (780, 660)))
-    main_window.show()
-    main_window.raise_()
-    main_window.activateWindow()
-    app.processEvents()
-    if LIVE:
-        wait(app, 1500)
+    returned = []
 
-    if docs:
-        capture_docs(app, main_window, out / "docs-filter.png", size)
-        print(f"Wrote {out / 'docs-filter.png'}")
-        return
+    def photograph() -> None:
+        area = main_window.frameGeometry().marginsAdded(QMargins(40, 40, 40, 360))
+        how = grab_screen(app, area, target)
+        print(f"{target.name}: {how}")
+        dismiss_popups(app)
 
-    test = main_window.test_page
-    for gap in [410, 520, 9, 380, 460, 12, 590, 350, 470, 7, 520, 400, 610, 380, 11, 500, 430, 560]:
-        test._on_pad_press(float(gap), float(gap + 60))
-    test.pad.set_flash_level(0.0)
+    def still_open() -> None:
+        # Should the first Escape miss, never wait for ever; but a stray
+        # Escape would reach the window and show up in the next picture.
+        if not returned or QApplication.activePopupWidget() is not None:
+            print(f"{target.name}: closing it again")
+            dismiss_popups(app)
 
-    suffix = "-windows" if as_windows else ""
-    # Live captures use the system's own appearance, because native controls
-    # follow it and cannot be switched from here.
-    for dark in ([None] if LIVE else [False, True]):
-        widgets.set_look(current_look(dark))
-        dark = widgets.look().dark
-        for label in main_window.findChildren(widgets.TextLabel):
-            label.restyle()
-        for index, (key, _title) in enumerate(window_module.PAGES):
-            main_window._show_page(index)
-            if key == "calibrate":
-                page = main_window.calibrate
-                page.restart()
-                page._advance()
-                for _ in range(5):
-                    page._on_pad_press(900.0, 960.0)
-                page.pad.set_flash_level(0.0)
-            app.processEvents()
-            # Offscreen, animations never advance; settle them before grabbing.
-            from PySide6.QtCore import QPropertyAnimation
+    timers = []
+    for delay, run in ((1200, photograph), (4000, still_open), (7000, still_open)):
+        timer = QTimer(main_window)
+        timer.setSingleShot(True)
+        timer.timeout.connect(run)
+        timer.start(delay)
+        timers.append(timer)
+    open_popup()
+    returned.append(True)
+    wait(app, 1500)
+    for timer in timers:  # this pop-up's, not the next one's
+        timer.stop()
+        timer.deleteLater()
 
-            for animation in main_window.findChildren(QPropertyAnimation):
-                animation.stop()
-            for pad in (main_window.test_page.pad, main_window.calibrate.pad):
-                pad.set_flash_level(0.0)
-            name = f"{key}-{'dark' if dark else 'light'}{suffix}.png"
-            if LIVE:
-                wait(app, 600)
-                frame = main_window.frameGeometry()
-                screen = main_window.screen()
-                screen.grabWindow(0, frame.x(), frame.y(), frame.width(), frame.height()).save(
-                    str(out / name.replace(".png", "-live.png"))
-                )
-            else:
-                main_window.grab().save(str(out / name))
-                # The whole pane, however long, for review.
-                size = main_window.size()
-                page = main_window.pages[index]
-                main_window.resize(size.width(), max(size.height(), page.sizeHint().height() + 40))
-                app.processEvents()
-                main_window.grab().save(str(out / name.replace(".png", "-full.png")))
-                main_window.resize(size)
-                app.processEvents()
-    if LIVE:
-        # The narrowest the window can get, to check nothing is clipped.
-        main_window._show_page(0)
-        main_window.resize(main_window.minimumSize())
+
+def capture_live(app, main_window, out: Path, scheme: str) -> None:
+    """Every pane in a real window, as the screen shows it (`NN-pane-scheme.png`,
+    then `-2.png` and on for the rest of a long one); then the pop-ups and
+    menus, the narrowest window, and the window switched to the other
+    appearance while open."""
+    from PySide6.QtCore import QPoint, Qt
+
+    from app.ui import window as window_module
+
+    screen = main_window.screen()
+    available = screen.availableGeometry()
+    print(f"Screen {screen.geometry().width()} x {screen.geometry().height()}, "
+          f"available {available.width()} x {available.height()}, scale {screen.devicePixelRatio()}, "
+          f"platform {app.platformName()}, style {app.style().name()}, scheme {scheme}")
+    main_window.resize(780, min(660, available.height() - 60))
+    main_window.move(available.topLeft() + QPoint(20, 20))
+    wait(app, 800)
+    size = main_window.size()
+
+    def shoot(name: str) -> None:
+        area = main_window.stack.currentWidget()
+        bar = area.verticalScrollBar()
+        bar.setValue(0)
+        settle(app, main_window)
+        wait(app, 500)
+        how = grab_window_live(app, main_window, out / f"{name}-{scheme}.png")
+        # The rest of a pane taller than the window, a screen at a time.
+        part = 2
+        while bar.value() < bar.maximum():
+            bar.setValue(min(bar.maximum(), bar.value() + area.viewport().height() - 80))
+            settle(app, main_window)
+            wait(app, 300)
+            grab_window_live(app, main_window, out / f"{name}-{scheme}-{part}.png")
+            part += 1
+        bar.setValue(0)
+        print(f"{name}-{scheme}: {how}, {part - 1} part(s)")
+
+    for index, (key, _title) in enumerate(window_module.PAGES):
+        main_window._show_page(index)
+        if key == "calibrate":
+            measuring_state(main_window.calibrate)
+        shoot(f"{index + 1:02d}-{key}")
+    calibrate = window_module.PAGES.index(("calibrate", "Calibrate"))
+    main_window._show_page(calibrate)
+    result_state(main_window.calibrate)
+    shoot(f"{calibrate + 1:02d}-calibrate-result")
+    main_window.calibrate.restart()
+
+    # Pop-ups and menus, which only the screen shows.
+    from app.core import Button
+
+    main_window.show_page("filter")
+    settle(app, main_window)
+    filter_page = main_window.filter_page
+    left = getattr(filter_page, "window_boxes", {}).get(Button.LEFT)
+    if left is not None and hasattr(left, "showPopup"):
+        capture_popup(app, main_window, left.showPopup, out / f"popup-window-{scheme}.png")
+    main_window.show_page("calibrate")
+    settle(app, main_window)
+    capture_popup(app, main_window, main_window.calibrate.button_picker.showPopup, out / f"popup-calibrate-{scheme}.png")
+    main_window.show_page("apps")
+    settle(app, main_window)
+    capture_popup(app, main_window, main_window.apps.add_button.click, out / f"popup-add-app-{scheme}.png")
+
+    # The narrowest the window can get, to check nothing is clipped.
+    main_window.show_page("filter")
+    main_window.resize(main_window.minimumSize())
+    settle(app, main_window)
+    wait(app, 800)
+    grab_window_live(app, main_window, out / f"filter-minimum-{scheme}.png")
+    main_window.resize(size)
+
+    # The other appearance, switched to while the window is open (as the
+    # system does at sunset), to compare with a window opened in it.
+    other = "light" if scheme == "dark" else "dark"
+    hints = app.styleHints()
+    if hasattr(hints, "setColorScheme"):
+        hints.setColorScheme(Qt.ColorScheme.Dark if other == "dark" else Qt.ColorScheme.Light)
         wait(app, 800)
-        frame = main_window.frameGeometry()
-        main_window.screen().grabWindow(0, frame.x(), frame.y(), frame.width(), frame.height()).save(
-            str(out / "filter-minimum-live.png")
-        )
-    # The notification area / menu bar icon, both states, on dark and light,
-    # at the sizes the tray actually uses.
+        main_window.apply_look()  # what the app does on colorSchemeChanged (app/main.py)
+        for key in ("filter", "calibrate"):
+            main_window.show_page(key)
+            settle(app, main_window)
+            wait(app, 500)
+            grab_window_live(app, main_window, out / f"switched-{key}-{scheme}-to-{other}.png")
+
+
+def tray_sheet(out: Path) -> None:
+    """The notification area / menu bar icon, both states, on dark and light,
+    at the sizes the tray actually uses."""
     from PySide6.QtGui import QColor, QImage, QPainter
 
     from app.ui import icons
@@ -471,6 +663,134 @@ def main() -> None:
                     x += size + 16
     painter.end()
     sheet.scaled(sheet.width() * 3, sheet.height() * 3).save(str(out / "tray-icons.png"))
+
+
+def main() -> None:
+    positional = [argument for argument in sys.argv[1:] if not argument.startswith("--")]
+    out = Path(positional[0] if positional else "screenshots")
+    out.mkdir(parents=True, exist_ok=True)
+    if "--social" in sys.argv:
+        from PySide6.QtGui import QGuiApplication
+
+        _app = QGuiApplication([])
+        social_preview().save(str(out / "social-preview.png"))
+        print(f"Wrote {out / 'social-preview.png'}")
+        return
+    as_windows = "--as-windows" in sys.argv
+    docs = "--docs" in sys.argv
+    scheme = parse_scheme(sys.argv)
+    if LIVE:
+        # A capture that hangs (a menu nobody closed) ends the run instead of
+        # holding a CI runner until it times out.
+        import faulthandler
+
+        faulthandler.dump_traceback_later(900, exit=True)
+
+    from app import settings
+
+    folder = Path(tempfile.mkdtemp())
+    settings.config_dir = lambda: folder  # type: ignore[assignment]
+    settings.LEGACY_PATH = folder / "none.json"
+
+    if as_windows:
+        from app.ui import theme
+
+        theme.IS_MAC, theme.IS_WINDOWS = False, True
+
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+
+    from app.ui.theme import application_font
+
+    app = QApplication([])
+    body = application_font()
+    if body is not None:
+        app.setFont(body)  # as the app itself does (app/main.py)
+    if scheme and hasattr(app.styleHints(), "setColorScheme"):
+        app.styleHints().setColorScheme(Qt.ColorScheme.Dark if scheme == "dark" else Qt.ColorScheme.Light)
+        wait(app, 300)
+    if docs and not LIVE and not as_windows:
+        # The README's Mac picture is dark, like the Windows one. Offscreen
+        # there is no system appearance, so the native controls get a dark
+        # palette by hand.
+        app.setPalette(dark_palette())
+    from app import permissions
+    from app.controller import AppController
+    from app.ui import widgets, window as window_module
+    from app.ui.theme import current_look
+
+    if as_windows:
+        from app.ui import base, panes
+
+        for module in (widgets, window_module, base, panes):
+            module.IS_MAC = False
+        permissions.needs_accessibility = lambda: False  # type: ignore[assignment]
+        from app.ui import symbols
+
+        symbols.IS_MAC, symbols.IS_WINDOWS = False, False
+
+    if docs:
+        # Shown as on, without installing a real mouse hook, and allowed, as
+        # it is once set up (a CI Mac may not have granted Accessibility).
+        AppController.active = property(lambda self: True)  # type: ignore[assignment]
+        permissions.has_accessibility = lambda: True  # type: ignore[assignment]
+        permissions.event_tap_allowed = lambda: True  # type: ignore[assignment]
+    controller = AppController()
+    if docs:
+        docs_state(controller)
+    else:
+        sample_state(controller)
+        controller.settings["filtered_total"] = 1284
+        controller.session_filtered = 37
+    updater = None if docs else sample_updater(controller)
+    main_window = window_module.MainWindow(controller, updater)
+    size = parse_size(sys.argv)
+    main_window.resize(*((size[0] if size else DOCS_WIDTH, 700) if docs else (780, 660)))
+    main_window.show()
+    main_window.raise_()
+    main_window.activateWindow()
+    app.processEvents()
+    if LIVE:
+        wait(app, 1500)
+
+    if docs:
+        capture_docs(app, main_window, out / "docs-filter.png", size)
+        print(f"Wrote {out / 'docs-filter.png'}")
+        return
+
+    test = main_window.test_page
+    for gap in [410, 520, 9, 380, 460, 12, 590, 350, 470, 7, 520, 400, 610, 380, 11, 500, 430, 560]:
+        test._on_pad_press(float(gap), float(gap + 60))
+    test.pad.set_flash_level(0.0)
+
+    if LIVE:
+        capture_live(app, main_window, out, scheme or ("dark" if widgets.look().dark else "light"))
+        tray_sheet(out)
+        print(f"Wrote screenshots to {out}")
+        return
+
+    suffix = "-windows" if as_windows else ""
+    for dark in [False, True]:
+        widgets.set_look(current_look(dark))
+        dark = widgets.look().dark
+        for label in main_window.findChildren(widgets.TextLabel):
+            label.restyle()
+        for index, (key, _title) in enumerate(window_module.PAGES):
+            main_window._show_page(index)
+            if key == "calibrate":
+                measuring_state(main_window.calibrate)
+            settle(app, main_window)
+            name = f"{key}-{'dark' if dark else 'light'}{suffix}.png"
+            main_window.grab().save(str(out / name))
+            # The whole pane, however long, for review.
+            size = main_window.size()
+            page = main_window.pages[index]
+            main_window.resize(size.width(), max(size.height(), page.sizeHint().height() + 40))
+            app.processEvents()
+            main_window.grab().save(str(out / name.replace(".png", "-full.png")))
+            main_window.resize(size)
+            app.processEvents()
+    tray_sheet(out)
     print(f"Wrote screenshots to {out}")
 
 

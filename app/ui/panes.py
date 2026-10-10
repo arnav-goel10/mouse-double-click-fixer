@@ -7,17 +7,18 @@ import platform
 import time
 from typing import Optional
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QPoint, QTimer
 from PySide6.QtWidgets import QComboBox, QFileDialog, QHBoxLayout, QMenu, QVBoxLayout, QWidget
 
 from .. import app_keys
 from ..core import Button
 from ..inputs import TOUCH_KINDS, as_button, button_name
 from ..wear import SHOWN_DAYS
+from . import popup_mac
 from .base import Page, card_icon, label, make_button
 from .charts import DailyRateChart, GapHistogram
 from .theme import IS_MAC
-from .widgets import Row, Switch, ValueLabel, wheel_needs_focus
+from .widgets import Row, Switch, ValueLabel, pop_up_button
 
 #: How often the History pane reads the counts again while it is on screen:
 #: the clicks someone makes to watch it are counted as they go.
@@ -75,7 +76,7 @@ class HistoryPage(LivePage):
         picker = self.section()
         self.button_picker = QComboBox()
         self.button_picker.setAccessibleName("Button to show")
-        wheel_needs_focus(self.button_picker)  # the wheel scrolls the pane
+        pop_up_button(self.button_picker)  # the wheel scrolls the pane
         self.button_picker.activated.connect(self._on_pick)
         picker.add(Row("Button", "", self.button_picker, card_icon("mouse")))
 
@@ -199,11 +200,16 @@ class AppsPage(Page):
         actions = QHBoxLayout()
         actions.setContentsMargins(0, 14, 0, 0)
         actions.addStretch(1)
+        # A push button like every other in the app, which opens its menu:
+        # QPushButton.setMenu would draw a pull-down button instead, with a
+        # chevron no other button here has. On macOS the menu is AppKit's
+        # (popup_mac); elsewhere, and if that fails, it is add_menu.
         self.add_button = make_button("Add App…")
         self.add_button.setAccessibleName("Add an app")
+        self.add_button.setAccessibleDescription("Opens a menu of running apps and more")
         self.add_menu = QMenu(self.add_button)
         self.add_menu.aboutToShow.connect(self._fill_menu)
-        self.add_button.setMenu(self.add_menu)
+        self.add_button.clicked.connect(self.show_add_menu)
         actions.addWidget(self.add_button)
         self.body.addLayout(actions)
         self.body.addStretch(1)
@@ -226,20 +232,37 @@ class AppsPage(Page):
             self.list_section.add(Row(entry["name"], detail, remove, card_icon("apps")))
             self.remove_buttons[entry["key"]] = remove
 
-    def _fill_menu(self) -> None:
-        """Running apps first, then the file dialog, built as the menu opens."""
-        self.add_menu.clear()
+    def show_add_menu(self) -> None:
+        """The menu, under the button and lined up with its leading edge."""
+        if popup_mac.pop_up(self.add_button, self.menu_entries()):
+            return
+        self.add_menu.popup(self.add_button.mapToGlobal(QPoint(0, self.add_button.height() + popup_mac.GAP)))
+
+    def menu_entries(self) -> list[popup_mac.Entry]:
+        """Running apps first, then the file dialog, read as the menu opens."""
         excluded = {entry["key"] for entry in self.controller.excluded_apps}
         running = [app for app in app_keys.running_apps() if app.key not in excluded]
+        entries: list[popup_mac.Entry] = []
         if running:
-            heading = self.add_menu.addAction("Running Apps" if IS_MAC else "Running apps")
-            heading.setEnabled(False)
+            entries.append(popup_mac.Entry(label("Running Apps")))
             for app in running:
-                action = self.add_menu.addAction(app.name)
-                action.setToolTip(app.key)
-                action.triggered.connect(lambda _checked=False, choice=app: self.add(choice))
-            self.add_menu.addSeparator()
-        self.add_menu.addAction(_choose_title(), self.choose_file)
+                entries.append(popup_mac.Entry(app.name, lambda choice=app: self.add(choice), app.key))
+            entries.append(popup_mac.Entry())
+        entries.append(popup_mac.Entry(_choose_title(), self.choose_file))
+        return entries
+
+    def _fill_menu(self) -> None:
+        self.add_menu.clear()
+        for entry in self.menu_entries():
+            if entry.separator:
+                self.add_menu.addSeparator()
+                continue
+            action = self.add_menu.addAction(entry.title)
+            if entry.action is None:
+                action.setEnabled(False)
+                continue
+            action.setToolTip(entry.tooltip)
+            action.triggered.connect(lambda _checked=False, run=entry.action: run())
 
     def add(self, choice: app_keys.AppChoice) -> None:
         self.controller.add_excluded_app(choice.key, choice.name)
