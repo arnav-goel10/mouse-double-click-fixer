@@ -5,8 +5,18 @@ on:
     branches: [main, modern-ui]
   pull_request:
   workflow_dispatch:
+    inputs:
+      screenshots_only:
+        description: Only capture the UI on macOS and Windows (the screenshots job), skipping the other jobs
+        type: boolean
+        default: false
   # release.yml runs these checks too, and publishes nothing unless they pass.
   workflow_call:
+    inputs:
+      screenshots_only:
+        description: Only capture the UI (never set by release.yml, which needs every check)
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -17,6 +27,7 @@ env:
 
 jobs:
   test:
+    if: ${{ !inputs.screenshots_only }}
     strategy:
       fail-fast: false
       matrix:
@@ -58,6 +69,7 @@ jobs:
       - run: python -m compileall -q app run.py
 
   macos-tap:
+    if: ${{ !inputs.screenshots_only }}
     name: macOS event tap end-to-end
     strategy:
       fail-fast: false
@@ -83,6 +95,7 @@ jobs:
           DCF_E2E: "1"
 
   windows-hook:
+    if: ${{ !inputs.screenshots_only }}
     name: Windows hook end-to-end
     runs-on: windows-latest
     timeout-minutes: 20
@@ -98,22 +111,57 @@ jobs:
         run: python -m unittest tests.test_windows_hook -v
         env:
           DCF_E2E: "1"
-      - name: Capture the real window
-        run: python tools/screenshots.py screenshots --live
-      - name: Capture the README screenshot (dark mode, as on macOS)
+
+  screenshots:
+    name: UI screenshots (${{ matrix.os }})
+    # Offscreen, Qt draws no native control, so only a real window on a real
+    # window server shows what users see: every pane, light and dark, its
+    # pop-ups and menus open (tools/screenshots.py --live). Look at them after
+    # any change to the panes; dispatch with screenshots_only to run just this.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-26
+            artifact: macos-screenshots
+          - os: windows-latest
+            artifact: windows-screenshots
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Install the pinned packages, each checked against its hash
+        run: |
+          python -m pip install --require-hashes --only-binary :all: -r requirements-build.txt
+      - name: Light appearance
+        shell: bash
+        run: python tools/screenshots.py screenshots/light --live --scheme=light
+      - name: Dark appearance (Windows also switches the system theme, for the title bar)
         shell: pwsh
         run: |
-          $key = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
-          New-Item -Path $key -Force | Out-Null
-          Set-ItemProperty -Path $key -Name AppsUseLightTheme -Value 0 -Type DWord
-          Set-ItemProperty -Path $key -Name SystemUsesLightTheme -Value 0 -Type DWord
-          python tools/screenshots.py screenshots --live --docs
+          if ($IsWindows) {
+            $key = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
+            New-Item -Path $key -Force | Out-Null
+            Set-ItemProperty -Path $key -Name AppsUseLightTheme -Value 0 -Type DWord
+            Set-ItemProperty -Path $key -Name SystemUsesLightTheme -Value 0 -Type DWord
+          }
+          python tools/screenshots.py screenshots/dark --live --scheme=dark
+          if ($LASTEXITCODE -ne 0) { throw "the dark capture failed" }
+      - name: Capture the README screenshot (dark mode, as on macOS)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: python tools/screenshots.py screenshots --live --docs
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
         with:
-          name: windows-screenshots
+          name: ${{ matrix.artifact }}
           path: screenshots/
 
   windows-install:
+    if: ${{ !inputs.screenshots_only }}
     name: Windows install, quit and update end-to-end
     runs-on: windows-latest
     timeout-minutes: 40

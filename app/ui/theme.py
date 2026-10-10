@@ -161,6 +161,17 @@ def base_font() -> QFont:
     return QFont(QGuiApplication.font())
 
 
+def application_font() -> QFont | None:
+    """The application-wide font to set, or None to keep the system's:
+    Windows 11's own UI font at its body size (14 px)."""
+    if not IS_WINDOWS:
+        return None
+    body = QFont()
+    body.setFamilies(["Segoe UI Variable Text", "Segoe UI"])
+    body.setPixelSize(14)
+    return body
+
+
 def font(role: str) -> QFont:
     """Fonts by role, following each platform's own type ramp."""
     f = base_font()
