@@ -535,8 +535,9 @@ def capture_popup(app, main_window, open_popup, target: Path) -> None:
 def capture_live(app, main_window, out: Path, scheme: str) -> None:
     """Every pane in a real window, as the screen shows it (`NN-pane-scheme.png`,
     then `-2.png` and on for the rest of a long one); then the pop-ups and
-    menus, and the narrowest window."""
-    from PySide6.QtCore import QPoint
+    menus, the narrowest window, and the window switched to the other
+    appearance while open."""
+    from PySide6.QtCore import QPoint, Qt
 
     from app.ui import window as window_module
 
@@ -548,6 +549,7 @@ def capture_live(app, main_window, out: Path, scheme: str) -> None:
     main_window.resize(780, min(660, available.height() - 60))
     main_window.move(available.topLeft() + QPoint(20, 20))
     wait(app, 800)
+    size = main_window.size()
 
     def shoot(name: str) -> None:
         area = main_window.stack.currentWidget()
@@ -600,6 +602,21 @@ def capture_live(app, main_window, out: Path, scheme: str) -> None:
     settle(app, main_window)
     wait(app, 800)
     grab_window_live(app, main_window, out / f"filter-minimum-{scheme}.png")
+    main_window.resize(size)
+
+    # The other appearance, switched to while the window is open (as the
+    # system does at sunset), to compare with a window opened in it.
+    other = "light" if scheme == "dark" else "dark"
+    hints = app.styleHints()
+    if hasattr(hints, "setColorScheme"):
+        hints.setColorScheme(Qt.ColorScheme.Dark if other == "dark" else Qt.ColorScheme.Light)
+        wait(app, 800)
+        main_window.apply_look()  # what the app does on colorSchemeChanged (app/main.py)
+        for key in ("filter", "calibrate"):
+            main_window.show_page(key)
+            settle(app, main_window)
+            wait(app, 500)
+            grab_window_live(app, main_window, out / f"switched-{key}-{scheme}-to-{other}.png")
 
 
 def tray_sheet(out: Path) -> None:
