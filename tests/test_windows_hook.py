@@ -1968,7 +1968,8 @@ class WindowsMotionSmoothnessTests(ProbedWindows):
     a millisecond more, as on a slow machine or with a fast mouse), and on
     beside another Python thread that keeps busy (the app's own UI thread at
     work: the hook needs the GIL), with the 1 ms timer period the filter asks
-    for (see app.platform.finer_timer) and, measured and reported only,
+    for (see app.platform.finer_timer; only how long the GIL keeps a move
+    waiting is held to GIL_WAIT_P50_MS) and, measured and reported only,
     without it.
 
     Thresholds keep headroom: a move may wait for one more of the hand's
@@ -1978,6 +1979,7 @@ class WindowsMotionSmoothnessTests(ProbedWindows):
     either."""
 
     LATENCY_MARGIN_MS = 40
+    GIL_WAIT_P50_MS = 25
 
     BUSY_S = 0.00025
 
@@ -2170,8 +2172,8 @@ class WindowsMotionSmoothnessTests(ProbedWindows):
         cases = ((1000, "move"), (1000, "click"), (125, "click"), (1000, "drag"))
         results = self.measure(modes, cases)
         for (mode, rate, scenario), result in results.items():
-            if mode.startswith("off") or "another Python thread" in mode:
-                continue  # the baselines, and measured and reported only
+            if mode.startswith("off") or "15.6 ms timer" in mode:
+                continue  # the baselines, and Windows' default timer: measured and reported only
             baseline = results[("off", rate, scenario)]
             with self.subTest(mode=mode, scenario=scenario, rate=rate):
                 self.assertTrue(result["cursor_ok"], f"the pointer ended off the hand's path: {result}")
@@ -2186,6 +2188,13 @@ class WindowsMotionSmoothnessTests(ProbedWindows):
                     self.assertEqual((result["resent"], result["teleports"]), (0, 0), f"moves were re-sent: {result}")
                 else:
                     self.assertEqual(result["resends"], 0, f"{result}")
+                if "another Python thread busy" in mode:
+                    # Every move waits for the GIL here, the filter's work or
+                    # not: about 45 ms an event (p50) with Windows' 15.6 ms
+                    # tick, 7-9 ms with the 1 ms period (CI, Windows Server
+                    # 2025). Only that is held to.
+                    self.assertLess(result["latency_ms"][0], self.GIL_WAIT_P50_MS, f"the hook waited for the GIL: {result}")
+                    continue
                 # No gap the filter adds beyond twice the hand's interval: no
                 # move of the hand's shows after more than two of its later
                 # moves have gone out, over what the baseline shows. A move

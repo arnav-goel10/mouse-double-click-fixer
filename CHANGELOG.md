@@ -15,8 +15,21 @@
 - Windows: movement after a click or a drag no longer goes missing. A
   re-sent move could land after one of yours and undo it, which left the
   pointer short of where you moved it, by up to a hundred pixels after a drag
-  let go while moving. A drag let go while moving still drops where you let
-  go of the button.
+  let go while moving. The app now sends no pointer movement at all: it
+  places the pointer itself, at a moment Windows waits for, so none of your
+  movement is lost. A drag let go while moving still drops where you let go
+  of the button.
+- Windows: the pointer keeps up while the app is busy. With another part of
+  the app at work, every mouse event on the computer could wait about 45 ms
+  for the filter; it now waits a few milliseconds, because the app asks
+  Windows for 1 ms timers while the filter is on.
+- Windows: a right click made during a drag, while the pointer was catching
+  up with your hand, now lands where you clicked, not where the pointer had
+  been left.
+- Windows: a click over an app running as administrator, made while the
+  pointer was catching up, is no longer lost: it goes through as it came.
+- Windows: a pen or touch tap made right after moving the mouse now lands
+  where the pen touched, not where the mouse pointer was.
 
 ## 1.0.1 — 2026-10-10
 

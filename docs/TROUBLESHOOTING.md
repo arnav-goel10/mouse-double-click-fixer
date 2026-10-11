@@ -203,17 +203,17 @@ next click or by a timer, wherever the pointer is then.
 The app doesn't add clicks of its own, but it re-sends some input: a release
 held back for the filter window, and whatever comes while that release is on
 its way (a press, another button's click, and on macOS pointer movement), so
-that games see them in the order they happened. On Windows the app doesn't
-re-send pointer movement: it puts the pointer where your hand has taken it,
-which isn't input. After a drag let go while moving, the release goes out
-where the button came up, with the pointer taken there and back; on Windows
-that is sent as input only when the release goes out by the timer. Games
-receive re-sent input as software input; on Windows it is marked as injected,
-and games that read raw input see it as injected input rather than as coming
-from your mouse. The app's hook is also in the input path whenever
-the filter is on. Some anti-cheat systems can object to software input or to
-input hooks, and the app can't know what yours accepts. Turn the filter off,
-or quit the app, before playing a game that uses one.
+that games see them in the order they happened. On Windows the app sends no
+pointer movement at all, only presses and releases: it puts the pointer where
+your hand has taken it, and after a drag let go while moving on the spot where
+the button came up and back, by placing it directly, which isn't input and
+which no input hook sees. Games receive re-sent input as software input; on
+Windows it is marked as injected, and games that read raw input see it as
+injected input rather than as coming from your mouse. The app's hook is also
+in the input path whenever the filter is on. Some anti-cheat systems can
+object to software input or to input hooks, and the app can't know what yours
+accepts. Turn the filter off, or quit the app, before playing a game that uses
+one.
 
 To keep the filter on for everything else, add the game under **Apps**. While
 it is in front nothing is filtered and nothing new is held back, and a
