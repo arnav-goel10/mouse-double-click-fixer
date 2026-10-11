@@ -461,6 +461,9 @@ class Application:
 
         self.updater.note_relaunch(self.controller.take_update_result(__version__))
         self.updater.start()
+        # The pause shortcut, the game check and the look for other mouse
+        # utilities: only a running app has them, never a test's controller.
+        self.controller.start_services()
         from . import install_cleanup
 
         install_cleanup.start()

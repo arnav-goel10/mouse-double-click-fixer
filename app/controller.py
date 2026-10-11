@@ -6,14 +6,15 @@ import dataclasses
 import logging
 import sys
 import threading
+import time
 from typing import Any, Optional
 
-from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 
-from . import DISPLAY_NAME, permissions
+from . import DISPLAY_NAME, conflicts, gamemode, health, pause, permissions
 from . import settings as settings_store
 from . import startup
-from .core import SIDE_BUTTONS, Button, ClickEvent, clamp_threshold
+from .core import DEFAULT_THRESHOLD_MS, SIDE_BUTTONS, Button, ClickEvent, clamp_threshold
 from .inputs import TOUCH_KINDS, as_button, button_name
 from .platform import DeviceInfo, FilterConfig, GlobalClickFilter, HookError, is_supported
 from .wear import WearHistory
@@ -27,6 +28,15 @@ SAVE_DELAY_MS = 300
 
 #: The settings the updater keeps, through store_update_state().
 UPDATE_STATE_KEYS = frozenset({"auto_check", "update_attempt_version", "update_attempt_count"})
+
+#: How often a timed pause checks whether it is over. By the wall clock, so a
+#: pause that ends while the computer sleeps is over when it wakes.
+PAUSE_CHECK_MS = 5000
+#: How often the list of other mouse utilities is read again (and whenever
+#: the app becomes active).
+CONFLICT_SCAN_MS = 60_000
+
+AUTOMATIC, CUSTOM = settings_store.AUTOMATIC, settings_store.CUSTOM
 
 
 def config_from_settings(values: dict[str, Any]) -> FilterConfig:
@@ -61,9 +71,50 @@ class AppController(QObject):
     #: The filter saw a device for the first time this run. Emitted from the
     #: hook's thread; connect with a queued connection.
     device_seen = Signal()
+    #: A pause started or ended (timed, or for a game in front).
+    pause_changed = Signal()
+    #: The other mouse utilities running changed (see conflicts()).
+    conflicts_changed = Signal()
+    #: The pause shortcut was pressed (from the shortcut's own thread on
+    #: Windows); handled on the UI thread.
+    shortcut_pressed = Signal()
 
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
+        # Set at quit. Nothing may start a hook after that: the window still
+        # hears hide events, and AppKit notifications, as the app goes down.
+        self._shut_down = False
+
+        # -- 1.1: pauses, the pause shortcut, games and other utilities. Set
+        # up first: every settings write (_follow_settings) reads them. --
+        # The wall clock, for when a timed pause ends (tests replace it).
+        self._clock = time.time
+        # A timed pause: when it ends (epoch seconds), or None.
+        self._paused_until: Optional[float] = None
+        # Paused for this full-screen game in front, or None.
+        self._game: Optional[gamemode.Game] = None
+        # The game the user resumed in: not paused for again until it leaves
+        # the front.
+        self._game_dismissed: Optional[str] = None
+        self._game_check = gamemode.game_in_front
+        self._conflict_scan = conflicts.scan
+        self._conflicts: list = []
+        self._make_shortcut = pause.create
+        self._shortcut: Optional[pause.Shortcut] = None
+        # start_services() was called: the app runs for real (a test's
+        # controller registers no shortcut and reads no process list).
+        self._services = False
+        self._pause_timer = QTimer(self)
+        self._pause_timer.setInterval(PAUSE_CHECK_MS)
+        self._pause_timer.timeout.connect(self._check_pause_end)
+        self._game_timer = QTimer(self)
+        self._game_timer.setInterval(gamemode.POLL_INTERVAL_MS)
+        self._game_timer.timeout.connect(self.check_game)
+        self._conflict_timer = QTimer(self)
+        self._conflict_timer.setInterval(CONFLICT_SCAN_MS)
+        self._conflict_timer.timeout.connect(self.refresh_conflicts)
+        self.shortcut_pressed.connect(self.toggle_pause, Qt.ConnectionType.QueuedConnection)
+
         self.settings = settings_store.load()
         # Changes held in `settings` that wait for their write (_store_later),
         # and the timer that ends the wait. Made when first needed.
@@ -92,9 +143,6 @@ class AppController(QObject):
         # stop tries it again.
         self._unstopped: Optional[GlobalClickFilter] = None
         self._suspended = False
-        # Set at quit. Nothing may start a hook after that: the window still
-        # hears hide events, and AppKit notifications, as the app goes down.
-        self._shut_down = False
         # Set while the user is in another login session (fast user
         # switching). A tap running in a session nobody is using can stall
         # the one in front, so nothing starts one until this session is back.
@@ -150,6 +198,66 @@ class AppController(QObject):
     def filter_config(self) -> FilterConfig:
         return config_from_settings(self.settings)
 
+    # -- strength ------------------------------------------------------------
+    @property
+    def strength(self) -> str:
+        """AUTOMATIC ("automatic"): the app picks each window, the measured
+        one or the default. CUSTOM ("custom"): the user's own windows."""
+        return str(self.settings["strength"])
+
+    def automatic_window(self, button: Any) -> int:
+        return settings_store.automatic_window(self.settings, as_button(button).value)
+
+    def custom_window(self, button: Any) -> int:
+        return settings_store.custom_window(self.settings, as_button(button).value)
+
+    def set_strength(self, strength: str) -> None:
+        """Switch between Automatic and Custom. Each keeps its own windows,
+        so switching back finds them as they were. Writing "strength" with
+        _apply does the same (settings.merge moves the windows)."""
+        if strength not in settings_store.STRENGTHS:
+            raise ValueError(f"Not a strength: {strength!r}")
+        if strength != self.strength:
+            self._apply(strength=strength)
+
+    def double_click_speeds(self) -> dict[Button, int]:
+        """The fastest deliberate double-click Test and Tune measured, per
+        button (release to press, ms)."""
+        return {Button(name): int(value) for name, value in self.settings["double_click_ms"].items()}
+
+    def note_double_click_speed(self, button: Any, fastest_ms: float) -> None:
+        """Remember Test and Tune's fastest deliberate double-click for the
+        button: a suggested window never goes above half of it."""
+        name = as_button(button).value
+        value = settings_store.milliseconds(
+            fastest_ms, -1, settings_store.DOUBLE_CLICK_MIN_MS, settings_store.DOUBLE_CLICK_MAX_MS
+        )
+        if value > 0 and self.settings["double_click_ms"].get(name) != value:
+            self._store(double_click_ms={**self.settings["double_click_ms"], name: value})
+
+    def apply_calibration(self, button: Any, threshold_ms: int, fastest_double_click_ms: Optional[float] = None) -> None:
+        """Test and Tune's Apply: the button's measured window (Automatic's
+        from now on, and the one in effect either way), marked calibrated,
+        and the button filtered, since it was worth measuring."""
+        button = as_button(button)
+        name = button.value
+        window = clamp_threshold(threshold_ms)
+        values: dict[str, object] = {
+            "automatic_windows": {**self.settings["automatic_windows"], name: window},
+            "thresholds": {**self.settings["thresholds"], name: window},
+            "calibrated_buttons": [*(other for other in self.settings["calibrated_buttons"] if other != name), name],
+            "buttons": [b.value for b in Button if b == button or b.value in self.settings["buttons"]],
+        }
+        if self.strength == CUSTOM:
+            values["custom_windows"] = {**self.settings["custom_windows"], name: window}
+        if fastest_double_click_ms:
+            value = settings_store.milliseconds(
+                fastest_double_click_ms, -1, settings_store.DOUBLE_CLICK_MIN_MS, settings_store.DOUBLE_CLICK_MAX_MS
+            )
+            if value > 0:
+                values["double_click_ms"] = {**self.settings["double_click_ms"], name: value}
+        self._apply(**values)
+
     @property
     def active(self) -> bool:
         return self._filter is not None and self._filter.running
@@ -197,7 +305,7 @@ class AppController(QObject):
         return (
             self.active
             or self.waiting_for_permission
-            or (bool(self.settings["fix_enabled"]) and (self._suspended or bool(self.failure)))
+            or (bool(self.settings["fix_enabled"]) and (self._suspended or self.paused or bool(self.failure)))
         )
 
     def set_active(self, active: bool) -> bool:
@@ -214,9 +322,15 @@ class AppController(QObject):
             return False
         if self.active:
             return True
+        if self.paused:
+            # A pause ends with resume() or on its own: the app's own
+            # restarts (a wake, a session switch, a retry) come through here
+            # and must not end it.
+            return False
         if self._shut_down or self._session_inactive:
             return False
-        # Turning the filter on (from the menu bar, say) ends a pause.
+        # Turning the filter on (from the menu bar, say) ends calibration's
+        # pause.
         self._suspended = False
         self._stop_filter()  # release a filter whose hook thread died
         if self._unstopped is not None:
@@ -256,10 +370,14 @@ class AppController(QObject):
         # A filter whose hook thread has died reads as inactive but still
         # needs releasing. Turning off also ends a wait for permission, a
         # pause, or a failed start, all of which the menus show as "on".
-        changed = self._filter is not None or self._suspended or bool(self.failure)
+        changed = self._filter is not None or self._suspended or bool(self.failure) or self.paused
+        paused = self.paused
         self._stop_filter()
         self._suspended = False
+        self._end_pause_state()
         self.failure = self.failure_detail = ""
+        if paused:
+            self.pause_changed.emit()
         if self.settings["fix_enabled"]:
             changed = True
             self._store(fix_enabled=False)
@@ -303,6 +421,11 @@ class AppController(QObject):
         """Turned on while calibration has filtering paused: remember it, and
         start once calibration ends, so the pad keeps measuring raw clicks."""
         self._store(fix_enabled=True)
+        if self.paused:
+            # The pause is the user's and outlasts the measuring: filtering
+            # starts when it ends (pauses and calibration's own never overlap).
+            self.filter_state_changed.emit(False, "")
+            return
         if self.active:
             self._stop_filter()
         self._suspended = True
@@ -372,6 +495,8 @@ class AppController(QObject):
         """One line for the menu bar and tray menus."""
         if self.active:
             return f"On · {self.filtered_total:,} blocked"
+        if self.paused:
+            return self._pause_words()
         if self._suspended and self.settings["fix_enabled"]:
             return "Paused for calibration"
         if self.waiting_for_permission:
@@ -394,6 +519,25 @@ class AppController(QObject):
         return f"{DISPLAY_NAME}: {status[0].lower()}{status[1:]}"
 
     def resume(self) -> None:
+        """End a pause (timed, or for a game in front) and start filtering
+        again. With no such pause, end calibration's (end_suspension), as
+        before 1.1: the two never overlap (a pause started while calibration
+        measures takes over from it), so there is never a doubt which one a
+        call means."""
+        if not self.paused:
+            self.end_suspension()
+            return
+        if self._game is not None:
+            # The user wants the filter in this game: not paused for it again
+            # until it has left the front.
+            self._game_dismissed = self._game.key
+        self._end_pause_state()
+        log.info("Resumed")
+        self.pause_changed.emit()
+        self._start_after_pause()
+
+    def end_suspension(self) -> None:
+        """Calibration is no longer measuring: filter again (see suspend)."""
         if self._suspended:
             self._suspended = False
             if self.settings["fix_enabled"]:
@@ -403,8 +547,332 @@ class AppController(QObject):
     def suspended(self) -> bool:
         return self._suspended
 
+    # -- pauses (1.1) --------------------------------------------------------
+    @property
+    def paused(self) -> bool:
+        """Paused by the user for a while, or while a game is in front. The
+        user's "on" is kept throughout (wanted stays True)."""
+        return self._paused_until is not None or self._game is not None
+
+    @property
+    def paused_until(self) -> Optional[float]:
+        """When a timed pause ends (epoch seconds), or None. None too while
+        paused only for a game, which has no end time."""
+        return self._paused_until
+
+    @property
+    def paused_for_game(self) -> Optional[str]:
+        """The name of the full-screen game the filter is paused for ("a
+        full-screen game" for one Windows wouldn't name), or None."""
+        if self._game is None:
+            return None
+        return self._game.name or "a full-screen game"
+
+    def pause(self, minutes: int = pause.DEFAULT_MINUTES) -> None:
+        """Stop filtering for `minutes` (1 to a day), keeping the user's
+        "on": filtering comes back by itself, or with resume(). Pausing again
+        restarts the time from now. Nothing to pause while the filter is
+        off."""
+        if self._shut_down or not self.settings["fix_enabled"]:
+            log.info("Nothing to pause: the filter is off")
+            return
+        minutes = pause.clamp_minutes(minutes)
+        self._paused_until = self._clock() + minutes * 60
+        self._pause_timer.start()
+        log.info("Paused for %d minutes", minutes)
+        # The user's pause takes over from calibration's: the pad goes on
+        # measuring an unfiltered mouse, and filtering comes back when the
+        # pause ends, not when the measuring does.
+        self._suspended = False
+        self._stop_filter()
+        self.filter_state_changed.emit(False, "")
+        self.pause_changed.emit()
+
+    def toggle_pause(self) -> None:
+        """The pause shortcut: resume when paused, else pause for the
+        menus' 15 minutes."""
+        log.info("Pause shortcut pressed")
+        if self.paused:
+            self.resume()
+        else:
+            self.pause(pause.DEFAULT_MINUTES)
+
+    def _end_pause_state(self) -> None:
+        self._paused_until = None
+        self._game = None
+        self._pause_timer.stop()
+
+    def _start_after_pause(self) -> None:
+        """Filter again after a pause, unless something else still holds it:
+        calibration measuring, another login session, the user's off."""
+        if self.settings["fix_enabled"] and not self._suspended and not self._shut_down:
+            self.set_active(True)
+
+    def _check_pause_end(self) -> None:
+        if self._paused_until is None:
+            self._pause_timer.stop()
+            return
+        if self._clock() < self._paused_until:
+            return
+        self._paused_until = None
+        self._pause_timer.stop()
+        log.info("The pause is over")
+        self.pause_changed.emit()
+        if self._game is None:
+            self._start_after_pause()
+
+    def _pause_words(self) -> str:
+        """"Paused until 3:45 PM", "Paused while Game is in front"."""
+        if self._paused_until is not None:
+            return f"Paused until {pause.until_text(self._paused_until, self._clock())}"
+        if self._game is not None:
+            return f"Paused while {self.paused_for_game} is in front"
+        return ""
+
+    def _pause_diagnostic(self) -> str:
+        if self._paused_until is not None:
+            left = max(0, int(round((self._paused_until - self._clock()) / 60)))
+            text = f"for {left} more minute{'' if left == 1 else 's'}"
+            return text + (", and for a game in front" if self._game is not None else "")
+        if self._game is not None:
+            return "while a full-screen game is in front"
+        return "no"
+
+    # -- games ---------------------------------------------------------------
+    @property
+    def auto_pause_games(self) -> bool:
+        return bool(self.settings["auto_pause_games"])
+
+    def set_auto_pause_games(self, enabled: bool) -> None:
+        """Pause while a full-screen game is in front (off by default).
+        Writing "auto_pause_games" any other way does the same (see
+        _follow_settings)."""
+        if bool(enabled) != self.auto_pause_games:
+            self._store(auto_pause_games=bool(enabled))
+            self.settings_changed.emit()
+
+    def _sync_game_timer(self) -> None:
+        if self._services and self.auto_pause_games and not self._shut_down:
+            if not self._game_timer.isActive():
+                self._game_timer.start()
+        else:
+            self._game_timer.stop()
+
+    def check_game(self) -> None:
+        """Pause while a full-screen game is in front, and filter again once
+        it isn't (gamemode.game_in_front, every few seconds while the
+        setting is on)."""
+        if self._shut_down:
+            return
+        if not self.auto_pause_games or not self.settings["fix_enabled"]:
+            if self._game is not None:
+                self._leave_game()
+            return
+        # Only the running app asks the system (start_services); a test's
+        # controller never reads the app in front.
+        game = self._game_check() if self._services else None
+        key = game.key if game is not None else None
+        if self._game_dismissed is not None and key != self._game_dismissed:
+            self._game_dismissed = None  # it left the front
+        if game is None:
+            if self._game is not None:
+                self._leave_game()
+            return
+        if key == self._game_dismissed:
+            return
+        if self._game is None:
+            self._game = game
+            log.info("Paused while a full-screen game is in front")
+            self._suspended = False  # this pause takes over (see pause())
+            self._stop_filter()
+            self.filter_state_changed.emit(False, "")
+            self.pause_changed.emit()
+        elif self._game != game:
+            self._game = game
+            self.pause_changed.emit()
+
+    def _leave_game(self) -> None:
+        self._game = None
+        log.info("The game left the front")
+        self.pause_changed.emit()
+        if self._paused_until is None:
+            self._start_after_pause()
+
+    # -- the pause shortcut --------------------------------------------------
+    @property
+    def pause_shortcut_text(self) -> str:
+        """"⌃⌥⌘P" on macOS, "Ctrl+Alt+Shift+P" on Windows ("" elsewhere)."""
+        return pause.shortcut_text()
+
+    @property
+    def pause_shortcut_enabled(self) -> bool:
+        return bool(self.settings["pause_shortcut_enabled"])
+
+    @property
+    def pause_shortcut_registered(self) -> bool:
+        """Whether the system has the shortcut now. False when it is turned
+        off, before start_services(), or when the system refused it (see
+        pause_shortcut_error)."""
+        return self._shortcut is not None and self._shortcut.registered
+
+    @property
+    def pause_shortcut_error(self) -> str:
+        return self._shortcut.error if self._shortcut is not None and not self._shortcut.registered else ""
+
+    def set_pause_shortcut_enabled(self, enabled: bool) -> None:
+        """Register the pause shortcut or give it back. Writing
+        "pause_shortcut_enabled" any other way does the same (see
+        _follow_settings)."""
+        if bool(enabled) != self.pause_shortcut_enabled:
+            self._store(pause_shortcut_enabled=bool(enabled))
+        else:
+            self._sync_shortcut()  # try again: the system may have refused it
+        self.settings_changed.emit()
+
+    def _sync_shortcut(self) -> None:
+        wanted = self._services and self.pause_shortcut_enabled and not self._shut_down
+        if wanted:
+            if self._shortcut is None:
+                self._shortcut = self._make_shortcut(self.shortcut_pressed.emit)
+            if not self._shortcut.registered:
+                if self._shortcut.start():
+                    log.info("Pause shortcut %s registered", self.pause_shortcut_text)
+                else:
+                    log.warning("Pause shortcut unavailable: %s", self._shortcut.error)
+        elif self._shortcut is not None and self._shortcut.registered:
+            self._shortcut.stop()
+            log.info("Pause shortcut unregistered")
+
+    def _shortcut_diagnostic(self) -> str:
+        text = self.pause_shortcut_text or "none on this system"
+        if not self.pause_shortcut_enabled:
+            return f"{text}, turned off"
+        if self.pause_shortcut_registered:
+            return f"{text}, registered"
+        if self._shortcut is not None and self._shortcut.error:
+            return f"{text}, unavailable: {self._shortcut.error}"
+        return f"{text}, not registered"
+
+    # -- services ------------------------------------------------------------
+    def start_services(self) -> None:
+        """Start what the running app needs beyond the filter: the pause
+        shortcut, the game check, and the look for other mouse utilities
+        (now, every CONFLICT_SCAN_MS, and when the app becomes active).
+        The app calls it once its windows exist; a test's controller doesn't,
+        so it registers nothing system-wide."""
+        if self._services or self._shut_down:
+            return
+        self._services = True
+        self._sync_shortcut()
+        self._sync_game_timer()
+        self._conflict_timer.start()
+        QTimer.singleShot(0, self.refresh_conflicts)
+        try:
+            from PySide6.QtGui import QGuiApplication
+
+            application = QGuiApplication.instance()
+            if application is not None:
+                application.applicationStateChanged.connect(self._on_application_state)
+        except Exception:  # noqa: BLE001 - the timer still refreshes the list
+            log.warning("Couldn't follow the app becoming active", exc_info=True)
+
+    def stop_services(self) -> None:
+        self._conflict_timer.stop()
+        self._game_timer.stop()
+        self._pause_timer.stop()
+        if self._shortcut is not None:
+            self._shortcut.stop()
+        if self._services:
+            self._services = False
+            try:
+                from PySide6.QtGui import QGuiApplication
+
+                application = QGuiApplication.instance()
+                if application is not None:
+                    application.applicationStateChanged.disconnect(self._on_application_state)
+            except (RuntimeError, TypeError):
+                pass
+
+    def _on_application_state(self, state: object) -> None:
+        if state == Qt.ApplicationState.ApplicationActive:
+            self.refresh_conflicts()
+
+    # -- other mouse utilities -------------------------------------------------
+    def conflicts(self) -> list:
+        """The other mouse utilities running (conflicts.Conflict: name, and
+        what it may take over), as last looked."""
+        return list(self._conflicts)
+
+    def refresh_conflicts(self) -> None:
+        if self._shut_down:
+            return
+        try:
+            found = list(self._conflict_scan())
+        except Exception:  # noqa: BLE001 - a note for the user only
+            log.warning("Couldn't look for other mouse utilities", exc_info=True)
+            return
+        if found != self._conflicts:
+            self._conflicts = found
+            log.info(
+                "Other mouse utilities running: %s",
+                ", ".join(conflict.name for conflict in found) or "none",
+            )
+            self.conflicts_changed.emit()
+
+    # -- health and status -----------------------------------------------------
+    def health(self) -> health.Health:
+        """The plain-words verdict on the mouse (see app.health)."""
+        return health.assess(
+            self.wear,
+            self.buttons,
+            self.thresholds,
+            self._conflicts,
+            self.double_click_speeds(),
+            watching=self.active,
+        )
+
+    def apply_suggestion(self, suggestion: health.Suggestion) -> None:
+        """Raise the button's window as health() suggested. Only ever
+        raises: a window already at or above the suggestion is left alone.
+        In Automatic the raised window becomes the button's measured one."""
+        button = as_button(suggestion.button)
+        target = clamp_threshold(suggestion.to_ms)
+        if target <= self.threshold_for(button):
+            return
+        name = button.value
+        own = "automatic_windows" if self.strength == AUTOMATIC else "custom_windows"
+        log.info("Raised the %s button's window to %d ms, as suggested", name, target)
+        self._apply(
+            thresholds={**self.settings["thresholds"], name: target},
+            **{own: {**self.settings[own], name: target}},
+        )
+
+    def status_sentence(self) -> str:
+        """One plain sentence on what the filter is doing, for the menu's
+        status line, the window and the tray's flyout."""
+        if not self.supported():
+            return "Not available on this system."
+        if self.active:
+            today = {}
+            for button in self.buttons:
+                stats = self.wear.daily(button, 1)[-1]
+                today[button] = stats.bounces + stats.dropouts
+            return health.today_sentence(today, self.filtered_total, health.crowded(self.wear, today, self.thresholds))
+        if self.paused:
+            return self._pause_words() + "."
+        if self._suspended and self.settings["fix_enabled"]:
+            return "Paused while you test your mouse."
+        if self.waiting_for_permission:
+            return f"Waiting for {permissions.pane_name()} permission."
+        if self.failure:
+            return f"{self.failure}."
+        if self.settings["fix_enabled"]:
+            return "Not filtering right now."
+        return "Off."
+
     def shutdown(self) -> None:
         self._shut_down = True
+        self.stop_services()
         self._stop_filter()
         self.flush_settings()
         self.flush_stats()
@@ -443,6 +911,14 @@ class AppController(QObject):
                 if button in SIDE_BUTTONS
             ),
             "wheel fix": f"on, {self.wheel_window_ms} ms" if self.wheel_fix else "off",
+            "paused": self._pause_diagnostic(),
+            "auto-pause in games": "on" if self.settings["auto_pause_games"] else "off",
+            "pause shortcut": self._shortcut_diagnostic(),
+            "strength": self.strength,
+            "other mouse utilities": ", ".join(
+                f"{conflict.name} ({', '.join(conflict.takes)})" for conflict in self._conflicts
+            )
+            or ("none" if self._services else "not checked"),
             "excluded apps": len(self.settings["excluded_apps"]),
             "ignored devices": ", ".join(entry["name"] for entry in self.settings["ignored_devices"]) or "none",
             "seen devices": ", ".join(f"{device.name} ({device.kind})" for device in self.seen_devices()) or "none",
@@ -486,7 +962,15 @@ class AppController(QObject):
         threshold = clamp_threshold(value)
         if threshold == self.threshold_for(button):
             return
-        self._apply(deferred=deferred, thresholds={**self.settings["thresholds"], button.value: threshold})
+        # Custom's window boxes are the usual caller. In Automatic (whose
+        # windows the UI doesn't show) only calibration sets a window, and
+        # what it sets is the button's measured window.
+        own = "automatic_windows" if self.strength == AUTOMATIC else "custom_windows"
+        self._apply(
+            deferred=deferred,
+            thresholds={**self.settings["thresholds"], button.value: threshold},
+            **{own: {**self.settings[own], button.value: threshold}},
+        )
 
     def set_buttons(self, buttons: list[Button]) -> None:
         """Choose the buttons to filter, side buttons included. One always
@@ -497,6 +981,9 @@ class AppController(QObject):
         names = [button.value for button in Button if button in chosen] or [Button.LEFT.value]
         if names == self.settings["buttons"]:
             return
+        # In Automatic a button turned on takes Automatic's window for it
+        # (settings.merge), not a window left from before that was never in
+        # effect.
         self._apply(buttons=names)
 
     def set_button_filtered(self, button: Any, filtered: bool) -> None:
@@ -510,12 +997,27 @@ class AppController(QObject):
         self.set_buttons(sorted(current | SIDE_BUTTONS if filtered else current - SIDE_BUTTONS, key=list(Button).index))
 
     def set_calibrated(self, button: Any, value: bool = True) -> None:
+        """Mark the button's window as calibrated (the window it has now is
+        its measured one, which Automatic uses), or forget that (Automatic
+        goes back to the default for it). apply_calibration() does the whole
+        of Test and Tune's Apply in one step."""
         name = as_button(button).value
         names = [other for other in self.settings["calibrated_buttons"] if other != name]
+        measured = dict(self.settings["automatic_windows"])
+        thresholds = dict(self.settings["thresholds"])
         if value:
             names.append(name)
-        if sorted(names) != sorted(self.settings["calibrated_buttons"]):
-            self._store(calibrated_buttons=names)
+            measured[name] = thresholds[name]
+        else:
+            measured.pop(name, None)
+            if self.strength == AUTOMATIC:
+                thresholds[name] = DEFAULT_THRESHOLD_MS
+        if sorted(names) == sorted(self.settings["calibrated_buttons"]) and measured == self.settings["automatic_windows"]:
+            return
+        if thresholds != self.settings["thresholds"]:
+            self._apply(calibrated_buttons=names, automatic_windows=measured, thresholds=thresholds)
+        else:
+            self._store(calibrated_buttons=names, automatic_windows=measured)
             self.settings_changed.emit()
 
     def set_wheel_fix(self, enabled: bool, window_ms: Optional[int] = None, *, deferred: bool = False) -> None:
@@ -669,7 +1171,21 @@ class AppController(QObject):
         self._store(filtered_total=0)
         self.settings_changed.emit()
 
+    def _follow_settings(self, before: dict[str, Any]) -> None:
+        """What a change to the 1.1 settings needs beyond the filter's
+        configuration, however it was written (the UI writes some keys
+        straight through _apply): the pause shortcut registered or given
+        back, and the game check started, stopped or ended."""
+        if self._shut_down:
+            return
+        if before.get("pause_shortcut_enabled") != self.settings["pause_shortcut_enabled"]:
+            self._sync_shortcut()
+        if before.get("auto_pause_games") != self.settings["auto_pause_games"]:
+            self._sync_game_timer()
+            self.check_game()  # pauses now for a game in front, or ends the pause
+
     def _store(self, **values: object) -> None:
+        before = self.settings
         try:
             # Merged onto what the app holds, never onto a fresh read of the
             # file: a read that fails for a moment would otherwise reset
@@ -684,11 +1200,13 @@ class AppController(QObject):
             self._unsaved = False
             if self._save_timer is not None:
                 self._save_timer.stop()
+        self._follow_settings(before)
 
     def _store_later(self, **values: object) -> None:
         """_store, with the write left until the changes stop for
         SAVE_DELAY_MS (any other write, flush_settings and shutdown take
         what is held too). The values are in `settings` at once."""
+        before = self.settings
         self.settings = settings_store.merge(values, self.settings)
         self._unsaved = True
         if self._save_timer is None:
@@ -697,6 +1215,7 @@ class AppController(QObject):
             self._save_timer.setInterval(SAVE_DELAY_MS)
             self._save_timer.timeout.connect(self.flush_settings)
         self._save_timer.start()
+        self._follow_settings(before)
 
     def flush_settings(self) -> None:
         """Write the changes _store_later is holding, if there are any."""

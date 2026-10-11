@@ -26,6 +26,24 @@ OLD_DEFAULT_THRESHOLD_MS = 60
 WHEEL_MIN_MS = 10
 WHEEL_MAX_MS = 150
 
+#: How the buttons' windows are chosen (1.1). AUTOMATIC: the app picks each
+#: one, a measured window where there is one ("automatic_windows": from Test
+#: and Tune, or a suggestion the user applied) and DEFAULT_THRESHOLD_MS
+#: otherwise. CUSTOM: the user's own per-button windows ("custom_windows",
+#: which hold only the windows the user set; any other button has its
+#: automatic window).
+#:
+#: "thresholds" stays the windows in effect, whichever it is: the filter, and
+#: a copy from before 1.1 after a downgrade, read only that.
+AUTOMATIC, CUSTOM = "automatic", "custom"
+STRENGTHS = (AUTOMATIC, CUSTOM)
+
+#: The fastest deliberate double-click Test and Tune measured, per button
+#: ("double_click_ms", release to press). A suggestion to raise a window
+#: never goes above half of it.
+DOUBLE_CLICK_MIN_MS = 1
+DOUBLE_CLICK_MAX_MS = 5000
+
 DEFAULTS: dict[str, Any] = {
     "version": SCHEMA_VERSION,
     # Per button name, in milliseconds.
@@ -63,6 +81,18 @@ DEFAULTS: dict[str, Any] = {
     "update_attempt_count": 0,
     # Windows: the "still running in the notification area" hint was shown.
     "tray_hint_shown": False,
+    # 1.1: how the windows are chosen (see AUTOMATIC and CUSTOM), the
+    # measured windows Automatic uses, and the user's own for Custom.
+    # A file without "strength" (1.0) gets all three from its windows: see
+    # _strength().
+    "strength": AUTOMATIC,
+    "automatic_windows": {},
+    "custom_windows": {},
+    "double_click_ms": {},
+    # Pause filtering while a full-screen game is in front (gamemode).
+    "auto_pause_games": False,
+    # The global shortcut that pauses and resumes (pause.Shortcut).
+    "pause_shortcut_enabled": True,
 }
 
 #: How often a settings file that can't be opened is tried again at launch.
@@ -120,6 +150,76 @@ def _button_names(values: Any) -> list[str]:
 def _thresholds(values: Any) -> dict[str, int]:
     stored = values if isinstance(values, dict) else {}
     return {button.value: milliseconds(stored.get(button.value), DEFAULT_THRESHOLD_MS) for button in Button}
+
+
+def _windows(values: Any, low: int = MIN_THRESHOLD_MS, high: int = MAX_THRESHOLD_MS) -> dict[str, int]:
+    """{button name: whole ms} with only known buttons and usable numbers."""
+    stored = values if isinstance(values, dict) else {}
+    windows = {}
+    for button in Button:
+        value = milliseconds(stored.get(button.value), -1, low, high)
+        if value > 0 and button.value in stored:
+            windows[button.value] = value
+    return windows
+
+
+def automatic_window(values: dict[str, Any], name: str) -> int:
+    """The window Automatic gives the button `name`: its measured one, or
+    the default."""
+    return int(values.get("automatic_windows", {}).get(name, DEFAULT_THRESHOLD_MS))
+
+
+def custom_window(values: dict[str, Any], name: str) -> int:
+    """The window Custom gives the button `name`: the user's own, or else
+    its automatic one."""
+    return int(values.get("custom_windows", {}).get(name, automatic_window(values, name)))
+
+
+def windows_for(values: dict[str, Any], strength: str) -> dict[str, int]:
+    """Every button's window under `strength`."""
+    pick = automatic_window if strength == AUTOMATIC else custom_window
+    return {button.value: pick(values, button.value) for button in Button}
+
+
+def _strength(stored: dict[str, Any], merged: dict[str, Any]) -> None:
+    """Settle "strength", "automatic_windows" and "custom_windows" against
+    the windows in effect ("thresholds"), which always win: they are what
+    the filter used, and what a copy from before 1.1 changes.
+
+    * A file from 1.0 (no "strength"): each calibrated button's window is its
+      measured one; any other window that isn't the default is the user's
+      own. It is Custom only when a button being filtered has a window that
+      Automatic wouldn't give it. Nothing changes a window. (The owner's:
+      left 59 and right 25, both calibrated and filtered, the rest 59 from
+      0.x and not filtered: Automatic, every window kept.)
+    * A later file: a calibrated button with no measured window (calibrated
+      by a 1.0 copy after a downgrade) takes its window as one. Automatic
+      with a filtered button at another window (a downgraded copy moved it)
+      becomes Custom; Custom takes in any window changed behind its back.
+    """
+    thresholds = merged["thresholds"]
+    automatic = _windows(merged.get("automatic_windows"))
+    for name in merged["calibrated_buttons"]:
+        automatic.setdefault(name, thresholds[name])
+    merged["automatic_windows"] = automatic
+    strength = stored.get("strength")
+    if strength not in STRENGTHS:
+        merged["custom_windows"] = {
+            name: value for name, value in thresholds.items() if value != automatic_window(merged, name)
+        }
+        strength = CUSTOM if any(
+            thresholds[name] != automatic_window(merged, name) for name in merged["buttons"]
+        ) else AUTOMATIC
+    else:
+        merged["custom_windows"] = _windows(merged.get("custom_windows"))
+    if strength == AUTOMATIC:
+        if any(thresholds[name] != automatic_window(merged, name) for name in merged["buttons"]):
+            strength = CUSTOM
+    if strength == CUSTOM:
+        for name, value in thresholds.items():
+            if value != custom_window(merged, name):
+                merged["custom_windows"][name] = value
+    merged["strength"] = strength
 
 
 def _named_keys(values: Any) -> list[dict[str, str]]:
@@ -195,8 +295,19 @@ def coerce(values: dict[str, Any]) -> dict[str, Any]:
     # What an older copy reads after a downgrade: the left button's.
     merged["threshold_ms"] = merged["thresholds"][Button.LEFT.value]
     merged["calibrated"] = Button.LEFT.value in merged["calibrated_buttons"]
-    for flag in ("fix_enabled", "start_at_login", "start_minimized", "auto_update", "tray_hint_shown", "wheel_fix"):
+    for flag in (
+        "fix_enabled", "start_at_login", "start_minimized", "auto_update", "tray_hint_shown", "wheel_fix",
+        "auto_pause_games", "pause_shortcut_enabled",
+    ):
         merged[flag] = bool(merged.get(flag))
+    speeds = merged.get("double_click_ms")
+    # A speed of nothing (or less) was never measured.
+    positive = {
+        name: value for name, value in (speeds.items() if isinstance(speeds, dict) else ())
+        if milliseconds(value, 0, 0, DOUBLE_CLICK_MAX_MS) > 0
+    }
+    merged["double_click_ms"] = _windows(positive, DOUBLE_CLICK_MIN_MS, DOUBLE_CLICK_MAX_MS)
+    _strength(migrated, merged)
     if "auto_check" in values:
         merged["auto_check"] = bool(values["auto_check"])
     else:
@@ -363,11 +474,49 @@ def _legacy_writes(values: dict[str, Any], base: dict[str, Any]) -> dict[str, An
     return values
 
 
+def _strength_writes(values: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+    """What a write means for the windows in effect ("thresholds"), so that
+    every way of writing these keys (the controller's own methods, or the UI
+    writing "strength" or "buttons" directly) leaves them right:
+
+    * "strength" changed: every button takes that strength's window (each
+      strength keeps its own, so switching back finds them as they were);
+    * otherwise, under Automatic, each filtered button has Automatic's
+      window: a button turned on takes its measured window or the default,
+      never a window left from before that was never in effect.
+
+    A write that sets "thresholds" itself is taken as it is: those windows
+    are deliberate (calibration, a window box, an applied suggestion), and
+    the writer keeps "automatic_windows" or "custom_windows" in step."""
+    if "thresholds" in values:
+        return values
+    combined = {**current, **values}
+    strength = combined.get("strength")
+    if strength not in STRENGTHS:
+        return values
+    own = {
+        **combined,
+        "automatic_windows": _windows(combined.get("automatic_windows")),
+        "custom_windows": _windows(combined.get("custom_windows")),
+    }
+    thresholds = _thresholds(current.get("thresholds"))
+    if strength != current.get("strength"):
+        wanted = windows_for(own, strength)
+    elif strength == AUTOMATIC:
+        wanted = {name: automatic_window(own, name) for name in _button_names(combined.get("buttons"))}
+    else:
+        return values
+    if all(thresholds.get(name) == window for name, window in wanted.items()):
+        return values
+    return {**values, "thresholds": {**thresholds, **wanted}}
+
+
 def merge(values: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
     """The settings `current` becomes with `values` written into it, the
     same whether or not the file can be written."""
     if _version(current) >= SCHEMA_VERSION:
         values = _legacy_writes(values, current)
+        values = _strength_writes(values, current)
     return coerce({**current, **values})
 
 
