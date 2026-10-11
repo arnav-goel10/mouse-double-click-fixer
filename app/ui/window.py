@@ -1,19 +1,32 @@
-"""The main window: a sidebar and its panes, in the platform's own idiom."""
+"""The app's window, in each platform's own idiom.
+
+macOS: a Settings window with a toolbar of panes (General, Exceptions,
+History, About), titled with the pane shown, sized to it, with the zoom
+button dimmed and the last pane restored; the menu bar menu is where the app
+is used day to day.
+Windows: one window with a left NavigationView (Home, Exceptions, History,
+and Settings pinned at the bottom) on Mica, as Windows Settings is.
+
+Test and Tune is a task, not a setting, so it has a window of its own
+(tune.py); the macOS first run too (first_run.py). This window still owns
+the filter's life: the permission poll, the retries at login, the health
+check and the pause while Test and Tune measures.
+"""
 
 from __future__ import annotations
 
 import logging
 from typing import Optional
 
-from PySide6.QtCore import QByteArray, QEvent, QRect, QTimer, Qt, Signal
+from PySide6.QtCore import QByteArray, QEvent, QPoint, QTimer, Qt, Signal
 from PySide6.QtGui import QGuiApplication, QPainter
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QFrame,
     QHBoxLayout,
     QMessageBox,
-    QProgressBar,
     QPushButton,
     QScrollArea,
     QStackedWidget,
@@ -24,58 +37,38 @@ from PySide6.QtWidgets import (
 
 from .. import DISPLAY_NAME, __version__, diagnostics, notices, permissions, startup
 from .. import settings as settings_store
-from ..core import SIDE_BUTTONS, Button
 from ..controller import AppController
-from ..core import (
-    BOUNCE_CANDIDATE_MS,
-    MAX_THRESHOLD_MS,
-    MIN_THRESHOLD_MS,
-    REQUIRED_DOUBLE_CLICKS,
-    REQUIRED_SINGLE_CLICKS,
-    Calibrator,
-    ClickEvent,
-)
-from ..inputs import as_button, button_name
-from . import icons, native
+from ..core import MAX_THRESHOLD_MS, MIN_THRESHOLD_MS, Button, ClickEvent
+from ..inputs import button_name
+from . import icons, menus, native, ui_state
 from .base import (
     COLUMN_MAX,
     COLUMN_MIN,
     Page,
     card_icon,
-    centred_column,
     controls,
     label,
-    link,
     make_button,
-    make_link_label,
     set_primary,
 )
-from .panes import AppsPage, DevicesPage, HistoryPage
+from .fluent import Expander, InfoBar, NavigationView
+from .panes import ExceptionsPage, HistoryPage
 from .theme import IS_MAC, current_look
+from .toolbar_mac import NativeToolbar, PaneBar
+from .tune import TuneWindow
 from .widgets import (
     AppIconView,
-    ClickPad,
-    GapTimeline,
+    CheckRow,
     Row,
-    Sidebar,
     Switch,
     SymbolView,
     TextLabel,
-    ValueLabel,
     look,
     pop_up_button,
     set_look,
 )
 
-# Older name, kept for callers.
-_button = make_button
-
 log = logging.getLogger(__name__)
-
-#: The longest release-to-press pause that still ends a double-click while
-#: calibrating, whatever the system's own setting (macOS allows 5 s, which
-#: would count two separate slow clicks as a double-click).
-PAIR_WINDOW_MAX_MS = 1000.0
 
 #: A background launch whose filter fails to start tries again this many
 #: seconds later: at login the window server or the permission database can
@@ -87,30 +80,61 @@ HEALTH_CHECK_MS = 5000
 #: Room left around a first-launch window for its frame and title bar.
 FRAME_ALLOWANCE = (16, 48)
 
+#: The macOS Settings window's width; its height follows the pane.
+SETTINGS_WIDTH = 620
+#: Room the Settings window leaves for the menu bar, its title bar and
+#: toolbar, and the Dock.
+SETTINGS_SCREEN_ROOM = 150
+
 DIAGNOSTICS_DETAIL = "Version, settings and the recent log, for a bug report. Never your clicks."
 ACKNOWLEDGEMENTS_DETAIL = "Qt, Python and the other software it is built on, with their licences."
 
-PAGES = [
-    ("filter", "Bounce Filter"),
-    ("test", "Test"),
-    ("calibrate", "Calibrate"),
-    ("history", "History"),
-    ("apps", "Apps"),
-    ("devices", "Devices"),
-    ("general", "General"),
-]
+
+def privacy_line() -> str:
+    """What the app sends over the network, in a sentence."""
+    computer = "Mac" if IS_MAC else "PC"
+    return (
+        f"{DISPLAY_NAME} goes online only to check GitHub for updates. "
+        f"Your clicks never leave this {computer}, and there is no account or tracking."
+    )
 
 
-# -- panes -----------------------------------------------------------------------
+def mac_pages() -> list[tuple[str, str]]:
+    return [("general", "General"), ("exceptions", "Exceptions"), ("history", "History"), ("about", "About")]
 
-#: Under the button rows.
-WINDOW_NOTE = (
-    "The window is how soon after a release a press counts as bounce. Most worn switches "
-    "bounce within 30 ms. Back and forward presses are never held back: a repeat within "
-    "the window is dropped."
-)
+
+def windows_pages() -> list[tuple[str, str]]:
+    return [("home", "Home"), ("exceptions", "Exceptions"), ("history", "History"), ("settings", "Settings")]
+
+
+def pages() -> list[tuple[str, str]]:
+    """The panes, in order, for this platform: (key, title)."""
+    return mac_pages() if IS_MAC else windows_pages()
+
+
+#: Either platform's name for the same pane, so callers can name one.
+PAGE_ALIASES = {"general": "home", "home": "general", "about": "settings", "settings": "about"}
+
+#: What ui_state keeps the last Settings pane under (macOS).
+LAST_PANE = "settings_pane"
+
+
+def updates_page_key() -> str:
+    """The pane with Software Update."""
+    return "about" if IS_MAC else "settings"
+
+
+# -- shared controls ----------------------------------------------------------------
+
 WHEEL_DETAIL = "Drops a notch that jumps the wrong way. Smooth scrolling from trackpads and precision touchpads is left alone."
-
+AUTOMATIC_NOTE = "Automatic uses what Test and Tune measured for each button, or a setting that suits most mice."
+CUSTOM_NOTE = (
+    "Each number is how soon after letting go a second click is ignored. Back and forward are never "
+    "held back: a repeat that soon is dropped."
+)
+#: The Strength card's one line on Windows; the notes above sit inside it.
+AUTOMATIC_SHORT = "Set by Test and tune, or what suits most mice."
+CUSTOM_SHORT = "Your own window for each button."
 
 #: The windows a button's pop-up offers, in milliseconds: the default (46)
 #: and enough steps across the allowed range to choose by. A window outside
@@ -122,9 +146,8 @@ WHEEL_WINDOWS = (10, 20, 30, 40, 50, 60, 70, 80, 100, 120, 150)
 
 class WindowPicker(QComboBox):
     """A window in milliseconds, chosen from a pop-up of values: a native
-    pop-up button on macOS (as System Settings uses for a choice like this)
-    and a ComboBox on Windows 11. `valueChanged` carries every change, the
-    user's and the code's, as a spin box's did."""
+    pop-up button on macOS and a ComboBox on Windows 11. `valueChanged`
+    carries every change, the user's and the code's, as a spin box's did."""
 
     valueChanged = Signal(int)
 
@@ -137,7 +160,7 @@ class WindowPicker(QComboBox):
         self.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
         self._fill(self._presets)
         self.currentIndexChanged.connect(self._follow)
-        # The Filter pane scrolls, and these sit where the pointer passes.
+        # The pane scrolls, and these sit where the pointer passes.
         pop_up_button(self)
 
     def _fill(self, values) -> None:
@@ -183,17 +206,124 @@ def window_box(low: int, high: int, accessible_name: str, presets: tuple[int, ..
     return WindowPicker(presets, low, high, accessible_name)
 
 
-class FilterPage(Page):
-    #: The user asked to calibrate a button (carries the Button).
-    calibrate_requested = Signal(object)
+def set_checked(control: QWidget, value: bool) -> None:
+    """Show a state from code, without an animation or a `clicked`."""
+    if isinstance(control, Switch):
+        control.setChecked(bool(value), animate=False)
+    else:
+        control.setChecked(bool(value))
+
+
+class LoginControl:
+    """Open at login (macOS: a checkbox) or Start with Windows (a toggle),
+    which the system can also switch off behind the app's back."""
+
+    def __init__(self, controller: AppController, owner: QWidget) -> None:
+        self.controller = controller
+        self.owner = owner
+        self.mac = IS_MAC
+        # Shown when the user switched the app off in System Settings › Login
+        # Items: only there can it be switched back on.
+        self.items_button = make_button("Open Login Items…")
+        self.items_button.clicked.connect(lambda: startup.open_login_items_settings())
+        self.items_button.setVisible(False)
+        if IS_MAC:
+            self.row = CheckRow("Open at login", "Open at login", trailing=self.items_button)
+            self.toggle = self.row.check
+        else:
+            self.toggle = Switch(accessible_name="Start with Windows")
+            self.row = Row("Start with Windows", self.detail(startup.ON), controls(self.items_button, self.toggle),
+                           card_icon("power"))
+        self.toggle.clicked.connect(self._on_login)
+
+    @staticmethod
+    def detail(state: str) -> str:
+        if state == startup.BLOCKED:
+            if IS_MAC:
+                return "Turned off in System Settings. Turn it on again in Login Items."
+            return "Turned off in Task Manager › Startup apps. Turn it on here to allow it again."
+        return "" if IS_MAC else "Starts in the notification area when you sign in."
+
+    def refresh(self) -> None:
+        set_checked(self.toggle, bool(self.controller.settings["start_at_login"]))
+        state = self.controller.login_item_state
+        self.row.set_detail(self.detail(state))
+        # On macOS only Login Items can switch it back on; the box here
+        # would tick and untick again.
+        blocked_by_system = self.mac and state == startup.BLOCKED
+        self.items_button.setVisible(blocked_by_system)
+        self.toggle.setEnabled(not blocked_by_system)
+
+    def _on_login(self, checked: bool) -> None:
+        error = self.controller.set_start_at_login(checked)
+        if error:
+            set_checked(self.toggle, not checked)
+            QMessageBox.warning(self.owner, "Couldn’t change the login item", error)
+            return
+        # Still off if macOS keeps it switched off in Login Items; say so.
+        self.refresh()
+
+
+class PauseControls:
+    """The pause shortcut, and pausing while a full-screen game is in front."""
+
+    def __init__(self, controller: AppController) -> None:
+        self.controller = controller
+        shortcut = controller.pause_shortcut_text
+        self.shortcut_toggle = Switch(accessible_name="Pause shortcut")
+        self.shortcut_row = Row(
+            "Pause shortcut",
+            f"{shortcut} pauses filtering for {menus.PAUSE_MINUTES} minutes, and resumes it.",
+            self.shortcut_toggle,
+            card_icon("keyboard"),
+        )
+        # A system with no shortcut of its own has nothing to switch.
+        self.shortcut_row.setVisible(bool(shortcut))
+        self.shortcut_toggle.clicked.connect(lambda checked: controller.set_pause_shortcut_enabled(bool(checked)))
+        self.games_toggle = Switch(accessible_name="Pause during full-screen games")
+        games_detail = (
+            "While a game fills the screen with Game Mode on." if IS_MAC
+            else "While a game runs full screen or Game Mode is on."
+        )
+        self.games_row = Row("Pause during full-screen games", games_detail, self.games_toggle, card_icon("game"))
+        self.games_toggle.clicked.connect(lambda checked: controller.set_auto_pause_games(bool(checked)))
+
+    @property
+    def rows(self) -> list[QWidget]:
+        return [self.shortcut_row, self.games_row]
+
+    def refresh(self) -> None:
+        settings = self.controller.settings
+        set_checked(self.shortcut_toggle, bool(settings.get("pause_shortcut_enabled", True)))
+        set_checked(self.games_toggle, bool(settings.get("auto_pause_games", False)))
+
+
+# -- panes -----------------------------------------------------------------------
+
+class HomePage(Page):
+    """General (macOS) / Home (Windows): the filter's switch and what it is
+    doing, the buttons it covers, its strength, Test and Tune, and the wheel
+    fix. On macOS also the pause options, Open at login and the menu bar
+    icon, which Windows keeps on its Settings page."""
+
+    #: Test and Tune, for a button or for any (None).
+    tune_requested = Signal(object)
+    #: macOS: the "Show in menu bar" switch.
+    menu_bar_toggled = Signal(bool)
 
     def __init__(self, controller: AppController, parent: Optional[QWidget] = None) -> None:
-        super().__init__("Bounce Filter", parent)
+        super().__init__("General" if IS_MAC else "Home", parent)
         self.controller = controller
+        # The layout it was built in, which its refreshes follow.
+        self.mac = IS_MAC
         self._loading = False
+        self.info_bar: Optional[InfoBar] = None
+        if not IS_MAC:
+            self._first_run_bar()
 
         self.permission = self.section()
-        self.permission_button = _button("Open Settings…")
+        self.permission_button = make_button("Open Settings…")
+        self.permission_button.setAccessibleName(f"Open {permissions.pane_name()} settings")
         # The same path as the switch: once access is granted, the filter starts.
         self.permission_button.clicked.connect(lambda: self.window().request_filter(True))
         self.permission_row = self.permission.add(
@@ -205,56 +335,172 @@ class FilterPage(Page):
             )
         )
         self.permission_gap = QWidget()
-        self.permission_gap.setFixedHeight(20)
+        self.permission_gap.setFixedHeight(20 if IS_MAC else 4)
         self.body.addWidget(self.permission_gap)
 
-        main = self.section()
+        hero = self.section()
         self.switch = Switch(accessible_name="Bounce filter")
-        self.status_row = main.add(Row("Bounce Filter", "", self.switch, AppIconView(34 if IS_MAC else 32)))
+        self.status_row = hero.add(Row(label("Bounce Filter"), " ", self.switch, AppIconView(36 if IS_MAC else 32)))
 
-        # One row per button: its window, a Calibrate link and its switch.
-        self.header("Buttons")
-        buttons = self.section()
-        self.button_switches: dict[Button, Switch] = {}
-        self.window_boxes: dict[Button, WindowPicker] = {}
-        self.button_rows: dict[Button, Row] = {}
-        for button in Button:
-            name = button_name(button)
-            box = window_box(MIN_THRESHOLD_MS, MAX_THRESHOLD_MS, f"{name} button window in milliseconds")
-            box.valueChanged.connect(lambda value, which=button: self._on_window(which, value))
-            switch = Switch(accessible_name=f"Filter the {name.lower()} button")
-            switch.clicked.connect(self._on_buttons)
-            row = Row(f"{name} button", " ", controls(box, switch), card_icon("mouse"))
-            make_link_label(row.detail)
-            # Five links all read "Calibrate"; a screen reader says whose.
-            row.detail.setAccessibleName(f"Calibrate the {name.lower()} button")
-            row.detail.linkActivated.connect(lambda _href, which=button: self.calibrate_requested.emit(which))
-            buttons.add(row)
-            self.button_switches[button] = switch
-            self.window_boxes[button] = box
-            self.button_rows[button] = row
-        self.window_note = self.footnote(WINDOW_NOTE)
+        # Another mouse utility that may take clicks over first.
+        self.conflict_gap = QWidget()
+        self.conflict_gap.setFixedHeight(10 if IS_MAC else 4)
+        self.body.addWidget(self.conflict_gap)
+        self.conflicts = self.section()
+        self._conflicts_shown: Optional[list] = None
 
-        self.header("Scroll wheel")
+        if not IS_MAC:
+            # Windows: the task as a card with an accent button.
+            self.gap(4)
+            tune_card = self.section()
+            self.test_button = make_button("Test and Tune", default=True)
+            self.test_button.setAccessibleName("Test and tune your mouse")
+            self.test_button.clicked.connect(lambda: self.tune_requested.emit(None))
+            tune_card.add(
+                Row("Test your mouse", "Find out whether it clicks twice on its own, and set the right strength.",
+                    self.test_button, card_icon("tune"))
+            )
+
+        self._buttons_section()
+        self._strength_section()
+
+        self.header("Other fixes" if not IS_MAC else "Other Fixes")
         wheel = self.section()
-        self.wheel_box = window_box(
-            settings_store.WHEEL_MIN_MS, settings_store.WHEEL_MAX_MS, "Wheel reversal window in milliseconds", WHEEL_WINDOWS
-        )
-        self.wheel_box.valueChanged.connect(self._on_wheel_window)
         self.wheel_switch = Switch(accessible_name="Fix scroll-wheel reversals")
         self.wheel_switch.clicked.connect(self._on_wheel)
-        self.wheel_row = wheel.add(
-            Row("Fix wheel reversals", WHEEL_DETAIL, controls(self.wheel_box, self.wheel_switch), card_icon("wheel"))
-        )
+        self.wheel_row = wheel.add(Row("Fix wheel reversals", WHEEL_DETAIL, self.wheel_switch, card_icon("wheel")))
 
-        self.header("Activity")
-        activity = self.section()
-        self.total_value = ValueLabel()
-        self.session_value = ValueLabel()
-        activity.add(Row("Blocked in total", "", self.total_value, card_icon("chart")))
-        activity.add(Row("Blocked since launch", "", self.session_value, card_icon("chart")))
+        self.pause: Optional[PauseControls] = None
+        self.login: Optional[LoginControl] = None
+        self.menu_bar_switch: Optional[Switch] = None
+        if IS_MAC:
+            self.header("Pausing")
+            pausing = self.section()
+            self.pause = PauseControls(controller)
+            for row in self.pause.rows:
+                pausing.add(row)
+
+            self.gap(20)
+            launch = self.section()
+            self.login = LoginControl(controller, self)
+            launch.add(self.login.row)
+            self.menu_bar_switch = Switch(accessible_name="Show in menu bar")
+            self.menu_bar_switch.clicked.connect(lambda checked: self.menu_bar_toggled.emit(bool(checked)))
+            self.menu_bar_row = launch.add(Row("Show in menu bar", "", self.menu_bar_switch))
+            if permissions.macos_major() >= 26:
+                self.menu_bar_note = self.footnote(
+                    f"If the icon doesn’t appear, allow {DISPLAY_NAME} in System Settings › Menu Bar. "
+                    "Opening the app again always opens Settings."
+                )
+            else:
+                self.menu_bar_note = self.footnote("Opening the app again always opens Settings.")
         self.body.addStretch(1)
 
+    # -- sections ---------------------------------------------------------------
+    def _first_run_bar(self) -> None:
+        """Windows, until closed once: where the icon lives, and a nudge to
+        Test and tune."""
+        self.info_bar = InfoBar(
+            "Pin the icon to the taskbar corner so it’s always visible",
+            "Select Show hidden icons (^) on the taskbar and drag the mouse icon next to the clock. "
+            "Then test your mouse below to set the right strength.",
+        )
+        self.info_bar.closed.connect(self.controller.note_tray_hint_shown)
+        self.body.addWidget(self.info_bar)
+        self.info_gap = QWidget()
+        self.info_gap.setFixedHeight(12)
+        self.body.addWidget(self.info_gap)
+
+    def _buttons_section(self) -> None:
+        self.button_checks: dict[Button, QCheckBox] = {}
+        self.button_rows: dict[Button, CheckRow] = {}
+        if IS_MAC:
+            self.header("Buttons")
+            section = self.section()
+            for button in Button:
+                name = button_name(button)
+                row = section.add(CheckRow(name, f"Filter the {name.lower()} button"))
+                row.check.clicked.connect(self._on_buttons)
+                self.button_checks[button] = row.check
+                self.button_rows[button] = row
+            return
+        # Windows: one card, its checkboxes under its header.
+        self.gap(4)
+        section = self.section()
+        card = QWidget()
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(0, 0, 0, 8)
+        layout.setSpacing(0)
+        self.buttons_row = Row("Buttons", "Tick each button that clicks twice on its own.", None, card_icon("mouse"))
+        layout.addWidget(self.buttons_row)
+        for button in Button:
+            name = button_name(button)
+            row = CheckRow(name, f"Filter the {name.lower()} button")
+            row.setContentsMargins(36, 0, 0, 0)
+            row.setMinimumHeight(36)
+            row.check.clicked.connect(self._on_buttons)
+            layout.addWidget(row)
+            self.button_checks[button] = row.check
+            self.button_rows[button] = row
+        section.add(card)
+
+    def _strength_section(self) -> None:
+        self.strength_picker = QComboBox()
+        self.strength_picker.addItem("Automatic", menus.AUTOMATIC)
+        self.strength_picker.addItem("Custom", menus.CUSTOM)
+        self.strength_picker.setAccessibleName("Strength")
+        pop_up_button(self.strength_picker)
+        self.strength_picker.activated.connect(self._on_strength)
+        self.window_boxes: dict[Button, WindowPicker] = {}
+        self.window_rows: dict[Button, Row] = {}
+        rows = []
+        for button in Button:
+            name = button_name(button)
+            box = window_box(MIN_THRESHOLD_MS, MAX_THRESHOLD_MS, f"{name} button: ignore a second click within")
+            box.valueChanged.connect(lambda value, which=button: self._on_window(which, value))
+            row = Row(f"{name} button", "", box)
+            self.window_boxes[button] = box
+            self.window_rows[button] = row
+            rows.append(row)
+        self.wheel_box = window_box(
+            settings_store.WHEEL_MIN_MS, settings_store.WHEEL_MAX_MS, "Scroll wheel: drop a reversal within", WHEEL_WINDOWS
+        )
+        self.wheel_box.valueChanged.connect(self._on_wheel_window)
+        self.wheel_window_row = Row("Scroll wheel", "", self.wheel_box)
+        rows.append(self.wheel_window_row)
+        self.strength_expander: Optional[Expander] = None
+        self.strength_note: Optional[TextLabel] = None
+        if IS_MAC:
+            self.gap(20)
+            section = self.section()
+            self.strength_row = section.add(Row("Strength", "", self.strength_picker))
+            for row in rows:
+                section.add(row)
+            self.strength_note = self.footnote("")
+            actions = QHBoxLayout()
+            actions.setContentsMargins(0, 12, 0, 0)
+            actions.addStretch(1)
+            self.test_button = make_button("Test and Tune…")
+            self.test_button.setAccessibleName("Test and tune your mouse")
+            self.test_button.clicked.connect(lambda: self.tune_requested.emit(None))
+            actions.addWidget(self.test_button)
+            self.body.addLayout(actions)
+            return
+        self.gap(4)
+        self.strength_expander = Expander(
+            "Strength", AUTOMATIC_SHORT, self.strength_picker, card_icon("stopwatch"), "Strength for each button"
+        )
+        self.strength_row = self.strength_expander.header
+        for row in rows:
+            self.strength_expander.add(row)
+        self.strength_note = TextLabel("", "caption", "secondary")
+        self.strength_note.setWordWrap(True)
+        self.strength_expander.add(self.strength_note)
+        # Lined up with the rows' titles, under the last of them.
+        self.strength_note.setContentsMargins(52, 10, 16, 14)
+        self.body.addWidget(self.strength_expander)
+
+    # -- state ------------------------------------------------------------------
     def refresh(self, granted: bool, waiting_for_permission: bool = False) -> None:
         self._loading = True
         try:
@@ -262,61 +508,109 @@ class FilterPage(Page):
         finally:
             self._loading = False
 
+    def status_sentence(self) -> str:
+        """The hero row's sentence: the controller's, with a failure's full
+        detail, since the menus' line only had room for its title."""
+        controller = self.controller
+        if controller.failure and not controller.active and not controller.waiting_for_permission:
+            # Kept here too: the failure may have happened while the window
+            # was closed, with only the menu's status line to show it.
+            return f"{controller.failure}. {controller.failure_detail}".strip()
+        return controller.status_sentence()
+
     def _refresh(self, granted: bool, waiting_for_permission: bool) -> None:
         controller = self.controller
         # The user's choice, as the menus show it: on while it waits for
-        # permission or calibration has it paused.
+        # permission, is paused, or Test and Tune has it paused.
         self.switch.setChecked(controller.wanted, animate=self.isVisible())
-        if controller.suspended and controller.settings["fix_enabled"]:
-            self.status_row.set_detail("Paused for calibration.")
-        elif waiting_for_permission:
-            self.status_row.set_detail(f"Waiting for {permissions.pane_name()} permission.")
-        elif controller.failure and not controller.active:
-            # Kept here too: the failure may have happened while the window
-            # was closed, with only the menu's status line to show it.
-            self.status_row.set_detail(f"{controller.failure}. {controller.failure_detail}".strip())
-        else:
-            self.status_row.set_detail("Ignores the extra click a worn switch adds.")
+        self.status_row.set_detail(self.status_sentence())
         filtered = set(controller.buttons)
         for button in Button:
-            on = button in filtered
-            self.button_switches[button].setChecked(on, animate=False)
-            box = self.window_boxes[button]
-            box.setValue(controller.threshold_for(button))
-            # A window only means something for a button being filtered.
-            box.setEnabled(on)
-            state = "Calibrated." if controller.is_calibrated(button) else "Not calibrated."
-            self.button_rows[button].set_detail(f"{state} {link(label('Calibrate'), 'calibrate')}")
-            self.button_rows[button].detail.setAccessibleDescription(state)
-        self.wheel_switch.setChecked(controller.wheel_fix, animate=False)
+            set_checked(self.button_checks[button], button in filtered)
+            calibrated = controller.is_calibrated(button)
+            self.button_rows[button].set_value("Calibrated" if calibrated else "")
+            self.button_checks[button].setAccessibleDescription("Calibrated" if calibrated else "")
+        custom = menus.strength(controller) == menus.CUSTOM
+        self.strength_picker.setCurrentIndex(1 if custom else 0)
+        for button in Button:
+            self.window_boxes[button].setValue(controller.threshold_for(button))
+            row = self.window_rows[button]
+            if self.mac:
+                # Custom shows the filtered buttons' windows; Automatic none.
+                row.setVisible(custom and button in filtered)
+            else:
+                row.setVisible(button in filtered)
+                self.window_boxes[button].setEnabled(custom)
         self.wheel_box.setValue(controller.wheel_window_ms)
-        self.wheel_box.setEnabled(controller.wheel_fix)
-        self.total_value.setText(f"{controller.filtered_total:,}")
-        self.session_value.setText(f"{controller.session_filtered:,}")
+        self.strength_note.setText(CUSTOM_NOTE if custom else AUTOMATIC_NOTE)
+        if self.mac:
+            self.wheel_window_row.setVisible(custom and controller.wheel_fix)
+        else:
+            self.wheel_window_row.setVisible(controller.wheel_fix)
+            self.wheel_box.setEnabled(custom)
+            self.strength_expander.header.set_detail(CUSTOM_SHORT if custom else AUTOMATIC_SHORT)
+        set_checked(self.wheel_switch, controller.wheel_fix)
         show = permissions.needs_accessibility() and not granted
         self.permission.setVisible(show)
         self.permission_gap.setVisible(show)
+        self._refresh_conflicts()
+        if self.pause is not None:
+            self.pause.refresh()
+        if self.login is not None:
+            self.login.refresh()
+        if self.info_bar is not None:
+            first_run = not controller.tray_hint_shown
+            self.info_bar.setVisible(first_run)
+            self.info_gap.setVisible(first_run)
+
+    def _refresh_conflicts(self) -> None:
+        conflicts = list(self.controller.conflicts())
+        shown = [(conflict.name, tuple(conflict.takes)) for conflict in conflicts]
+        if shown != self._conflicts_shown:
+            # Built again only when they change, so focus stays put.
+            self._conflicts_shown = shown
+            self.conflicts.clear()
+            for conflict in conflicts:
+                self.conflicts.add(
+                    Row(menus.conflict_title(conflict), menus.conflict_detail(conflict), None,
+                        SymbolView("warning", 20, "symbol"))
+                )
+        self.conflicts.setVisible(bool(conflicts))
+        self.conflict_gap.setVisible(bool(conflicts))
+
+    def set_menu_bar_shown(self, shown: bool) -> None:
+        if self.menu_bar_switch is not None:
+            self.menu_bar_switch.setChecked(shown, animate=False)
 
     def note_global_event(self, event: ClickEvent) -> None:
-        if event.is_bounce:
-            self.total_value.setText(f"{self.controller.filtered_total:,}")
-            self.session_value.setText(f"{self.controller.session_filtered:,}")
+        """A blocked bounce: the status sentence counts them."""
+        if event.is_bounce and self.isVisible():
+            self.status_row.set_detail(self.status_sentence())
+
+    # -- changes ----------------------------------------------------------------
+    def _on_buttons(self, _checked: bool = False) -> None:
+        if self._loading:
+            return
+        selected = [button for button, check in self.button_checks.items() if check.isChecked()]
+        if not selected:
+            # Something has to stay protected; keep the left button on.
+            set_checked(self.button_checks[Button.LEFT], True)
+            selected = [Button.LEFT]
+        self.controller.set_buttons(selected)
+
+    def _on_strength(self, index: int) -> None:
+        value = self.strength_picker.itemData(index)
+        if self._loading or value == menus.strength(self.controller):
+            return
+        self.controller.set_strength(value)
+        if value == menus.CUSTOM and self.strength_expander is not None:
+            self.strength_expander.set_expanded(True)
 
     def _on_window(self, button: Button, value: int) -> None:
         # Each step reaches the filter at once; the file is written once the
         # steps stop, not on every one.
         if not self._loading:
             self.controller.set_threshold(button, value, deferred=True)
-
-    def _on_buttons(self, _checked: bool) -> None:
-        if self._loading:
-            return
-        selected = [button for button, switch in self.button_switches.items() if switch.isChecked()]
-        if not selected:
-            # Something has to stay protected; keep the left button on.
-            self.button_switches[Button.LEFT].setChecked(True)
-            selected = [Button.LEFT]
-        self.controller.set_buttons(selected)
 
     def _on_wheel(self, checked: bool) -> None:
         if not self._loading:
@@ -327,471 +621,58 @@ class FilterPage(Page):
             self.controller.set_wheel_fix(self.controller.wheel_fix, value, deferred=True)
 
 
-class TestPage(Page):
-    def __init__(self, controller: AppController, parent: Optional[QWidget] = None) -> None:
-        super().__init__("Test", parent)
-        self.controller = controller
-        self.clicks = 0
-        self.shortest_gap: Optional[float] = None
-        # The button whose window the chart's line marks: the one last pressed
-        # (its press is what "Last gap" names), the left until one is.
-        self.shown_button: Button = Button.LEFT
+class AboutPage(Page):
+    """About (macOS) / Settings (Windows): updates, diagnostics, the
+    acknowledgements, what the app sends over the network, and the count's
+    reset. Windows also keeps Start with Windows and the pause options here."""
 
-        self.pad = ClickPad()
-        self.pad.setMaximumHeight(320)
-        # In the platform's case, as Calibrate's pad words are.
-        self.pad.set_text(label("Click Here"), "")
-        self.body.addWidget(self.pad, 1)
-        self.gap(12)
-
-        chart = self.section()
-        holder = QWidget()
-        holder_layout = QVBoxLayout(holder)
-        holder_layout.setContentsMargins(14, 10, 14, 8)
-        self.timeline = GapTimeline()
-        holder_layout.addWidget(self.timeline)
-        chart.add(holder)
-        self.chart_note = self.footnote("")
-
-        self.header("Measurements")
-        values = self.section()
-        self.last_value = ValueLabel("—")
-        self.shortest_value = ValueLabel("—")
-        self.count_value = ValueLabel("0")
-        values.add(Row("Last gap", "", self.last_value))
-        values.add(Row("Shortest gap", "", self.shortest_value))
-        values.add(Row("Clicks", "", self.count_value))
-
-        actions = QHBoxLayout()
-        actions.setContentsMargins(0, 14, 0, 0)
-        actions.addStretch(1)
-        self.clear_button = _button("Clear")
-        self.clear_button.clicked.connect(self.reset)
-        actions.addWidget(self.clear_button)
-        self.body.addLayout(actions)
-        # Once the pad reaches its full height, spare space collects at the
-        # bottom instead of opening gaps between sections.
-        self.body.addStretch(1)
-
-        self.pad.pressed_with_gap.connect(self._on_pad_press)
-
-    def refresh(self) -> None:
-        # Each press is judged by its own button's window, so the line is
-        # that button's, and the note says whose when it isn't the left's.
-        self.timeline.set_threshold(self.controller.threshold_for(self.shown_button))
-        # With the filter on, bounces are removed before this pad sees them,
-        # so an all-green chart would otherwise read as a healthy mouse.
-        note = (
-            "Bounce Filter is on: red bars are bounces it blocked."
-            if self.controller.active
-            else "Red bars fall within the filter window."
-        )
-        if self.shown_button is not Button.LEFT:
-            note += f" The line is the {button_name(self.shown_button).lower()} button’s window."
-        self.chart_note.setText(note)
-
-    def _show_button(self, button: Button) -> None:
-        if button is not self.shown_button:
-            self.shown_button = button
-            self.refresh()
-
-    def note_global_event(self, event: ClickEvent) -> None:
-        """A bounce the system-wide filter blocked. With the filter on, this
-        pad never receives it, so show it here: proof the filter works."""
-        if self.isVisible() and event.is_bounce and event.gap_ms is not None:
-            self._show_button(as_button(event.button))
-            self.timeline.add(event.gap_ms, True)
-            self.pad.flash(True)
-
-    def reset(self) -> None:
-        self.clicks = 0
-        self.shortest_gap = None
-        self.timeline.clear()
-        self._show_button(Button.LEFT)
-        self.pad.reset()
-        self.last_value.setText("—")
-        self.shortest_value.setText("—")
-        self.count_value.setText("0")
-
-    def _on_pad_press(
-        self, gap_ms: Optional[float], _interval_ms: Optional[float], button: Button = Button.LEFT
-    ) -> None:
-        self.clicks += 1
-        self.count_value.setText(str(self.clicks))
-        if gap_ms is None:
-            self.pad.flash(False)
-            return
-        button = as_button(button)
-        self._show_button(button)
-        bounce = gap_ms <= self.controller.threshold_for(button)
-        self.timeline.add(gap_ms, bounce)
-        # Each button is timed against its own release; say which one.
-        which = "" if button is Button.LEFT else f" ({button_name(button).lower()})"
-        self.last_value.setText(f"{gap_ms:.0f} ms{which}")
-        if self.shortest_gap is None or gap_ms < self.shortest_gap:
-            self.shortest_gap = gap_ms
-            self.shortest_value.setText(f"{gap_ms:.0f} ms")
-        self.pad.flash(bounce)
-
-
-class CalibratePage(Page):
-    """Two measured phases for one button, then a recommendation."""
-
-    #: Apply: (Button, window in ms).
-    threshold_chosen = Signal(object, int)
-    #: The phase moved: "intro", "single", "double" or "done". Filtering
-    #: pauses only while a measuring phase is on screen.
-    phase_changed = Signal(str)
-
-    def __init__(self, controller: AppController, parent: Optional[QWidget] = None) -> None:
-        super().__init__("Calibrate", parent)
-        self.controller = controller
-        self.calibrator = Calibrator()
-        self.phase = "intro"
-        self.suggestion = None
-        # The button whose first press of a double-click is waiting for its
-        # second, or None.
-        self._pair_button: Optional[Button] = None
-        # The button being measured. Presses of the others are ignored.
-        self.button: Button = Button.LEFT
-
-        picker = self.section()
-        self.button_picker = QComboBox()
-        for button in Button:
-            self.button_picker.addItem(button_name(button), button.value)
-        self.button_picker.setAccessibleName("Button to calibrate")
-        # A wheel turn on the way down the pane would pick another button and
-        # throw away a measurement under way.
-        pop_up_button(self.button_picker)
-        # activated, not currentIndexChanged: only the user's own choice.
-        self.button_picker.activated.connect(lambda index: self.set_button(list(Button)[index]))
-        self.picker_row = picker.add(Row("Button", "", self.button_picker, card_icon("mouse")))
-        self.gap(12)
-
-        # The step and its progress bar are one row, so they share one box
-        # (macOS) or one card (Windows).
-        step = self.section()
-        holder = QWidget()
-        holder_layout = QVBoxLayout(holder)
-        holder_layout.setContentsMargins(0, 0, 0, 0)
-        holder_layout.setSpacing(0)
-        self.count_label = ValueLabel()
-        self.step_row = Row("", "", self.count_label)
-        holder_layout.addWidget(self.step_row)
-        self.progress_row = QWidget()
-        progress_layout = QVBoxLayout(self.progress_row)
-        progress_layout.setContentsMargins(12 if IS_MAC else 16, 0, 12 if IS_MAC else 16, 12 if IS_MAC else 16)
-        self.progress = QProgressBar()
-        self.progress.setRange(0, 100)
-        self.progress.setTextVisible(False)
-        self.progress.setAccessibleName("Calibration progress")
-        progress_layout.addWidget(self.progress)
-        holder_layout.addWidget(self.progress_row)
-        step.add(holder)
-        self.gap(12)
-
-        self.pad = ClickPad()
-        self.pad.setMaximumHeight(360)
-        self.body.addWidget(self.pad, 1)
-
-        self.result_header = self.header("Result")
-        self.result = self.section()
-        self.recommended_value = ValueLabel()
-        self.bounce_value = ValueLabel()
-        self.double_value = ValueLabel()
-        self.result.add(Row("Recommended window", "", self.recommended_value))
-        self.result.add(Row("Longest bounce", "", self.bounce_value))
-        self.double_row = self.result.add(Row("Fastest double-click", "", self.double_value))
-        self.summary = self.footnote("")
-
-        actions = QHBoxLayout()
-        actions.setContentsMargins(0, 16, 0, 0)
-        actions.setSpacing(8)
-        actions.addStretch(1)
-        self.restart_button = _button("Start Over")
-        self.restart_button.clicked.connect(self.restart)
-        self.primary_button = _button("Begin", default=True)
-        self.primary_button.clicked.connect(self._advance)
-        actions.addWidget(self.restart_button)
-        actions.addWidget(self.primary_button)
-        self.body.addLayout(actions)
-        self.body.addStretch(1)
-
-        self.pad.pressed_with_gap.connect(self._on_pad_press)
-        self.restart()
-
-    # -- flow ------------------------------------------------------------------
-    @property
-    def measuring(self) -> bool:
-        return self.phase in ("single", "double")
-
-    def _set_phase(self, phase: str) -> None:
-        if phase != self.phase:
-            self.phase = phase
-            self.phase_changed.emit(phase)
-
-    def set_button(self, button: object) -> None:
-        """Measure `button` from now on, starting afresh if it is another."""
-        button = as_button(button)
-        self.button_picker.setCurrentIndex(list(Button).index(button))
-        if button is not self.button:
-            self.button = button
-            self.restart()
-
-    @property
-    def _side(self) -> bool:
-        return self.button in SIDE_BUTTONS
-
-    @property
-    def _pair(self) -> str:
-        """What a quick second press is called for this button."""
-        return "repeat" if self._side else "double-click"
-
-    def restart(self) -> None:
-        self.calibrator = Calibrator()
-        self.suggestion = None
-        self._pair_button = None
-        self.pad.reset()
-        self._set_phase("intro")
-        self._render()
-
-    def _advance(self) -> None:
-        if self.phase == "intro":
-            self._set_phase("single")
-        elif self.phase == "single":
-            self._pair_button = None
-            self._set_phase("double")
-        elif self.phase == "double":
-            self._finish()
-            return
-        elif self.phase == "done":
-            if self.suggestion is not None:
-                button = self.button
-                self.threshold_chosen.emit(button, self.suggestion.threshold_ms)
-                self.controller.set_calibrated(button, True)
-            return
-        self.pad.reset()
-        self._render()
-
-    def _finish(self) -> None:
-        self.suggestion = self.calibrator.suggest()
-        self._set_phase("done")
-        self._render()
-
-    @staticmethod
-    def pair_window_ms() -> float:
-        """How long a double-click may pause between its release and second
-        press: the system's own double-click setting, so a pair counts here
-        when the system would take it for one, up to PAIR_WINDOW_MAX_MS."""
-        interval = QGuiApplication.styleHints().mouseDoubleClickInterval()
-        return min(float(interval), PAIR_WINDOW_MAX_MS)
-
-    def _on_pad_press(
-        self, gap_ms: Optional[float], _interval_ms: Optional[float], button: Button = Button.LEFT
-    ) -> None:
-        note = ""
-        button = as_button(button)
-        if button is not self.button:
-            if self.phase != "done":
-                self._render(
-                    f"That was the {button_name(button).lower()} button. To measure it, "
-                    "choose it above; this measures the "
-                    f"{button_name(self.button).lower()} button."
-                )
-            return
-        if self.phase == "intro":
-            # Clicking the pad is as good as Begin, and counts as the first
-            # single click. Its gap means nothing: it is the first.
-            self._advance()
-            gap_ms = None
-        if self.phase == "single":
-            counted = self.calibrator.add_single_click(gap_ms)
-            self.pad.flash(not counted)
-            if not counted:
-                note = f"Bounce detected ({gap_ms:.0f} ms)."
-            if self.calibrator.has_enough_singles:
-                self._pair_button = None
-                self._set_phase("double")
-                self.pad.reset()
-                note = ""
-        elif self.phase == "double":
-            note = self._double_click_press(gap_ms, button)
-            if self.calibrator.has_enough_doubles:
-                self._finish()
-                return
-        else:
-            return
-        self._render(note)
-
-    def _double_click_press(self, gap_ms: Optional[float], button: Button) -> str:
-        """Pair presses into double-clicks: a first press opens a pair, and
-        the same button's next press within the pair window closes it and
-        counts. Anything else opens a new pair, so the third press of a
-        triple-click never counts as another double. Returns a note."""
-        if gap_ms is not None and gap_ms <= BOUNCE_CANDIDATE_MS:
-            # Chatter, wherever it lands, is evidence; the pair stays open.
-            self.calibrator.add_double_click(gap_ms)
-            self.pad.flash(True)
-            return f"Bounce detected ({gap_ms:.0f} ms)."
-        if self._pair_button is button and gap_ms is not None and gap_ms <= self.pair_window_ms():
-            self.calibrator.add_double_click(gap_ms)
-            self._pair_button = None
-            self.pad.flash(False)
-            return ""
-        too_slow = self._pair_button is button
-        self._pair_button = button
-        # Only the start of a pair: no "counted" flash.
-        self.pad.flash(False, neutral=True)
-        if too_slow:
-            if self._side:
-                return "Too slow for a repeat, so it wasn’t counted. Press a little faster."
-            return "Too slow for a double-click, so it wasn’t counted. Double-click a little faster."
-        return ""
-
-    # -- rendering ---------------------------------------------------------------
-    def _render(self, note: str = "") -> None:
-        done = self.phase == "done"
-        has_result = done and self.suggestion is not None
-        self.result_header.setVisible(has_result)
-        self.result.setVisible(has_result)
-        self.summary.setVisible(has_result)
-        self.restart_button.setVisible(self.phase != "intro")
-        self.progress_row.setVisible(self.phase in ("single", "double"))
-        self.pad.setVisible(not done)
-        self.primary_button.setVisible(True)
-        # The button can change before measuring starts and once it is over.
-        self.button_picker.setEnabled(not self.measuring)
-        name = button_name(self.button).lower()
-        side = self._side
-        self.double_row.title.setText("Fastest repeat" if side else "Fastest double-click")
-
-        if self.phase == "intro":
-            self.step_row.title.setText(f"Calibrate the {name} button")
-            self.step_row.set_detail(
-                note
-                or (
-                    f"Press the {name} button once at a time, then twice quickly. "
-                    if side
-                    else f"Click the {name} button once at a time, then double-click it. "
-                )
-                + "Filtering pauses while you do, so the pad sees your mouse as it is."
-            )
-            self.count_label.setText("")
-            self.pad.set_text(label("Ready"), "")
-            self.primary_button.setText(label("Begin"))
-            self.primary_button.setEnabled(True)
-        elif self.phase == "single":
-            count = self.calibrator.single_clicks
-            self.step_row.title.setText("Single presses" if side else "Single clicks")
-            self.step_row.set_detail(note or ("Press once, then pause." if side else "Click once, then pause."))
-            self.count_label.setText(f"{count} of {REQUIRED_SINGLE_CLICKS}")
-            self.progress.setValue(int(self.calibrator.single_progress * 100))
-            self.pad.set_text(label("Press Once" if side else "Click Once"), "")
-            self.primary_button.setText(label("Skip"))
-            self.primary_button.setEnabled(True)
-        elif self.phase == "double":
-            count = self.calibrator.double_clicks
-            self.step_row.title.setText("Repeats" if side else "Double-clicks")
-            self.step_row.set_detail(
-                note or ("Press twice quickly, as when going back two pages." if side else "Double-click at your usual speed.")
-            )
-            self.count_label.setText(f"{count} of {REQUIRED_DOUBLE_CLICKS}")
-            self.progress.setValue(int(self.calibrator.double_progress * 100))
-            self.pad.set_text(label("Press Twice" if side else "Double-Click"), "")
-            # It finishes by itself at the last double-click; a Finish button
-            # here could only lead to "not enough double-clicks".
-            self.primary_button.setVisible(False)
-        else:
-            suggestion = self.suggestion
-            self.count_label.setText("")
-            if suggestion is None:
-                if side:
-                    self.step_row.title.setText("Not enough repeats")
-                    self.step_row.set_detail(f"Start over and press twice quickly at least {REQUIRED_DOUBLE_CLICKS} times.")
-                else:
-                    self.step_row.title.setText("Not enough double-clicks")
-                    self.step_row.set_detail(f"Start over and double-click at least {REQUIRED_DOUBLE_CLICKS} times.")
-                self.primary_button.setText(label("Apply"))
-                self.primary_button.setEnabled(False)
-                return
-            self.step_row.title.setText("Calibration complete")
-            filtered = self.button in self.controller.buttons
-            self.step_row.set_detail(
-                f"Apply sets the {name} button’s window" + (".", " and starts filtering it.")[not filtered]
-            )
-            self.recommended_value.setText(f"{suggestion.threshold_ms} ms")
-            self.bounce_value.setText(
-                "None detected" if suggestion.worst_bounce_ms is None else f"{suggestion.worst_bounce_ms:.0f} ms"
-            )
-            self.double_value.setText(f"{suggestion.fastest_double_click_ms:.0f} ms")
-            # Only speak up when the result needs a caveat or an explanation.
-            # About this button alone: it may not be filtered until Apply, and
-            # a side button is repeated, not double-clicked.
-            if not suggestion.confident:
-                note = (
-                    f"Little margin between bounce and your {'quick repeats' if side else 'double-clicks'}. "
-                    "Raise the window if bounce still gets through."
-                )
-            elif suggestion.worst_bounce_ms is None:
-                note = (
-                    f"The {name} button didn’t bounce this time. Bounce comes and goes, so this is a "
-                    "light window, to catch it when it does; the Test pane shows bounce when it happens."
-                )
-            else:
-                note = ""
-            self.summary.setText(note)
-            self.summary.setVisible(bool(note))
-            self.primary_button.setText(label("Apply"))
-            self.primary_button.setEnabled(True)
-
-
-class GeneralPage(Page):
     def __init__(self, controller: AppController, updater=None, parent: Optional[QWidget] = None) -> None:
-        super().__init__("General", parent)
+        super().__init__("About" if IS_MAC else "Settings", parent)
         self.controller = controller
         self.updater = updater
+        self.login: Optional[LoginControl] = None
+        self.pause: Optional[PauseControls] = None
 
-        startup_section = self.section()
-        self.login_switch = Switch(accessible_name="Open at login")
-        # Shown when the user switched the app off in System Settings › Login
-        # Items: only there can it be switched back on.
-        self.login_items_button = _button("Open Login Items…")
-        self.login_items_button.clicked.connect(lambda: startup.open_login_items_settings())
-        self.login_items_button.setVisible(False)
-        login_controls = QWidget()
-        login_layout = QHBoxLayout(login_controls)
-        login_layout.setContentsMargins(0, 0, 0, 0)
-        login_layout.setSpacing(10)
-        login_layout.addWidget(self.login_items_button)
-        login_layout.addWidget(self.login_switch)
-        self.login_row = startup_section.add(
-            Row("Open at login", self._login_detail(startup.ON), login_controls, card_icon("power"))
-        )
-        self.login_switch.clicked.connect(self._on_login)
+        if IS_MAC:
+            hero = self.section()
+            self.version_row = hero.add(Row(DISPLAY_NAME, f"Version {__version__}", None, AppIconView(40)))
+        else:
+            self.header("Startup")
+            startup_section = self.section()
+            self.login = LoginControl(controller, self)
+            startup_section.add(self.login.row)
+            self.header("Pausing")
+            pausing = self.section()
+            self.pause = PauseControls(controller)
+            for row in self.pause.rows:
+                pausing.add(row)
 
         self.permission_row: Optional[Row] = None
         if permissions.needs_accessibility():
-            self.header("Permissions")
+            self.header("Permission")
             section = self.section()
             self.permission_icon = SymbolView("ok", 20, "symbol")
-            button = _button("Open Settings…")
+            button = make_button("Open Settings…")
+            button.setAccessibleName(f"Open {permissions.pane_name()} settings")
             button.clicked.connect(lambda: permissions.open_accessibility_settings())
             self.permission_button = button
             # The name System Settings itself uses, which macOS 27 changed.
             self.permission_row = section.add(Row(permissions.pane_name(), "", button, self.permission_icon))
 
-        self.update_header = self.header("Software update")
+        self.update_header = self.header("Software Update" if IS_MAC else "Updates")
         self.update_section = self.section()
         self.auto_check_switch = Switch(accessible_name="Check for updates automatically")
         self.auto_check_switch.clicked.connect(self._on_auto_check)
         self.update_section.add(Row("Check for updates automatically", "", self.auto_check_switch, card_icon("sync")))
         self.auto_install_switch = Switch(accessible_name="Install updates automatically")
         self.auto_install_switch.clicked.connect(self._on_auto_install)
-        self.update_section.add(Row("Install updates automatically", "", self.auto_install_switch, card_icon("sync")))
-        self.update_button = _button("Check Now")
+        self.update_section.add(Row("Install updates automatically", "", self.auto_install_switch,
+                                    card_icon("download")))
+        self.update_button = make_button("Check Now")
+        self.update_button.setAccessibleName("Check for updates now")
         self.update_button.clicked.connect(self._on_update_button)
         self.update_row = self.update_section.add(
-            Row(f"{DISPLAY_NAME} {__version__}", "", self.update_button, card_icon("sync"))
+            Row(f"Version {__version__}", "", self.update_button, card_icon("info"))
         )
         supported = updater is not None and updater.supported
         self.update_header.setVisible(supported)
@@ -799,15 +680,9 @@ class GeneralPage(Page):
         if supported:
             updater.changed.connect(self.refresh_update)
 
-        self.header("Statistics")
-        stats = self.section()
-        reset = _button("Reset…")
-        reset.clicked.connect(self._confirm_reset)
-        self.stats_row = stats.add(Row("Blocked bounces", "", reset, card_icon("chart")))
-
         self.header("Troubleshooting")
         troubleshooting = self.section()
-        self.diagnostics_button = _button("Copy Diagnostics")
+        self.diagnostics_button = make_button("Copy Diagnostics")
         self.diagnostics_button.clicked.connect(self._copy_diagnostics)
         self.diagnostics_row = troubleshooting.add(
             Row("Diagnostics", DIAGNOSTICS_DETAIL, self.diagnostics_button, card_icon("copy"))
@@ -816,45 +691,42 @@ class GeneralPage(Page):
         self._diagnostics_timer.setSingleShot(True)
         self._diagnostics_timer.setInterval(4000)
         self._diagnostics_timer.timeout.connect(lambda: self.diagnostics_row.set_detail(DIAGNOSTICS_DETAIL))
+        self.reset_button = make_button("Reset…")
+        self.reset_button.setAccessibleName("Reset the count of blocked bounces")
+        self.reset_button.clicked.connect(self._confirm_reset)
+        self.stats_row = troubleshooting.add(Row("Blocked bounces", "", self.reset_button, card_icon("reset")))
 
-        self.header("About")
+        self.header("Privacy and Licences" if IS_MAC else "About")
         about = self.section()
-        self.acknowledgements_button = _button("Acknowledgements…")
+        if not IS_MAC:
+            about.add(Row(DISPLAY_NAME, f"Version {__version__} · Free and open source", None, AppIconView(28)))
+        self.privacy_row = about.add(Row("Privacy", privacy_line(), None, card_icon("privacy")))
+        self.acknowledgements_button = make_button("Acknowledgements…")
         self.acknowledgements_button.clicked.connect(self._open_acknowledgements)
         self.acknowledgements_row = about.add(
             Row("Open-source software", ACKNOWLEDGEMENTS_DETAIL, self.acknowledgements_button, card_icon("info"))
         )
-
         self.body.addStretch(1)
-        version = TextLabel(f"{DISPLAY_NAME} {__version__}", "caption", "tertiary")
-        version.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        version.setContentsMargins(0, 24, 0, 0)
-        self.body.addWidget(version)
-
-    @staticmethod
-    def _login_detail(state: str) -> str:
-        if state == startup.BLOCKED:
-            if IS_MAC:
-                return "Turned off in System Settings. Turn it on again in Login Items."
-            return "Turned off in Task Manager › Startup apps. Turn it on here to allow it again."
-        return f"Starts in the {'menu bar' if IS_MAC else 'notification area'}."
 
     def refresh(self, granted: bool) -> None:
-        self.refresh_login()
+        if self.login is not None:
+            self.login.refresh()
+        if self.pause is not None:
+            self.pause.refresh()
         if self.permission_row is not None:
             self.permission_icon.name = "ok" if granted else "warning"
             self.permission_icon.update()
             self.permission_row.set_detail("Allowed" if granted else "Not allowed")
         total = self.controller.filtered_total
-        self.stats_row.set_detail(f"{total:,} total")
+        self.stats_row.set_detail(f"{total:,} blocked so far. Reset starts the count again from zero.")
         self.refresh_update()
 
     def refresh_update(self) -> None:
         updater = self.updater
         if updater is None or not updater.supported:
             return
-        self.auto_check_switch.setChecked(updater.auto_check, animate=False)
-        self.auto_install_switch.setChecked(updater.auto_install, animate=False)
+        set_checked(self.auto_check_switch, updater.auto_check)
+        set_checked(self.auto_install_switch, updater.auto_install)
         # Only a background check installs anything by itself.
         self.auto_install_switch.setEnabled(updater.auto_check)
         release = updater.release
@@ -874,7 +746,10 @@ class GeneralPage(Page):
         }
         detail, text, enabled = states.get(updater.state, ("", "Check Now", True))
         self.update_row.set_detail(detail)
-        self.update_button.setText(globals()["label"](text))
+        self.update_button.setText(label(text))
+        self.update_button.setAccessibleName(
+            "Check for updates now" if text == "Check Now" else label(text)
+        )
         self.update_button.setEnabled(enabled)
         set_primary(self.update_button, updater.state in (updater.AVAILABLE, updater.READY))
 
@@ -895,25 +770,6 @@ class GeneralPage(Page):
         # install when this is turned off.
         if self.updater is not None:
             self.updater.set_auto_install(checked)
-
-    def refresh_login(self) -> None:
-        self.login_switch.setChecked(bool(self.controller.settings["start_at_login"]), animate=False)
-        state = self.controller.login_item_state
-        self.login_row.set_detail(self._login_detail(state))
-        # On macOS only Login Items can switch it back on; the switch here
-        # would slide on and snap off again.
-        blocked_by_system = IS_MAC and state == startup.BLOCKED
-        self.login_items_button.setVisible(blocked_by_system)
-        self.login_switch.setEnabled(not blocked_by_system)
-
-    def _on_login(self, checked: bool) -> None:
-        error = self.controller.set_start_at_login(checked)
-        if error:
-            self.login_switch.setChecked(not checked)
-            QMessageBox.warning(self, "Couldn’t change the login item", error)
-            return
-        # Still off if macOS keeps it switched off in Login Items; say so.
-        self.refresh_login()
 
     def _copy_diagnostics(self) -> None:
         """Put a bug report's worth of detail on the clipboard: versions,
@@ -948,7 +804,7 @@ class GeneralPage(Page):
         answer = QMessageBox.question(
             self,
             "Reset the count?",
-            "Blocked bounces will start again from zero.",
+            "Blocked bounces will start again from zero. The History is kept.",
             QMessageBox.StandardButton.Reset | QMessageBox.StandardButton.Cancel,
             QMessageBox.StandardButton.Cancel,
         )
@@ -965,70 +821,39 @@ def transparent(widget: QWidget) -> None:
 
 
 class MainWindow(QWidget):
-    """Sidebar navigation over the panes (PAGES)."""
+    """Settings (macOS) or the app's window (Windows), over the panes
+    (pages()). Also keeps the filter running: see the module's docstring."""
 
     closed_to_tray = Signal()
+    #: macOS: "Show in menu bar" was switched (the app shows or hides the item).
+    menu_bar_toggled = Signal(bool)
 
     def __init__(self, controller: AppController, updater=None) -> None:
         super().__init__()
         self.controller = controller
         self.updater = updater
         set_look(current_look())
+        # The layout it was built in, which everything after follows.
+        self.mac = IS_MAC
+        self.items = pages()
+        self.page_keys = [key for key, _title in self.items]
         self.setWindowTitle(DISPLAY_NAME)
         self.setWindowIcon(icons.app_icon())
-        self.translucent = native.prepare(self)
         self._material = False
-        side = look().sidebar_width
-        page_margins = 40 if IS_MAC else 72
-        # Every pane scrolls, so the minimum height only has to fit the
-        # sidebar; Windows at 200% scaling leaves about 490 px.
-        self.setMinimumSize(side + page_margins + COLUMN_MIN + 16, 480)
-        self.resize(side + page_margins + COLUMN_MAX // (1 if IS_MAC else 2) + 60, 640 if IS_MAC else 700)
+        self.translucent = False
+        self.native_toolbar: Optional[NativeToolbar] = None
+        self.pane_bar: Optional[PaneBar] = None
 
-        root = QHBoxLayout(self)
-        root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(0)
-
-        self.title_bar_height = 52 if IS_MAC else 0
-        self.sidebar = Sidebar(list(PAGES), top_inset=self.title_bar_height)
-        root.addWidget(self.sidebar)
-
-        content = QWidget()
-        content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(0, 0, 0, 0)
-        content_layout.setSpacing(0)
-        self.title_label = TextLabel("", "title")
-        if IS_MAC:
-            # The pane title sits in the (transparent) toolbar, level with the
-            # window controls, as in System Settings.
-            bar = QWidget()
-            bar.setFixedHeight(self.title_bar_height)
-            # Same centred column as the pages, so the title lines up with the
-            # content at any window width.
-            bar_column = centred_column(bar)
-            bar_layout = QHBoxLayout(bar_column)
-            bar_layout.setContentsMargins(20, 0, 20, 0)
-            bar_layout.addWidget(self.title_label, 0, Qt.AlignmentFlag.AlignVCenter)
-            bar_layout.addStretch(1)
-            content_layout.addWidget(bar)
-
-        self.filter_page = FilterPage(controller)
-        self.test_page = TestPage(controller)
-        self.calibrate = CalibratePage(controller)
+        self.home = HomePage(controller)
+        self.exceptions = ExceptionsPage(controller)
         self.history = HistoryPage(controller)
-        self.apps = AppsPage(controller)
-        self.devices = DevicesPage(controller)
-        self.general = GeneralPage(controller, updater)
-        by_key = {
-            "filter": self.filter_page,
-            "test": self.test_page,
-            "calibrate": self.calibrate,
-            "history": self.history,
-            "apps": self.apps,
-            "devices": self.devices,
-            "general": self.general,
-        }
-        self.pages = [by_key[key] for key, _title in PAGES]
+        self.about = AboutPage(controller, updater)
+        # The halves of Exceptions.
+        self.apps = self.exceptions.apps
+        self.devices = self.exceptions.devices
+        by_key = {"general": self.home, "home": self.home, "exceptions": self.exceptions,
+                  "history": self.history, "about": self.about, "settings": self.about}
+        self.pages = [by_key[key] for key in self.page_keys]
         self.stack = QStackedWidget()
         for page in self.pages:
             area = QScrollArea()
@@ -1040,31 +865,38 @@ class MainWindow(QWidget):
             area.setFrameShape(QFrame.Shape.NoFrame)
             area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             area.setWidget(page)
-            # The pane colour is painted once by the window; the scroll area,
-            # its viewport and the page must not paint over it. Never with a
-            # style sheet: one on any ancestor sends every control below it
-            # through Qt's style-sheet style, which on macOS draws pop-up
-            # buttons, spin boxes and menu buttons as boxes of its own.
+            # The window's colour shows through; never a style sheet, which
+            # would send every control below it through Qt's own drawing.
             transparent(area)
             transparent(area.viewport())
             transparent(page)  # setWidget turned its fill on
             self.stack.addWidget(area)
-        content_layout.addWidget(self.stack, 1)
-        root.addWidget(content, 1)
 
-        self.sidebar.current_changed.connect(self._show_page)
+        # Test and Tune: its own window, kept for the app's life.
+        self.tune = TuneWindow(controller)
+        self.destroyed.connect(self.tune.deleteLater)
+
+        if IS_MAC:
+            self._build_mac()
+        else:
+            self._build_windows()
+
+        self.navigation.current_changed.connect(self._show_page)
         # clicked, not toggled: refresh() sets the switch, and must not echo
         # back into a request.
-        self.filter_page.switch.clicked.connect(self._on_switch)
-        self.calibrate.threshold_chosen.connect(self._apply_calibration)
-        self.calibrate.phase_changed.connect(lambda _phase: self._sync_pause())
+        self.home.switch.clicked.connect(self._on_switch)
+        self.home.tune_requested.connect(self.show_tune)
+        self.home.menu_bar_toggled.connect(self.menu_bar_toggled)
+        self.tune.state_changed.connect(self._sync_pause)
+        self.tune.filter_requested.connect(self.request_filter)
         controller.filter_state_changed.connect(self._on_filter_state)
         controller.settings_changed.connect(self.refresh)
-        controller.global_event.connect(self.filter_page.note_global_event)
-        controller.global_event.connect(self.test_page.note_global_event)
+        controller.pause_changed.connect(self.refresh)
+        controller.conflicts_changed.connect(self.refresh)
+        controller.global_event.connect(self.home.note_global_event)
+        controller.global_event.connect(self.tune.note_global_event)
         # From the hook's thread.
         controller.device_seen.connect(self.devices.refresh, Qt.ConnectionType.QueuedConnection)
-        self.filter_page.calibrate_requested.connect(self.show_calibration)
         controller.hook_failed.connect(self._on_hook_failed)
         # Reported from the hook's thread; handled here, on the UI thread.
         controller.permission_lost.connect(self._on_permission_lost, Qt.ConnectionType.QueuedConnection)
@@ -1099,11 +931,53 @@ class MainWindow(QWidget):
         # Set while a retry runs: its failure shows no dialog.
         self._quiet = False
 
-        self._show_page(0)
-        if not self._restore_geometry():
+        # A Mac Settings window opens on the pane last shown; Windows on Home.
+        remembered = ui_state.load().get(LAST_PANE, "") if IS_MAC else ""
+        self._show_page(self.page_keys.index(remembered) if remembered in self.page_keys else 0)
+        if not self._restore_geometry() and not IS_MAC:
             self._fit_to_screen()
+        self._fit_to_pane()
 
-    # -- size and position -------------------------------------------------------
+    # -- chrome -------------------------------------------------------------------
+    def _build_mac(self) -> None:
+        """A Settings window: a toolbar of panes, titled with the pane, sized
+        to it, and no zoom."""
+        self.setWindowFlags(
+            Qt.WindowType.Window | Qt.WindowType.WindowTitleHint | Qt.WindowType.WindowCloseButtonHint
+            | Qt.WindowType.WindowMinimizeButtonHint | Qt.WindowType.CustomizeWindowHint
+        )
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        # Drawn by Qt where AppKit's own toolbar can't be had.
+        self.pane_bar = PaneBar(self.items)
+        self.navigation = self.pane_bar
+        root.addWidget(self.pane_bar)
+        self.bar_line = QFrame()
+        self.bar_line.setFrameShape(QFrame.Shape.HLine)
+        self.bar_line.setFrameShadow(QFrame.Shadow.Sunken)
+        root.addWidget(self.bar_line)
+        root.addWidget(self.stack, 1)
+        self.native_toolbar = NativeToolbar(self.items, lambda index: self._show_page(index))
+
+    def _build_windows(self) -> None:
+        """Windows Settings' layout: the navigation pane on the left, Settings
+        pinned at its foot, the page on the right; Mica behind both."""
+        self.translucent = native.prepare(self)
+        side = look().sidebar_width
+        page_margins = 72
+        # Every pane scrolls, so the minimum height only has to fit the
+        # navigation; Windows at 200% scaling leaves about 490 px.
+        self.setMinimumSize(side + page_margins + COLUMN_MIN + 16, 480)
+        self.resize(side + page_margins + COLUMN_MAX // 2 + 60, 700)
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        self.navigation = NavigationView(self.items[:-1], self.items[-1:])
+        root.addWidget(self.navigation)
+        root.addWidget(self.stack, 1)
+
+    # -- size and position ---------------------------------------------------------
     def _restore_geometry(self) -> bool:
         """Reopen where the window was left, as Mac and Windows apps do.
         Qt keeps a restored window on a screen that is still there."""
@@ -1127,6 +1001,26 @@ class MainWindow(QWidget):
         self.setMinimumSize(min(self.minimumWidth(), width), min(self.minimumHeight(), height))
         self.resize(width, height)
 
+    def pane_height(self, index: Optional[int] = None) -> int:
+        """How tall pane `index` (the current one) is at the window's width."""
+        page = self.pages[self.stack.currentIndex() if index is None else index]
+        height = page.heightForWidth(SETTINGS_WIDTH) if page.hasHeightForWidth() else -1
+        return max(height, page.sizeHint().height())
+
+    def _fit_to_pane(self) -> None:
+        """macOS: the Settings window takes its pane's height, up to what
+        the screen can show (the pane scrolls beyond that), at a fixed width.
+        The top edge stays where it is."""
+        if not self.mac:
+            return
+        chrome = 0
+        if self.pane_bar is not None and not self.pane_bar.isHidden():
+            chrome = self.pane_bar.sizeHint().height() + self.bar_line.sizeHint().height()
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        room = (screen.availableGeometry().height() if screen is not None else 800) - SETTINGS_SCREEN_ROOM
+        height = max(260, min(self.pane_height() + chrome, room))
+        self.setFixedSize(SETTINGS_WIDTH, height)
+
     def save_geometry(self) -> None:
         encoded = bytes(self.saveGeometry().toBase64()).decode("ascii")
         self.controller.set_window_geometry(encoded)
@@ -1134,9 +1028,16 @@ class MainWindow(QWidget):
     # -- native chrome ---------------------------------------------------------------
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
-        if self.translucent and not self._material:
-            self._material = native.apply(self, self.sidebar.width(), look().dark)
-        self.sidebar.paint_background = not (self.translucent and self._material)
+        if self.mac:
+            toolbar = self.native_toolbar
+            if toolbar is not None and not toolbar.installed and toolbar.available():
+                if toolbar.install(self, self.stack.currentIndex()):
+                    self.pane_bar.hide()
+                    self.bar_line.hide()
+                    self._fit_to_pane()
+            self._rest_focus()
+        elif self.translucent and not self._material:
+            self._material = native.apply(self, look().dark)
         self._tint_title_bar()
         self._sync_pause()
         self.update()
@@ -1146,37 +1047,24 @@ class MainWindow(QWidget):
         self._sync_pause()
 
     def paintEvent(self, _event) -> None:  # noqa: N802
-        lk = look()
-        painter = QPainter(self)
+        if self.mac:
+            return  # the window's own background, as AppKit draws it
         if self.translucent and self._material:
-            if IS_MAC:
-                # The sidebar shows the vibrant material; the pane is solid.
-                painter.fillRect(
-                    QRect(self.sidebar.width(), 0, self.width() - self.sidebar.width(), self.height()),
-                    lk.pane,
-                )
-            # Windows: Mica fills the whole window, as in Windows Settings.
-            return
-        painter.fillRect(self.rect(), lk.pane)
-        if IS_MAC:
-            painter.fillRect(QRect(0, 0, self.sidebar.width(), self.height()), lk.sidebar)
+            return  # Mica fills the whole window, as in Windows Settings
+        QPainter(self).fillRect(self.rect(), look().pane)
 
     def changeEvent(self, event) -> None:  # noqa: N802
         if event.type() == QEvent.Type.ActivationChange:
-            self.sidebar.set_window_active(self.isActiveWindow())
-            if self.isActiveWindow() and PAGES[self.stack.currentIndex()][0] == "general":
+            if hasattr(self.navigation, "set_window_active"):
+                self.navigation.set_window_active(self.isActiveWindow())
+            if self.isActiveWindow() and self._login_page_shown():
                 # Back from System Settings or Task Manager, where the login
                 # item may just have been switched.
                 self.controller.refresh_login_item()
                 self.refresh()
-            # Calibrating in a window left behind another app would leave
-            # every click in that app unfiltered.
-            self._sync_pause()
-        elif event.type() == QEvent.Type.WindowStateChange:
-            self._sync_pause()
         if (
             event.type() == QEvent.Type.WindowStateChange
-            and not IS_MAC
+            and not self.mac
             and self.isMinimized()
             and QSystemTrayIcon.isSystemTrayAvailable()
         ):
@@ -1185,65 +1073,98 @@ class MainWindow(QWidget):
             QTimer.singleShot(0, self.close)
         super().changeEvent(event)
 
+    def _rest_focus(self) -> None:
+        """macOS: a pane opens with no control focused, as AppKit's do (Qt
+        would otherwise ring the first one); Tab moves into it from here."""
+        focused = QApplication.focusWidget()
+        if focused is None or focused is self or self.stack.isAncestorOf(focused):
+            self.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def _login_page_shown(self) -> bool:
+        return self.current_key in ("general", "settings")
+
     def apply_look(self) -> None:
         """Pick up a light/dark or accent change from the system."""
         set_look(current_look())
         self._tint_title_bar()
-        for label in self.findChildren(TextLabel):
-            label.restyle()
+        for text in self.findChildren(TextLabel):
+            text.restyle()
         for button in self.findChildren(QPushButton):
             if button.isDefault():
                 set_primary(button, True)
         for widget in self.findChildren(QWidget):
+            if hasattr(widget, "restyle") and not isinstance(widget, TextLabel):
+                widget.restyle()
             widget.update()
+        self.tune.apply_look()
         self.update()
 
     def _tint_title_bar(self) -> None:
         # Mica already runs through the title bar; a solid window tints it.
         native.set_dark_title_bar(self, look().dark, None if self._material else look().pane)
 
-    # Older name, kept for callers.
-    apply_palette = apply_look
-
     # -- navigation --------------------------------------------------------------
+    @property
+    def current_key(self) -> str:
+        return self.page_keys[self.stack.currentIndex()]
+
     def _show_page(self, index: int) -> None:
-        self.sidebar.set_current(index, emit=False)
+        self.navigation.set_current(index, emit=False)
         self.stack.setCurrentIndex(index)
-        self.title_label.setText(PAGES[index][1])
-        if PAGES[index][0] == "general":
+        if self.mac:
+            # The window is titled with the pane, as Settings windows are,
+            # and opens on it next time.
+            self.setWindowTitle(self.items[index][1])
+            if self.native_toolbar is not None:
+                self.native_toolbar.select(index)
+            ui_state.remember(**{LAST_PANE: self.page_keys[index]})
+            self._rest_focus()
+        if self._login_page_shown():
             self.controller.refresh_login_item()
-        self._sync_pause()
         self.refresh()
+        self._fit_to_pane()
 
     def show_page(self, key: str) -> None:
-        for index, (name, _title) in enumerate(PAGES):
-            if name == key:
-                self._show_page(index)
+        """Show the pane named `key` (either platform's name for it)."""
+        if key not in self.page_keys:
+            key = PAGE_ALIASES.get(key, key)
+        if key in self.page_keys:
+            self._show_page(self.page_keys.index(key))
 
-    def show_calibration(self, button: object = None) -> None:
-        """Open Calibrate, measuring `button` if one is named."""
-        if button is not None:
-            self.calibrate.set_button(button)
-        self.show_page("calibrate")
+    def show_tune(self, button: object = None) -> None:
+        """Open Test and Tune, testing `button` if one is named: over this
+        window when it is up, in the middle of the screen when not."""
+        tune = self.tune
+        tune.open_for(button)
+        if not tune.isVisible():
+            anchor = self.frameGeometry() if self.isVisible() else None
+            if anchor is None:
+                screen = QGuiApplication.primaryScreen()
+                anchor = screen.availableGeometry() if screen is not None else None
+            if anchor is not None:
+                tune.move(anchor.center() - QPoint(tune.width() // 2, tune.height() // 2))
+        if tune.isMinimized():
+            tune.showNormal()
+        else:
+            tune.show()
+        tune.raise_()
+        tune.activateWindow()
 
-    # -- calibration pause -------------------------------------------------------
+    # -- the pause while Test and Tune measures ------------------------------------
     def _should_pause(self) -> bool:
-        """Calibration has to see the raw clicks, so filtering pauses, but
-        only while it is measuring in front of the user: not on the intro or
-        the result, and not while the window is hidden, minimized or behind
-        another app, where those clicks would go unfiltered."""
-        return (
-            PAGES[self.stack.currentIndex()][0] == "calibrate"
-            and self.calibrate.measuring
-            and self.isVisible()
-            and not self.isMinimized()
-            and self.isActiveWindow()
-        )
+        """Test and Tune has to see the raw clicks, so filtering pauses, but
+        only while it is measuring in front of the user: not on the verdict
+        or the tune step, and not while its window is hidden, minimized or
+        behind another app, where those clicks would go unfiltered."""
+        tune = self.tune
+        return tune.measuring and tune.isVisible() and not tune.isMinimized() and tune.isActiveWindow()
 
     def _sync_pause(self) -> None:
         if self._should_pause():
             self.controller.suspend()
-        else:
+        elif self.controller.suspended and not self.controller.paused:
+            # Only Test and Tune's own pause ends here; a pause the user
+            # asked for from the menu runs its course.
             self.controller.resume()
 
     # -- state -------------------------------------------------------------------
@@ -1251,13 +1172,19 @@ class MainWindow(QWidget):
         granted = self._permission_granted
         waiting = self._enable_when_granted and not self.controller.active
         self.controller.set_waiting_for_permission(waiting)
-        self.filter_page.refresh(granted, waiting)
-        self.test_page.refresh()
+        self.home.refresh(granted, waiting)
         self.history.refresh()
-        self.apps.refresh()
-        self.devices.refresh()
-        self.general.refresh(granted)
+        self.exceptions.refresh()
+        self.about.refresh(granted)
+        self.tune.refresh()
+        # A row shown or hidden (Custom's windows, a note) changes the
+        # pane's height, which a Mac Settings window follows.
+        self._fit_to_pane()
 
+    def set_menu_bar_shown(self, shown: bool) -> None:
+        self.home.set_menu_bar_shown(shown)
+
+    # -- permission and the filter's life ----------------------------------------
     def _read_permission(self) -> bool:
         if not permissions.has_accessibility():
             return False
@@ -1393,7 +1320,7 @@ class MainWindow(QWidget):
         late, so a refused tap is tried again at each of RETRY_AT_S before
         it is left to the user. The first failure shows as usual (a dialog
         only if the window is on screen); the retries show only in the
-        menu's status line and the Filter pane."""
+        menu's status line and the hero row."""
         self.request_filter(True, prompt=False)
         if self._start_failed():
             marks = (0, *RETRY_AT_S)
@@ -1468,20 +1395,8 @@ class MainWindow(QWidget):
         nobody asked for would open over whatever the user is doing."""
         return self.isVisible() and not self.isMinimized()
 
-    def _apply_calibration(self, button: object, threshold_ms: int) -> None:
-        """Calibration's Apply: the button's window, and filtering it, since
-        it was worth measuring."""
-        self.controller.set_threshold(button, threshold_ms)
-        self.controller.set_button_filtered(button, True)
-        self.calibrate.restart()
-        self._show_page(0)
-
     def closeEvent(self, event) -> None:  # noqa: N802
         event.ignore()
-        # A calibration left half done, or finished but not applied, starts
-        # over next time, so reopening the window never pauses filtering.
-        if self.calibrate.phase != "intro":
-            self.calibrate.restart()
         self.save_geometry()
         self.controller.flush_settings()
         self.controller.flush_stats()
