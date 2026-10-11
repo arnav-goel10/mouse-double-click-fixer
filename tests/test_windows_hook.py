@@ -127,9 +127,11 @@ class FakeWindows:
     Each event goes to the filter's hook first; what it lets through moves the
     pointer and reaches apps (`seen`), and what it drops leaves the pointer
     where it was. SendInput adds to the end of the queue, as it does while a
-    low-level hook is installed. Buttons are swapped for a left-handed user
-    the way this hook assumes Windows does: SendInput names the physical
-    button, hooks and apps see the logical one.
+    low-level hook is installed, and returns once the last of its input has
+    been handled (InputSender then settles it). SetCursorPos moves the
+    pointer at once, and apps see it move, but no hook does. Buttons are
+    swapped for a left-handed user the way this hook assumes Windows does:
+    SendInput names the physical button, hooks and apps see the logical one.
     """
 
     INJECTED = 0x1
@@ -147,9 +149,15 @@ class FakeWindows:
         self.cursor_known = True
         self.relocation_checks = 0
         self.now_ms = 10_000.0
-        self.hook = WindowsHook(click_filter, self, accepts_injection=lambda _x, _y: True)
+        self.filter = click_filter
+        # Batches sent and not yet in: (their last input, what they settle).
+        self.arrivals: list = []
+        # Where SetCursorPos put the pointer.
+        self.placed: list = []
+        self.hook = WindowsHook(click_filter, self, accepts_injection=lambda _x, _y: True, send=self.send_batch)
         click_filter._use_os_time = True
         click_filter._stamp_error_s = WINDOWS_STAMP_ERROR_S
+        click_filter._resend_motion = False
         click_filter._inject = self.hook.inject
         click_filter._is_near = self.within_drag_rect
         click_filter._set_motion_tap = self.hook.set_watch
@@ -199,6 +207,25 @@ class FakeWindows:
         self.queue.extend(inputs)
         return len(inputs)
 
+    def send_batch(self, batch: list) -> None:
+        """InputSender: what doesn't go in is settled as lost at once, and
+        what does once the last of it has been handled."""
+        inputs = [item for item, _button, _seq in batch]
+        sent = self.send(inputs)
+        for _item, button, seq in batch[sent:]:
+            if button is not None:
+                self.filter._resend_lost(button, seq)
+        counted = [(button, seq) for _item, button, seq in batch[:sent] if button is not None]
+        if sent and counted:
+            self.arrivals.append((inputs[sent - 1], counted))
+
+    def set_cursor_pos(self, x: int, y: int):
+        left, top, width, height = self.screen
+        self.cursor = (min(max(int(x), left), left + width - 1), min(max(int(y), top), top + height - 1))
+        self.placed.append(self.cursor)
+        self.seen.append(("move", self.cursor, 0))
+        return self.cursor
+
     # -- the hand ----------------------------------------------------------
     def move(self, dx: int, dy: int, extra: int = 0) -> None:
         self.queue.append(("hand-move", dx, dy, extra))
@@ -227,7 +254,11 @@ class FakeWindows:
 
     def run(self) -> None:
         while self.queue:
-            self._process(self.queue.pop(0))
+            item = self.queue.pop(0)
+            self._process(item)
+            if self.arrivals and item is self.arrivals[0][0]:
+                for button, seq in self.arrivals.pop(0)[1]:
+                    self.filter._injected_passed(button, seq)
 
     def _process(self, item) -> None:
         kind = item[0]
@@ -322,10 +353,75 @@ class WindowsHookLogicTests(unittest.TestCase):
             [("down", Button.LEFT, (200, 200)), ("up", Button.LEFT, (200, 200))],
         )
         self.assertEqual(self.win.moves_between("down", "up"), [], "apps saw the pointer leave a held button")
-        self.assertEqual(self.win.cursor, (420, 330))
-        self.assertFalse(self.win.hook.watch[0], "motion is watched only while it matters")
+        # The move was held, never re-sent: the hand stopped, so the pointer
+        # is put where it took it once nothing waits.
+        self.assertEqual(self.win.cursor, (200, 200))
         self.fire_timers()
+        self.assertEqual(self.win.cursor, (420, 330))
+        self.assertEqual(self.win.placed, [(420, 330)])
+        self.assertEqual(self.resent_moves(), [], "no move of the hand's was re-sent")
+        self.assertFalse(self.win.hook.watch[0], "motion is watched only while it matters")
         self.assertEqual(len(self.win.buttons()), 2, "the timer must not send the up again")
+
+    def resent_moves(self) -> list:
+        """Moves this app sent: the hand's re-sent, or the pointer taken
+        somewhere and back."""
+        return [entry for entry in self.win.seen if entry[0] == "move" and entry[2]]
+
+    def test_the_pointer_catches_up_with_the_hands_next_move(self) -> None:
+        # The hand leaves the click and keeps moving: the moves made while
+        # the up is on its way are held, and the first one after it is in
+        # puts the pointer where the hand has taken it, inside the hook's
+        # callback. Every later move goes straight through.
+        self.click()
+        self.win.move(20, 0)                                          # leaves the spot: the up goes out
+        self.win.move(5, 0)                                           # handled before the up is in: held
+        self.win.run()
+        self.assertEqual(self.win.buttons()[1][:3], ("up", Button.LEFT, (200, 200)))
+        self.assertEqual(self.win.cursor, (200, 200), "held, not re-sent")
+        self.win.move(5, 0)                                           # the up is in: the pointer catches up
+        self.win.run()
+        self.assertEqual(self.win.placed, [(230, 200)])
+        self.assertFalse(self.win.hook.watch[0])
+        self.win.move(5, 0)
+        self.win.run()
+        self.assertEqual(self.win.cursor, (235, 200))
+        self.assertEqual(self.win.seen[-1], ("move", (235, 200), 0), "the hand's own move")
+        self.assertEqual(self.resent_moves(), [])
+        self.fire_timers()
+        self.assertEqual(self.win.placed, [(230, 200)], "nothing more to catch up")
+
+    def test_a_re_sent_event_is_waited_for_until_it_is_in(self) -> None:
+        # The hook seeing this app's release go by doesn't settle it: SendInput
+        # returning does, once every hook has seen it and it has arrived.
+        # Until then the hand's motion is held, so the pointer can't move
+        # before apps have the up.
+        self.click()
+        self.win.move(20, 0)
+        self.win._process(self.win.queue.pop(0))                      # the move: held, the up sent
+        up = self.win.queue.pop(0)
+        self.win._process(up)                                         # the up goes by the hook ...
+        self.assertEqual(len(self.filter._in_flight[Button.LEFT]), 1, "... and is still on its way")
+        self.assertIs(self.win.arrivals[0][0], up)
+        for button, seq in self.win.arrivals.pop(0)[1]:               # ... until SendInput returns
+            self.filter._injected_passed(button, seq)
+        self.assertEqual(len(self.filter._in_flight[Button.LEFT]), 0)
+
+    def test_a_press_while_motion_is_held_goes_where_the_hand_is(self) -> None:
+        # The hand moved on from a click and pressed again before moving
+        # once more: the pointer is put where the hand is from inside the
+        # press's callback, and the press re-sent there.
+        self.click()
+        self.win.move(30, 0)
+        self.win.run()                                                # the up is in; the move held
+        self.win.now_ms += 100
+        self.win.press()
+        self.win.run()
+        downs = [entry for entry in self.win.buttons() if entry[0] == "down"]
+        self.assertEqual(downs[1][2], (230, 200))
+        self.assertEqual(mark_kind(downs[1][4]), INJECTED_MARK, "re-sent where the pointer now is")
+        self.assertEqual(self.win.placed, [(230, 200)])
+        self.assertEqual(self.resent_moves(), [])
 
     def test_the_up_keeps_its_own_time_when_nothing_passed_it(self) -> None:
         self.win.press()
@@ -349,7 +445,9 @@ class WindowsHookLogicTests(unittest.TestCase):
                 self.win.run()
                 self.assertEqual(self.win.buttons()[1][2], (200, 200))
                 self.assertEqual(self.win.moves_between("down", "up"), [])
+                self.fire_timers()
                 self.assertEqual(self.win.cursor, (410, 320))
+                self.assertEqual(self.resent_moves(), [])
 
     def test_small_motion_passes_and_the_up_goes_out_where_the_pointer_is(self) -> None:
         self.click()
@@ -372,6 +470,7 @@ class WindowsHookLogicTests(unittest.TestCase):
         self.win.run()
         self.assertEqual(self.win.buttons()[1][:3], ("up", Button.LEFT, (202, 200)))
         self.assertNotIn(TELEPORT_MARK, [entry[2] for entry in self.win.seen if entry[0] == "move"])
+        self.fire_timers()
         self.assertEqual(self.win.cursor, (212, 200))
 
     def test_a_drop_still_inside_the_drag_rectangle_goes_out_where_the_pointer_is(self) -> None:
@@ -428,11 +527,12 @@ class WindowsHookLogicTests(unittest.TestCase):
         self.win.move(10, 0)                                          # past it
         self.win.run()
         self.assertEqual(self.win.buttons()[1][:3], ("up", Button.LEFT, (300, 200)))
+        self.assertEqual(self.win.cursor, (310, 200), "back where it was; the hand's last move is held")
+        self.fire_timers()
         self.assertEqual(self.win.cursor, (320, 200))
         marks = [mark_kind(entry[2]) for entry in self.win.seen if entry[0] == "move"][-3:]
-        self.assertEqual(marks, [TELEPORT_MARK, MOTION_MARK_FOR[Button.LEFT], MOTION_MARK_FOR[Button.LEFT]])
+        self.assertEqual(marks, [TELEPORT_MARK, MOTION_MARK_FOR[Button.LEFT], 0], "there, back, then where the hand is")
         self.assertFalse(self.win.hook.watch[0])
-        self.fire_timers()
         self.assertEqual(len(self.win.buttons()), 2, "the timer must not send the up again")
 
     def test_a_release_sent_with_its_way_back_is_waited_for_until_that_is_back(self) -> None:
@@ -470,6 +570,7 @@ class WindowsHookLogicTests(unittest.TestCase):
                 self.win.queue.insert(position, ("hand-move", 10, 0, 0))
                 self.win.run()
                 self.assertEqual(self.win.buttons()[1][:3], ("up", Button.LEFT, (300, 200)))
+                self.fire_timers()
                 self.assertEqual(self.win.cursor, (510, 200))
 
     def test_a_teleport_that_cannot_be_made_leaves_nothing_in_flight(self) -> None:
@@ -652,18 +753,19 @@ class WindowsHookLogicTests(unittest.TestCase):
         self.win.move(30, 0)                                          # waits behind it too
         self.win.run()
         self.assertEqual(self.win.buttons()[1][:3], ("up", Button.LEFT, (200, 200)))
+        self.fire_timers()
         after_up = [entry[1] for entry in self.win.seen[self.win.seen.index(self.win.buttons()[1]) + 1:]]
-        self.assertEqual(after_up, [(600, 600), (602, 600), (632, 600)], "back, then the hand's two steps")
+        self.assertEqual(after_up, [(600, 600), (632, 600)], "back, then where the hand's two steps took it")
         self.assertEqual(self.win.cursor, (632, 600))
         self.fire_timers()
         self.assertEqual(len(self.win.buttons()), 2, "the up went out once")
 
     def test_another_programs_move_while_the_hands_moves_are_held_back(self) -> None:
-        # The hand leaves the click: the up is re-sent and the hand's move
-        # waits behind it. Another program's move gets in before the up comes
-        # back, then the hand moves on. The hand's held moves still land, after
-        # the other program's, so its next step goes on from where they lead,
-        # not from where the other program put the pointer.
+        # The hand leaves the click: the up is re-sent and the hand's move is
+        # held behind it. Another program's move gets in before the up is in,
+        # then the hand moves on. The pointer still goes where the hand's
+        # moves lead, after the other program's, so its next step goes on
+        # from there, not from where the other program put the pointer.
         self.click()
         self.win.move(30, 0)                                          # held: (230, 200)
         self.win.queue.append(("move", normalized_absolute(600, 600, *self.win.screen), 0))
@@ -671,7 +773,7 @@ class WindowsHookLogicTests(unittest.TestCase):
         self.win.run()
         self.fire_timers()
         moves = [entry[1] for entry in self.win.seen if entry[0] == "move"]
-        self.assertEqual(moves, [(600, 600), (230, 200), (240, 200)], "the hand's path, after the other program's move")
+        self.assertEqual(moves, [(600, 600), (240, 200)], "where the hand went, after the other program's move")
         self.assertEqual(self.win.cursor, (240, 200))
         self.assertFalse(self.win.hook.watch[0])
 
@@ -1527,28 +1629,16 @@ def _quantile(values: list, share: float) -> float:
     return ordered[min(len(ordered) - 1, max(0, int(round(share * (len(ordered) - 1)))))]
 
 
-@unittest.skipUnless(_run_e2e(), "needs Windows and DCF_E2E=1 (it injects real input)")
-class WindowsMotionSmoothnessTests(RealWindows):
-    """Motion after a click reaches apps as smoothly as with the filter off.
-
-    The owner's report on 1.0.0: after a click, the pointer moved like a
-    slide show. A process of its own (tests/windows_input_probe.py) stands
-    for the mouse and for the apps: it sends the hand's relative moves on a
-    schedule, at 1000 Hz or 125 Hz, and its hook, behind the filter's, sees
-    what apps see and when. From that: how long each of the hand's moves took
-    to reach apps, the gaps between the updates they saw, moves delivered in
-    bursts, moves the filter re-sent (absolute), whether every re-send was
-    seen coming back, and the pointer's whole path. Each case runs with the
-    filter off (the baseline), on, on without Raw Input, on with a busy hook
-    thread (every WM_INPUT costs it a quarter of a millisecond more, as on a
-    slow machine or with a fast mouse), and on beside another Python thread
-    that is busy (the app's own UI thread at work: the hook needs the GIL)."""
+class ProbedWindows(RealWindows):
+    """Real input from the probe, a process of its own that stands for the
+    mouse and for the apps (tests/windows_input_probe.py). Its hook goes in
+    before any filter a test starts, so the filter's is called first."""
 
     PROBE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "windows_input_probe.py")
-    BUSY_S = 0.00025
 
     def setUp(self) -> None:
         import json
+        import subprocess
 
         from app.main import INTERPRETER_SWITCH_INTERVAL_S
 
@@ -1556,51 +1646,60 @@ class WindowsMotionSmoothnessTests(RealWindows):
         self.exact_relative_motion()
         self.pointer_where_it_counts()
         self.json = json
-        self.probe = None
-        self.observer = None
-        self.addCleanup(self.stop_probe)
         # The app's own: how long another of its Python threads can keep the
         # hook waiting for the GIL.
         interval = sys.getswitchinterval()
         sys.setswitchinterval(INTERPRETER_SWITCH_INTERVAL_S)
         self.addCleanup(sys.setswitchinterval, interval)
-
-    def use_probe(self, observer: str) -> None:
-        """The probe, observing by its hook ("hook") or by the pointer's
-        place ("cursor"). Its hook goes in before the filter's, so the
-        filter's is called first."""
-        import subprocess
-
-        if self.observer == observer:
-            return
-        self.stop_probe()
         self.probe = subprocess.Popen(
-            [sys.executable, "-I", self.PROBE, "--observe", observer],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
+            [sys.executable, "-I", self.PROBE], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1
         )
-        self.observer = observer
+        self.addCleanup(self.stop_probe)
         self.assertEqual(self.probe.stdout.readline().strip(), "ready")
         time.sleep(0.2)
 
     def stop_probe(self) -> None:
-        probe, self.probe, self.observer = self.probe, None, None
-        if probe is None:
-            return
         try:
-            probe.stdin.write(self.json.dumps({"do": "quit"}) + "\n")
-            probe.stdin.close()
-            probe.wait(5)
+            self.probe.stdin.write(self.json.dumps({"do": "quit"}) + "\n")
+            self.probe.stdin.close()
+            self.probe.wait(5)
         except Exception:  # noqa: BLE001 - it goes either way
-            probe.kill()
+            self.probe.kill()
+
+    def play(self, rate: int, count: int, step, scenario: str, settle_s: float = 0.4) -> dict:
+        command = {"do": "stream", "rate": rate, "count": count, "step": list(step), "scenario": scenario, "settle_s": settle_s}
+        self.probe.stdin.write(self.json.dumps(command) + "\n")
+        return self.json.loads(self.probe.stdout.readline())
+
+
+@unittest.skipUnless(_run_e2e(), "needs Windows and DCF_E2E=1 (it injects real input)")
+class WindowsMotionSmoothnessTests(ProbedWindows):
+    """Motion after a click reaches apps as smoothly as with the filter off.
+
+    The owner's report on 1.0.0: after a click, the pointer moved like a
+    slide show. The probe sends the hand's relative moves on a schedule, at
+    1000 Hz or 125 Hz, after a click, from inside a drag let go while moving,
+    or on their own, and sees what apps see and when: by the pointer's place,
+    how long each of the hand's moves took to show and the gaps between
+    updates; by its hook, the buttons and any move this app sent. Every
+    re-send must arrive, and the pointer must end where the hand took it.
+    Each case runs with the filter off (the baseline), on, on without Raw
+    Input, on with a busy hook thread (every WM_INPUT costs it a quarter of
+    a millisecond more, as on a slow machine or with a fast mouse), and on
+    beside another Python thread that keeps busy (the app's own UI thread at
+    work: the hook needs the GIL), which is measured and reported only."""
+
+    BUSY_S = 0.00025
 
     # -- the modes -------------------------------------------------------------
     @contextmanager
     def mode(self, name: str):
         """The filter as `name` says, for one stream."""
+        import app.platform
+
         patches = []
         busy_thread = None
         stop = threading.Event()
-        interval = sys.getswitchinterval()
         if "no raw input" in name:
             patches.append(mock.patch("app.devices_win.Win32RawInput", side_effect=OSError("off for the test")))
         if "busy hook thread" in name:
@@ -1616,26 +1715,32 @@ class WindowsMotionSmoothnessTests(RealWindows):
                 return original(devices, lparam)
 
             patches.append(mock.patch.object(RawInputDevices, "on_input", on_input))
+        # What this app re-sends, and what of it arrived (SendInput returned).
+        traffic = self.traffic = {"sent": [], "in": set()}
+        send_batch = app.platform.send_batch
+
+        def counted_send_batch(api, batch, lost, done=None):
+            def arrived(button, seq):
+                traffic["in"].add((button, seq))
+                if done is not None:
+                    done(button, seq)
+
+            return send_batch(api, batch, lost, arrived)
+
+        patches.append(mock.patch("app.platform.send_batch", counted_send_batch))
         for patch in patches:
             patch.start()
-        self.traffic = {"sent": [], "back": set()}
         try:
             if name.startswith("on"):
                 self.start_filter()
                 self.filter._callback_timings = []
-                inject, passed = self.filter._inject, self.filter._injected_passed
-                traffic = self.traffic
+                inject = self.filter._inject
 
                 def counted_inject(button, pressed, template, seq):
                     traffic["sent"].append((button, seq))
                     return inject(button, pressed, template, seq)
 
-                def counted_passed(button, seq):
-                    traffic["back"].add((button, seq))
-                    return passed(button, seq)
-
                 self.filter._inject = counted_inject
-                self.filter._injected_passed = counted_passed
             if "another Python thread busy" in name:
 
                 def spin() -> None:
@@ -1649,7 +1754,6 @@ class WindowsMotionSmoothnessTests(RealWindows):
             stop.set()
             if busy_thread is not None:
                 busy_thread.join(2)
-            sys.setswitchinterval(interval)
             if self.filter is not None:
                 self.filter.stop()
                 self.filter = None
@@ -1672,83 +1776,68 @@ class WindowsMotionSmoothnessTests(RealWindows):
         time.sleep(0.05)
         if self.filter is not None and self.filter._callback_timings is not None:
             self.filter._callback_timings.clear()
-        command = {"do": "stream", "rate": rate, "count": count, "step": list(step), "scenario": scenario, "settle_s": 0.4}
-        self.probe.stdin.write(self.json.dumps(command) + "\n")
-        answer = self.json.loads(self.probe.stdout.readline())
+        answer = self.play(rate, count, step, scenario)
         timings = list(self.filter._callback_timings or []) if self.filter is not None else []
-        observed = [(message, (x, y), extra, 0, seen, 0) for message, x, y, extra, seen in answer["observed"]]
         expected = (start[0] + count * step[0], start[1] + count * step[1])
-        result = self.analyse(scenario, interval, start, step, answer["sent"], expected, self.cursor(), observed, timings)
+        result = self.analyse(scenario, interval, start, step, answer, expected, self.cursor(), timings)
         sent = self.traffic["sent"]
         result["resends"] = len(sent)
-        # A re-send the hook never saw come back was waited for until the
-        # in-flight time-out, and everything behind it with it.
-        result["never_back"] = sum(1 for button, seq in sent if (button, seq % MARK_SEQ_SPAN or MARK_SEQ_SPAN) not in self.traffic["back"])
+        # A re-send that never arrived: what waits behind it waited for the
+        # in-flight time-out.
+        result["never_in"] = sum(1 for button, seq in sent if (button, seq) not in self.traffic["in"])
         return result
 
-    def analyse(self, scenario, interval, start, step, sent, expected, cursor, observed, timings) -> dict:
+    def analyse(self, scenario, interval, start, step, answer, expected, cursor, timings) -> dict:
+        sent = answer["sent"]
         count = len(sent)
-        moves = [entry for entry in observed if entry[0] == WM_MOUSEMOVE]
-        # When apps first saw the pointer at (or past) each of the hand's
-        # positions: hand move k takes it to start + (k + 1) * step.
+        samples = [((x, y), at) for x, y, at in answer["samples"]]
+        hooked = [(message, (x, y), extra, at) for message, x, y, extra, at in answer["observed"]]
+        moves = [entry for entry in hooked if entry[0] == WM_MOUSEMOVE]
+        # When the screen first showed the pointer at (or past) each of the
+        # hand's positions: hand move k takes it to start + (k + 1) * step.
         reached = [None] * count
         furthest = -1
-        for entry in moves:
-            index = (entry[1][0] - start[0]) // step[0] - 1
+        for (x, _y), at in samples:
+            index = (x - start[0]) // step[0] - 1
             if index > furthest:
                 for k in range(max(furthest + 1, 0), min(index, count - 1) + 1):
-                    reached[k] = entry[4]
+                    reached[k] = at
                 furthest = index
         latencies = [(seen - sent[k]) * 1000 for k, seen in enumerate(reached) if seen is not None]
-        times = [entry[4] for entry in moves if entry[4] >= sent[0]]
-        gaps = [(later - earlier) * 1000 for earlier, later in zip(times, times[1:])]
-        # The gaps apps saw while the hand was moving, its own last one
-        # included: from its first move to the update showing its last.
+        times = [at for _place, at in samples if at >= sent[0]]
         until = reached[-1] if reached[-1] is not None else times[-1] if times else sent[-1]
-        moving = [(later - earlier) * 1000 for earlier, later in zip(times, times[1:]) if later <= until]
+        gaps = [(later - earlier) * 1000 for earlier, later in zip(times, times[1:]) if later <= until]
         inputs = [(later - earlier) * 1000 for earlier, later in zip(sent, sent[1:])]
-        # Bursts: updates that came within a quarter of the input interval
-        # of the one before, counted together.
-        burst = longest = 1
-        for gap in gaps:
-            burst = burst + 1 if gap < interval * 250 else 1
-            longest = max(longest, burst)
-        path, here = 0.0, start
-        for entry in moves:
-            path += ((entry[1][0] - here[0]) ** 2 + (entry[1][1] - here[1]) ** 2) ** 0.5
-            here = entry[1]
-        hand_path = count * (step[0] ** 2 + step[1] ** 2) ** 0.5
-        # Steps back along the hand's path, and how far the furthest went.
-        backs = [earlier[1][0] - later[1][0] for earlier, later in zip(moves, moves[1:]) if later[1][0] < earlier[1][0]]
+        places = [place for place, _at in samples]
+        backs = [a[0] - b[0] for a, b in zip(places, places[1:]) if b[0] < a[0]]
         result = {
             "scenario": scenario,
             "rate": round(1 / interval),
             "moves": count,
             "input_ms": (round(statistics.median(inputs), 3), round(max(inputs), 3)),
-            "updates": len(moves),
-            "gap_ms": (round(_quantile(moving, 0.5), 3), round(_quantile(moving, 0.99), 2), round(max(moving or [0]), 2)),
-            "gaps_over_2x": sum(1 for gap in moving if gap > 2 * interval * 1000),
+            "updates": len(samples),
+            "gap_ms": (round(_quantile(gaps, 0.5), 3), round(_quantile(gaps, 0.99), 2), round(max(gaps or [0]), 2)),
+            "gaps_over_2x": sum(1 for gap in gaps if gap > 2 * interval * 1000),
             "latency_ms": (
                 round(_quantile(latencies, 0.5), 3), round(_quantile(latencies, 0.99), 2), round(max(latencies or [0]), 2)
             ),
-            "burst": longest,
+            # Moves this app sent, as the hook behind it saw them: the hand's
+            # re-sent (absolute), and a release's way there and back.
             "resent": sum(1 for entry in moves if mark_kind(entry[2]) in INJECTED_MOTION_MARKS),
             "teleports": sum(1 for entry in moves if mark_kind(entry[2]) == TELEPORT_MARK),
-            "path_ratio": round(path / hand_path, 3),
             "backs": (len(backs), max(backs or [0])),
             "short_px": expected[0] - cursor[0],
             "cursor_ok": cursor == expected,
             "unseen": sum(1 for seen in reached if seen is None),
         }
         if scenario == "click":
-            ups = [index for index, entry in enumerate(observed) if entry[0] == WM_LBUTTONUP]
-            off = [
-                index for index, entry in enumerate(observed)
-                if entry[0] == WM_MOUSEMOVE and not self.api.within_drag_rect(start, entry[1])
-            ]
+            # The up reached apps before the screen showed the pointer off
+            # the click.
+            ups = [at for message, _place, _extra, at in hooked if message == WM_LBUTTONUP]
+            off = [at for place, at in samples if not self.api.within_drag_rect(start, place)]
             result["up_first"] = bool(ups) and (not off or ups[0] < off[0])
         elif scenario == "drag":
-            result["ups"] = sum(1 for entry in observed if entry[0] == WM_LBUTTONUP)
+            result["ups"] = sum(1 for entry in hooked if entry[0] == WM_LBUTTONUP)
         if timings:
             def cost(kind) -> str:
                 values = [seconds * 1000 for message, watched, seconds in timings if kind(message, watched)]
@@ -1766,8 +1855,6 @@ class WindowsMotionSmoothnessTests(RealWindows):
     def measure(self, modes, cases) -> dict:
         results = {}
         for mode in modes:
-            observer = "cursor" if "pointer watched" in mode else "hook"
-            self.use_probe(observer)
             for rate, scenario in cases:
                 with self.mode(mode):
                     result = self.stream(rate, scenario)
@@ -1776,46 +1863,44 @@ class WindowsMotionSmoothnessTests(RealWindows):
         return results
 
     def test_motion_after_a_click_is_as_smooth_as_with_the_filter_off(self) -> None:
-        modes = (
-            "off",
-            "on",
-            "on, no raw input",
-            "on, busy hook thread",
-            "off, another Python thread busy",
-            "on, another Python thread busy",
-            # No hook behind the filter's: apps' view is the pointer's place.
-            "off, pointer watched",
-            "on, pointer watched",
-        )
+        modes = ("off", "on", "on, no raw input", "on, busy hook thread", "on, another Python thread busy")
         cases = ((1000, "move"), (1000, "click"), (125, "click"), (1000, "drag"))
         results = self.measure(modes, cases)
         for (mode, rate, scenario), result in results.items():
-            if "another Python thread" in mode or "pointer watched" in mode:
-                continue  # measured and reported only
+            if mode == "off" or "another Python thread" in mode:
+                continue  # the baseline, and measured and reported only
+            baseline = results[("off", rate, scenario)]
             with self.subTest(mode=mode, scenario=scenario, rate=rate):
-                if mode.startswith("on"):
-                    self.assertEqual(result["never_back"], 0, f"a re-send was never seen coming back: {result}")
-                if scenario == "click" and mode.startswith("on"):
+                self.assertTrue(result["cursor_ok"], f"the pointer ended off the hand's path: {result}")
+                self.assertEqual(result["never_in"], 0, f"a re-send never arrived: {result}")
+                self.assertEqual(result["unseen"], 0, f"some of the hand's motion never showed: {result}")
+                if scenario == "click":
                     self.assertTrue(result["up_first"], f"the pointer left the click before its up: {result}")
-                # Reported, not yet held to: how far short of the hand's path
-                # the pointer ended.
-                if scenario == "drag":
+                    self.assertEqual((result["resent"], result["teleports"]), (0, 0), f"moves were re-sent: {result}")
+                elif scenario == "drag":
                     self.assertEqual(result["ups"], 1, f"{result}")
+                    # The release is taken to where the button came up and back.
+                    self.assertEqual((result["resent"], result["teleports"]), (1, 1), f"{result}")
+                else:
+                    self.assertEqual(result["resends"], 0, f"{result}")
+                # No gap the filter adds beyond twice the hand's interval: no
+                # move of the hand's shows later than that, over the baseline.
+                allowed = 2 * 1000 / rate + baseline["latency_ms"][2]
+                self.assertLessEqual(result["latency_ms"][2], allowed, f"apps waited for the hand's motion: {result}")
 
 
 @unittest.skipUnless(_run_e2e(), "needs Windows and DCF_E2E=1 (it injects real input)")
-class WindowsCursorPlacementProbe(WindowsMotionSmoothnessTests):
-    """What SetCursorPos does when called from inside a low-level hook's
-    callback, with the mouse (the probe) moving: whether it returns, whether
-    any hook sees it, and where the mouse's next moves start from."""
-
-    test_motion_after_a_click_is_as_smooth_as_with_the_filter_off = None  # measured above
+class WindowsCursorPlacementTests(ProbedWindows):
+    """What WindowsHook's catching up rests on, measured: SetCursorPos,
+    called from inside a low-level hook's callback for the mouse's move and
+    with that move dropped, returns at once, no hook sees it (nor is the
+    callback re-entered), and the mouse's next moves start from where it
+    put the pointer."""
 
     def test_set_cursor_pos_inside_a_hook_callback(self) -> None:
         import ctypes
         from ctypes import wintypes
 
-        self.use_probe("hook")
         seen, state = [], {"depth": 0, "moves": 0, "set_ms": None, "nested": []}
         ready, done = threading.Event(), threading.Event()
         LRESULT = ctypes.c_ssize_t
@@ -1828,22 +1913,20 @@ class WindowsCursorPlacementProbe(WindowsMotionSmoothnessTests):
         user32.CallNextHookEx.restype = LRESULT
         user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
         user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), ctypes.c_void_p, wintypes.UINT, wintypes.UINT]
+        user32.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
         user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
-        user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
         record = ctypes.POINTER(self.api.MSLLHOOKSTRUCT)
         thread = [0]
 
         def run() -> None:
             self.api.use_physical_pixels()
             thread[0] = kernel32.GetCurrentThreadId()
-            point = wintypes.POINT()
 
             @HOOKPROC
             def callback(code: int, message: int, data: int) -> int:
                 if code >= 0 and message == WM_MOUSEMOVE:
                     info = ctypes.cast(data, record).contents
-                    user32.GetCursorPos(ctypes.byref(point))
-                    entry = (state["depth"], (info.pt.x, info.pt.y), int(info.flags), int(info.dwExtraInfo), (point.x, point.y))
+                    entry = ((info.pt.x, info.pt.y), int(info.dwExtraInfo))
                     seen.append(entry)
                     if state["depth"]:
                         state["nested"].append(entry)
@@ -1869,18 +1952,20 @@ class WindowsCursorPlacementProbe(WindowsMotionSmoothnessTests):
         worker.start()
         self.assertTrue(ready.wait(5))
         self.place(200, 200)
-        command = {"do": "stream", "rate": 125, "count": 20, "step": [1, 0], "scenario": "move", "settle_s": 0.3}
-        self.probe.stdin.write(self.json.dumps(command) + "\n")
-        answer = self.json.loads(self.probe.stdout.readline())
+        answer = self.play(125, 20, (1, 0), "move", settle_s=0.3)
         final = self.cursor()
         done.set()
         user32.PostThreadMessageW(thread[0], 0x0012, 0, 0)
         worker.join(3)
-        observed = [(x, y, hex(extra)) for message, x, y, extra, _at in answer["observed"] if message == WM_MOUSEMOVE]
-        self.report(f"[setcursorpos] took {state['set_ms']} ms inside the callback; nested hook calls {state['nested']}")
-        self.report(f"[setcursorpos] the hook saw (depth, pt, flags, extra, GetCursorPos): {seen}")
-        self.report(f"[setcursorpos] the observer behind it saw: {observed}")
-        self.report(f"[setcursorpos] final pointer {final}; 4 moves, a jump of 100 from the 5th, 15 more: (320, 200) if they follow it")
+        observed = [(x, y) for message, x, y, _extra, _at in answer["observed"] if message == WM_MOUSEMOVE]
+        self.report(f"[setcursorpos] {state['set_ms']:.3f} ms inside the callback; the hook saw {seen}")
+        self.assertLess(state["set_ms"], 50)
+        self.assertEqual(state["nested"], [], "SetCursorPos ran the hook again")
+        self.assertEqual([place for place, _extra in seen], [(201 + i, 200) for i in range(5)] + [(306 + i, 200) for i in range(15)],
+                         "a hook saw SetCursorPos, or the mouse's next moves didn't start from where it put the pointer")
+        self.assertEqual(observed, [(201 + i, 200) for i in range(4)] + [(306 + i, 200) for i in range(15)])
+        self.assertIn((305, 200), [(x, y) for x, y, _at in answer["samples"]], "the screen never showed it there")
+        self.assertEqual(final, (320, 200))
 
 
 MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_HWHEEL = 0x0080, 0x0100, 0x0800, 0x1000

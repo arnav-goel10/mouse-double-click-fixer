@@ -15,6 +15,7 @@ import logging
 import math
 import os
 import platform
+import queue
 import threading
 import time
 from collections import deque
@@ -73,8 +74,10 @@ def _mark(index: int) -> int:
 INJECTED_MARK = _mark(1)
 
 #: Marks pointer motion this app re-sends, one value per button whose queue it
-#: waited in, so the hook knows which button's re-sends it settles (see
-#: GlobalClickFilter._injected_passed).
+#: waited in, so the macOS tap knows which button's re-sends it settles (see
+#: GlobalClickFilter._injected_passed). On Windows, which never re-sends the
+#: hand's motion, only the move back after a release taken to its spot
+#: carries one (see WindowsHook._batch).
 INJECTED_MOTION_MARKS = {_mark(2 + index): button for index, button in enumerate(Button)}
 MOTION_MARK_FOR = {button: mark for mark, button in INJECTED_MOTION_MARKS.items()}
 
@@ -83,8 +86,9 @@ MOTION_MARK_FOR = {button: mark for mark, button in INJECTED_MOTION_MARKS.items(
 RESTORE_MARK = _mark(2 + len(Button))
 
 #: Marks the pointer motion that takes the pointer to where a held release
-#: happened, just before the release is re-sent there (Windows; see
-#: WindowsHook). The move back after it carries the button's motion mark.
+#: happened, just before the release is re-sent there, or to where a press
+#: happened after motion held back (Windows; see WindowsHook._batch). The move
+#: back after a release carries the button's motion mark.
 TELEPORT_MARK = _mark(3 + len(Button))
 
 
@@ -476,6 +480,11 @@ class GlobalClickFilter:
         # held the moment something becomes pending, so every move decided
         # after that is judged.
         self._motion_wanted = False
+        # Whether motion held back behind re-sent events is re-sent itself,
+        # as macOS does (a re-posted copy keeps its own deltas). Windows holds
+        # the hand's motion instead and puts the pointer where the hand has
+        # taken it once nothing waits (see WindowsHook).
+        self._resend_motion = True
         # Set by the Windows runner: turns its hook's motion watch on or off
         # (WindowsHook.set_watch). Motion only needs watching while a release
         # is held or re-sent.
@@ -749,15 +758,18 @@ class GlobalClickFilter:
         location: Optional[tuple[float, float]] = None,
         passes: Optional[str] = None,
         device: Optional[str] = None,
+        resend: bool = False,
     ) -> ClickEvent:
         """What a platform hook calls for each press and release: filter it
         (_handle), or let it pass untouched (_pass) when `passes` gives a
         reason (see _passes), as _route_for decides. The caller suppresses
-        whatever is not accepted."""
+        whatever is not accepted. `resend` says that if it is to reach apps
+        it must be re-sent, even with nothing ahead of it (Windows: the
+        pointer was moved under it, see WindowsHook.button)."""
         passing, hold = self._route_for(button, pressed, passes)
         if passing:
-            return self._pass(button, pressed, timestamp, template, allow_hold, device)
-        return self._handle(button, pressed, timestamp, template, allow_hold, location, device, hold)
+            return self._pass(button, pressed, timestamp, template, allow_hold, device, resend)
+        return self._handle(button, pressed, timestamp, template, allow_hold, location, device, hold, resend)
 
     def _route_for(self, button: Button, pressed: bool, passes: Optional[str]) -> tuple[bool, bool]:
         """Whether an event passes untouched, and if not, whether the filter
@@ -786,6 +798,7 @@ class GlobalClickFilter:
         template: object,
         allow_hold: bool = True,
         device: Optional[str] = None,
+        resend: bool = False,
     ) -> ClickEvent:
         """An event the filter doesn't judge (see _passes). A held release of
         its button is settled first, with any other this event's time shows
@@ -806,7 +819,7 @@ class GlobalClickFilter:
                     if click_filter.held_id is not None and (other is button or click_filter.due(timestamp))
                 ]
             )
-            deferred = self._route_accepted(button, pressed, template, timestamp, settled, behind, allow_hold)
+            deferred = self._route_accepted(button, pressed, template, timestamp, settled, behind, allow_hold, resend)
         self._send_outbox()
         self._update_motion_tap()
         return ClickEvent(button, pressed, not deferred, None, None, deferred=deferred, device=device)
@@ -820,20 +833,22 @@ class GlobalClickFilter:
         settled: list,
         behind: Optional[Button],
         allow_hold: bool,
+        force: bool = False,
     ) -> bool:
         """With the lock held: an event of `button` that is to reach apps.
         It must reach them after the events of its button still waiting to be
         re-sent, after the releases `settled` (which happened first), and
         after another button's release that happened first and has not
         reached apps yet: it waits where they wait, or is re-sent right
-        behind them. Returns True when it was queued or re-sent (the platform
-        then drops the original), False when it may go through now."""
+        behind them. With `force` it is re-sent even with nothing ahead of
+        it. Returns True when it was queued or re-sent (the platform then
+        drops the original), False when it may go through now."""
         queue = self._queue_for(button)
         resend = False
         if queue is None and allow_hold:
             earlier, on_way = self._follow_earlier_releases(button, timestamp)
             queue = behind if behind is not None else earlier
-            resend = bool(settled) or (on_way and not self._in_flight[button])
+            resend = bool(settled) or (on_way and not self._in_flight[button]) or force
         if queue is None and not resend and self._in_flight[button]:
             # Events of this button re-sent a moment ago may still be on
             # their way. Letting this one through now could overtake them
@@ -874,6 +889,7 @@ class GlobalClickFilter:
         location: Optional[tuple[float, float]] = None,
         device: Optional[str] = None,
         hold: bool = True,
+        resend: bool = False,
     ) -> ClickEvent:
         """Decide one event. `template` is a copy of it, kept in case it has to
         be re-injected later; the caller suppresses whatever is not accepted.
@@ -883,7 +899,7 @@ class GlobalClickFilter:
         platform knows: a release held where apps saw its press is a click
         made in place, and pointer motion leaving that spot delivers it rather
         than the timer. `device` is the key of the device it came from, if
-        known (ClickEvent.device).
+        known (ClickEvent.device). `resend`: see _button_event.
 
         First, every held release this event's timestamp shows was real is
         settled, its own button's among them (see _settle_due); this event,
@@ -936,7 +952,7 @@ class GlobalClickFilter:
                 else:
                     self._enqueue(queue, True, template, button, timestamp)
             if event.accepted and self._route_accepted(
-                button, pressed, template, timestamp, settled, behind, allow_hold
+                button, pressed, template, timestamp, settled, behind, allow_hold, resend
             ):
                 _amend(event, accepted=False, deferred=True)
             if pressed and not event.is_bounce:
@@ -1107,13 +1123,17 @@ class GlobalClickFilter:
         apps never see the pointer leave before a click is over. Unless
         `placeless`, asked only then, says the pointer's place means nothing
         now (Windows: a hidden pointer, a remote session): then it never
-        waits, and so is never re-sent. A re-sent move is absolute, and in a
-        game's mouse-look it would jerk the view; where the pointer is no
-        one sees, a release reaching apps after the hand's motion changes
-        nothing. Buttons still keep their order among themselves.
+        waits. Where the pointer is no one sees, a release reaching apps
+        after the hand's motion changes nothing. Buttons still keep their
+        order among themselves.
+
+        Motion that waits is queued and re-sent in turn on macOS. On Windows
+        (`_resend_motion` off) it is not: the hook holds it and puts the
+        pointer where the hand has taken it once nothing waits any more (see
+        WindowsHook.motion).
 
         Returns True to let the event through unchanged, False when the
-        platform must drop it because it was queued to be re-sent.
+        platform must drop it because it has to wait.
         """
         arrived = monotonic()
         if timestamp is not None:
@@ -1142,11 +1162,17 @@ class GlobalClickFilter:
                 queue = waiting[0] if waiting else None
             if queue is not None and placeless is not None and placeless():
                 queue = None
-            if queue is not None:
+            if queue is not None and self._resend_motion:
                 self._enqueue(queue, None, template)
         self._send_outbox()
         self._update_motion_tap()
         return queue is None
+
+    def _waiting(self) -> bool:
+        """Whether events this app re-sent, or is to re-send, have still to
+        reach apps. Call without the lock held."""
+        with self._lock:
+            return any(self._in_flight[button] or self._queued[button] for button in Button)
 
     def _update_motion_tap(self) -> None:
         """Judge pointer motion only while it matters: a release is held at a
@@ -1266,11 +1292,13 @@ class GlobalClickFilter:
             self._resend_lost(button, seq)
 
     def _injected_passed(self, button: Button, seq: int) -> None:
-        """The hook saw one of this app's re-sent events go by, numbered `seq`
-        in its mark (see make_mark; 0 numbers none and settles nothing). The
-        ones re-sent as this button before it are settled too: they come back
-        in the order sent, so each came back before it or never will. Once
-        none is left, the events queued behind them go out, in order."""
+        """One of this app's re-sent events has gone by, numbered `seq` in its
+        mark (see make_mark; 0 numbers none and settles nothing): the macOS
+        tap saw it come back, or on Windows SendInput returned, which it does
+        once every hook has seen it and it has arrived (see InputSender). The
+        ones re-sent as this button before it are settled too: they go by in
+        the order sent, so each did before it or never will. Once none is
+        left, the events queued behind them go out, in order."""
         with self._lock:
             in_flight = self._in_flight[button]
             if seq and in_flight:
@@ -1529,19 +1557,32 @@ class GlobalClickFilter:
         call_next = user32.CallNextHookEx
 
         targets = InjectableWindows(user32, kernel32)
-        sender = InputSender(api, self._resend_lost)
+        # SendInput returns once what it sent has arrived: that settles it.
+        sender = InputSender(api, self._resend_lost, self._injected_passed)
+        # Calls the hook hands to its own thread, run between its callbacks.
+        WM_RUN = 0x8000 + 0x46  # WM_APP + n
+        thread_id = kernel32.GetCurrentThreadId()
+        calls: "queue.SimpleQueue" = queue.SimpleQueue()
+
+        def on_hook_thread(call: Callable[[], object]) -> None:
+            calls.put(call)
+            user32.PostThreadMessageW(thread_id, WM_RUN, 0, 0)
+
         hook_logic = WindowsHook(
             self,
             api,
             accepts_injection=lambda x, y: targets.accepts_injection(wintypes.POINT(x, y)),
             filter_injected=_filter_injected(),
             send=sender.submit,
+            on_hook_thread=on_hook_thread,
         )
         watch = hook_logic.watch
         self._inject = hook_logic.inject
         self._is_near = api.within_drag_rect
         with self._motion_tap_lock:
             self._set_motion_tap = hook_logic.set_watch
+        # The hand's motion is held, never re-sent (see WindowsHook).
+        self._resend_motion = False
         # Every stamp is on monotonic()'s clock (see WindowsHook.button), so
         # the once-per-run check in _normalise_time must not second-guess it.
         self._use_os_time = True
@@ -1559,7 +1600,6 @@ class GlobalClickFilter:
         REARM_SLOW, REARM_SESSION = 1, 2
         WM_TIMER = 0x0113
         SLOW_CALLBACK_S = 0.2
-        thread_id = kernel32.GetCurrentThreadId()
         rearm_interval_ms = WINDOWS_REARM_INTERVAL_MS
         # Arrival times come from the precise clock, moved onto monotonic()'s.
         clock_offset = monotonic() - perf_counter()
@@ -1684,6 +1724,17 @@ class GlobalClickFilter:
                     break
                 if message.message == WM_DEVICE and not message.hWnd:
                     devices.resolved()
+                    continue
+                if message.message == WM_RUN and not message.hWnd:
+                    while True:
+                        try:
+                            call = calls.get_nowait()
+                        except queue.Empty:
+                            break
+                        try:
+                            call()
+                        except Exception:  # noqa: BLE001 - never break the hook's thread
+                            _log_ignored("a call on the hook's thread")
                     continue
                 if message.message in (WM_REARM, WM_TIMER) and not message.hWnd:
                     fresh = user32.SetWindowsHookExW(WH_MOUSE_LL, callback, None, 0)
@@ -2263,6 +2314,12 @@ def normalized_absolute(x: int, y: int, left: int, top: int, width: int, height:
     return max(1, -(-(x - left) * 65536 // width)), max(1, -(-(y - top) * 65536 // height))
 
 
+#: When the hand's motion was held back and the hand then stops, nothing comes
+#: to put the pointer where the hand took it (see WindowsHook.motion): after
+#: this long with nothing waiting, the hook does so anyway.
+CATCH_UP_QUIET_S = 0.015
+
+
 class WindowsHook:
     """What the Windows hook decides, apart from its ctypes plumbing (see
     _run_windows), so it can be tested against a stand-in for Windows.
@@ -2273,19 +2330,32 @@ class WindowsHook:
     with the button still down and start a drag. The hook therefore watches
     motion while a release is held in place: the first move that leaves the
     spot is held back, the release goes out where the pointer still is, and
-    the move follows it. A release that can't be delivered that way (the
-    hand moved on before the timer delivered it, as when a drag ends while
-    moving) is re-sent in one batch with motion that takes the pointer to
-    where the button came up and back again; while the pointer is still
-    inside the drag rectangle there, it goes out where the pointer is.
+    the pointer follows the hand once it has. A release that can't be
+    delivered that way (the hand moved on before the timer delivered it, as
+    when a drag ends while moving) is re-sent in one batch with motion that
+    takes the pointer to where the button came up and back again; while the
+    pointer is still inside the drag rectangle there, it goes out where the
+    pointer is.
 
     A move held back leaves the pointer where it was, so Windows works out
-    the next move from that stale spot. While motion is watched, `basis` is
-    where the last move that went through left the pointer (this app's own
-    included), and `virtual` where the hand has really taken it: the target
-    of the last move held back. Each real move keeps its own step, already
-    shaped by pointer acceleration, on top of `virtual`. Moves held back are
-    re-sent as the exact pixel they were headed for.
+    the next move from that spot. While motion is watched, `basis` is where
+    the last move that went through left the pointer (this app's own
+    included), and `virtual` where the hand has really taken it: each real
+    move keeps its own step, already shaped by pointer acceleration, on top
+    of `virtual`. Held motion is never re-sent. Windows works out where a
+    move takes the pointer before it calls the hooks, so a re-sent move,
+    which SendInput runs on another thread, can land after a move of the
+    hand's that Windows had already placed from the old spot, and the hand's
+    step is lost (CI measured it). Instead, once nothing this app re-sent is
+    still on its way, the next move of the hand's is dropped and the pointer
+    put where the hand has taken it (SetCursorPos), inside the hook's
+    callback: Windows waits for the callback before it takes the next input,
+    which then starts from there. A press while motion is held is re-sent
+    from there too (see button); if the hand stops instead, the pointer is
+    put there after CATCH_UP_QUIET_S (see set_watch). This app's own batches
+    leave the pointer where they found it, but for a press that has to land
+    where the held motion took the hand (see _batch), so nothing else moves
+    it in between.
     """
 
     LLMHF_INJECTED = 0x00000001
@@ -2297,15 +2367,19 @@ class WindowsHook:
         accepts_injection: Callable[[int, int], bool],
         filter_injected: bool = False,
         send: Optional[Callable[[list], object]] = None,
+        on_hook_thread: Optional[Callable[[Callable[[], object]], object]] = None,
     ) -> None:
         self._owner = owner
         self._api = api
         self._accepts_injection = accepts_injection
         self._filter_injected = filter_injected
         # Sends a batch of (input, button it counts for or None, its number),
-        # in order. The hook runs with an InputSender (see there); by
-        # default, at once.
-        self._send = send or (lambda batch: send_batch(api, batch, owner._resend_lost))
+        # in order, and settles each counted one once it has arrived. The
+        # hook runs with an InputSender (see there); by default, at once.
+        self._send = send or (lambda batch: send_batch(api, batch, owner._resend_lost, owner._injected_passed))
+        # Runs a call on the hook's thread, between its callbacks (the
+        # runner posts it there); by default, at once.
+        self._on_hook_thread = on_hook_thread or (lambda call: call())
         # Which device the event being decided came from, given the bit a
         # mouse reports for it (devices_win.RawInputDevices.attribute), set
         # by the runner; None while unknown.
@@ -2314,34 +2388,53 @@ class WindowsHook:
         self.watch = [False]
         self.basis = (0, 0)
         self.virtual = (0, 0)
+        # Where the pointer will be once everything sent so far has arrived:
+        # `basis`, but for a press sent where the hand pressed (see _batch).
+        self.shown = (0, 0)
         # False when Windows couldn't say where the pointer was as watching
-        # began (another desktop had the input); the next real move sets both.
+        # began (another desktop had the input); the next real move sets them.
         self.known = False
         # Whether the pointer's place means nothing now (see button): the
-        # hand's motion then never waits to be re-sent (see
-        # GlobalClickFilter._motion). Asked only when it would.
+        # hand's motion then never waits (see GlobalClickFilter._motion), and
+        # the pointer is never put anywhere. Asked only when it would.
         self._placeless = lambda: not api.relocation_allowed()
+        # The timer that puts the pointer where the hand stopped (see set_watch).
+        self._catch_up_timer: Optional[threading.Timer] = None
 
     # -- watching motion ----------------------------------------------------
+    def held(self) -> bool:
+        """Whether the hand's motion is held back: the pointer is not where
+        the hand has taken it."""
+        return self.watch[0] and self.known and self.virtual != self.basis
+
     def set_watch(self, wanted: bool) -> None:
         """The filter's motion switch (GlobalClickFilter._set_motion_tap),
         called with its _motion_tap_lock held. As watching begins, the
-        pointer is where Windows says it is."""
+        pointer is where Windows says it is. While the hand's motion is held
+        back, watching goes on, so that the next move puts the pointer where
+        the hand took it; and once the filter has nothing waiting, a timer
+        does that if the hand has stopped."""
         if wanted and not self.watch[0]:
             here = self._api.cursor_pos()
             self.known = here is not None
             if here is not None:
-                self.basis = self.virtual = here
-        self.watch[0] = wanted
+                self.basis = self.virtual = self.shown = here
+        held = self.held()
+        if held and not wanted and self._catch_up_timer is None:
+            timer = threading.Timer(CATCH_UP_QUIET_S, self._on_hook_thread, (self._catch_up_quiet,))
+            timer.daemon = True
+            self._catch_up_timer = timer
+            timer.start()
+        self.watch[0] = wanted or held
 
     def _watch_now(self) -> Optional[tuple[int, int]]:
         """Watch motion before anything is sent: a real move processed while
-        SendInput runs (other hooks make it interleave) must queue behind
+        SendInput runs (other hooks make it interleave) must wait behind
         what is being sent, not overtake it. Returns where the pointer will
         be once everything sent before has arrived, if known."""
         with self._owner._motion_tap_lock:
             self.set_watch(True)
-            return self.virtual if self.known else None
+            return self.shown if self.known else None
 
     def _where(self, x: int, y: int) -> tuple[int, int]:
         """Where an event at (x, y) really happened: while motion is held
@@ -2349,6 +2442,30 @@ class WindowsHook:
         if not self.watch[0] or not self.known:
             return (x, y)
         return (self.virtual[0] + x - self.basis[0], self.virtual[1] + y - self.basis[1])
+
+    def _catch_up(self, target: tuple[int, int]) -> bool:
+        """On the hook's thread, with nothing this app sent still on its way:
+        put the pointer on `target`, where the hand has taken it. Returns
+        False when it isn't (the pointer's place means nothing now, or
+        Windows refused): the held motion is then let go."""
+        place = None if self._placeless() else self._api.set_cursor_pos(*target)
+        with self._owner._motion_tap_lock:
+            if place is not None:
+                self.basis = self.virtual = self.shown = place
+            else:
+                self.virtual = self.basis
+        self._owner._update_motion_tap()
+        return place is not None
+
+    def _catch_up_quiet(self) -> None:
+        """On the hook's thread: the hand stopped while its motion was held
+        back, and nothing waits any more (see set_watch). Puts the pointer
+        where it took it."""
+        self._catch_up_timer = None
+        if self.held() and not self._owner._waiting():
+            self._catch_up(self.virtual)
+        else:
+            self._owner._update_motion_tap()  # waiting again: looked at once that is over
 
     # -- events the hook sees -------------------------------------------------
     def button(
@@ -2368,8 +2485,7 @@ class WindowsHook:
         read `tick_now`. Returns True when the hook must drop it."""
         owner = self._owner
         if mark_kind(extra) == INJECTED_MARK:
-            owner._injected_passed(button, mark_seq(extra))  # re-sent by this app; already decided
-            return False
+            return False  # re-sent by this app; already decided (its sender says when it is in)
         if flags & self.LLMHF_INJECTED and not self._filter_injected:
             return False  # synthetic input from another app; leave it alone
         # The tick is far coarser than the 12 ms and 30 ms rules and the
@@ -2390,6 +2506,11 @@ class WindowsHook:
         # or a remote session.
         relocate = not pen and (pressed or self._api.relocation_allowed())
         at = self._where(x, y)
+        # The hand's motion before this button is still held back, and
+        # nothing waits for it any more: the pointer is put where the hand
+        # is first, from inside this callback, and the button re-sent there
+        # (Windows may already have placed it where the pointer was).
+        resend = self.held() and allow_hold and not owner._waiting() and self._catch_up(at)
         return not owner._button_event(
             button,
             pressed,
@@ -2399,6 +2520,7 @@ class WindowsHook:
             location=at if relocate else None,
             passes=passes,
             device=key,
+            resend=resend,
         ).accepted
 
     def wheel(
@@ -2450,14 +2572,11 @@ class WindowsHook:
     ) -> bool:
         """A move to (x, y), seen while motion is watched, timed as `button`
         times a press when `tick`, `arrival` and `tick_now` are given.
-        Returns True when the hook must drop it (it was queued to be re-sent)."""
+        Returns True when the hook must drop it: it has to wait, or the
+        pointer was put where the hand has taken it instead."""
         kind = mark_kind(extra)
-        if kind in INJECTED_MOTION_MARKS:
-            self.basis = (x, y)
-            self._owner._injected_passed(INJECTED_MOTION_MARKS[kind], mark_seq(extra))
-            return False
-        if kind == TELEPORT_MARK:
-            self.basis = (x, y)
+        if kind in INJECTED_MOTION_MARKS or kind == TELEPORT_MARK:
+            self.basis = (x, y)  # this app's own, taking a release to its spot and back
             return False
         if (flags & self.LLMHF_INJECTED and not self._filter_injected) or (
             extra & PEN_SIGNATURE_MASK
@@ -2469,28 +2588,30 @@ class WindowsHook:
             # where it happened rather than landing here.
             if not self.known or self.virtual == self.basis:
                 self.virtual = (x, y)
-            self.basis = (x, y)
+            self.basis = self.shown = (x, y)
             self.known = True
             return False
         if not self.known:
-            self.basis = self.virtual = (x, y)
+            self.basis = self.virtual = self.shown = (x, y)
             self.known = True
         target = (self.virtual[0] + x - self.basis[0], self.virtual[1] + y - self.basis[1])
         stamp = None
         if tick is not None and arrival is not None and tick_now is not None:
             stamp = windows_event_time(arrival, tick_now, tick)
         if not self._owner._motion(target, target, stamp, self._placeless):
-            self.virtual = target
+            self.virtual = target  # held: the pointer stays where it is
             return True
-        self.basis = self.virtual = (x, y)
+        if self.virtual != self.basis and self._catch_up(target):
+            return True
+        self.basis = self.virtual = self.shown = (x, y)
         return False
 
     # -- sending ----------------------------------------------------------------
     def inject(self, button: Button, pressed: Optional[bool], template: object, seq: int) -> bool:
         """The filter's re-send (GlobalClickFilter._inject) of re-send `seq`
-        of `button`. `template` is a WindowsTemplate, or for motion the (x, y)
-        it was headed for. What to send is decided here, at once; the sending
-        itself is handed on."""
+        of `button`, a press or release; `template` is its WindowsTemplate.
+        What to send is decided here, at once; the sending itself is handed
+        on."""
         api = self._api
         with api.physical_pixels():
             batch = self._batch(api, button, pressed, template, seq)
@@ -2499,49 +2620,56 @@ class WindowsHook:
 
     def _batch(self, api: "WindowsApi", button: Button, pressed: Optional[bool], template: object, seq: int) -> list:
         if pressed is None:
-            x, y = template
-            self._watch_now()
-            return [(api.move_input(x, y, make_mark(MOTION_MARK_FOR[button], seq)), button, seq)]
+            raise ValueError("Windows never re-sends motion")
         tick, x, y, relocate = template
         flags = api.button_flags(button, pressed)
+        data = api.button_data(button)
+        mark = make_mark(INJECTED_MARK, seq)
         here = self._watch_now()
         moved = here is not None and here != (x, y)
         # Message times must not run backwards: once later motion has
         # reached apps, a release goes out stamped now.
         when = 0 if moved and not pressed else int(tick) & 0xFFFFFFFF
         if (
-            pressed
-            or not moved
+            not moved
             or not relocate
             or not api.relocation_allowed()
             or self._owner._is_near((x, y), here)
         ):
-            # A press goes where the pointer is: it is re-sent right after the
-            # events that came before it, motion included. So does a release
-            # where the pointer still is, or still inside the drag rectangle
-            # around where the button came up (apps take that as the same
-            # spot, so the pointer needn't jump), one made where the
-            # pointer's place means nothing (see button), and one whose way
-            # back isn't known.
-            return [(api.button_input(flags, when, make_mark(INJECTED_MARK, seq), api.button_data(button)), button, seq)]
+            # Where the pointer will be: where the hand had it (motion held
+            # before it is not), or inside the drag rectangle around that
+            # spot (apps take that as the same spot, so the pointer needn't
+            # jump), or where the pointer's place means nothing (see button),
+            # or where its way there isn't known.
+            return [(api.button_input(flags, when, mark, data), button, seq)]
+        if pressed:
+            # The hand pressed after moving on, its motion held back: the
+            # pointer goes there first and stays, the place the hand's held
+            # motion took it.
+            with self._owner._motion_tap_lock:
+                self.shown = (x, y)
+            return [(api.move_input(x, y, TELEPORT_MARK), None, 0), (api.button_input(flags, when, mark, data), button, seq)]
         # The pointer has moved on: take it to where the button came up,
-        # release it there and take it back, in one batch so the three arrive
-        # in order. The release is waited for until the way back has come
-        # back too: that carries the release's number, and the release
-        # itself none. So a real move that comes between the release and the
-        # way back queues behind it rather than being undone by it.
+        # release it there and take it back, in one batch, which Windows
+        # never mixes with other input, so the three arrive together and the
+        # pointer is back where it was for the hand's next move. The release
+        # is waited for until the way back is in: that carries the release's
+        # number, and the release itself none.
         return [
             (api.move_input(x, y, TELEPORT_MARK), None, 0),
-            (api.button_input(flags, when, INJECTED_MARK, api.button_data(button)), None, 0),
+            (api.button_input(flags, when, INJECTED_MARK, data), None, 0),
             (api.move_input(here[0], here[1], make_mark(MOTION_MARK_FOR[button], seq)), button, seq),
         ]
 
 
-def send_batch(api, batch: list, lost: Callable[[Button, int], object]) -> int:
+def send_batch(
+    api, batch: list, lost: Callable[[Button, int], object], done: Optional[Callable[[Button, int], object]] = None
+) -> int:
     """SendInput one batch of (input, button it counts for or None, its
-    number). An input that didn't go in never comes back through the hook,
-    so it is settled with `lost` rather than waited for. Returns how many
-    went in."""
+    number). It returns once every hook has seen what went in and it has
+    arrived: each counted one is then settled with `done`. One that didn't
+    go in never will, so it is settled with `lost` rather than waited for.
+    Returns how many went in."""
     try:
         with api.physical_pixels():
             sent = api.send([item for item, _button, _seq in batch])
@@ -2551,6 +2679,10 @@ def send_batch(api, batch: list, lost: Callable[[Button, int], object]) -> int:
     for _item, button, seq in batch[sent:]:
         if button is not None:
             lost(button, seq)
+    if done is not None:
+        for _item, button, seq in batch[:sent]:
+            if button is not None:
+                done(button, seq)
     return sent
 
 
@@ -2563,14 +2695,21 @@ class InputSender:
     ever: all input on the machine stops. So the hook decides what to send
     and hands it here, and timers and stop() do the same. Batches arrive in
     the order the filter decided them (see GlobalClickFilter._send_outbox),
-    and one queue keeps them in it.
+    and one queue keeps them in it. Once SendInput returns, what went in has
+    arrived: `done` settles it (GlobalClickFilter._injected_passed).
     """
 
-    def __init__(self, api: "WindowsApi", lost: Callable[[Button, int], object]) -> None:
+    def __init__(
+        self,
+        api: "WindowsApi",
+        lost: Callable[[Button, int], object],
+        done: Optional[Callable[[Button, int], object]] = None,
+    ) -> None:
         import queue
 
         self._api = api
         self._lost = lost
+        self._done = done
         self._queue: "queue.SimpleQueue" = queue.SimpleQueue()
         self._closed = False
         self._lock = threading.Lock()
@@ -2582,7 +2721,7 @@ class InputSender:
             if not self._closed:
                 self._queue.put(batch)
                 return
-        send_batch(self._api, batch, self._lost)  # the hook is gone: nothing to wait on
+        send_batch(self._api, batch, self._lost, self._done)  # the hook is gone: nothing to wait on
 
     def close(self, timeout: float = 2.0) -> None:
         """Send what is queued, then stop; later batches are sent directly."""
@@ -2596,7 +2735,7 @@ class InputSender:
             batch = self._queue.get()
             if batch is None:
                 return
-            send_batch(self._api, batch, self._lost)
+            send_batch(self._api, batch, self._lost, self._done)
 
 
 class WindowsApi:
@@ -2678,6 +2817,8 @@ class WindowsApi:
         user32.GetSystemMetrics.restype = ctypes.c_int
         user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
         user32.GetCursorPos.restype = wintypes.BOOL
+        user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+        user32.SetCursorPos.restype = wintypes.BOOL
         user32.GetCursorInfo.argtypes = [ctypes.POINTER(CURSORINFO)]
         user32.GetCursorInfo.restype = wintypes.BOOL
         user32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
@@ -2730,6 +2871,16 @@ class WindowsApi:
             if not self.user32.GetCursorPos(self._ctypes.byref(point)):
                 return None  # another desktop has the input (a UAC prompt, the lock screen)
         return (point.x, point.y)
+
+    def set_cursor_pos(self, x: int, y: int) -> Optional[tuple[int, int]]:
+        """Put the pointer on pixel (x, y). No hook sees it, and Windows
+        works out the next input from there. Returns where the pointer is
+        then (a clip rectangle can keep it elsewhere), or None if Windows
+        refused."""
+        with self.physical_pixels():
+            if not self.user32.SetCursorPos(int(x), int(y)):
+                return None
+        return self.cursor_pos()
 
     def cursor_showing(self) -> bool:
         info = self.CURSORINFO()
