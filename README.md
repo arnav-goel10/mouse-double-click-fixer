@@ -128,13 +128,14 @@ If a game uses anti-cheat, turn the filter off, or quit the app, before you play
 
 ## Privacy
 
-- The app receives mouse button events and pointer movement, and nothing from the keyboard. It also receives scroll-wheel events: on macOS only while the scroll-wheel fix is on, and on Windows always, though it looks at them only while the fix is on. It uses which button went up or down, when, and where the pointer was, and keeps no record of individual clicks.
+- The app receives mouse button events and pointer movement, and nothing from the keyboard except its pause shortcut: the system tells it when ⌃⌥⌘P (Ctrl+Alt+Shift+P on Windows) is pressed, and no other key reaches it. It also receives scroll-wheel events: on macOS only while the scroll-wheel fix is on, and on Windows always, though it looks at them only while the fix is on. It uses which button went up or down, when, and where the pointer was, and keeps no record of individual clicks.
 - What it does keep is a running total of the bounces it blocked and, for the History pane, daily counts: for each button the presses, bounces and repaired dropouts, how long after a release each bounce came, and the filter window in use; and for the scroll wheel the notches the wheel fix judged and the reversals it dropped. That is in `wear.json` beside the settings, for up to a year, and holds no times or places of clicks.
 - To tell your devices apart it reads each pointing device's name, vendor and product IDs and serial number from the system, and on Windows it takes Raw Input reports from mice, touchpads and touchscreens to learn which device a click or wheel notch came from. It notes only which device sent each report, when, and for a mouse which buttons or wheel the report names, never a position. Only the devices you choose to leave unfiltered are saved, in the settings.
 - To apply the Apps list it reads which app is in front, and the list of running apps when you open the add menu. It saves only the apps you add.
+- To name other mouse utilities that may take over your buttons or wheel, it reads the names of the running programs once a minute and when you bring it forward. To pause during full-screen games, if you turn that on, it checks every two seconds whether the app in front is a game that covers the screen. Neither is saved.
 - No telemetry, no analytics, no accounts.
 - Its only network use is the update check to this repository's GitHub releases, and downloading an update from there. Turn off **General › Check for updates automatically** and it makes no request unless you ask it to check.
-- Its log records start-up, the filter starting and stopping, permission changes, waking from sleep and switching users, the TLS library in use, failures and updates, never clicks. It stays on your computer unless you paste it into a bug report. Copy Diagnostics also lists the pointing devices the app has seen, by name.
+- Its log records start-up, the filter starting and stopping, pauses, the other mouse utilities it found, permission changes, waking from sleep and switching users, the TLS library in use, failures and updates, never clicks. It stays on your computer unless you paste it into a bug report. Copy Diagnostics also lists the pointing devices the app has seen, by name.
 
 ## Known limitations
 
