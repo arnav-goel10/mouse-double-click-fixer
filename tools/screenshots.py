@@ -38,6 +38,7 @@ taller than its window.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 import tempfile
@@ -269,23 +270,50 @@ def docs_state(controller) -> None:
     controller.session_filtered = 14
 
 
+@contextlib.contextmanager
 def suggesting(controller):
     """The health check as History shows it when bounce creeps up on the
-    left button's window: a verdict, and the change it suggests."""
+    left button's window: a verdict, and the change it suggests. The
+    controller's own check, in its own words, on the left button's recent
+    bounces reaching the high 50s of its 59 ms window, with a 200 ms
+    double-click measured by Test and Tune (the wear history and that
+    measurement are what change). The stand-in, until the controller has
+    one, is worded the same way: the detail carries the suggestion's reason,
+    question and all."""
     from unittest import mock
 
-    from _contract_standin import Health, Suggestion
+    from _contract_standin import Health, Suggestion, standing_in
 
     from app.core import Button
+    from app.inputs import as_button
+    from app.wear import Histogram
 
-    health = Health(
-        "Your left button double-clicks on its own",
-        "Caught 412 of 412 extra clicks in the last 30 days. The left button is bouncing more often than two "
-        "weeks ago: the switch is wearing out, and in time it will need replacing.",
-        Suggestion(Button.LEFT, 59, 64, "Recent bounces on the left button reached about 50 ms."),
-        "bouncing",
-    )
-    return mock.patch.object(controller, "health", return_value=health)
+    if standing_in():
+        reason = "Recent bounces on the left button reached about 58 ms, close to its 59 ms window. Raise it to 83 ms?"
+        health = Health(
+            "Your left button double-clicks on its own: caught 412 of 412",
+            "Over the last 30 days the filter ignored every extra click. The left button is bouncing more often "
+            f"than two weeks ago: the switch is wearing out, and in time it will need replacing. {reason}",
+            Suggestion(Button.LEFT, 59, 83, reason),
+            "bouncing",
+        )
+        with mock.patch.object(controller, "health", return_value=health):
+            yield
+        return
+
+    histogram = controller.wear.histogram
+
+    def crowded(button, *args, **kwargs):
+        found = histogram(button, *args, **kwargs)
+        if as_button(button) is not Button.LEFT:
+            return found
+        bins = [(low, count + (12 if 50 <= low <= 56 else 0)) for low, count in found.bins]
+        return Histogram(bins, found.overflow, found.window_ms)
+
+    speeds = {**controller.double_click_speeds(), Button.LEFT: 200}
+    with mock.patch.object(controller.wear, "histogram", crowded), \
+            mock.patch.object(controller, "double_click_speeds", return_value=speeds):
+        yield
 
 
 def with_conflict(controller):
@@ -366,21 +394,27 @@ def grab_window_live(app, window, target: Path) -> str:
     return grab_screen(app, window.frameGeometry(), target)
 
 
-def _post_escape() -> None:
-    """Close a native menu that is tracking: an Escape key event into the
-    app's own queue (no permission needed), and failing that the system's."""
+def _post_escape(system: bool = False) -> None:
+    """Close a native menu that is tracking with one Escape: into the app's
+    own queue (no permission needed), or with `system`, the system's (for a
+    menu the first didn't close).
+
+    Only while a menu is still open: a stray Escape goes to the window in
+    front instead, and closes Test and Tune, a dialog."""
     if sys.platform != "darwin" or not _on_real_screen():
         return
-    try:
-        import AppKit
+    if not system:
+        try:
+            import AppKit
 
-        for kind in (AppKit.NSEventTypeKeyDown, AppKit.NSEventTypeKeyUp):
-            event = AppKit.NSEvent.keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode_(  # noqa: E501
-                kind, (0, 0), 0, 0, 0, None, "\x1b", "\x1b", False, 53
-            )
-            AppKit.NSApp.postEvent_atStart_(event, True)
-    except Exception as error:  # noqa: BLE001
-        print(f"Couldn't queue Escape: {error}")
+            for kind in (AppKit.NSEventTypeKeyDown, AppKit.NSEventTypeKeyUp):
+                event = AppKit.NSEvent.keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode_(  # noqa: E501
+                    kind, (0, 0), 0, 0, 0, None, "\x1b", "\x1b", False, 53
+                )
+                AppKit.NSApp.postEvent_atStart_(event, True)
+            return
+        except Exception as error:  # noqa: BLE001
+            print(f"Couldn't queue Escape: {error}")
     try:
         import Quartz
 
@@ -399,18 +433,25 @@ class Popups:
         self.app = app
         self.menus: list = []  # NSMenus opened, for cancelTracking
 
-    def close_all(self) -> None:
+    def close_all(self, tracking: bool, system: bool = False) -> None:
+        """Close what is open. `tracking`: a native menu is still running
+        its loop (the call that opened it hasn't returned). One that
+        cancelTracking can't reach gets an Escape, sent only then; with
+        `system`, a later try, it gets one even after cancelTracking."""
         from PySide6.QtWidgets import QApplication
 
         popup = QApplication.activePopupWidget()
         if popup is not None:
             popup.close()
+        cancelled = False
         for menu in self.menus:
             try:
                 menu.cancelTracking()
+                cancelled = True
             except Exception:  # noqa: BLE001
                 pass
-        _post_escape()
+        if tracking and (system or not cancelled):
+            _post_escape(system)
 
     def capture(self, open_popup, area, target: Path) -> None:
         """`area()` gives the screen rectangle to photograph once open."""
@@ -422,12 +463,12 @@ class Popups:
         def photograph() -> None:
             how = grab_screen(self.app, area(), target)
             print(f"{target.name}: {how}")
-            self.close_all()
+            self.close_all(tracking=not returned)
 
         def still_open() -> None:
             if not returned or QApplication.activePopupWidget() is not None:
                 print(f"{target.name}: closing it again")
-                self.close_all()
+                self.close_all(tracking=not returned, system=True)
 
         timers = []
         for delay, run in ((1400, photograph), (4000, still_open), (7000, still_open)):
@@ -483,6 +524,8 @@ class Camera:
     def window(self, name: str, window, scroll_area=None) -> None:
         """A whole window; with `scroll_area`, the rest of a pane taller
         than the window as further parts, a screen at a time."""
+        if not window.isVisible():
+            print(f"{name}: the window isn't on screen")
         if LIVE:
             # In front and active, as the user has it when looking at it.
             window.raise_()
@@ -562,6 +605,11 @@ def capture_settings(app, camera: Camera, main_window, controller) -> None:
         main_window.refresh()
     place(app, main_window)
     show(app, main_window)
+    if mac:
+        # What each pane needs: it fits, unscrolled, on a screen whose
+        # available height is this plus SETTINGS_SCREEN_ROOM.
+        heights = {key: main_window.pane_height(index) for index, (key, _title) in enumerate(window_module.pages())}
+        print(f"Pane heights {heights}, plus {window_module.SETTINGS_SCREEN_ROOM} for the window's chrome")
     for index, (key, _title) in enumerate(window_module.pages()):
         main_window._show_page(index)
         app.processEvents()
