@@ -265,7 +265,8 @@ class LoginControl:
 
 
 class PauseControls:
-    """The pause shortcut, and pausing while a full-screen game is in front."""
+    """The pause shortcut's switch. (Pausing during full-screen games is an
+    exception, on the Exceptions pane.)"""
 
     def __init__(self, controller: AppController) -> None:
         self.controller = controller
@@ -280,22 +281,13 @@ class PauseControls:
         # A system with no shortcut of its own has nothing to switch.
         self.shortcut_row.setVisible(bool(shortcut))
         self.shortcut_toggle.clicked.connect(lambda checked: controller.set_pause_shortcut_enabled(bool(checked)))
-        self.games_toggle = Switch(accessible_name="Pause during full-screen games")
-        games_detail = (
-            "While a game fills the screen with Game Mode on." if IS_MAC
-            else "While a game runs full screen or Game Mode is on."
-        )
-        self.games_row = Row("Pause during full-screen games", games_detail, self.games_toggle, card_icon("game"))
-        self.games_toggle.clicked.connect(lambda checked: controller.set_auto_pause_games(bool(checked)))
 
     @property
     def rows(self) -> list[QWidget]:
-        return [self.shortcut_row, self.games_row]
+        return [self.shortcut_row]
 
     def refresh(self) -> None:
-        settings = self.controller.settings
-        set_checked(self.shortcut_toggle, bool(settings.get("pause_shortcut_enabled", True)))
-        set_checked(self.games_toggle, bool(settings.get("auto_pause_games", False)))
+        set_checked(self.shortcut_toggle, bool(self.controller.settings.get("pause_shortcut_enabled", True)))
 
 
 # -- panes -----------------------------------------------------------------------
@@ -303,7 +295,7 @@ class PauseControls:
 class HomePage(Page):
     """General (macOS) / Home (Windows): the filter's switch and what it is
     doing, the buttons it covers, its strength, Test and Tune, and the wheel
-    fix. On macOS also the pause options, Open at login and the menu bar
+    fix. On macOS also the pause shortcut, Open at login and the menu bar
     icon, which Windows keeps on its Settings page."""
 
     #: Test and Tune, for a button or for any (None).
@@ -374,14 +366,13 @@ class HomePage(Page):
         self.login: Optional[LoginControl] = None
         self.menu_bar_switch: Optional[Switch] = None
         if IS_MAC:
-            self.header("Pausing")
-            pausing = self.section()
-            self.pause = PauseControls(controller)
-            for row in self.pause.rows:
-                pausing.add(row)
-
+            # How the app fits in: its shortcut, login and the menu bar. One
+            # section, so the pane fits a laptop's screen without scrolling.
             self.gap(20)
             launch = self.section()
+            self.pause = PauseControls(controller)
+            for row in self.pause.rows:
+                launch.add(row)
             self.login = LoginControl(controller, self)
             launch.add(self.login.row)
             self.menu_bar_switch = Switch(accessible_name="Show in menu bar")

@@ -14,7 +14,7 @@ from .. import app_keys
 from ..core import Button
 from ..inputs import TOUCH_KINDS, as_button, button_name
 from ..wear import SHOWN_DAYS
-from . import popup_mac
+from . import menus, popup_mac
 from .base import Block, Page, card_icon, label, make_button
 from .charts import DailyRateChart, GapHistogram
 from .theme import IS_MAC
@@ -196,7 +196,7 @@ class HistoryPage(LivePage):
         when bounce creeps up to a button's window."""
         health = self.controller.health()
         self.verdict_row.title.setText(health.verdict)
-        self.verdict_row.set_detail(health.detail)
+        self.verdict_row.set_detail(menus.health_detail(health))
         # "bouncing" or "conflict": something to act on.
         attention = getattr(health, "kind", "") in ("bouncing", "conflict")
         self.verdict_icon.name = "warning" if attention else "history"
@@ -324,6 +324,31 @@ class AppsPage(Block):
             self.add(choice)
 
 
+# -- Games -------------------------------------------------------------------------
+
+#: What the game check looks for (app/gamemode.py): an app that calls itself
+#: a game, in front, with a window covering a whole display. Whether the
+#: system's Game Mode is on has no public API, so it isn't promised.
+GAMES_DETAIL = "While a game is in front and fills the screen."
+
+
+class GamesBlock(Block):
+    """Exceptions: pausing while a full-screen game is in front, off by
+    default. The menus show the pause, with Resume."""
+
+    def __init__(self, controller, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.controller = controller
+        self.heading = self.header("Games")
+        section = self.section()
+        self.toggle = Switch(accessible_name="Pause during full-screen games")
+        self.row = section.add(Row("Pause during full-screen games", GAMES_DETAIL, self.toggle, card_icon("game")))
+        self.toggle.clicked.connect(lambda checked: controller.set_auto_pause_games(bool(checked)))
+
+    def refresh(self) -> None:
+        self.toggle.setChecked(bool(self.controller.settings.get("auto_pause_games", False)), animate=False)
+
+
 # -- Devices -----------------------------------------------------------------------
 
 KIND_NAMES = {"trackpad": "Trackpad", "touchscreen": "Touchscreen", "pen": "Pen", "mouse": "Mouse", "unknown": "Pointing device"}
@@ -446,23 +471,28 @@ class DevicesPage(Block):
 
 
 class ExceptionsPage(LivePage):
-    """What is never filtered: apps (while in front) and devices."""
+    """What is never filtered: apps (while in front), full-screen games
+    (when turned on) and devices."""
 
     def __init__(self, controller, parent: Optional[QWidget] = None) -> None:
         super().__init__("Exceptions", DEVICES_TICK_MS, parent)
         self.controller = controller
         self.apps = AppsPage(controller)
+        self.games = GamesBlock(controller)
         self.devices = DevicesPage(controller)
         # The first heading sits where the pane starts.
         self.apps.heading.setContentsMargins(self.apps.heading.contentsMargins().left(), 0 if IS_MAC else 4, 0,
                                              self.apps.heading.contentsMargins().bottom())
         self.body.addWidget(self.apps)
         self.gap(8)
+        self.body.addWidget(self.games)
+        self.gap(8)
         self.body.addWidget(self.devices)
         self.body.addStretch(1)
 
     def refresh(self) -> None:
         self.apps.refresh()
+        self.games.refresh()
         self.devices.refresh()
 
     def _tick(self) -> None:

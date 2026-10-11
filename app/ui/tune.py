@@ -586,7 +586,7 @@ class TuneWindow(QDialog):
         self.health_heading.setVisible(bool(health.verdict))
         if health.verdict:
             self.health_row.title.setText(health.verdict)
-            self.health_row.set_detail(health.detail)
+            self.health_row.set_detail(menus.health_detail(health))
             self.health_icon.name = "warning" if self._health_kind in ("bouncing", "conflict") else "history"
             self.health_icon.tone = "symbol" if self.health_icon.name == "warning" else "secondary"
             self.health_icon.update()

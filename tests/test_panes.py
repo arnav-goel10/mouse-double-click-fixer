@@ -522,6 +522,22 @@ class TuneTests(PaneTestCase):
         self.assertEqual(tune.health_row.title.text(), health.verdict)
         self.assertEqual(tune.health_icon.name, "warning")
 
+    def test_the_verdict_leaves_the_suggestions_question_to_history(self) -> None:
+        from app.core import Button
+
+        reason = "Recent bounces on the left button reached about 56 ms, close to its 59 ms window. Raise it to 80 ms?"
+        health = support.Health(
+            "Your left button double-clicks on its own: caught 9 of 9",
+            f"Over the last 30 days the filter ignored every extra click. {reason}",
+            support.Suggestion(Button.LEFT, 59, 80, reason),
+            "bouncing",
+        )
+        with mock.patch.object(self.controller, "health", return_value=health):
+            tune = self.measure()
+        detail = tune.health_row.detail.text()
+        self.assertIn("reached about 56 ms, close to its 59 ms window.", detail)
+        self.assertNotIn("?", detail, "Test and Tune sets the window itself: no question without an answer")
+
     def test_another_mouse_utility_is_named_once(self) -> None:
         found = [support.Conflict("Logi Options+", ["side buttons", "wheel"])]
         quiet = support.Health("No bounce seen", "", None, "quiet")
@@ -781,6 +797,30 @@ class HistoryPaneTests(PaneTestCase):
             with mock.patch.object(self.controller, "apply_suggestion") as apply:
                 page.suggestion_button.click()
         apply.assert_called_once_with(suggestion)
+
+    def test_the_suggestions_question_is_asked_once(self) -> None:
+        # The health check's detail carries the suggestion's reason, which
+        # ends in the same question the row beside Apply asks.
+        from app.core import Button
+
+        reason = "Recent bounces on the left button reached about 56 ms, close to its 59 ms window. Raise it to 80 ms?"
+        health = support.Health(
+            "Your left button double-clicks on its own: caught 412 of 412",
+            f"Over the last 30 days the filter ignored every extra click. {reason}",
+            support.Suggestion(Button.LEFT, 59, 80, reason),
+            "bouncing",
+        )
+        with mock.patch.object(self.controller, "health", return_value=health):
+            self.show("history")
+            page = self.window.history
+            shown = f"{page.verdict_row.detail.text()} {page.suggestion_row.title.text()}"
+        self.assertEqual(shown.count("?"), 1, shown)
+        self.assertEqual(page.suggestion_row.title.text(), "Raise the left button to 80 ms?")
+        self.assertEqual(
+            page.verdict_row.detail.text(),
+            "Over the last 30 days the filter ignored every extra click. Recent bounces on the left button "
+            "reached about 56 ms, close to its 59 ms window.",
+        )
 
     def test_the_trend_is_read_out_with_its_value(self) -> None:
         from PySide6.QtGui import QAccessible

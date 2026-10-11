@@ -1183,29 +1183,50 @@ class LoginControlTests(WindowTestCase):
 
 
 class PauseOptionsTests(WindowTestCase):
-    """The pause shortcut and pausing for full-screen games: General on the
-    Mac, Settings on Windows."""
+    """The pause shortcut (General on the Mac, Settings on Windows) and
+    pausing for full-screen games (Exceptions on both)."""
 
-    def pause_controls(self, mac: bool):
+    def make_window(self, mac: bool):
         from app.ui.window import MainWindow
 
         with support.as_platform(mac):
             window = MainWindow(self.controller)
         self.addCleanup(window.deleteLater)
         self.addCleanup(support.stop_timers, window, window.tune)
+        return window
+
+    def pause_controls(self, mac: bool):
+        window = self.make_window(mac)
         return (window.home if mac else window.about).pause
 
     def test_both_switches_reach_the_controller(self) -> None:
         for mac in (True, False):
-            controls = self.pause_controls(mac)
+            window = self.make_window(mac)
+            controls = (window.home if mac else window.about).pause
+            games = window.exceptions.games
+            window.refresh()
             self.assertTrue(controls.shortcut_toggle.isChecked(), "on by default")
-            self.assertFalse(controls.games_toggle.isChecked(), "off by default")
+            self.assertFalse(games.toggle.isChecked(), "off by default")
             with mock.patch.object(self.controller, "set_pause_shortcut_enabled") as shortcut, \
-                    mock.patch.object(self.controller, "set_auto_pause_games") as games:
+                    mock.patch.object(self.controller, "set_auto_pause_games") as auto_pause:
                 controls.shortcut_toggle.click()
-                controls.games_toggle.click()
+                games.toggle.click()
             shortcut.assert_called_once_with(False)
-            games.assert_called_once_with(True)
+            auto_pause.assert_called_once_with(True)
+
+    def test_the_games_switch_follows_the_setting(self) -> None:
+        window = self.make_window(True)
+        self.controller.set_auto_pause_games(True)
+        self.assertTrue(window.exceptions.games.toggle.isChecked())
+        self.controller.set_auto_pause_games(False)
+        self.assertFalse(window.exceptions.games.toggle.isChecked())
+
+    def test_the_games_row_promises_only_what_is_checked(self) -> None:
+        # The check reads the app in front and its windows; whether the
+        # system's Game Mode is on has no public API.
+        detail = self.make_window(True).exceptions.games.row.detail.text()
+        self.assertNotIn("Game Mode", detail)
+        self.assertIn("fills the screen", detail)
 
     def test_the_shortcut_row_names_the_keys(self) -> None:
         controls = self.pause_controls(True)

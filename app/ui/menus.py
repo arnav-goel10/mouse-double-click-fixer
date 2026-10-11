@@ -6,6 +6,7 @@ status lines all read the controller the same way, so they never disagree.
 
 from __future__ import annotations
 
+import re
 from typing import Iterable
 
 from .. import DISPLAY_NAME
@@ -119,3 +120,21 @@ def conflict_detail(conflict) -> str:
     if not takes:
         return "It may change clicks before this app sees them."
     return f"It may take over {join_words(takes)}. If those act up, check its settings."
+
+
+def health_detail(health) -> str:
+    """The health check's detail without the question its suggestion asks
+    ("Raise it to 80 ms?"): History asks it once, beside its Apply button,
+    and Test and Tune sets the window itself. What the bounces reached
+    stays."""
+    detail = health.detail or ""
+    suggestion = getattr(health, "suggestion", None)
+    reason = getattr(suggestion, "reason", "") or ""
+    if not reason or reason not in detail:
+        return detail
+    evidence = " ".join(sentence for sentence in _sentences(reason) if not sentence.endswith("?"))
+    return " ".join(detail.replace(reason, evidence).split())
+
+
+def _sentences(text: str) -> list[str]:
+    return [part for part in re.split(r"(?<=[.?!])\s+", text.strip()) if part]
