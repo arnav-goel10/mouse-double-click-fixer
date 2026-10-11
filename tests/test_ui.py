@@ -122,8 +122,6 @@ class WindowTests(WindowTestCase):
         self.assertNotEqual(heights["general"], heights["exceptions"], "each pane its own height")
 
     def test_a_pane_that_fits_fills_the_window_without_a_gap_or_a_scroll(self) -> None:
-        from PySide6.QtWidgets import QWidget
-
         from app.ui.window import MainWindow
 
         with support.as_platform(True), mock.patch("app.ui.window.SETTINGS_SCREEN_ROOM", -10_000):
@@ -136,12 +134,11 @@ class WindowTests(WindowTestCase):
                 self.application.processEvents()
                 area = window.stack.currentWidget()
                 self.assertEqual(area.verticalScrollBar().maximum(), 0, f"{key}: nothing to scroll")
+                # No taller than the scroll area lays the pane out: at its
+                # height for the width, and never under its minimum.
                 page = area.widget()
-                column = page.column  # the pane's sections, in a column as wide as the window
-                bottom = max(child.mapTo(page, child.rect().bottomLeft()).y() for child in column.findChildren(QWidget)
-                             if child.parentWidget() is column and child.isVisible())
-                margin = page.body.contentsMargins().bottom()
-                self.assertLessEqual(page.height() - 1 - bottom, margin + 2, f"{key}: no gap below the pane")
+                needed = max(page.heightForWidth(page.width()), page.minimumSizeHint().height())
+                self.assertEqual(page.height(), needed, f"{key}: no gap below the pane")
 
     def test_a_pane_taller_than_the_screen_allows_scrolls(self) -> None:
         from PySide6.QtGui import QGuiApplication
