@@ -10,6 +10,10 @@ installed before the filter's (Windows calls the newest hook first, so this
 one sees only what the filter lets through, as applications do), timed on
 this process's own clock.
 
+With `--observe cursor` it installs no hook: it samples where the pointer
+is (GetCursorPos) as fast as it can instead, so that no hook but the
+filter's stands between an event and its effect.
+
 Commands come one per line of JSON on stdin; each answer is one line of JSON
 on stdout. "ready" is printed once the observer is in place.
 
@@ -85,6 +89,24 @@ def main() -> int:
     record = ctypes.POINTER(MSLLHOOKSTRUCT)
     ready = threading.Event()
     thread_id = [0]
+    by_cursor = "--observe" in sys.argv and sys.argv[sys.argv.index("--observe") + 1] == "cursor"
+    sampling = threading.Event()
+    user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+    user32.GetCursorPos.restype = wintypes.BOOL
+
+    def sample() -> None:
+        if set_context is not None:
+            set_context(ctypes.c_void_p(-4))
+        point = wintypes.POINT()
+        last = None
+        while True:
+            sampling.wait()
+            if user32.GetCursorPos(ctypes.byref(point)):
+                here = (point.x, point.y)
+                if here != last:
+                    observed.append((0x0200, here[0], here[1], 0, time.perf_counter()))
+                    last = here
+            time.sleep(0)
 
     def observe() -> None:
         if set_context is not None:
@@ -105,9 +127,13 @@ def main() -> int:
             pass
         user32.UnhookWindowsHookEx(hook)
 
-    observer = threading.Thread(target=observe, daemon=True)
-    observer.start()
-    ready.wait(5)
+    if by_cursor:
+        threading.Thread(target=sample, daemon=True).start()
+        observer = None
+    else:
+        observer = threading.Thread(target=observe, daemon=True)
+        observer.start()
+        ready.wait(5)
     size = ctypes.sizeof(INPUT)
 
     def send(flags: int, dx: int = 0, dy: int = 0) -> None:
@@ -131,6 +157,7 @@ def main() -> int:
             send(MOUSEEVENTF_LEFTDOWN)
             time.sleep(0.05)
         del observed[:]
+        sampling.set()
         sent = []
         began = time.perf_counter() + 0.002
         for index in range(count):
@@ -142,9 +169,12 @@ def main() -> int:
             sent.append(time.perf_counter())
             send(MOUSEEVENTF_MOVE, dx, dy)
         time.sleep(command.get("settle_s", 0.4))
+        sampling.clear()
+        time.sleep(0.01)
         print(json.dumps({"sent": sent, "observed": list(observed)}), flush=True)
-    user32.PostThreadMessageW(thread_id[0], WM_QUIT, 0, 0)
-    observer.join(2)
+    if observer is not None:
+        user32.PostThreadMessageW(thread_id[0], WM_QUIT, 0, 0)
+        observer.join(2)
     return 0
 
 

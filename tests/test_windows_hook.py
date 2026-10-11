@@ -1549,28 +1549,49 @@ class WindowsMotionSmoothnessTests(RealWindows):
 
     def setUp(self) -> None:
         import json
-        import subprocess
+
+        from app.main import INTERPRETER_SWITCH_INTERVAL_S
 
         super().setUp()
         self.exact_relative_motion()
         self.pointer_where_it_counts()
         self.json = json
-        # The probe's hook goes in first, so the filter's, installed after it,
-        # is called before it.
-        self.probe = subprocess.Popen(
-            [sys.executable, "-I", self.PROBE], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1
-        )
+        self.probe = None
+        self.observer = None
         self.addCleanup(self.stop_probe)
+        # The app's own: how long another of its Python threads can keep the
+        # hook waiting for the GIL.
+        interval = sys.getswitchinterval()
+        sys.setswitchinterval(INTERPRETER_SWITCH_INTERVAL_S)
+        self.addCleanup(sys.setswitchinterval, interval)
+
+    def use_probe(self, observer: str) -> None:
+        """The probe, observing by its hook ("hook") or by the pointer's
+        place ("cursor"). Its hook goes in before the filter's, so the
+        filter's is called first."""
+        import subprocess
+
+        if self.observer == observer:
+            return
+        self.stop_probe()
+        self.probe = subprocess.Popen(
+            [sys.executable, "-I", self.PROBE, "--observe", observer],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1,
+        )
+        self.observer = observer
         self.assertEqual(self.probe.stdout.readline().strip(), "ready")
         time.sleep(0.2)
 
     def stop_probe(self) -> None:
+        probe, self.probe, self.observer = self.probe, None, None
+        if probe is None:
+            return
         try:
-            self.probe.stdin.write(self.json.dumps({"do": "quit"}) + "\n")
-            self.probe.stdin.close()
-            self.probe.wait(5)
+            probe.stdin.write(self.json.dumps({"do": "quit"}) + "\n")
+            probe.stdin.close()
+            probe.wait(5)
         except Exception:  # noqa: BLE001 - it goes either way
-            self.probe.kill()
+            probe.kill()
 
     # -- the modes -------------------------------------------------------------
     @contextmanager
@@ -1616,8 +1637,6 @@ class WindowsMotionSmoothnessTests(RealWindows):
                 self.filter._inject = counted_inject
                 self.filter._injected_passed = counted_passed
             if "another Python thread busy" in name:
-                if "0.5 ms" in name:
-                    sys.setswitchinterval(0.0005)
 
                 def spin() -> None:
                     while not stop.is_set():
@@ -1699,6 +1718,8 @@ class WindowsMotionSmoothnessTests(RealWindows):
             path += ((entry[1][0] - here[0]) ** 2 + (entry[1][1] - here[1]) ** 2) ** 0.5
             here = entry[1]
         hand_path = count * (step[0] ** 2 + step[1] ** 2) ** 0.5
+        # Steps back along the hand's path, and how far the furthest went.
+        backs = [earlier[1][0] - later[1][0] for earlier, later in zip(moves, moves[1:]) if later[1][0] < earlier[1][0]]
         result = {
             "scenario": scenario,
             "rate": round(1 / interval),
@@ -1714,6 +1735,8 @@ class WindowsMotionSmoothnessTests(RealWindows):
             "resent": sum(1 for entry in moves if mark_kind(entry[2]) in INJECTED_MOTION_MARKS),
             "teleports": sum(1 for entry in moves if mark_kind(entry[2]) == TELEPORT_MARK),
             "path_ratio": round(path / hand_path, 3),
+            "backs": (len(backs), max(backs or [0])),
+            "short_px": expected[0] - cursor[0],
             "cursor_ok": cursor == expected,
             "unseen": sum(1 for seen in reached if seen is None),
         }
@@ -1743,6 +1766,8 @@ class WindowsMotionSmoothnessTests(RealWindows):
     def measure(self, modes, cases) -> dict:
         results = {}
         for mode in modes:
+            observer = "cursor" if "pointer watched" in mode else "hook"
+            self.use_probe(observer)
             for rate, scenario in cases:
                 with self.mode(mode):
                     result = self.stream(rate, scenario)
@@ -1758,21 +1783,104 @@ class WindowsMotionSmoothnessTests(RealWindows):
             "on, busy hook thread",
             "off, another Python thread busy",
             "on, another Python thread busy",
-            "on, another Python thread busy, 0.5 ms switch interval",
+            # No hook behind the filter's: apps' view is the pointer's place.
+            "off, pointer watched",
+            "on, pointer watched",
         )
         cases = ((1000, "move"), (1000, "click"), (125, "click"), (1000, "drag"))
         results = self.measure(modes, cases)
         for (mode, rate, scenario), result in results.items():
-            if "another Python thread" in mode:
+            if "another Python thread" in mode or "pointer watched" in mode:
                 continue  # measured and reported only
             with self.subTest(mode=mode, scenario=scenario, rate=rate):
-                self.assertTrue(result["cursor_ok"], f"the pointer ended off the hand's path: {result}")
                 if mode.startswith("on"):
                     self.assertEqual(result["never_back"], 0, f"a re-send was never seen coming back: {result}")
                 if scenario == "click" and mode.startswith("on"):
                     self.assertTrue(result["up_first"], f"the pointer left the click before its up: {result}")
+                # Reported, not yet held to: how far short of the hand's path
+                # the pointer ended.
                 if scenario == "drag":
                     self.assertEqual(result["ups"], 1, f"{result}")
+
+
+@unittest.skipUnless(_run_e2e(), "needs Windows and DCF_E2E=1 (it injects real input)")
+class WindowsCursorPlacementProbe(WindowsMotionSmoothnessTests):
+    """What SetCursorPos does when called from inside a low-level hook's
+    callback, with the mouse (the probe) moving: whether it returns, whether
+    any hook sees it, and where the mouse's next moves start from."""
+
+    test_motion_after_a_click_is_as_smooth_as_with_the_filter_off = None  # measured above
+
+    def test_set_cursor_pos_inside_a_hook_callback(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        self.use_probe("hook")
+        seen, state = [], {"depth": 0, "moves": 0, "set_ms": None, "nested": []}
+        ready, done = threading.Event(), threading.Event()
+        LRESULT = ctypes.c_ssize_t
+        HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        user32.SetWindowsHookExW.argtypes = [ctypes.c_int, HOOKPROC, ctypes.c_void_p, wintypes.DWORD]
+        user32.SetWindowsHookExW.restype = ctypes.c_void_p
+        user32.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+        user32.CallNextHookEx.restype = LRESULT
+        user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+        user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), ctypes.c_void_p, wintypes.UINT, wintypes.UINT]
+        user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+        user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+        record = ctypes.POINTER(self.api.MSLLHOOKSTRUCT)
+        thread = [0]
+
+        def run() -> None:
+            self.api.use_physical_pixels()
+            thread[0] = kernel32.GetCurrentThreadId()
+            point = wintypes.POINT()
+
+            @HOOKPROC
+            def callback(code: int, message: int, data: int) -> int:
+                if code >= 0 and message == WM_MOUSEMOVE:
+                    info = ctypes.cast(data, record).contents
+                    user32.GetCursorPos(ctypes.byref(point))
+                    entry = (state["depth"], (info.pt.x, info.pt.y), int(info.flags), int(info.dwExtraInfo), (point.x, point.y))
+                    seen.append(entry)
+                    if state["depth"]:
+                        state["nested"].append(entry)
+                    elif int(info.dwExtraInfo) == 0:
+                        state["moves"] += 1
+                        if state["moves"] == 5:
+                            state["depth"] += 1
+                            began = time.perf_counter()
+                            user32.SetCursorPos(info.pt.x + 100, info.pt.y)
+                            state["set_ms"] = (time.perf_counter() - began) * 1000
+                            state["depth"] -= 1
+                            return 1
+                return user32.CallNextHookEx(None, code, message, data)
+
+            hook = user32.SetWindowsHookExW(14, callback, None, 0)
+            ready.set()
+            message = wintypes.MSG()
+            while not done.is_set() and user32.GetMessageW(ctypes.byref(message), None, 0, 0) > 0:
+                pass
+            user32.UnhookWindowsHookEx(hook)
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        self.assertTrue(ready.wait(5))
+        self.place(200, 200)
+        command = {"do": "stream", "rate": 125, "count": 20, "step": [1, 0], "scenario": "move", "settle_s": 0.3}
+        self.probe.stdin.write(self.json.dumps(command) + "\n")
+        answer = self.json.loads(self.probe.stdout.readline())
+        final = self.cursor()
+        done.set()
+        user32.PostThreadMessageW(thread[0], 0x0012, 0, 0)
+        worker.join(3)
+        observed = [(x, y, hex(extra)) for message, x, y, extra, _at in answer["observed"] if message == WM_MOUSEMOVE]
+        self.report(f"[setcursorpos] took {state['set_ms']} ms inside the callback; nested hook calls {state['nested']}")
+        self.report(f"[setcursorpos] the hook saw (depth, pt, flags, extra, GetCursorPos): {seen}")
+        self.report(f"[setcursorpos] the observer behind it saw: {observed}")
+        self.report(f"[setcursorpos] final pointer {final}; 4 moves, a jump of 100 from the 5th, 15 more: (320, 200) if they follow it")
 
 
 MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_HWHEEL = 0x0080, 0x0100, 0x0800, 0x1000
