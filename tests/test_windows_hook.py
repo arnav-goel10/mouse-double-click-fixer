@@ -1516,6 +1516,228 @@ class WindowsMotionTests(RealWindows):
         self.assertLess(p99(watched), 1.0)
 
 
+def _quantile(values: list, share: float) -> float:
+    ordered = sorted(values)
+    if not ordered:
+        return float("nan")
+    return ordered[min(len(ordered) - 1, max(0, int(round(share * (len(ordered) - 1)))))]
+
+
+@unittest.skipUnless(_run_e2e(), "needs Windows and DCF_E2E=1 (it injects real input)")
+class WindowsMotionSmoothnessTests(RealWindows):
+    """Motion after a click reaches apps as smoothly as with the filter off.
+
+    The owner's report on 1.0.0: after a click, the pointer moved like a
+    slide show. The test's moves stand for a mouse's reports, sent on a
+    schedule at 1000 Hz or 125 Hz, and the observer behind the filter sees
+    what apps see and when: how long each of the hand's moves took to reach
+    them, the gaps between the updates they saw, moves delivered in bursts,
+    moves the filter re-sent (absolute), and the pointer's whole path. Each
+    case runs with the filter off (the baseline), on, on without Raw Input,
+    on with a busy hook thread (every WM_INPUT costs it a quarter of a
+    millisecond more, as on a slow machine or with a fast mouse), and with
+    another Python thread busy (the app's own UI thread at work)."""
+
+    BUSY_S = 0.00025
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.exact_relative_motion()
+        self.pointer_where_it_counts()
+        self.start_observer()
+
+    # -- the modes -------------------------------------------------------------
+    @contextmanager
+    def mode(self, name: str):
+        """The filter as `name` says, for one stream."""
+        patches = []
+        gil = None
+        if name in ("on, no raw input",):
+            patches.append(mock.patch("app.devices_win.Win32RawInput", side_effect=OSError("off for the test")))
+        if name == "on, busy hook thread":
+            from app.devices_win import RawInputDevices
+
+            original = RawInputDevices.on_input
+            busy = self.BUSY_S
+
+            def on_input(devices, lparam):
+                until = time.perf_counter() + busy
+                while time.perf_counter() < until:
+                    pass
+                return original(devices, lparam)
+
+            patches.append(mock.patch.object(RawInputDevices, "on_input", on_input))
+        for patch in patches:
+            patch.start()
+        try:
+            if name != "off" and not name.startswith("off"):
+                self.start_filter()
+                self.filter._callback_timings = []
+            if name.endswith("another Python thread busy"):
+                stop = threading.Event()
+
+                def spin() -> None:
+                    while not stop.is_set():
+                        sum(range(2000))
+
+                gil = threading.Thread(target=spin, daemon=True)
+                gil.start()
+            yield
+        finally:
+            if gil is not None:
+                stop.set()
+                gil.join(2)
+            if self.filter is not None:
+                self.filter.stop()
+                self.filter = None
+            for patch in reversed(patches):
+                patch.stop()
+
+    # -- one stream --------------------------------------------------------------
+    def stream(self, rate: int, scenario: str, seconds: float = 0.4) -> dict:
+        """Send `seconds` of the hand's relative moves at `rate` Hz, after a
+        click ("click"), from inside a drag let go a quarter of the way in
+        ("drag"), or on their own ("move"); return what apps saw."""
+        faulthandler.dump_traceback_later(120, exit=True)  # per stream: the test runs many
+        interval = 1.0 / rate
+        count = int(round(seconds * rate))
+        left, top, width, height = self.api.virtual_screen()
+        start = (left + 80, top + 80)
+        step = (max(1, min(12, (width - 200) // count)), max(1, min(6, (height - 200) // (2 * count))))
+        self.place(*start)
+        time.sleep(0.05)
+        release_at = count // 4 if scenario == "drag" else None
+        if scenario == "click":
+            self.button(0x0002)
+            time.sleep(0.08)
+            self.button(0x0004)
+            time.sleep(0.005)
+        elif scenario == "drag":
+            self.button(0x0002)
+            time.sleep(0.05)
+        self.observed.clear()
+        if self.filter is not None and self.filter._callback_timings is not None:
+            self.filter._callback_timings.clear()
+        move = self.mouse(0x0001, *step)
+        up = self.mouse(0x0004)
+        sent = []
+        began = time.perf_counter() + 0.002
+        for index in range(count):
+            wait = began + index * interval - time.perf_counter()
+            if wait > 0:
+                time.sleep(wait)
+            if index == release_at:
+                self.send(up)
+            sent.append(time.perf_counter())
+            self.send(move)
+        time.sleep(0.4)
+        timings = list(self.filter._callback_timings or []) if self.filter is not None else []
+        expected = (start[0] + count * step[0], start[1] + count * step[1])
+        return self.analyse(scenario, interval, start, step, sent, expected, self.cursor(), list(self.observed), timings)
+
+    def analyse(self, scenario, interval, start, step, sent, expected, cursor, observed, timings) -> dict:
+        count = len(sent)
+        moves = [entry for entry in observed if entry[0] == WM_MOUSEMOVE]
+        # When apps first saw the pointer at (or past) each of the hand's
+        # positions: hand move k takes it to start + (k + 1) * step.
+        reached = [None] * count
+        furthest = -1
+        for entry in moves:
+            index = (entry[1][0] - start[0]) // step[0] - 1
+            if index > furthest:
+                for k in range(max(furthest + 1, 0), min(index, count - 1) + 1):
+                    reached[k] = entry[4]
+                furthest = index
+        latencies = [(seen - sent[k]) * 1000 for k, seen in enumerate(reached) if seen is not None]
+        times = [entry[4] for entry in moves if entry[4] >= sent[0]]
+        gaps = [(later - earlier) * 1000 for earlier, later in zip(times, times[1:])]
+        # The gaps apps saw while the hand was moving, its own last one
+        # included: from its first move to the update showing its last.
+        until = reached[-1] if reached[-1] is not None else times[-1] if times else sent[-1]
+        moving = [(later - earlier) * 1000 for earlier, later in zip(times, times[1:]) if later <= until]
+        inputs = [(later - earlier) * 1000 for earlier, later in zip(sent, sent[1:])]
+        # Bursts: updates that came within a quarter of the input interval
+        # of the one before, counted together.
+        burst = longest = 1
+        for gap in gaps:
+            burst = burst + 1 if gap < interval * 250 else 1
+            longest = max(longest, burst)
+        path, here = 0.0, start
+        for entry in moves:
+            path += ((entry[1][0] - here[0]) ** 2 + (entry[1][1] - here[1]) ** 2) ** 0.5
+            here = entry[1]
+        hand_path = count * (step[0] ** 2 + step[1] ** 2) ** 0.5
+        resent = sum(1 for entry in moves if mark_kind(entry[2]) in INJECTED_MOTION_MARKS)
+        teleports = sum(1 for entry in moves if mark_kind(entry[2]) == TELEPORT_MARK)
+        result = {
+            "scenario": scenario,
+            "rate": round(1 / interval),
+            "moves": count,
+            "input_ms": (round(statistics.median(inputs), 3), round(max(inputs), 3)),
+            "updates": len(moves),
+            "gap_ms": (round(_quantile(moving, 0.5), 3), round(_quantile(moving, 0.99), 2), round(max(moving or [0]), 2)),
+            "gaps_over_2x": sum(1 for gap in moving if gap > 2 * interval * 1000),
+            "latency_ms": (
+                round(_quantile(latencies, 0.5), 3), round(_quantile(latencies, 0.99), 2), round(max(latencies or [0]), 2)
+            ),
+            "burst": longest,
+            "resent": resent,
+            "teleports": teleports,
+            "path_ratio": round(path / hand_path, 3),
+            "cursor_ok": cursor == expected,
+            "unseen": sum(1 for seen in reached if seen is None),
+        }
+        if scenario == "click":
+            ups = [index for index, entry in enumerate(observed) if entry[0] == WM_LBUTTONUP]
+            off = [
+                index for index, entry in enumerate(observed)
+                if entry[0] == WM_MOUSEMOVE and not self.api.within_drag_rect(start, entry[1])
+            ]
+            result["up_first"] = bool(ups) and (not off or ups[0] < off[0])
+        elif scenario == "drag":
+            result["ups"] = sum(1 for entry in observed if entry[0] == WM_LBUTTONUP)
+        if timings:
+            def cost(kind) -> str:
+                values = [seconds * 1000 for message, watched, seconds in timings if kind(message, watched)]
+                if not values:
+                    return "n=0"
+                return f"n={len(values)} p50={_quantile(values, 0.5):.3f} p99={_quantile(values, 0.99):.3f} max={max(values):.2f}"
+
+            result["hook_ms"] = {
+                "move unwatched": cost(lambda message, watched: message == WM_MOUSEMOVE and not watched),
+                "move watched": cost(lambda message, watched: message == WM_MOUSEMOVE and watched),
+                "WM_INPUT": cost(lambda message, _watched: message == 0x00FF),
+            }
+        return result
+
+    def measure(self, modes, cases) -> dict:
+        results = {}
+        for mode in modes:
+            for rate, scenario in cases:
+                with self.mode(mode):
+                    result = self.stream(rate, scenario)
+                results[(mode, rate, scenario)] = result
+                self.report(f"[smooth] {mode} | {scenario} @ {rate} Hz: {result}")
+        return results
+
+    def test_motion_after_a_click_is_as_smooth_as_with_the_filter_off(self) -> None:
+        modes = (
+            "off",
+            "on",
+            "on, no raw input",
+            "on, busy hook thread",
+            "off, another Python thread busy",
+            "on, another Python thread busy",
+        )
+        cases = ((1000, "move"), (1000, "click"), (125, "click"), (1000, "drag"))
+        results = self.measure(modes, cases)
+        for (mode, _rate, scenario), result in results.items():
+            with self.subTest(mode=mode, scenario=scenario, rate=_rate):
+                self.assertTrue(result["cursor_ok"], f"the pointer ended off the hand's path: {result}")
+                if scenario == "click" and mode.startswith("on"):
+                    self.assertTrue(result["up_first"], f"the pointer left the click before its up: {result}")
+
+
 MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP, MOUSEEVENTF_WHEEL, MOUSEEVENTF_HWHEEL = 0x0080, 0x0100, 0x0800, 0x1000
 
 
