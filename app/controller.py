@@ -408,12 +408,23 @@ class AppController(QObject):
         )
 
     def suspend(self) -> None:
-        """Pause filtering so the click pad measures the raw mouse.
+        """Hold filtering off so the click pad measures the raw mouse.
 
-        Calibration has to see the faulty clicks to learn from them.
+        Calibration has to see the faulty clicks to learn from them. The
+        hold is its own, apart from a pause (the user's, or for a game):
+        taken while the filter runs or while it is paused, so a pause that
+        ends mid-measurement can't start filtering under the pad. Only
+        end_suspension() (or turning the filter off or on) ends it.
         """
-        if self.active and not self._suspended:
-            self._suspended = True
+        if self._suspended or not self.settings["fix_enabled"]:
+            return
+        if not (self.active or self.paused):
+            # Off for another reason (a failed start, no permission, another
+            # login session): nothing filters, and that reason's own path
+            # brings it back.
+            return
+        self._suspended = True
+        if self.active:
             self._stop_filter()
             self.filter_state_changed.emit(False, "")
 
@@ -421,13 +432,10 @@ class AppController(QObject):
         """Turned on while calibration has filtering paused: remember it, and
         start once calibration ends, so the pad keeps measuring raw clicks."""
         self._store(fix_enabled=True)
-        if self.paused:
-            # The pause is the user's and outlasts the measuring: filtering
-            # starts when it ends (pauses and calibration's own never overlap).
-            self.filter_state_changed.emit(False, "")
-            return
         if self.active:
             self._stop_filter()
+        # Held for the measuring, and paused too if a pause is on: filtering
+        # starts once both are over, whichever ends last.
         self._suspended = True
         self.failure = self.failure_detail = ""
         self.filter_state_changed.emit(False, "")
@@ -520,10 +528,10 @@ class AppController(QObject):
 
     def resume(self) -> None:
         """End a pause (timed, or for a game in front) and start filtering
-        again. With no such pause, end calibration's (end_suspension), as
-        before 1.1: the two never overlap (a pause started while calibration
-        measures takes over from it), so there is never a doubt which one a
-        call means."""
+        again, unless Test and Tune still holds it off while it measures
+        (suspend): then filtering starts when that hold ends. With no pause,
+        end Test and Tune's hold instead (end_suspension), as resume() did
+        before 1.1; the window ends that hold with end_suspension() itself."""
         if not self.paused:
             self.end_suspension()
             return
@@ -580,10 +588,8 @@ class AppController(QObject):
         self._paused_until = self._clock() + minutes * 60
         self._pause_timer.start()
         log.info("Paused for %d minutes", minutes)
-        # The user's pause takes over from calibration's: the pad goes on
-        # measuring an unfiltered mouse, and filtering comes back when the
-        # pause ends, not when the measuring does.
-        self._suspended = False
+        # Test and Tune's hold (suspend), if it has one, is left alone: the
+        # two are separate, and filtering comes back only once both are over.
         self._stop_filter()
         self.filter_state_changed.emit(False, "")
         self.pause_changed.emit()
@@ -604,7 +610,8 @@ class AppController(QObject):
 
     def _start_after_pause(self) -> None:
         """Filter again after a pause, unless something else still holds it:
-        calibration measuring, another login session, the user's off."""
+        Test and Tune measuring (its end_suspension starts it then), another
+        login session, the user's off."""
         if self.settings["fix_enabled"] and not self._suspended and not self._shut_down:
             self.set_active(True)
 
@@ -683,8 +690,7 @@ class AppController(QObject):
         if self._game is None:
             self._game = game
             log.info("Paused while a full-screen game is in front")
-            self._suspended = False  # this pause takes over (see pause())
-            self._stop_filter()
+            self._stop_filter()  # Test and Tune's hold, if any, stays (see pause())
             self.filter_state_changed.emit(False, "")
             self.pause_changed.emit()
         elif self._game != game:

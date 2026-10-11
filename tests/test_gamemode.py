@@ -121,8 +121,9 @@ class MacGamesTests(unittest.TestCase):
         games = gamemode.MacGames()
         front = games.front()
         self.assertIsNotNone(front)
+        # No active display (asleep, or a closed lid with none attached) is
+        # an empty list, which in_front() reads as no game: nothing to cover.
         self.assertIsInstance(games.displays(), list)
-        self.assertGreater(len(games.displays()), 0)
         self.assertIsInstance(games.windows(front[0]), list)
         self.assertIsInstance(games.bundle_info(front[3]), dict)
         found = gamemode.game_in_front()
@@ -394,6 +395,38 @@ class ControllerGameTests(helpers.ControllerCase):
         self.assertTrue(controller.paused)
         self.assertEqual(controller.paused_for_game, "Example Game")
         self.assertFalse(controller.active)
+
+    def test_a_game_pause_keeps_test_and_tunes_hold(self) -> None:
+        # Test and Tune measuring when a game comes to the front, then the
+        # game leaving before the measuring is done: no filter under the pad.
+        controller = self.controller
+        controller.set_active(True)
+        controller.set_auto_pause_games(True)
+        controller.suspend()
+        self.game = self.GAME
+        controller.check_game()
+        self.assertTrue(controller.paused)
+        self.assertTrue(controller.suspended, "the game's pause is separate")
+        self.game = None
+        controller.check_game()
+        self.assertFalse(controller.paused)
+        self.assertFalse(controller.active, "still measuring")
+        controller.end_suspension()
+        self.assertTrue(controller.active)
+
+    def test_measuring_during_a_game_pause_holds_after_it(self) -> None:
+        controller = self.controller
+        controller.set_active(True)
+        controller.set_auto_pause_games(True)
+        self.game = self.GAME
+        controller.check_game()
+        controller.suspend()
+        self.assertTrue(controller.suspended)
+        self.game = None
+        controller.check_game()
+        self.assertFalse(controller.active, "still measuring")
+        controller.end_suspension()
+        self.assertTrue(controller.active)
 
     def test_turning_the_filter_off_in_a_game_ends_the_pause(self) -> None:
         controller = self.controller

@@ -483,44 +483,112 @@ class ControllerPauseTests(helpers.ControllerCase):
         controller.resume()
         self.assertTrue(controller.active)
 
-    def test_turned_on_from_calibration_during_a_pause_keeps_the_pause(self) -> None:
+    def test_turned_on_from_calibration_during_a_pause_keeps_both(self) -> None:
         controller = self.controller
         controller.set_active(True)
         controller.pause(15)
         controller.enable_after_calibration()
         self.assertTrue(controller.paused)
-        self.assertFalse(controller.suspended, "a pause and calibration's never overlap")
+        self.assertTrue(controller.suspended, "Test and Tune's hold is its own")
         self.clock.now += 16 * 60
         controller._check_pause_end()
+        self.assertFalse(controller.active, "still measuring")
+        controller.end_suspension()
         self.assertTrue(controller.active)
 
-    def test_a_pause_while_calibration_measures_takes_over(self) -> None:
-        # The shortcut pressed while Test and Tune measures: the user's pause
-        # replaces calibration's, so resume() can only mean the pause.
+    def test_a_pause_while_test_and_tune_measures_keeps_its_hold(self) -> None:
+        # The shortcut or the menu pressed while Test and Tune measures: the
+        # two holds stay separate, and filtering waits for both to end.
         controller = self.controller
         controller.set_active(True)
         controller.suspend()
         self.assertTrue(controller.suspended)
         controller.pause(15)
-        self.assertFalse(controller.suspended)
+        self.assertTrue(controller.suspended)
         self.assertTrue(controller.paused)
-        controller.suspend()  # Test and Tune measuring again: nothing to stop
-        self.assertFalse(controller.suspended)
         controller.resume()
         self.assertFalse(controller.paused)
+        self.assertFalse(controller.active, "the pad is still measuring")
+        self.assertEqual(controller.status_text(), "Paused for calibration")
+        controller.end_suspension()
         self.assertTrue(controller.active)
+        self.assertEqual(len(helpers.FakeFilter.instances), 2)
 
     def test_measuring_ending_during_a_pause_leaves_the_pause_alone(self) -> None:
-        # What the 1.1 window does when Test and Tune stops measuring: resume()
-        # only while suspended. During a pause it isn't, so the pause runs on.
+        # What the 1.1 window does when Test and Tune stops measuring:
+        # end_suspension(). During a pause, the pause runs on, and filtering
+        # comes back when it ends.
         controller = self.controller
         controller.set_active(True)
         controller.suspend()
         controller.pause(15)
-        if controller.suspended:
-            controller.resume()
+        controller.end_suspension()
+        self.assertFalse(controller.suspended)
         self.assertTrue(controller.paused)
         self.assertFalse(controller.active)
+        self.assertEqual(controller.failure, "", "not a failure")
+        self.clock.now += 15 * 60
+        controller._check_pause_end()
+        self.assertTrue(controller.active)
+
+    # Regressions from the 1.1 review: a pause ending while Test and Tune
+    # measured started filtering under the pad, which then saw no bounces
+    # and suggested a smaller window.
+    def test_a_pause_running_out_mid_measurement_doesnt_filter(self) -> None:
+        # (a) Paused for 15 minutes, then Test and Tune starts measuring, and
+        # the time runs out before it is done.
+        controller = self.controller
+        controller.set_active(True)
+        controller.pause(15)
+        controller.suspend()  # Test and Tune measuring, filter already paused
+        self.assertTrue(controller.suspended)
+        self.clock.now += 15 * 60
+        controller._check_pause_end()
+        self.assertFalse(controller.paused)
+        self.assertFalse(controller.active, "the pad is measuring raw clicks")
+        self.assertEqual(len(helpers.FakeFilter.instances), 1, "no filter started under the pad")
+        self.assertTrue(controller.wanted)
+        self.assertEqual(controller.status_sentence(), "Paused while you test your mouse.")
+        controller.end_suspension()  # done measuring
+        self.assertTrue(controller.active)
+
+    def test_the_shortcut_pressed_twice_mid_measurement_doesnt_filter(self) -> None:
+        # (b) Test and Tune measures first, then the shortcut is pressed
+        # twice: paused, then resumed.
+        controller = self.controller
+        controller.set_active(True)
+        controller.suspend()
+        controller.toggle_pause()
+        self.assertTrue(controller.paused)
+        controller.toggle_pause()
+        self.assertFalse(controller.paused)
+        self.assertFalse(controller.active, "the pad is measuring raw clicks")
+        self.assertTrue(controller.suspended)
+        self.assertEqual(len(helpers.FakeFilter.instances), 1, "no filter started under the pad")
+        controller.end_suspension()
+        self.assertTrue(controller.active)
+
+    def test_turning_off_mid_measurement_and_pause_ends_both(self) -> None:
+        controller = self.controller
+        controller.set_active(True)
+        controller.pause(15)
+        controller.suspend()
+        controller.set_active(False)
+        self.assertFalse(controller.paused)
+        self.assertFalse(controller.suspended)
+        controller.end_suspension()
+        self.clock.now += 16 * 60
+        controller._check_pause_end()
+        self.assertFalse(controller.active)
+
+    def test_nothing_held_while_off_or_stopped_for_another_reason(self) -> None:
+        controller = self.controller
+        controller.suspend()
+        self.assertFalse(controller.suspended, "off: nothing to hold")
+        controller.set_active(True)
+        controller.stop_keeping_choice()  # access gone, another session...
+        controller.suspend()
+        self.assertFalse(controller.suspended, "that reason brings it back, not the pad")
 
     def test_status_and_tooltip_say_until_when(self) -> None:
         controller = self.controller
