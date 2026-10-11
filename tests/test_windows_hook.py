@@ -1938,8 +1938,13 @@ class WindowsMotionSmoothnessTests(ProbedWindows):
                     self.assertEqual(result["resends"], 0, f"{result}")
                 # No gap the filter adds beyond twice the hand's interval: no
                 # move of the hand's shows after more than two of its later
-                # moves have gone out, over what the baseline shows.
-                self.assertLessEqual(result["waited"], 2 + baseline["waited"], f"apps waited for the hand's motion: {result}")
+                # moves have gone out, over what the baseline shows. A move
+                # held while a release goes out shows with the next move once
+                # the release is in. With the hook thread slowed, the
+                # release's own trip takes longer than an interval, so one
+                # more of the hand's moves can go out first.
+                allowed = (3 if "busy hook thread" in mode else 2) + baseline["waited"]
+                self.assertLessEqual(result["waited"], allowed, f"apps waited for the hand's motion: {result}")
 
 
 @unittest.skipUnless(_run_e2e(), "needs Windows and DCF_E2E=1 (it injects real input)")
