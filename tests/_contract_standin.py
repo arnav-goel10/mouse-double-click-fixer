@@ -21,7 +21,7 @@ from PySide6.QtCore import QTimer, Signal
 #: What the UI calls beyond 1.0's controller: the agreed contract and the
 #: setters for the settings it names.
 CONTRACT = (
-    "pause", "resume", "paused", "paused_until", "pause_changed", "pause_shortcut_text",
+    "pause", "resume", "paused", "paused_until", "pause_changed", "pause_shortcut_text", "end_suspension",
     "set_pause_shortcut_enabled", "set_auto_pause_games", "set_strength", "apply_calibration",
     "status_sentence", "health", "apply_suggestion", "conflicts", "conflicts_changed",
 )
@@ -92,9 +92,12 @@ def _stand_in(base):
         def __init__(self, *args, **kwargs) -> None:
             super().__init__(*args, **kwargs)
             self._paused_until: Optional[float] = None
+            # As the controller's: a timed pause ends by the wall clock,
+            # checked now and then (tests replace the clock and check).
+            self._clock = time.time
             self._pause_timer = QTimer(self)
-            self._pause_timer.setSingleShot(True)
-            self._pause_timer.timeout.connect(self.resume)
+            self._pause_timer.setInterval(5000)
+            self._pause_timer.timeout.connect(self._check_pause_end)
             self.stand_in_conflicts: list = []
             self.stand_in_health: Optional[Health] = None
             self.calibrations: list = []
@@ -102,6 +105,9 @@ def _stand_in(base):
                 self.settings.setdefault(key, value)
 
         # -- pause --------------------------------------------------------
+        # Two holds, each on its own: the user's pause, and Test and Tune's
+        # while it measures (suspend / end_suspension). Filtering starts
+        # again only once neither holds it.
         @property
         def paused(self) -> bool:
             return self._paused_until is not None
@@ -117,21 +123,47 @@ def _stand_in(base):
         def pause(self, minutes: int = 15) -> None:
             if not self.settings["fix_enabled"]:
                 return
-            self._paused_until = time.time() + 60 * int(minutes)
+            self._paused_until = self._clock() + 60 * int(minutes)
             self._stop_filter()
-            self._pause_timer.start(int(minutes) * 60 * 1000)
+            self._pause_timer.start()
             self.filter_state_changed.emit(False, "")
             self.pause_changed.emit()
 
         def resume(self) -> None:
-            if self._paused_until is not None:
-                self._paused_until = None
-                self._pause_timer.stop()
-                self.pause_changed.emit()
-                if self.settings["fix_enabled"] and not self.suspended:
-                    self.set_active(True)
+            if self._paused_until is None:
+                self.end_suspension()
                 return
-            super().resume()
+            self._paused_until = None
+            self._pause_timer.stop()
+            self.pause_changed.emit()
+            self._start_after_pause()
+
+        def _check_pause_end(self) -> None:
+            if self._paused_until is None or self._clock() < self._paused_until:
+                return
+            self._paused_until = None
+            self._pause_timer.stop()
+            self.pause_changed.emit()
+            self._start_after_pause()
+
+        def _start_after_pause(self) -> None:
+            if self.settings["fix_enabled"] and not self.suspended:
+                self.set_active(True)
+
+        def suspend(self) -> None:
+            """Test and Tune's hold, whether the filter runs or a pause has
+            stopped it already."""
+            if self._suspended or not self.settings["fix_enabled"]:
+                return
+            self._suspended = True
+            self._stop_filter()
+            self.filter_state_changed.emit(False, "")
+
+        def end_suspension(self) -> None:
+            if self._suspended:
+                self._suspended = False
+                if self.settings["fix_enabled"]:
+                    self.set_active(True)  # still held by a pause: stays off
 
         def set_active(self, active: bool) -> bool:
             if active and self.paused:

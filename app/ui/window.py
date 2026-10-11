@@ -1160,12 +1160,15 @@ class MainWindow(QWidget):
         return tune.measuring and tune.isVisible() and not tune.isMinimized() and tune.isActiveWindow()
 
     def _sync_pause(self) -> None:
+        """Hold filtering while Test and Tune measures, and let go after.
+        The hold is its own (suspend / end_suspension), apart from the user's
+        pause and a game's: either may start or end while the pad measures,
+        and filtering starts again only once neither holds it. resume()
+        would end the user's pause instead."""
         if self._should_pause():
             self.controller.suspend()
-        elif self.controller.suspended and not self.controller.paused:
-            # Only Test and Tune's own pause ends here; a pause the user
-            # asked for from the menu runs its course.
-            self.controller.resume()
+        elif self.controller.suspended:
+            self.controller.end_suspension()
 
     # -- state -------------------------------------------------------------------
     def refresh(self) -> None:

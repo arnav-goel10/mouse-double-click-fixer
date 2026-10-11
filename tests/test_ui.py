@@ -409,6 +409,57 @@ class TunePauseTests(LiveWindowTests):
         self.assertTrue(self.controller.paused, "the menu's pause runs its course")
         self.assertFalse(self.controller.active)
 
+    # The user's pause and Test and Tune's hold are separate: either can end
+    # first, and filtering starts again only when neither holds it. A filter
+    # running under the pad would hide the bounces it measures, and Test and
+    # Tune would then recommend too short a window.
+
+    def test_a_pause_running_out_mid_measurement_waits_for_the_pad(self) -> None:
+        self.controller.set_active(True)
+        self.controller.pause(15)
+        tune = self.window.tune
+        self.window.show_tune()
+        tune._advance()  # measuring, while paused
+        self.assertTrue(tune.measuring)
+        self.assertTrue(self.controller.suspended, "Test and Tune holds filtering as well")
+        later = self.controller._clock() + 16 * 60
+        self.controller._clock = lambda: later
+        self.controller._check_pause_end()  # the 15 minutes run out
+        self.assertFalse(self.controller.paused)
+        self.assertFalse(self.controller.active, "the pad still measures the raw mouse")
+        self.assertTrue(self.controller.wanted)
+        tune._finish()
+        self.assertTrue(self.controller.active, "filtering starts once the measuring is over")
+
+    def test_the_pause_shortcut_pressed_twice_mid_measurement_waits_for_the_pad(self) -> None:
+        from app.ui import menus
+
+        # The shortcut where the controller has it, else the menus' item,
+        # which does the same: pause, then resume.
+        press = getattr(self.controller, "toggle_pause", None) or (lambda: menus.toggle_pause(self.controller))
+        tune = self.open_tune()
+        tune._advance()  # measuring
+        self.assertFalse(self.controller.active)
+        press()
+        self.assertTrue(self.controller.paused)
+        press()
+        self.assertFalse(self.controller.paused)
+        self.assertFalse(self.controller.active, "the pad still measures the raw mouse")
+        self.assertTrue(self.controller.suspended)
+        tune._finish()
+        self.assertTrue(self.controller.active, "filtering starts once the measuring is over")
+
+    def test_measuring_ending_mid_pause_leaves_the_pause_running(self) -> None:
+        tune = self.open_tune()
+        tune._advance()  # measuring
+        self.controller.pause(15)
+        tune._finish()
+        self.assertFalse(self.controller.suspended, "Test and Tune let go")
+        self.assertTrue(self.controller.paused, "the user's pause runs its course")
+        self.assertFalse(self.controller.active)
+        self.controller.resume()
+        self.assertTrue(self.controller.active)
+
 
 class KeepFilterAliveTests(LiveWindowTests):
     """Fail open, and never lose the user's on."""
