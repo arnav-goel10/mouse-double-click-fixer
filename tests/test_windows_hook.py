@@ -1979,7 +1979,8 @@ class WindowsMotionSmoothnessTests(ProbedWindows):
     for the 150 ms in-flight time-out, far past the margin. How many of the
     hand's later moves went out first is reported ("waited"): counted in
     moves at 1000 Hz, one hiccup of the probe's own sampler of a few ms
-    would fail a bound in moves."""
+    would fail a bound in moves (CI saw one of 24 ms, with every send
+    answered within 3.2 ms)."""
 
     LATENCY_MARGIN_MS = 40
     GIL_WAIT_P50_MS = 25
@@ -2194,7 +2195,7 @@ class WindowsMotionSmoothnessTests(ProbedWindows):
                 if "another Python thread busy" in mode:
                     # Every move waits for the GIL here, the filter's work or
                     # not: about 45 ms an event (p50) with Windows' 15.6 ms
-                    # tick, 7-9 ms with the 1 ms period (CI, Windows Server
+                    # tick, 3-10 ms with the 1 ms period (CI, Windows Server
                     # 2025). Only that is held to.
                     self.assertLess(result["latency_ms"][0], self.GIL_WAIT_P50_MS, f"the hook waited for the GIL: {result}")
                     continue

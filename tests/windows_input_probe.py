@@ -97,13 +97,11 @@ def main() -> int:
             set_context(ctypes.c_void_p(-4))  # per-monitor aware v2: the hook's own pixels
 
     physical_pixels()
-    # A thread waiting here for the GIL asks for it after the switch
-    # interval, which Windows rounds up to its 15.6 ms tick: the sampler
-    # could then miss the pointer's places for that long and report the
-    # filter late. 1 ms timers keep the probe's own waits short, as the
-    # filter's are (app.platform.finer_timer).
-    winmm = ctypes.WinDLL("winmm")
-    winmm.timeBeginPeriod(1)
+    # The sampler runs at the highest priority, so the runner's other work
+    # makes it miss as few of the pointer's places as it can. (The probe
+    # asks for no finer timer: on Windows Server 2025 one process's 1 ms
+    # period shortened the filter's GIL waits too, hiding what the filter's
+    # own asking changes.)
     kernel32.GetCurrentThread.restype = wintypes.HANDLE
     kernel32.SetThreadPriority.argtypes = [wintypes.HANDLE, ctypes.c_int]
     observed: list = []
@@ -188,7 +186,6 @@ def main() -> int:
         print(json.dumps({"sent": sent, "observed": list(observed), "samples": list(samples)}), flush=True)
     user32.PostThreadMessageW(thread_id[0], WM_QUIT, 0, 0)
     observer.join(2)
-    winmm.timeEndPeriod(1)
     return 0
 
 
