@@ -1972,11 +1972,14 @@ class WindowsMotionSmoothnessTests(ProbedWindows):
     waiting is held to GIL_WAIT_P50_MS) and, measured and reported only,
     without it.
 
-    Thresholds keep headroom: a move may wait for one more of the hand's
-    later moves than the rule below allows, and no move may show more than
-    LATENCY_MARGIN_MS later than with the filter off. A re-send that never
-    comes back holds motion for the 150 ms in-flight time-out, far past
-    either."""
+    The threshold is in milliseconds, with headroom: no move of the hand's
+    may show more than LATENCY_MARGIN_MS later than with the filter off. A
+    held move shows with the hand's next move or the one after, a few ms at
+    most in every mode (CI); a re-send that never comes back holds motion
+    for the 150 ms in-flight time-out, far past the margin. How many of the
+    hand's later moves went out first is reported ("waited"): counted in
+    moves at 1000 Hz, one hiccup of the probe's own sampler of a few ms
+    would fail a bound in moves."""
 
     LATENCY_MARGIN_MS = 40
     GIL_WAIT_P50_MS = 25
@@ -2195,15 +2198,8 @@ class WindowsMotionSmoothnessTests(ProbedWindows):
                     # 2025). Only that is held to.
                     self.assertLess(result["latency_ms"][0], self.GIL_WAIT_P50_MS, f"the hook waited for the GIL: {result}")
                     continue
-                # No gap the filter adds beyond twice the hand's interval: no
-                # move of the hand's shows after more than two of its later
-                # moves have gone out, over what the baseline shows. A move
-                # held while a release goes out shows with the next move once
-                # the release is in. With the hook thread slowed, the
-                # release's own trip takes longer than an interval, so one
-                # more of the hand's moves can go out first.
-                allowed = (3 if "busy hook thread" in mode else 2) + baseline["waited"] + 1
-                self.assertLessEqual(result["waited"], allowed, f"apps waited for the hand's motion: {result}")
+                # No move of the hand's shows much later than with the
+                # filter off (see the class's docstring).
                 self.assertLess(
                     result["latency_ms"][2], baseline["latency_ms"][2] + self.LATENCY_MARGIN_MS,
                     f"a move of the hand's showed late: {result}",
