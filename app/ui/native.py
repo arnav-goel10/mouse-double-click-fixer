@@ -1,4 +1,8 @@
-"""Native window materials: macOS sidebar vibrancy and Windows 11 Mica.
+"""Windows 11's window materials and frame: Mica, the dark title bar and the
+rounded corners, through DWM.
+
+macOS needs none of this: the Settings window is an ordinary AppKit window
+with a toolbar (toolbar_mac.py), whose background AppKit draws.
 
 Everything here is best effort. If a call is unavailable the window simply
 keeps the solid colours it already paints, so a failure is cosmetic only.
@@ -8,138 +12,31 @@ from __future__ import annotations
 
 import platform
 import sys
-import warnings
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QWidget
 
-IS_MAC = platform.system() == "Darwin"
 IS_WINDOWS = platform.system() == "Windows"
+
+#: DwmSetWindowAttribute's attributes (dwmapi.h).
+DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+DWMWA_WINDOW_CORNER_PREFERENCE = 33
+DWMWA_CAPTION_COLOR = 35
+DWMWA_SYSTEMBACKDROP_TYPE = 38
+#: DWM_SYSTEMBACKDROP_TYPE: Mica, for a long-lived main window.
+DWMSBT_MAINWINDOW = 2
+#: DWM_WINDOW_CORNER_PREFERENCE: 8 px (a window, flyout or dialog), 4 px.
+DWMWCP_ROUND, DWMWCP_ROUNDSMALL = 2, 3
+#: The first Windows 11 build, and the first with DWMWA_SYSTEMBACKDROP_TYPE.
+WINDOWS_11, BACKDROP_BUILD = 22000, 22621
 
 
 def _native_backend() -> bool:
     """True only with the real window system (not offscreen or minimal),
-    where a window handle is an actual NSView or HWND."""
-    return QGuiApplication.platformName() in ("cocoa", "windows")
+    where a window handle is an actual HWND."""
+    return QGuiApplication.platformName() == "windows"
 
-
-def prepare(window: QWidget) -> bool:
-    """Set window hints before the native window exists.
-
-    Returns True when the window will be translucent, which means the caller
-    must leave the areas that should show the material unpainted.
-    """
-    if not _native_backend():
-        return False
-    if IS_MAC:
-        with warnings.catch_warnings():
-            # PySide6 flags this enum because it shares a value with a
-            # deprecated one; the hint itself is current (Qt 6.9+).
-            warnings.simplefilter("ignore", DeprecationWarning)
-            hint = getattr(Qt.WindowType, "ExpandedClientAreaHint", None)
-            no_background = getattr(Qt.WindowType, "NoTitleBarBackgroundHint", None)
-        if hint is None or no_background is None:
-            return False
-        window.setWindowFlag(hint, True)
-        window.setWindowFlag(no_background, True)
-        window.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        # The layout reserves the title bar itself (sidebar inset, pane title
-        # row); Qt must not add the safe-area margin on top of that.
-        respects = getattr(Qt.WidgetAttribute, "WA_ContentsMarginsRespectsSafeArea", None)
-        if respects is not None:
-            window.setAttribute(respects, False)
-        return True
-    if IS_WINDOWS and _windows_build() >= 22621:
-        window.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        return True
-    return False
-
-
-def apply(window: QWidget, sidebar_width: int, dark: bool) -> bool:
-    """Attach the material once the native window exists. True on success."""
-    if not _native_backend():
-        return False
-    try:
-        if IS_MAC:
-            return _mac_sidebar(window, sidebar_width)
-        if IS_WINDOWS:
-            return _windows_mica(window, dark)
-    except Exception:  # noqa: BLE001 - cosmetic only
-        return False
-    return False
-
-
-def set_dark_title_bar(window: QWidget, dark: bool, caption=None) -> None:
-    """Match the Windows title bar to the theme. Without Mica, `caption`
-    (the window colour) also tints it, so bar and window read as one surface."""
-    if not IS_WINDOWS or not _native_backend():
-        return
-    try:
-        import ctypes
-
-        hwnd = int(window.winId())
-        value = ctypes.c_int(1 if dark else 0)
-        ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 20, ctypes.byref(value), ctypes.sizeof(value))
-        if caption is not None and _windows_build() >= 22000:
-            # DWMWA_CAPTION_COLOR takes a COLORREF (0x00BBGGRR).
-            colour = ctypes.c_uint(caption.red() | caption.green() << 8 | caption.blue() << 16)
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(hwnd, 35, ctypes.byref(colour), ctypes.sizeof(colour))
-    except Exception:  # noqa: BLE001
-        pass
-
-
-# -- macOS -------------------------------------------------------------------
-
-def _mac_sidebar(window: QWidget, sidebar_width: int) -> bool:
-    import AppKit
-    import objc
-
-    view = objc.objc_object(c_void_p=int(window.winId()))
-    ns_window = view.window()
-    frame_view = view.superview()
-    if ns_window is None or frame_view is None:
-        return False
-
-    # A unified toolbar gives the title bar the height System Settings uses,
-    # with the traffic lights centred in it. It holds no items.
-    if ns_window.toolbar() is None:
-        toolbar = AppKit.NSToolbar.alloc().initWithIdentifier_("DoubleClickFixer")
-        toolbar.setShowsBaselineSeparator_(False)
-        ns_window.setToolbar_(toolbar)
-    if hasattr(ns_window, "setToolbarStyle_"):
-        ns_window.setToolbarStyle_(AppKit.NSWindowToolbarStyleUnified)
-    if hasattr(ns_window, "setTitlebarSeparatorStyle_"):
-        ns_window.setTitlebarSeparatorStyle_(AppKit.NSTitlebarSeparatorStyleNone)
-    ns_window.setTitleVisibility_(AppKit.NSWindowTitleHidden)
-    ns_window.setTitlebarAppearsTransparent_(True)
-
-    height = ns_window.frame().size.height
-    effect = AppKit.NSVisualEffectView.alloc().initWithFrame_(((0, 0), (sidebar_width, height)))
-    effect.setMaterial_(AppKit.NSVisualEffectMaterialSidebar)
-    effect.setBlendingMode_(AppKit.NSVisualEffectBlendingModeBehindWindow)
-    effect.setState_(AppKit.NSVisualEffectStateFollowsWindowActiveState)
-    effect.setAutoresizingMask_(AppKit.NSViewHeightSizable | AppKit.NSViewMaxXMargin)
-    frame_view.addSubview_positioned_relativeTo_(effect, AppKit.NSWindowBelow, view)
-    return True
-
-
-def title_bar_height(window: QWidget) -> int:
-    """Height of the (transparent) title bar region content must clear."""
-    if not IS_MAC:
-        return 0
-    try:
-        import objc
-
-        view = objc.objc_object(c_void_p=int(window.winId()))
-        ns_window = view.window()
-        content = ns_window.contentLayoutRect()
-        return int(ns_window.frame().size.height - content.size.height)
-    except Exception:  # noqa: BLE001
-        return 52
-
-
-# -- Windows -----------------------------------------------------------------
 
 def _windows_build() -> int:
     if not IS_WINDOWS:
@@ -150,12 +47,70 @@ def _windows_build() -> int:
         return 0
 
 
-def _windows_mica(window: QWidget, dark: bool) -> bool:
+def prepare(window: QWidget) -> bool:
+    """Set window hints before the native window exists. Returns True when
+    Mica can be had (Windows 11 22H2 and later), which means the caller must
+    leave the areas that should show it unpainted; otherwise the window
+    paints its own solid colour, Mica's fallback."""
+    if not IS_WINDOWS or not _native_backend() or _windows_build() < BACKDROP_BUILD:
+        return False
+    window.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+    return True
+
+
+def apply(window: QWidget, dark: bool) -> bool:
+    """Attach Mica once the native window exists. True on success."""
+    if not IS_WINDOWS or not _native_backend():
+        return False
+    try:
+        return _windows_mica(window, dark)
+    except Exception:  # noqa: BLE001 - cosmetic only
+        return False
+
+
+def _set_attribute(window: QWidget, attribute: int, value) -> int:
     import ctypes
     from ctypes import wintypes
 
-    hwnd = int(window.winId())
-    dwm = ctypes.windll.dwmapi
+    return ctypes.windll.dwmapi.DwmSetWindowAttribute(
+        wintypes.HWND(int(window.winId())), attribute, ctypes.byref(value), ctypes.sizeof(value)
+    )
+
+
+def set_dark_title_bar(window: QWidget, dark: bool, caption=None) -> None:
+    """Match the Windows title bar to the theme. Without Mica, `caption`
+    (the window colour) also tints it, so bar and window read as one surface."""
+    if not IS_WINDOWS or not _native_backend():
+        return
+    try:
+        import ctypes
+
+        _set_attribute(window, DWMWA_USE_IMMERSIVE_DARK_MODE, ctypes.c_int(1 if dark else 0))
+        if caption is not None and _windows_build() >= WINDOWS_11:
+            # A COLORREF (0x00BBGGRR).
+            colour = ctypes.c_uint(caption.red() | caption.green() << 8 | caption.blue() << 16)
+            _set_attribute(window, DWMWA_CAPTION_COLOR, colour)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def round_corners(window: QWidget, small: bool = False) -> None:
+    """Windows 11: rounded corners, 8 px for a window, flyout or dialog, or
+    `small` (4 px). Windows 10 keeps square ones."""
+    if not IS_WINDOWS or not _native_backend() or _windows_build() < WINDOWS_11:
+        return
+    try:
+        import ctypes
+
+        preference = ctypes.c_int(DWMWCP_ROUNDSMALL if small else DWMWCP_ROUND)
+        _set_attribute(window, DWMWA_WINDOW_CORNER_PREFERENCE, preference)
+    except Exception:  # noqa: BLE001 - cosmetic
+        pass
+
+
+def _windows_mica(window: QWidget, dark: bool) -> bool:
+    import ctypes
+    from ctypes import wintypes
 
     class MARGINS(ctypes.Structure):
         _fields_ = [
@@ -166,8 +121,8 @@ def _windows_mica(window: QWidget, dark: bool) -> bool:
         ]
 
     set_dark_title_bar(window, dark)
+    round_corners(window)
+    # Mica runs through the title bar and behind the whole client area.
     margins = MARGINS(-1, -1, -1, -1)
-    dwm.DwmExtendFrameIntoClientArea(wintypes.HWND(hwnd), ctypes.byref(margins))
-    backdrop = ctypes.c_int(2)  # DWMSBT_MAINWINDOW: Mica
-    result = dwm.DwmSetWindowAttribute(wintypes.HWND(hwnd), 38, ctypes.byref(backdrop), ctypes.sizeof(backdrop))
-    return result == 0
+    ctypes.windll.dwmapi.DwmExtendFrameIntoClientArea(wintypes.HWND(int(window.winId())), ctypes.byref(margins))
+    return _set_attribute(window, DWMWA_SYSTEMBACKDROP_TYPE, ctypes.c_int(DWMSBT_MAINWINDOW)) == 0

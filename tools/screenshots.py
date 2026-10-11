@@ -1,51 +1,44 @@
-"""Render every pane in light and dark, offscreen, for review and the docs.
+"""Picture every surface of the app, in light and dark, for review and the docs.
 
     python tools/screenshots.py OUTPUT_DIR [--as-windows | --live [--scheme=light|dark]] [--docs | --social]
 
-`--as-windows` previews the Windows layout on another platform (fonts and
-icons fall back, so use it for layout only). Offscreen, Qt draws no native
-control: buttons, pop-up buttons and the rest come out in Qt's own Fusion
-style, so only a live capture shows what users see.
+The surfaces, by platform:
 
-`--live` opens a real window on the real window server and captures every
-pane from the screen, so native controls, materials (Mica, vibrancy) and the
-title bar show as they do for users (`NN-pane-SCHEME.png`, and `-2.png` on
-for the rest of a pane taller than the window), then the pop-ups and menus
-open (`popup-*.png`) and the narrowest window. `--scheme` asks for the light
-or dark appearance. CI's `screenshots` job runs it on macOS and Windows, in
-both (the macos-screenshots and windows-screenshots artifacts). It opens a
-window and, on macOS, presses Escape to close each menu, so run it on a
-machine where that is welcome. Settings are isolated in a temporary folder,
-so this never touches a real configuration.
+    macOS    the Settings window's panes (General, Exceptions, History,
+             About), General with Custom strength and with a note about
+             another mouse utility, the menu bar menu (filtering and paused),
+             the Dock menu, Test and Tune at each step, the first run's three
+             states, and the pop-up buttons and menus the panes open.
+    Windows  the window's pages (Home with its first-run InfoBar, then
+             without; Exceptions, History, Settings), Home with the Strength
+             expander open, the tray's flyout and its menu, Test and tune at
+             each step, and the pop-ups.
 
-`--docs` captures only the Bounce Filter pane for the README, in the same
-state on both platforms (the filter on, three buttons with windows of their own,
-the wheel fix on) so the two screenshots match side by side. Nothing is
-scrolled or cut through: a pane the window can't show whole ends below the last
-section that fits.
+Offscreen (the default) every window is drawn with `grab()`: Qt draws no
+native control there (buttons and pop-ups come out in Fusion), menus can't
+be opened, and the Mac's toolbar is Qt's stand-in, so use it for layout only.
+`--as-windows` previews the Windows layout on another platform the same way.
 
-    docs/images/windows.png  CI's `--live --docs` run on Windows (the
-                             windows-screenshots artifact's docs-filter.png): a
-                             real window, title bar included, as tall as the
-                             runner's 1024 x 768 screen allows.
-    docs/images/macos.png    CI's `--live --docs --size=WIDTHxHEIGHT` run on
-                             macOS (the macos-screenshots artifact's
-                             docs-filter.png), dark, with the Windows picture's
-                             size so the two match. Offscreen, `--docs` draws
-                             the window with its corners and window buttons
-                             instead, but Qt draws no native control there.
+`--live` opens real windows on the real window server and photographs the
+screen, so native controls, the toolbar, materials (Mica) and title bars show
+as users see them, and the menus open. `--scheme` asks for the light or dark
+appearance. CI's `screenshots` job runs it on macOS and Windows, in both (the
+macos-screenshots and windows-screenshots artifacts). It opens windows, a
+menu bar item and menus, so run it only where that is welcome: a CI runner,
+never someone's own Mac. Settings live in a temporary folder throughout.
 
-Without `--size` the window is as tall as the pane needs (a live window is held
-to what the screen shows).
+`--docs` captures only the General / Home pane for the README, in the same
+state on both platforms, so the two pictures match side by side; `--size`
+sets the window's size. `--social` draws docs/images/social-preview.png,
+the card GitHub shows for links to the repository.
 
-`--social` draws docs/images/social-preview.png, the 1280 x 640 card GitHub
-shows for links to the repository (upload it under Settings › General ›
-Social preview): the app icon, its name and what it does. It draws into an
-image, offscreen, with the system font (SF Pro on a Mac).
+Names: `NN-surface-SCHEME.png`, `-2.png` and on for the rest of a pane
+taller than its window.
 """
 
 from __future__ import annotations
 
+import contextlib
 import os
 import sys
 import tempfile
@@ -53,6 +46,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "tests"))
 LIVE = "--live" in sys.argv
 if not LIVE:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -78,7 +72,7 @@ def wait(app, milliseconds: int) -> None:
 
 def social_preview():
     """The repository's social preview card, as a QImage."""
-    from PySide6.QtCore import QPointF, QRectF, Qt
+    from PySide6.QtCore import QPointF, QRectF
     from PySide6.QtGui import QColor, QFont, QFontDatabase, QFontMetricsF, QImage, QLinearGradient, QPainter
 
     from app import DISPLAY_NAME
@@ -143,21 +137,6 @@ DOCS_WIDTH = 860
 WINDOWS_TITLE_BAR = 31
 
 
-def docs_state(controller) -> None:
-    """The Filter pane as the README shows it: on, with three buttons
-    filtered, each with a window of its own, the wheel fix on and the counts a
-    few months of use leaves."""
-    from app.core import Button
-
-    controller.set_buttons([Button.LEFT, Button.RIGHT, Button.BACK])
-    controller.set_threshold(Button.LEFT, 46)
-    controller.set_calibrated(Button.LEFT)
-    controller.set_threshold(Button.BACK, 30)
-    controller.set_wheel_fix(True)
-    controller.settings["filtered_total"] = 8324
-    controller.session_filtered = 945
-
-
 def parse_size(argv) -> tuple[int, int] | None:
     for argument in argv:
         if argument.startswith("--size="):
@@ -166,36 +145,17 @@ def parse_size(argv) -> tuple[int, int] | None:
     return None
 
 
-def fit_pane(app, window, room: int | None = None) -> tuple[int, int | None]:
-    """The window height that shows the current pane whole, no scrolling, and
-    the index of the last item of the page to keep (None: all of them).
-
-    Squeezed to its shortest the pane is as tall as its content, so the
-    difference to the viewport is what the rest of the window adds. With
-    `room` (the most the screen can show) and a pane taller than that, the
-    height ends below the last section or note that fits, never through a
-    row and never between a heading and what it heads.
-    """
-    from PySide6.QtCore import QPoint
-
-    window.resize(window.width(), window.minimumHeight())
-    app.processEvents()
-    area = window.stack.currentWidget()
-    page = area.widget()
-    chrome = window.height() - area.viewport().height()
-    full = chrome + page.height()
-    if room is None or full <= room:
-        return full, None
-    pad = 14
-    fits = []
-    for index in range(page.body.count()):
-        item = page.body.itemAt(index).widget()
-        if item is None or getattr(item, "role", "") in ("headline", "title"):
-            continue
-        bottom = chrome + item.mapTo(page, QPoint(0, item.height())).y() + pad
-        if bottom <= room:
-            fits.append((bottom, index))
-    return max(fits)
+def parse_scheme(argv) -> str | None:
+    """`--scheme=light` or `--scheme=dark`: the appearance a live capture
+    asks the system for (Qt's QStyleHints.setColorScheme, which sets the
+    app's own appearance on macOS and the app's theme on Windows)."""
+    for argument in argv:
+        if argument.startswith("--scheme="):
+            scheme = argument[len("--scheme="):]
+            if scheme not in ("light", "dark"):
+                raise SystemExit(f"--scheme must be light or dark, not {scheme!r}")
+            return scheme
+    return None
 
 
 def dark_palette():
@@ -223,7 +183,7 @@ def dark_palette():
 def mac_frame(grabbed, width: int, height: int):
     """A window grab drawn as a Mac window, since offscreen there is no window
     server to supply one: rounded corners, a hairline edge and the three window
-    buttons over the sidebar."""
+    buttons."""
     from PySide6.QtCore import QRectF, Qt
     from PySide6.QtGui import QColor, QImage, QPainter, QPainterPath, QPen
 
@@ -247,11 +207,12 @@ def mac_frame(grabbed, width: int, height: int):
     return image
 
 
+# -- the state shown --------------------------------------------------------------
+
 def sample_state(controller) -> None:
-    """Something to show on every pane: a few buttons with their own windows
-    (the left one calibrated to a window none of the presets has), the wheel
-    fix, excluded apps, the devices a Mac usually has, and a month of wear on
-    a switch that is getting worse."""
+    """Something to show everywhere: a few buttons filtered (the left one
+    calibrated), the wheel fix, excluded apps, the devices a computer usually
+    has, and a month of wear on a switch that is getting worse."""
     import time
 
     from app.core import Button, ClickEvent
@@ -265,7 +226,7 @@ def sample_state(controller) -> None:
     controller.add_excluded_app("com.valvesoftware.steam", "Steam")
     controller.add_excluded_app("cs2.exe", "Counter-Strike 2")
     controller.set_device_ignored("usb:046D:C08B:0F3A1B", "Logitech G502 HERO", True)
-    # The Apps pane's menu offers these as running, whatever this computer runs.
+    # The Apps menu offers these as running, whatever this computer runs.
     from app import app_keys
 
     running = [("com.apple.Safari", "Safari"), ("com.apple.mail", "Mail"), ("com.spotify.client", "Spotify")]
@@ -292,143 +253,79 @@ def sample_state(controller) -> None:
         for index in range(400):
             wear.note_wheel(1, index % 97 == 0)
     wear._clock = clock
+    controller.settings["filtered_total"] = 1284
+    controller.session_filtered = 14
 
 
-def trim_to_viewport(app, main_window, pad: int = 14) -> None:
-    """Hide what the window shows only part of, so the pane ends below the
-    last section or note that fits, never through a row or under a heading.
-    Measured on the window as laid out (a real window resizes later than
-    an offscreen one, so fit_pane's arithmetic can't be trusted there)."""
-    from PySide6.QtCore import QPoint
+def docs_state(controller) -> None:
+    """The General / Home pane as the README shows it: on, three buttons
+    filtered (the left one calibrated), the wheel fix on."""
+    from app.core import Button
 
-    area = main_window.stack.currentWidget()
-    page, viewport = area.widget(), area.viewport()
-    items = [page.body.itemAt(index).widget() for index in range(page.body.count())]
-    items = [item for item in items if item is not None and item.isVisible()]
-    for position, item in enumerate(items):
-        if item.mapTo(viewport, QPoint(0, item.height())).y() + pad <= viewport.height():
-            continue
-        cut = position
-        while cut > 0 and getattr(items[cut - 1], "role", "") == "headline":
-            cut -= 1  # a heading goes with what it heads
-        for hidden in items[cut:]:
-            hidden.hide()
-        break
-    app.processEvents()
+    controller.set_buttons([Button.LEFT, Button.RIGHT, Button.BACK])
+    controller.set_threshold(Button.LEFT, 46)
+    controller.set_calibrated(Button.LEFT)
+    controller.set_wheel_fix(True)
+    controller.settings["filtered_total"] = 8324
+    controller.session_filtered = 14
 
 
-def capture_docs(app, main_window, target: Path, size: tuple[int, int] | None) -> None:
-    """The Filter pane into `target`: whole if the window can show it whole."""
-    from PySide6.QtCore import Qt
+@contextlib.contextmanager
+def suggesting(controller):
+    """The health check as History shows it when bounce creeps up on the
+    left button's window: a verdict, and the change it suggests. The
+    controller's own check, in its own words, on the left button's recent
+    bounces reaching the high 50s of its 59 ms window, with a 200 ms
+    double-click measured by Test and Tune (the wear history and that
+    measurement are what change). The stand-in, until the controller has
+    one, is worded the same way: the detail carries the suggestion's reason,
+    question and all."""
+    from unittest import mock
 
-    main_window._show_page(0)
-    main_window.refresh()
-    # What is cut off is not worth a scroll bar in a picture.
-    main_window.stack.currentWidget().setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-    app.processEvents()
-    if not LIVE:
-        # Offscreen, the picture is the window as the Mac draws one: the
-        # whole window, so `size` counts the title bar's room too.
-        width, height = size or (DOCS_WIDTH, 0)
-        wanted, last = fit_pane(app, main_window, height or None)
-        height = height or wanted
-        page = main_window.stack.currentWidget().widget()
-        for index in range(page.body.count() if last is not None else 0):
-            if index > last and page.body.itemAt(index).widget() is not None:
-                page.body.itemAt(index).widget().hide()
-        main_window.resize(width, height)
-        app.processEvents()
-        wait(app, 50)
-        mac_frame(main_window.grab().toImage(), width, height).save(str(target))
+    from _contract_standin import Health, Suggestion, standing_in
+
+    from app.core import Button
+    from app.inputs import as_button
+    from app.wear import Histogram
+
+    if standing_in():
+        reason = "Recent bounces on the left button reached about 58 ms, close to its 59 ms window. Raise it to 83 ms?"
+        health = Health(
+            "Your left button double-clicks on its own: caught 412 of 412",
+            "Over the last 30 days the filter ignored every extra click. The left button is bouncing more often "
+            f"than two weeks ago: the switch is wearing out, and in time it will need replacing. {reason}",
+            Suggestion(Button.LEFT, 59, 83, reason),
+            "bouncing",
+        )
+        with mock.patch.object(controller, "health", return_value=health):
+            yield
         return
-    # A live window is a real one, held to what the screen can show.
-    screen = main_window.screen()
-    available = screen.availableGeometry()
-    print(f"Screen {screen.geometry().width()} x {screen.geometry().height()}, "
-          f"available {available.width()} x {available.height()}, scale {screen.devicePixelRatio()}")
-    main_window.move(available.x(), available.y())
-    wait(app, 300)
-    # A Mac window draws its title bar inside itself; Windows adds one.
-    title_bar = 0 if sys.platform == "darwin" else WINDOWS_TITLE_BAR
-    room = available.height() - title_bar - 8
-    if size:
-        height = min(size[1] - title_bar, room)
-    else:
-        wanted = fit_pane(app, main_window, room)[0]
-        height = min(wanted, room)
-        print(f"The pane shows {wanted} px of the {room} the screen leaves")
-    main_window.resize(size[0] if size else DOCS_WIDTH, height)
-    main_window.move(available.x(), available.y())
-    app.processEvents()
-    wait(app, 800)
-    trim_to_viewport(app, main_window)
-    wait(app, 300)
-    frame = main_window.frameGeometry()
-    print(f"Window frame {frame.width()} x {frame.height()}: {grab_window_live(app, main_window, target)}")
+
+    histogram = controller.wear.histogram
+
+    def crowded(button, *args, **kwargs):
+        found = histogram(button, *args, **kwargs)
+        if as_button(button) is not Button.LEFT:
+            return found
+        bins = [(low, count + (12 if 50 <= low <= 56 else 0)) for low, count in found.bins]
+        return Histogram(bins, found.overflow, found.window_ms)
+
+    speeds = {**controller.double_click_speeds(), Button.LEFT: 200}
+    with mock.patch.object(controller.wear, "histogram", crowded), \
+            mock.patch.object(controller, "double_click_speeds", return_value=speeds):
+        yield
 
 
-def parse_scheme(argv) -> str | None:
-    """`--scheme=light` or `--scheme=dark`: the appearance a live capture
-    asks the system for (Qt's QStyleHints.setColorScheme, which sets the
-    app's own appearance on macOS and the app's theme on Windows)."""
-    for argument in argv:
-        if argument.startswith("--scheme="):
-            scheme = argument[len("--scheme="):]
-            if scheme not in ("light", "dark"):
-                raise SystemExit(f"--scheme must be light or dark, not {scheme!r}")
-            return scheme
-    return None
+def with_conflict(controller):
+    """Logi Options+ running beside the app."""
+    from unittest import mock
+
+    from _contract_standin import Conflict
+
+    return mock.patch.object(controller, "conflicts", return_value=[Conflict("Logi Options+", ["side buttons", "wheel"])])
 
 
-def sample_updater(controller):
-    """An updater that says the app is up to date, so General shows its
-    Software update rows as an installed copy does. It never starts, so it
-    never goes online."""
-    from app.updater import Updater
-
-    updater = Updater(controller)
-    updater.kind = "installed"
-    updater.state = updater.CURRENT
-    updater.message = "Up to date"
-    return updater
-
-
-def settle(app, main_window) -> None:
-    """Stop animations (offscreen they never advance) and clear the pads' flash."""
-    from PySide6.QtCore import QPropertyAnimation
-
-    from app.ui.widgets import Switch
-
-    app.processEvents()
-    for animation in main_window.findChildren(QPropertyAnimation):
-        animation.stop()
-    for pad in (main_window.test_page.pad, main_window.calibrate.pad):
-        pad.set_flash_level(0.0)
-    for switch in main_window.findChildren(Switch):
-        switch.set_position(1.0 if switch.isChecked() else 0.0)
-    app.processEvents()
-
-
-def measuring_state(page) -> None:
-    """Calibrate part-way through its single clicks."""
-    page.restart()
-    page._advance()
-    for _ in range(5):
-        page._on_pad_press(900.0, 960.0)
-
-
-def result_state(page) -> None:
-    """Calibrate finished, with a result and the note it adds."""
-    from app.core import REQUIRED_DOUBLE_CLICKS, REQUIRED_SINGLE_CLICKS
-
-    page.restart()
-    page._advance()
-    for _ in range(REQUIRED_SINGLE_CLICKS):
-        page._on_pad_press(900.0, 960.0)
-    for _ in range(REQUIRED_DOUBLE_CLICKS):
-        page._on_pad_press(900.0, 960.0)
-        page._on_pad_press(150.0, 210.0)
-
+# -- capturing -------------------------------------------------------------------
 
 def _on_real_screen() -> bool:
     """True with the real window system. Offscreen (a dry run of `--live`)
@@ -475,170 +372,552 @@ def grab_screen(app, rect, target: Path) -> str:
     pop-ups included. Returns how it was captured."""
     screen = app.primaryScreen()
     rect = rect.intersected(screen.geometry())
-    pixmap = screen.grabWindow(0, rect.x(), rect.y(), rect.width(), rect.height())
-    if not pixmap.isNull() and not _uniform(pixmap.toImage()):
-        pixmap.save(str(target))
-        return "QScreen"
     if sys.platform == "darwin" and _on_real_screen():
+        # QScreen can't see other apps' windows (the menu bar, the Dock).
         region = f"-R{rect.x()},{rect.y()},{rect.width()},{rect.height()}"
         if _screencapture([region], target):
-            return "screencapture"
+            return "screencapture -R"
+    pixmap = screen.grabWindow(0, rect.x(), rect.y(), rect.width(), rect.height())
     if not pixmap.isNull():
         pixmap.save(str(target))
-        return "QScreen (uniform)"
+        return "QScreen" if not _uniform(pixmap.toImage()) else "QScreen (uniform)"
     return "nothing"
 
 
-def grab_window_live(app, main_window, target: Path) -> str:
-    """The real window as the screen shows it: title bar, materials and
-    native controls as the window server composites them."""
+def grab_window_live(app, window, target: Path) -> str:
+    """The real window as the screen shows it: title bar, toolbar, materials
+    and native controls as the window server composites them."""
     if sys.platform == "darwin" and _on_real_screen():
-        number = _mac_window_number(main_window)
+        number = _mac_window_number(window)
         if number is not None and _screencapture(["-o", f"-l{number}"], target):
             return "screencapture -l"
-    return grab_screen(app, main_window.frameGeometry(), target)
+    return grab_screen(app, window.frameGeometry(), target)
 
 
-def dismiss_popups(app) -> None:
-    """Close whatever pop-up or menu is open: Qt's own, and on macOS a native
-    menu (NSMenu tracking), with the Escape key."""
-    from PySide6.QtWidgets import QApplication
+def _post_escape(system: bool = False) -> None:
+    """Close a native menu that is tracking with one Escape: into the app's
+    own queue (no permission needed), or with `system`, the system's (for a
+    menu the first didn't close).
 
-    popup = QApplication.activePopupWidget()
-    if popup is not None:
-        popup.close()
-    if sys.platform == "darwin" and _on_real_screen():
+    Only while a menu is still open: a stray Escape goes to the window in
+    front instead, and closes Test and Tune, a dialog."""
+    if sys.platform != "darwin" or not _on_real_screen():
+        return
+    if not system:
         try:
-            import Quartz
+            import AppKit
 
-            for down in (True, False):
-                event = Quartz.CGEventCreateKeyboardEvent(None, 53, down)  # Escape
-                Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
+            for kind in (AppKit.NSEventTypeKeyDown, AppKit.NSEventTypeKeyUp):
+                event = AppKit.NSEvent.keyEventWithType_location_modifierFlags_timestamp_windowNumber_context_characters_charactersIgnoringModifiers_isARepeat_keyCode_(  # noqa: E501
+                    kind, (0, 0), 0, 0, 0, None, "\x1b", "\x1b", False, 53
+                )
+                AppKit.NSApp.postEvent_atStart_(event, True)
+            return
         except Exception as error:  # noqa: BLE001
-            print(f"Couldn't post Escape: {error}")
+            print(f"Couldn't queue Escape: {error}")
+    try:
+        import Quartz
+
+        for down in (True, False):
+            Quartz.CGEventPost(Quartz.kCGHIDEventTap, Quartz.CGEventCreateKeyboardEvent(None, 53, down))
+    except Exception as error:  # noqa: BLE001
+        print(f"Couldn't post Escape: {error}")
 
 
-def capture_popup(app, main_window, open_popup, target: Path) -> None:
-    """Open a pop-up (an AppKit menu on macOS runs its own event loop until
-    it closes), photograph the screen around the window, then close it."""
-    from PySide6.QtCore import QMargins, QTimer
-    from PySide6.QtWidgets import QApplication
+class Popups:
+    """Open a menu or pop-up, photograph it, close it. A native menu on
+    macOS runs its own loop until it closes, so the picture is taken from a
+    timer, which Qt's event loop keeps running while the menu tracks."""
 
-    returned = []
+    def __init__(self, app) -> None:
+        self.app = app
+        self.menus: list = []  # NSMenus opened, for cancelTracking
 
-    def photograph() -> None:
-        area = main_window.frameGeometry().marginsAdded(QMargins(40, 40, 40, 360))
-        how = grab_screen(app, area, target)
-        print(f"{target.name}: {how}")
-        dismiss_popups(app)
+    def close_all(self, tracking: bool, system: bool = False) -> None:
+        """Close what is open. `tracking`: a native menu is still running
+        its loop (the call that opened it hasn't returned). One that
+        cancelTracking can't reach gets an Escape, sent only then; with
+        `system`, a later try, it gets one even after cancelTracking."""
+        from PySide6.QtWidgets import QApplication
 
-    def still_open() -> None:
-        # Should the first Escape miss, never wait for ever; but a stray
-        # Escape would reach the window and show up in the next picture.
-        if not returned or QApplication.activePopupWidget() is not None:
-            print(f"{target.name}: closing it again")
-            dismiss_popups(app)
+        popup = QApplication.activePopupWidget()
+        if popup is not None:
+            popup.close()
+        cancelled = False
+        for menu in self.menus:
+            try:
+                menu.cancelTracking()
+                cancelled = True
+            except Exception:  # noqa: BLE001
+                pass
+        if tracking and (system or not cancelled):
+            _post_escape(system)
 
-    timers = []
-    for delay, run in ((1200, photograph), (4000, still_open), (7000, still_open)):
-        timer = QTimer(main_window)
-        timer.setSingleShot(True)
-        timer.timeout.connect(run)
-        timer.start(delay)
-        timers.append(timer)
-    open_popup()
-    returned.append(True)
-    wait(app, 1500)
-    for timer in timers:  # this pop-up's, not the next one's
-        timer.stop()
-        timer.deleteLater()
+    def capture(self, open_popup, area, target: Path) -> None:
+        """`area()` gives the screen rectangle to photograph once open."""
+        from PySide6.QtCore import QTimer
+        from PySide6.QtWidgets import QApplication
+
+        returned: list = []
+
+        def photograph() -> None:
+            how = grab_screen(self.app, area(), target)
+            print(f"{target.name}: {how}")
+            self.close_all(tracking=not returned)
+
+        def still_open() -> None:
+            if not returned or QApplication.activePopupWidget() is not None:
+                print(f"{target.name}: closing it again")
+                self.close_all(tracking=not returned, system=True)
+
+        timers = []
+        for delay, run in ((1400, photograph), (4000, still_open), (7000, still_open)):
+            timer = QTimer()
+            timer.setSingleShot(True)
+            timer.timeout.connect(run)
+            timer.start(delay)
+            timers.append(timer)
+        open_popup()
+        returned.append(True)
+        wait(self.app, 1800)
+        for timer in timers:
+            timer.stop()
+        self.menus.clear()
 
 
-def capture_live(app, main_window, out: Path, scheme: str) -> None:
-    """Every pane in a real window, as the screen shows it (`NN-pane-scheme.png`,
-    then `-2.png` and on for the rest of a long one); then the pop-ups and
-    menus, the narrowest window, and the window switched to the other
-    appearance while open."""
-    from PySide6.QtCore import QPoint, Qt
+def settle(app, *windows) -> None:
+    """Stop animations (offscreen they never advance) and clear the pads'
+    flashes, so a picture shows the state, not a moment of a transition."""
+    from PySide6.QtCore import QPropertyAnimation
 
+    from app.ui.widgets import ClickPad, Switch
+
+    app.processEvents()
+    for window in windows:
+        if window is None:
+            continue
+        for animation in window.findChildren(QPropertyAnimation):
+            animation.stop()
+        for pad in window.findChildren(ClickPad):
+            pad.set_flash_level(0.0)
+        for switch in window.findChildren(Switch):
+            switch.set_position(1.0 if switch.isChecked() else 0.0)
+    app.processEvents()
+
+
+class Camera:
+    """Takes the pictures: from the screen (`--live`) or by drawing each
+    window (offscreen)."""
+
+    def __init__(self, app, out: Path, scheme: str, suffix: str = "") -> None:
+        self.app = app
+        self.out = out
+        self.scheme = scheme
+        self.suffix = suffix
+        self.popups = Popups(app)
+        self.taken: list[str] = []
+
+    def path(self, name: str, part: int = 1) -> Path:
+        extra = f"-{part}" if part > 1 else ""
+        return self.out / f"{name}-{self.scheme}{self.suffix}{extra}.png"
+
+    def window(self, name: str, window, scroll_area=None) -> None:
+        """A whole window; with `scroll_area`, the rest of a pane taller
+        than the window as further parts, a screen at a time."""
+        if not window.isVisible():
+            print(f"{name}: the window isn't on screen")
+        if LIVE:
+            # In front and active, as the user has it when looking at it.
+            window.raise_()
+            window.activateWindow()
+        settle(self.app, window)
+        if LIVE:
+            wait(self.app, 500)
+        self._one(window, self.path(name))
+        parts = 1
+        if scroll_area is not None:
+            bar = scroll_area.verticalScrollBar()
+            bar.setValue(0)
+            while bar.value() < bar.maximum():
+                bar.setValue(min(bar.maximum(), bar.value() + scroll_area.viewport().height() - 80))
+                parts += 1
+                settle(self.app, window)
+                if LIVE:
+                    wait(self.app, 300)
+                self._one(window, self.path(name, parts))
+            bar.setValue(0)
+        self.taken.append(name)
+        print(f"{name}-{self.scheme}: {parts} part(s)")
+
+    def _one(self, window, target: Path) -> None:
+        if LIVE:
+            grab_window_live(self.app, window, target)
+        else:
+            window.grab().save(str(target))
+
+    def popup(self, name: str, open_popup, area) -> None:
+        if not LIVE or not _on_real_screen():
+            return  # nothing to photograph off the screen
+        self.popups.capture(open_popup, area, self.path(name))
+        self.taken.append(name)
+
+
+def around(widget, margins=(40, 40, 40, 360)):
+    """The screen rectangle around `widget`'s window, room below for a
+    pop-up."""
+    from PySide6.QtCore import QMargins
+
+    left, top, right, bottom = margins
+    return lambda: widget.window().frameGeometry().marginsAdded(QMargins(left, top, right, bottom))
+
+
+# -- the surfaces ----------------------------------------------------------------
+
+def window_module_is_mac() -> bool:
     from app.ui import window as window_module
 
-    screen = main_window.screen()
-    available = screen.availableGeometry()
-    print(f"Screen {screen.geometry().width()} x {screen.geometry().height()}, "
-          f"available {available.width()} x {available.height()}, scale {screen.devicePixelRatio()}, "
-          f"platform {app.platformName()}, style {app.style().name()}, scheme {scheme}")
-    main_window.resize(780, min(660, available.height() - 60))
-    main_window.move(available.topLeft() + QPoint(20, 20))
-    wait(app, 800)
-    size = main_window.size()
+    return window_module.IS_MAC
 
-    def shoot(name: str) -> None:
-        area = main_window.stack.currentWidget()
-        bar = area.verticalScrollBar()
-        bar.setValue(0)
-        settle(app, main_window)
-        wait(app, 500)
-        how = grab_window_live(app, main_window, out / f"{name}-{scheme}.png")
-        # The rest of a pane taller than the window, a screen at a time.
-        part = 2
-        while bar.value() < bar.maximum():
-            bar.setValue(min(bar.maximum(), bar.value() + area.viewport().height() - 80))
-            settle(app, main_window)
-            wait(app, 300)
-            grab_window_live(app, main_window, out / f"{name}-{scheme}-{part}.png")
-            part += 1
-        bar.setValue(0)
-        print(f"{name}-{scheme}: {how}, {part - 1} part(s)")
 
-    for index, (key, _title) in enumerate(window_module.PAGES):
+def place(app, window, x: int = 20, y: int = 20) -> None:
+    screen = app.primaryScreen().availableGeometry()
+    window.move(screen.x() + x, screen.y() + y)
+
+
+def show(app, window) -> None:
+    window.show()
+    window.raise_()
+    window.activateWindow()
+    app.processEvents()
+    if LIVE:
+        wait(app, 700)
+
+
+def capture_settings(app, camera: Camera, main_window, controller) -> None:
+    """Every pane of the window, then the states worth a look."""
+    from app.ui import menus
+    from app.ui import window as window_module
+
+    mac = window_module.IS_MAC
+    if not mac:
+        # The first run's InfoBar shows until it is closed once.
+        controller.settings["tray_hint_shown"] = False
+        main_window.refresh()
+    place(app, main_window)
+    show(app, main_window)
+    if mac:
+        # What each pane needs: it fits, unscrolled, on a screen whose
+        # available height is this plus SETTINGS_SCREEN_ROOM.
+        heights = {key: main_window.pane_height(index) for index, (key, _title) in enumerate(window_module.pages())}
+        print(f"Pane heights {heights}, plus {window_module.SETTINGS_SCREEN_ROOM} for the window's chrome")
+    for index, (key, _title) in enumerate(window_module.pages()):
         main_window._show_page(index)
-        if key == "calibrate":
-            measuring_state(main_window.calibrate)
-        shoot(f"{index + 1:02d}-{key}")
-    calibrate = window_module.PAGES.index(("calibrate", "Calibrate"))
-    main_window._show_page(calibrate)
-    result_state(main_window.calibrate)
-    shoot(f"{calibrate + 1:02d}-calibrate-result")
-    main_window.calibrate.restart()
+        app.processEvents()
+        area = main_window.stack.currentWidget()
+        name = f"{index + 1:02d}-{key}"
+        if key == "home":
+            name += "-first-run"  # the InfoBar shows until it is closed once
+        camera.window(name, main_window, area)
+    if not mac and main_window.home.info_bar is not None:
+        main_window.home.info_bar.close_button.click()
+        main_window._show_page(0)
+        camera.window("01-home", main_window, main_window.stack.currentWidget())
 
-    # Pop-ups and menus, which only the screen shows.
+    home = main_window.home
+    main_window.show_page("general")
+    controller.set_strength(menus.CUSTOM)  # Custom shows each button's window
+    if home.strength_expander is not None:
+        home.strength_expander.set_expanded(True)
+    app.processEvents()
+    area = main_window.stack.currentWidget()
+    if mac:
+        # The window grows with the pane; what the screen can't show scrolls.
+        camera.window("05-general-custom", main_window, area)
+    else:
+        area.ensureWidgetVisible(home.strength_expander, 0, 0)
+        camera.window("05-home-strength", main_window)
+    camera.popup(
+        "popup-strength", home.strength_picker.showPopup, around(home.strength_picker)
+    )
     from app.core import Button
 
-    main_window.show_page("filter")
-    settle(app, main_window)
-    filter_page = main_window.filter_page
-    left = getattr(filter_page, "window_boxes", {}).get(Button.LEFT)
-    if left is not None and hasattr(left, "showPopup"):
-        capture_popup(app, main_window, left.showPopup, out / f"popup-window-{scheme}.png")
-    main_window.show_page("calibrate")
-    settle(app, main_window)
-    capture_popup(app, main_window, main_window.calibrate.button_picker.showPopup, out / f"popup-calibrate-{scheme}.png")
-    main_window.show_page("apps")
-    settle(app, main_window)
-    capture_popup(app, main_window, main_window.apps.add_button.click, out / f"popup-add-app-{scheme}.png")
+    left = home.window_boxes[Button.LEFT]
+    main_window.stack.currentWidget().ensureWidgetVisible(left)
+    camera.popup("popup-window", left.showPopup, around(left))
+    controller.set_strength(menus.AUTOMATIC)
+    if home.strength_expander is not None:
+        home.strength_expander.set_expanded(False)
+    main_window.stack.currentWidget().verticalScrollBar().setValue(0)
 
-    # The narrowest the window can get, to check nothing is clipped.
-    main_window.show_page("filter")
-    main_window.resize(main_window.minimumSize())
-    settle(app, main_window)
-    wait(app, 800)
-    grab_window_live(app, main_window, out / f"filter-minimum-{scheme}.png")
-    main_window.resize(size)
+    with with_conflict(controller):
+        controller.conflicts_changed.emit()
+        main_window._show_page(0)
+        camera.window(f"06-{main_window.current_key}-note", main_window)
+    controller.conflicts_changed.emit()
 
-    # The other appearance, switched to while the window is open (as the
-    # system does at sunset), to compare with a window opened in it.
+    with suggesting(controller):
+        main_window.show_page("history")
+        camera.window("07-history-suggestion", main_window)
+
+    main_window.show_page("exceptions")
+    apps = main_window.apps
+    main_window.stack.currentWidget().ensureWidgetVisible(apps.add_button)
+    capture_native_menu_of(camera, "popup-add-app", apps.show_add_menu, around(apps.add_button))
+    main_window.show_page("general")
+
+
+def capture_native_menu_of(camera: Camera, name: str, open_menu, area) -> None:
+    """A button's menu: AppKit's on macOS (popup_mac, whose NSMenu is kept
+    so it can be closed), Qt's elsewhere."""
+    from unittest import mock
+
+    from app.ui import popup_mac
+
+    build = popup_mac.build
+
+    def keep(entries):
+        menu, target = build(entries)
+        camera.popups.menus.append(menu)
+        return menu, target
+
+    with mock.patch.object(popup_mac, "build", keep):
+        camera.popup(name, open_menu, area)
+
+
+def capture_tune(app, camera: Camera, main_window, controller) -> None:
+    """Test and Tune, each step: the pad before and during the test, the
+    verdict, the tune step, and done."""
+    tune = main_window.tune
+    tune.restart()
+    main_window.show_tune()
+    # Beside the Settings window on a Mac; over the window on Windows, whose
+    # pictures come from the screen.
+    place(app, tune, 680 if window_module_is_mac() else 60, 20 if window_module_is_mac() else 30)
+    app.processEvents()
+    if LIVE:
+        wait(app, 700)
+    camera.window("10-tune-1-pad", tune)
+    tune._on_pad_press(None, None)
+    for _ in range(4):
+        tune._on_pad_press(900.0, 960.0)
+    tune._on_pad_press(11.0, 40.0)  # a bounce, caught
+    camera.window("11-tune-1-pad-measuring", tune)
+    while tune.phase == "single":
+        tune._on_pad_press(900.0, 960.0)
+    while tune.phase == "double":
+        tune._on_pad_press(900.0, 960.0)
+        tune._on_pad_press(150.0, 210.0)
+    camera.window("12-tune-2-verdict", tune)
+    with with_conflict(controller):
+        tune._render()
+        camera.window("12-tune-2-verdict-note", tune)
+    tune._render()
+    tune._primary()  # Continue
+    camera.window("13-tune-3-tune", tune)
+    camera.popup("popup-tune-window", tune.window_picker.showPopup, around(tune.window_picker))
+    tune._primary()  # Apply
+    camera.window("14-tune-4-done", tune)
+    tune.close()
+    app.processEvents()
+
+
+def capture_first_run(app, camera: Camera, controller) -> None:
+    """macOS's first run: before the system's request, waiting for the
+    switch in System Settings, and ready. Nothing here asks macOS for
+    anything: the states are set, not reached."""
+    from app.ui import first_run
+
+    window = first_run.FirstRunWindow(controller)
+    place(app, window, 200, 120)
+    show(app, window)
+    for index, state in enumerate((first_run.ASK, first_run.WAITING, first_run.READY)):
+        window.state = state
+        window._render()
+        app.processEvents()
+        camera.window(f"20-first-run-{index + 1}-{state}", window)
+    window.hide()
+    window.deleteLater()
+
+
+def capture_mac_menus(app, camera: Camera, controller, main_window) -> None:
+    """The menu bar item's menu, filtering and paused, and the Dock menu."""
+    from PySide6.QtCore import QRect
+
+    from app.ui import menu_bar_mac
+
+    if not (LIVE and _on_real_screen()):
+        return
+    item = menu_bar_mac.MacMenuBarItem(
+        controller, on_settings=lambda: None, on_tune=lambda: None, on_quit=lambda: None,
+        on_toggle=main_window.request_filter,
+    )
+    item.show()
+    wait(app, 1500)
+    screen = app.primaryScreen().geometry()
+
+    def below_item():
+        try:
+            frame = item._item.button().window().frame()
+            x = int(frame.origin.x)
+        except Exception:  # noqa: BLE001
+            x = screen.width() - 300
+        left = max(0, x - 340)
+        return QRect(left, 0, min(screen.width() - left, 720), 420)
+
+    def open_item_menu():
+        camera.popups.menus.append(item.menu)
+        item.open_menu()
+
+    camera.popup("30-menu-bar", open_item_menu, below_item)
+    controller.pause(15)
+    camera.popup("31-menu-bar-paused", open_item_menu, below_item)
+    controller.resume()
+    app.processEvents()
+
+    # The Dock menu as macOS asks Qt for it (applicationDockMenu:), opened
+    # where the Dock is. The Dock adds its own items under these.
+    dock = menu_bar_mac.DockMenu(controller, on_settings=lambda: None, on_tune=lambda: None,
+                                 on_toggle=main_window.request_filter)
+    app.processEvents()
+
+    def open_dock_menu():
+        import AppKit
+
+        native = None
+        delegate = AppKit.NSApp.delegate()
+        if delegate is not None and delegate.respondsToSelector_(b"applicationDockMenu:"):
+            native = delegate.applicationDockMenu_(AppKit.NSApp)
+        if native is None:
+            print("No Dock menu from Qt; showing the QMenu")
+            dock.menu.popup(main_window.mapToGlobal(main_window.rect().center()))
+            return
+        camera.popups.menus.append(native)
+        # Screen coordinates start at the bottom left in AppKit; the menu
+        # hangs down from this point, above the Dock.
+        native.popUpMenuPositioningItem_atLocation_inView_(None, (screen.width() // 2, 260), None)
+
+    def above_dock():
+        return QRect(screen.width() // 2 - 30, screen.height() - 300, 420, 300)
+
+    camera.popup("32-dock-menu", open_dock_menu, above_dock)
+    item.hide()
+
+
+def capture_tray(app, camera: Camera, controller, main_window) -> None:
+    """Windows' notification area icon: its flyout (left click) and its
+    menu (right click)."""
+    from PySide6.QtCore import QMargins, QPoint, QRect
+
+    from app.ui import tray as tray_module
+
+    tray = tray_module.Tray(controller, on_open=lambda: None, on_tune=lambda: None, on_quit=lambda: None,
+                            on_toggle=main_window.request_filter)
+    tray.show()
+    app.processEvents()
+    if LIVE:
+        wait(app, 1200)
+    print(f"Tray icon at {tray.geometry()}")
+    flyout = tray.flyout
+
+    def show_flyout() -> None:
+        tray.show_flyout()
+        app.processEvents()
+
+    if LIVE and _on_real_screen():
+        show_flyout()
+        wait(app, 600)
+        settle(app, flyout)
+        grab_screen(app, flyout.frameGeometry().marginsAdded(QMargins(24, 24, 24, 24)), camera.path("30-tray-flyout"))
+        camera.taken.append("30-tray-flyout")
+        flyout.close()
+        controller.pause(15)
+        show_flyout()
+        wait(app, 600)
+        settle(app, flyout)
+        grab_screen(app, flyout.frameGeometry().marginsAdded(QMargins(24, 24, 24, 24)),
+                    camera.path("31-tray-flyout-paused"))
+        camera.taken.append("31-tray-flyout-paused")
+        flyout.close()
+        controller.resume()
+    else:
+        flyout.refresh()
+        flyout.adjustSize()
+        settle(app, flyout)
+        flyout.grab().save(str(camera.path("30-tray-flyout")))
+        camera.taken.append("30-tray-flyout")
+
+    screen = app.primaryScreen().availableGeometry()
+    at = QPoint(screen.right() - 260, screen.bottom() - 220)
+    menu = tray.contextMenu()
+
+    def open_menu() -> None:
+        tray._before_menu()
+        menu.popup(at)
+
+    camera.popup("32-tray-menu", open_menu, lambda: QRect(at.x() - 30, at.y() - 30, 330, 260))
+    tray.hide()
+
+
+def capture_switched(app, camera: Camera, main_window, scheme: str) -> None:
+    """The other appearance, switched to while the window is open (as the
+    system does at sunset), to compare with a window opened in it."""
+    from PySide6.QtCore import Qt
+
     other = "light" if scheme == "dark" else "dark"
     hints = app.styleHints()
-    if hasattr(hints, "setColorScheme"):
-        hints.setColorScheme(Qt.ColorScheme.Dark if other == "dark" else Qt.ColorScheme.Light)
-        wait(app, 800)
-        main_window.apply_look()  # what the app does on colorSchemeChanged (app/main.py)
-        for key in ("filter", "calibrate"):
-            main_window.show_page(key)
-            settle(app, main_window)
-            wait(app, 500)
-            grab_window_live(app, main_window, out / f"switched-{key}-{scheme}-to-{other}.png")
+    if not LIVE or not hasattr(hints, "setColorScheme"):
+        return
+    hints.setColorScheme(Qt.ColorScheme.Dark if other == "dark" else Qt.ColorScheme.Light)
+    wait(app, 800)
+    main_window.apply_look()  # what the app does on colorSchemeChanged (app/main.py)
+    main_window.show_page("general")
+    show(app, main_window)
+    settle(app, main_window)
+    grab_window_live(app, main_window, camera.out / f"switched-general-{scheme}-to-{other}.png")
+
+
+def capture_docs(app, main_window, target: Path, size: tuple[int, int] | None) -> None:
+    """The General / Home pane into `target`, nothing scrolled or cut
+    through: a pane the window can't show whole ends below the last section
+    that fits."""
+    from PySide6.QtCore import QPoint, Qt
+
+    main_window.show_page("general")
+    main_window.refresh()
+    area = main_window.stack.currentWidget()
+    area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    if main_window.home.info_bar is not None:
+        main_window.home.info_bar.hide()
+        main_window.home.info_gap.hide()
+    app.processEvents()
+    width = size[0] if size else (620 if sys.platform == "darwin" else DOCS_WIDTH)
+    if size:
+        main_window.setFixedSize(size[0], max(260, size[1] - (0 if sys.platform == "darwin" else WINDOWS_TITLE_BAR)))
+    elif sys.platform != "darwin":
+        main_window.resize(width, main_window.height())
+    place(app, main_window, 0, 0)
+    show(app, main_window)
+    settle(app, main_window)
+    # Hide what the window shows only part of.
+    page, viewport = area.widget(), area.viewport()
+    items = [page.body.itemAt(index).widget() for index in range(page.body.count())]
+    items = [item for item in items if item is not None and item.isVisible()]
+    for position, item in enumerate(items):
+        if item.mapTo(viewport, QPoint(0, item.height())).y() + 14 <= viewport.height():
+            continue
+        cut = position
+        while cut > 0 and getattr(items[cut - 1], "role", "") == "headline":
+            cut -= 1
+        for hidden in items[cut:]:
+            hidden.hide()
+        break
+    settle(app, main_window)
+    if LIVE:
+        wait(app, 600)
+        print(f"docs: {grab_window_live(app, main_window, target)}")
+    else:
+        grabbed = main_window.grab().toImage()
+        mac_frame(grabbed, grabbed.width(), grabbed.height()).save(str(target))
 
 
 def tray_sheet(out: Path) -> None:
@@ -684,7 +963,7 @@ def main() -> None:
         # holding a CI runner until it times out.
         import faulthandler
 
-        faulthandler.dump_traceback_later(900, exit=True)
+        faulthandler.dump_traceback_later(1200, exit=True)
 
     from app import settings
 
@@ -703,95 +982,94 @@ def main() -> None:
     from app.ui.theme import application_font
 
     app = QApplication([])
+    app.setQuitOnLastWindowClosed(False)
     body = application_font()
     if body is not None:
         app.setFont(body)  # as the app itself does (app/main.py)
     if scheme and hasattr(app.styleHints(), "setColorScheme"):
         app.styleHints().setColorScheme(Qt.ColorScheme.Dark if scheme == "dark" else Qt.ColorScheme.Light)
         wait(app, 300)
-    if docs and not LIVE and not as_windows:
-        # The README's Mac picture is dark, like the Windows one. Offscreen
-        # there is no system appearance, so the native controls get a dark
-        # palette by hand.
+    if docs and not LIVE and not as_windows and sys.platform == "darwin":
+        # Offscreen there is no system appearance: give the native controls
+        # a dark palette by hand, as the README's pictures are dark.
         app.setPalette(dark_palette())
     from app import permissions
-    from app.controller import AppController
     from app.ui import widgets, window as window_module
     from app.ui.theme import current_look
 
     if as_windows:
-        from app.ui import base, panes
+        from app.ui import base, menus, panes, symbols, tray, tune
 
-        for module in (widgets, window_module, base, panes):
+        for module in (widgets, window_module, base, panes, menus, tray, tune):
             module.IS_MAC = False
         permissions.needs_accessibility = lambda: False  # type: ignore[assignment]
-        from app.ui import symbols
-
         symbols.IS_MAC, symbols.IS_WINDOWS = False, False
 
-    if docs:
-        # Shown as on, without installing a real mouse hook, and allowed, as
-        # it is once set up (a CI Mac may not have granted Accessibility).
-        AppController.active = property(lambda self: True)  # type: ignore[assignment]
-        permissions.has_accessibility = lambda: True  # type: ignore[assignment]
-        permissions.event_tap_allowed = lambda: True  # type: ignore[assignment]
-    controller = AppController()
+    from _contract_standin import controller_class
+
+    controller_type = controller_class()
+    # Shown as on, without a real mouse hook, and allowed, as it is once set
+    # up (a CI Mac hasn't granted the permission). Off where a state says so.
+    shown_on = [True]
+    controller_type.active = property(lambda self: shown_on[0] and not self.paused)  # type: ignore[assignment]
+    permissions.has_accessibility = lambda: True  # type: ignore[assignment]
+    permissions.event_tap_allowed = lambda: True  # type: ignore[assignment]
+    controller = controller_type()
+    controller.settings["fix_enabled"] = True
     if docs:
         docs_state(controller)
     else:
         sample_state(controller)
-        controller.settings["filtered_total"] = 1284
-        controller.session_filtered = 37
     updater = None if docs else sample_updater(controller)
     main_window = window_module.MainWindow(controller, updater)
-    size = parse_size(sys.argv)
-    main_window.resize(*((size[0] if size else DOCS_WIDTH, 700) if docs else (780, 660)))
-    main_window.show()
-    main_window.raise_()
-    main_window.activateWindow()
-    app.processEvents()
+    if not window_module.IS_MAC:
+        screen = app.primaryScreen().availableGeometry()
+        main_window.resize(min(920, screen.width() - 40), min(720, screen.height() - 60))
+    scheme = scheme or ("dark" if widgets.look().dark else "light")
     if LIVE:
-        wait(app, 1500)
+        screen = app.primaryScreen()
+        print(f"Screen {screen.geometry().width()} x {screen.geometry().height()}, available "
+              f"{screen.availableGeometry().width()} x {screen.availableGeometry().height()}, scale "
+              f"{screen.devicePixelRatio()}, platform {app.platformName()}, style {app.style().name()}, scheme {scheme}")
 
     if docs:
-        capture_docs(app, main_window, out / "docs-filter.png", size)
+        capture_docs(app, main_window, out / "docs-filter.png", parse_size(sys.argv))
         print(f"Wrote {out / 'docs-filter.png'}")
         return
 
-    test = main_window.test_page
-    for gap in [410, 520, 9, 380, 460, 12, 590, 350, 470, 7, 520, 400, 610, 380, 11, 500, 430, 560]:
-        test._on_pad_press(float(gap), float(gap + 60))
-    test.pad.set_flash_level(0.0)
-
-    if LIVE:
-        capture_live(app, main_window, out, scheme or ("dark" if widgets.look().dark else "light"))
-        tray_sheet(out)
-        print(f"Wrote screenshots to {out}")
-        return
-
-    suffix = "-windows" if as_windows else ""
-    for dark in [False, True]:
-        widgets.set_look(current_look(dark))
-        dark = widgets.look().dark
-        for label in main_window.findChildren(widgets.TextLabel):
-            label.restyle()
-        for index, (key, _title) in enumerate(window_module.PAGES):
-            main_window._show_page(index)
-            if key == "calibrate":
-                measuring_state(main_window.calibrate)
-            settle(app, main_window)
-            name = f"{key}-{'dark' if dark else 'light'}{suffix}.png"
-            main_window.grab().save(str(out / name))
-            # The whole pane, however long, for review.
-            size = main_window.size()
-            page = main_window.pages[index]
-            main_window.resize(size.width(), max(size.height(), page.sizeHint().height() + 40))
-            app.processEvents()
-            main_window.grab().save(str(out / name.replace(".png", "-full.png")))
-            main_window.resize(size)
-            app.processEvents()
+    passes = [(scheme, None)] if LIVE else [("light", False), ("dark", True)]
+    for name, dark in passes:
+        if dark is not None:
+            # Offscreen there is no system appearance to follow: the window
+            # takes the one asked for.
+            window_module.current_look = lambda _dark=None, chosen=dark: current_look(chosen)
+            main_window.apply_look()
+        camera = Camera(app, out, name, "-windows" if as_windows else "")
+        capture_settings(app, camera, main_window, controller)
+        capture_tune(app, camera, main_window, controller)
+        if window_module.IS_MAC:
+            capture_first_run(app, camera, controller)
+            capture_mac_menus(app, camera, controller, main_window)
+        else:
+            capture_tray(app, camera, controller, main_window)
+        if LIVE:
+            capture_switched(app, camera, main_window, name)
+        print(f"{name}: {', '.join(camera.taken)}")
     tray_sheet(out)
     print(f"Wrote screenshots to {out}")
+
+
+def sample_updater(controller):
+    """An updater that says the app is up to date, so About / Settings
+    shows its rows as an installed copy does. It never starts, so it never
+    goes online."""
+    from app.updater import Updater
+
+    updater = Updater(controller)
+    updater.kind = "installed"
+    updater.state = updater.CURRENT
+    updater.message = "Up to date"
+    return updater
 
 
 if __name__ == "__main__":

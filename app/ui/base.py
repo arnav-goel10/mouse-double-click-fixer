@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Optional
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QPalette
 from PySide6.QtWidgets import QHBoxLayout, QPushButton, QVBoxLayout, QWidget
 
 from .. import DISPLAY_NAME
@@ -23,9 +24,18 @@ def label(text: str) -> str:
     macOS ("Check Now"), sentence case on Windows ("Check now")."""
     if IS_MAC:
         return text
-    first, *rest = text.split(" ")
-    keep = {*DISPLAY_NAME.split(" "), "Accessibility"}
-    return " ".join([first, *(word if word in keep else word.lower() for word in rest)])
+    # Names keep their capitals: the app's ("Open Mouse Double-Click Fixer")
+    # and the system's ("Accessibility"), but not words that merely share
+    # one ("Try a double-click").
+    parts = text.split(DISPLAY_NAME)
+    cased = []
+    for index, part in enumerate(parts):
+        words = part.split(" ")
+        cased.append(" ".join(
+            word if (index == 0 and position == 0) or word == "Accessibility" else word.lower()
+            for position, word in enumerate(words)
+        ))
+    return DISPLAY_NAME.join(cased)
 
 
 def make_button(text: str, default: bool = False) -> QPushButton:
@@ -59,6 +69,26 @@ def set_primary(button: QPushButton, primary: bool) -> None:
     )
 
 
+def link_button(text: str) -> QPushButton:
+    """WinUI's HyperlinkButton: a flat button with its text in the accent
+    colour. A real button, so Tab reaches it and Space or Return press it,
+    and Narrator says "button"; coloured through its palette, never a
+    style sheet (see restyle_link)."""
+    button = QPushButton(text)
+    button.setFlat(True)
+    button.setCursor(Qt.CursorShape.PointingHandCursor)
+    button.setAutoDefault(False)
+    restyle_link(button)
+    return button
+
+
+def restyle_link(button: QPushButton) -> None:
+    palette = button.palette()
+    for role in (QPalette.ColorRole.ButtonText, QPalette.ColorRole.WindowText):
+        palette.setColor(role, look().accent)
+    button.setPalette(palette)
+
+
 def card_icon(name: str) -> Optional[SymbolView]:
     """Windows 11 Settings leads every card with a Fluent icon; macOS rows
     inside a grouped box carry none."""
@@ -78,22 +108,10 @@ def centred_column(parent: QWidget, maximum: int = COLUMN_MAX) -> QWidget:
     return column
 
 
-class Page(QWidget):
-    """A pane: stacked sections with headers and footnotes."""
+class Sections:
+    """Stacked sections with headers and footnotes, added to `self.body`."""
 
-    def __init__(self, title: str, parent: Optional[QWidget] = None) -> None:
-        super().__init__(parent)
-        self.page_title = title
-        self.column = centred_column(self)
-        self.body = QVBoxLayout(self.column)
-        self.body.setSpacing(0)
-        if IS_MAC:
-            self.body.setContentsMargins(20, 4, 20, 20)
-        else:
-            self.body.setContentsMargins(36, 0, 36, 28)
-            heading = TextLabel(title, "title")
-            heading.setContentsMargins(0, 24, 0, 20)
-            self.body.addWidget(heading)
+    body: QVBoxLayout
 
     def header(self, text: str) -> TextLabel:
         label = TextLabel(text, "headline")
@@ -117,21 +135,35 @@ class Page(QWidget):
         self.body.addSpacing(height)
 
 
-def link(text: str, href: str) -> str:
-    """An inline link in the accent colour, for a rich-text label."""
-    accent = look().accent.name()
-    return f'<a href="{href}" style="color:{accent}; text-decoration:none">{text}</a>'
+class Page(Sections, QWidget):
+    """A pane: stacked sections with headers and footnotes, in a column.
+    macOS titles the window with the pane's name; Windows heads the page
+    with it, as Windows Settings does."""
+
+    def __init__(self, title: str, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.page_title = title
+        self.column = centred_column(self)
+        self.body = QVBoxLayout(self.column)
+        self.body.setSpacing(0)
+        if IS_MAC:
+            self.body.setContentsMargins(20, 14, 20, 20)
+        else:
+            self.body.setContentsMargins(36, 0, 36, 28)
+            self.heading = TextLabel(title, "title")
+            self.heading.setContentsMargins(0, 24, 0, 20)
+            self.body.addWidget(self.heading)
 
 
-def make_link_label(label_widget: TextLabel) -> TextLabel:
-    """Let `label_widget` show links that the mouse and the keyboard (Tab,
-    then Return) can follow."""
-    label_widget.setTextFormat(Qt.TextFormat.RichText)
-    label_widget.setOpenExternalLinks(False)
-    label_widget.setTextInteractionFlags(
-        Qt.TextInteractionFlag.LinksAccessibleByMouse | Qt.TextInteractionFlag.LinksAccessibleByKeyboard
-    )
-    return label_widget
+class Block(Sections, QWidget):
+    """Sections that belong to a pane, as one widget: the Apps and Devices
+    halves of Exceptions."""
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.body = QVBoxLayout(self)
+        self.body.setContentsMargins(0, 0, 0, 0)
+        self.body.setSpacing(0)
 
 
 def controls(*widgets: QWidget, spacing: int = 10) -> QWidget:

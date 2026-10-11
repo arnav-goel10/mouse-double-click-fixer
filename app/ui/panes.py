@@ -1,4 +1,4 @@
-"""The History, Apps and Devices panes."""
+"""The Exceptions pane (apps and devices left alone) and the History pane."""
 
 from __future__ import annotations
 
@@ -14,11 +14,11 @@ from .. import app_keys
 from ..core import Button
 from ..inputs import TOUCH_KINDS, as_button, button_name
 from ..wear import SHOWN_DAYS
-from . import popup_mac
-from .base import Page, card_icon, label, make_button
+from . import menus, popup_mac
+from .base import Block, Page, card_icon, label, make_button
 from .charts import DailyRateChart, GapHistogram
 from .theme import IS_MAC
-from .widgets import Row, Switch, ValueLabel, pop_up_button
+from .widgets import Row, Switch, SymbolView, ValueLabel, pop_up_button
 
 #: How often the History pane reads the counts again while it is on screen:
 #: the clicks someone makes to watch it are counted as they go.
@@ -57,11 +57,21 @@ class LivePage(Page):
 # -- History -----------------------------------------------------------------------
 
 TREND_NOTES = {
-    "worse": "More of your clicks bounce than two weeks ago: the switch is wearing.",
+    "worse": (
+        "More of your clicks bounce than two weeks ago: the switch is wearing. Test and Tune can "
+        "set a stronger filter; a new switch or mouse fixes it for good."
+    ),
     "better": "Fewer of your clicks bounce than two weeks ago.",
     "same": "The share of clicks that bounce has held steady.",
     "unknown": "A trend needs two weeks of clicks.",
 }
+
+
+def suggestion_title(suggestion) -> str:
+    """The suggestion as a question: "Raise the left button to 64 ms?"."""
+    name = button_name(suggestion.button).lower()
+    verb = "Raise" if suggestion.to_ms > suggestion.from_ms else "Lower"
+    return f"{verb} the {name} button to {suggestion.to_ms} ms?"
 
 
 class HistoryPage(LivePage):
@@ -72,6 +82,16 @@ class HistoryPage(LivePage):
         self.controller = controller
         self.button: Button = Button.LEFT
         self._choices_shown: list[Button] = []
+
+        # The plain answer first: is the mouse getting worse, and what to do.
+        verdict = self.section()
+        self.verdict_icon = SymbolView("history", 22, "secondary")
+        self.verdict_row = verdict.add(Row(" ", "", None, self.verdict_icon))
+        self.suggestion_button = make_button("Apply")
+        self.suggestion_button.clicked.connect(self._apply_suggestion)
+        self.suggestion_row = verdict.add(Row(" ", "", self.suggestion_button, card_icon("tune")))
+        self._suggestion = None
+        self.gap(20 if IS_MAC else 24)
 
         picker = self.section()
         self.button_picker = QComboBox()
@@ -169,6 +189,32 @@ class HistoryPage(LivePage):
         self.wheel_header.setVisible(show_wheel)
         self.wheel_section.setVisible(show_wheel)
         self.wheel_value.setText(f"{dropped:,} of {ticks:,} ticks")
+        self._refresh_health()
+
+    def _refresh_health(self) -> None:
+        """The controller's verdict on the mouse, and the change it suggests
+        when bounce creeps up to a button's window."""
+        health = self.controller.health()
+        self.verdict_row.title.setText(health.verdict)
+        self.verdict_row.set_detail(menus.health_detail(health))
+        # "bouncing" or "conflict": something to act on.
+        attention = getattr(health, "kind", "") in ("bouncing", "conflict")
+        self.verdict_icon.name = "warning" if attention else "history"
+        self.verdict_icon.tone = "symbol" if attention else "secondary"
+        self.verdict_icon.update()
+        suggestion = health.suggestion
+        self._suggestion = suggestion
+        self.suggestion_row.setVisible(suggestion is not None)
+        if suggestion is not None:
+            # The verdict above already says why.
+            self.suggestion_row.title.setText(suggestion_title(suggestion))
+            self.suggestion_row.set_detail("")
+            self.suggestion_button.setAccessibleName(f"Apply: {suggestion_title(suggestion)}")
+
+    def _apply_suggestion(self) -> None:
+        if self._suggestion is not None:
+            self.controller.apply_suggestion(self._suggestion)
+            self.refresh()
 
 
 # -- Apps --------------------------------------------------------------------------
@@ -184,15 +230,15 @@ def _choose_title() -> str:
     return label("Choose App…") if IS_MAC else label("Choose Program…")
 
 
-class AppsPage(Page):
-    """Apps in which nothing is filtered."""
+class AppsPage(Block):
+    """The Apps half of Exceptions: apps in which nothing is filtered."""
 
     def __init__(self, controller, parent: Optional[QWidget] = None) -> None:
-        super().__init__("Apps", parent)
+        super().__init__(parent)
         self.controller = controller
         self._shown: Optional[list] = None
 
-        self.header("Never filtered in")
+        self.heading = self.header("Apps")
         self.list_section = self.section()
         self.remove_buttons: dict[str, QWidget] = {}
         self.footnote(APPS_NOTE)
@@ -212,7 +258,6 @@ class AppsPage(Page):
         self.add_button.clicked.connect(self.show_add_menu)
         actions.addWidget(self.add_button)
         self.body.addLayout(actions)
-        self.body.addStretch(1)
 
     def refresh(self) -> None:
         apps = self.controller.excluded_apps
@@ -279,6 +324,31 @@ class AppsPage(Page):
             self.add(choice)
 
 
+# -- Games -------------------------------------------------------------------------
+
+#: What the game check looks for (app/gamemode.py): an app that calls itself
+#: a game, in front, with a window covering a whole display. Whether the
+#: system's Game Mode is on has no public API, so it isn't promised.
+GAMES_DETAIL = "While a game is in front and fills the screen."
+
+
+class GamesBlock(Block):
+    """Exceptions: pausing while a full-screen game is in front, off by
+    default. The menus show the pause, with Resume."""
+
+    def __init__(self, controller, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.controller = controller
+        self.heading = self.header("Games")
+        section = self.section()
+        self.toggle = Switch(accessible_name="Pause during full-screen games")
+        self.row = section.add(Row("Pause during full-screen games", GAMES_DETAIL, self.toggle, card_icon("game")))
+        self.toggle.clicked.connect(lambda checked: controller.set_auto_pause_games(bool(checked)))
+
+    def refresh(self) -> None:
+        self.toggle.setChecked(bool(self.controller.settings.get("auto_pause_games", False)), animate=False)
+
+
 # -- Devices -----------------------------------------------------------------------
 
 KIND_NAMES = {"trackpad": "Trackpad", "touchscreen": "Touchscreen", "pen": "Pen", "mouse": "Mouse", "unknown": "Pointing device"}
@@ -333,20 +403,20 @@ def _mouse_detail(key: str, kind: str, last_seen: float) -> str:
     return " · ".join(part for part in parts if part)
 
 
-class DevicesPage(LivePage):
-    """The pointing devices the filter has seen, and which it filters."""
+class DevicesPage(Block):
+    """The Devices half of Exceptions: the pointing devices the filter has
+    seen, and which it filters."""
 
     def __init__(self, controller, parent: Optional[QWidget] = None) -> None:
-        super().__init__("Devices", DEVICES_TICK_MS, parent)
+        super().__init__(parent)
         self.controller = controller
         self._shown: Optional[tuple] = None
 
-        self.header("Mice")
+        self.heading = self.header("Devices")
         self.mice = self.section()
         self.header_touch = self.header("Trackpads, touchscreens and pens")
         self.touch = self.section()
         self.footnote(devices_note())
-        self.body.addStretch(1)
         self.switches: dict[str, Switch] = {}
         self.mouse_rows: dict[str, Row] = {}
 
@@ -398,3 +468,34 @@ class DevicesPage(LivePage):
             self.touch.add(Row(name, KIND_NAMES.get(kind, ""), value, card_icon("devices")))
         self.header_touch.setVisible(bool(touch))
         self.touch.setVisible(bool(touch))
+
+
+class ExceptionsPage(LivePage):
+    """What is never filtered: apps (while in front), full-screen games
+    (when turned on) and devices."""
+
+    def __init__(self, controller, parent: Optional[QWidget] = None) -> None:
+        super().__init__("Exceptions", DEVICES_TICK_MS, parent)
+        self.controller = controller
+        self.apps = AppsPage(controller)
+        self.games = GamesBlock(controller)
+        self.devices = DevicesPage(controller)
+        # The first heading sits where the pane starts.
+        self.apps.heading.setContentsMargins(self.apps.heading.contentsMargins().left(), 0 if IS_MAC else 4, 0,
+                                             self.apps.heading.contentsMargins().bottom())
+        self.body.addWidget(self.apps)
+        self.gap(8)
+        self.body.addWidget(self.games)
+        self.gap(8)
+        self.body.addWidget(self.devices)
+        self.body.addStretch(1)
+
+    def refresh(self) -> None:
+        self.apps.refresh()
+        self.games.refresh()
+        self.devices.refresh()
+
+    def _tick(self) -> None:
+        # Only "seen 5 min ago" moves by itself.
+        if not self.window().isMinimized():
+            self.devices.refresh()

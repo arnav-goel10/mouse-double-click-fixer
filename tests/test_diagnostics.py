@@ -201,12 +201,16 @@ class CopyDiagnosticsTests(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
         from app import __version__
-        from app.controller import AppController
-        from app.ui.window import DIAGNOSTICS_DETAIL, GeneralPage
+        from app.ui.window import DIAGNOSTICS_DETAIL, AboutPage
 
-        controller = AppController()
+        try:
+            from _contract_standin import controller_class
+        except ImportError:  # run as tests.<module> from the repository root
+            from tests._contract_standin import controller_class
+
+        controller = controller_class()()
         self.addCleanup(controller.shutdown)  # before the patches are undone
-        page = GeneralPage(controller)
+        page = AboutPage(controller)
         self.addCleanup(page.deleteLater)
         page.diagnostics_button.click()
         text = application.clipboard().text()
