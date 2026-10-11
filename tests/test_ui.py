@@ -106,7 +106,8 @@ class WindowTests(WindowTestCase):
     def test_the_mac_settings_window_takes_its_panes_height_at_a_fixed_width(self) -> None:
         from app.ui.window import SETTINGS_WIDTH, MainWindow
 
-        with support.as_platform(True):
+        # A screen tall enough for every pane (the test machine's may not be).
+        with support.as_platform(True), mock.patch("app.ui.window.SETTINGS_SCREEN_ROOM", -10_000):
             window = MainWindow(self.controller)
             self.addCleanup(window.deleteLater)
             self.addCleanup(support.stop_timers, window, window.tune)
@@ -119,6 +120,47 @@ class WindowTests(WindowTestCase):
                 self.assertEqual(window.width(), SETTINGS_WIDTH)
                 self.assertEqual(window.minimumSize(), window.maximumSize(), "the pane sets the size, not the user")
         self.assertNotEqual(heights["general"], heights["exceptions"], "each pane its own height")
+
+    def test_a_pane_that_fits_fills_the_window_without_a_gap_or_a_scroll(self) -> None:
+        from PySide6.QtWidgets import QWidget
+
+        from app.ui.window import MainWindow
+
+        with support.as_platform(True), mock.patch("app.ui.window.SETTINGS_SCREEN_ROOM", -10_000):
+            window = MainWindow(self.controller)
+            self.addCleanup(window.deleteLater)
+            self.addCleanup(support.stop_timers, window, window.tune)
+            window.show()
+            for key in ("general", "exceptions", "history", "about"):
+                window.show_page(key)
+                self.application.processEvents()
+                area = window.stack.currentWidget()
+                self.assertEqual(area.verticalScrollBar().maximum(), 0, f"{key}: nothing to scroll")
+                page = area.widget()
+                column = page.column  # the pane's sections, in a column as wide as the window
+                bottom = max(child.mapTo(page, child.rect().bottomLeft()).y() for child in column.findChildren(QWidget)
+                             if child.parentWidget() is column and child.isVisible())
+                margin = page.body.contentsMargins().bottom()
+                self.assertLessEqual(page.height() - 1 - bottom, margin + 2, f"{key}: no gap below the pane")
+
+    def test_a_pane_taller_than_the_screen_allows_scrolls(self) -> None:
+        from PySide6.QtGui import QGuiApplication
+
+        from app.ui import window as window_module
+        from app.ui.window import MainWindow
+
+        with support.as_platform(True):
+            window = MainWindow(self.controller)
+            self.addCleanup(window.deleteLater)
+            self.addCleanup(support.stop_timers, window, window.tune)
+            window.show()
+            window.show_page("general")
+            self.application.processEvents()
+            screen = window.screen() or QGuiApplication.primaryScreen()
+            room = screen.availableGeometry().height() - window_module.SETTINGS_SCREEN_ROOM
+            with mock.patch.object(window, "pane_height", return_value=room + 400):
+                window._fit_to_pane()
+            self.assertEqual(window.height(), max(260, room), "no taller than the screen allows")
 
     def test_the_mac_settings_window_has_no_zoom(self) -> None:
         from PySide6.QtCore import Qt

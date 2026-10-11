@@ -993,10 +993,15 @@ class MainWindow(QWidget):
         self.resize(width, height)
 
     def pane_height(self, index: Optional[int] = None) -> int:
-        """How tall pane `index` (the current one) is at the window's width."""
+        """How tall pane `index` (the current one) is at the window's width,
+        as its scroll area lays it out: the height for that width, never
+        under the pane's minimum. (Its size hint is for a narrower width,
+        where text wraps more, and would leave a gap below the pane.)"""
         page = self.pages[self.stack.currentIndex() if index is None else index]
-        height = page.heightForWidth(SETTINGS_WIDTH) if page.hasHeightForWidth() else -1
-        return max(height, page.sizeHint().height())
+        minimum = page.minimumSizeHint().height()
+        if page.hasHeightForWidth():
+            return max(page.heightForWidth(SETTINGS_WIDTH), minimum)
+        return max(page.sizeHint().height(), minimum)
 
     def _fit_to_pane(self) -> None:
         """macOS: the Settings window takes its pane's height, up to what
