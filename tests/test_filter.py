@@ -976,18 +976,24 @@ class ResendNumberTests(unittest.TestCase):
     """Every re-sent event carries its number in its button's sequence; the
     hook settles exactly what came back, and everything sent before it."""
 
-    def test_marks_keep_their_kind_below_the_number(self) -> None:
-        for kind in (INJECTED_MARK, *MOTION_MARK_FOR.values()):
+    def test_marks_keep_their_kind_and_number_in_32_bits(self) -> None:
+        # Windows hands a low-level hook only the low 32 bits of dwExtraInfo:
+        # a number kept above them never came back, so nothing re-sent was
+        # ever seen to pass, and everything behind it waited for the time-out.
+        kinds = (INJECTED_MARK, *MOTION_MARK_FOR.values(), RESTORE_MARK, TELEPORT_MARK)
+        self.assertEqual(len(set(kinds)), len(kinds))
+        for kind in kinds:
             for seq in (1, 2, 1000, MARK_SEQ_SPAN, MARK_SEQ_SPAN + 1, 5 * MARK_SEQ_SPAN + 7):
                 mark = make_mark(kind, seq)
+                self.assertTrue(0 < mark <= 0xFFFFFFFF, "fits in the 32 bits Windows passes on")
                 self.assertEqual(mark_kind(mark), kind)
-                self.assertEqual(mark & 0xFFFFFFFF, kind, "the low 32 bits are the kind")
                 self.assertEqual(mark_seq(mark), (seq - 1) % MARK_SEQ_SPAN + 1)
-                self.assertTrue(0 < mark < 2**63, "a positive 64-bit value")
                 self.assertNotEqual(mark & 0xFFFFFF00, 0xFF515700, "never pen or touch")
-        for kind in (INJECTED_MARK, RESTORE_MARK, TELEPORT_MARK):
             self.assertEqual(make_mark(kind), kind, "numbering none, a mark is its kind")
             self.assertEqual(mark_seq(kind), 0)
+        for other in (0, 1, 0xFF515701, 1 << 40 | INJECTED_MARK, -INJECTED_MARK):
+            self.assertNotIn(mark_kind(other), kinds, f"{other:#x} is none of this app's")
+        self.assertGreaterEqual(MARK_SEQ_SPAN, 4095, "far more numbers than are ever on their way at once")
 
     def test_an_event_back_settles_every_resend_before_it(self) -> None:
         # down2 settles up1, and both are re-sent. up1 is swallowed by

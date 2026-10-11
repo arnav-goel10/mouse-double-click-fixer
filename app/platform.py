@@ -44,55 +44,66 @@ log = logging.getLogger(__name__)
 #: automated end-to-end tests, which have no other way to produce input.
 FILTER_INJECTED_ENV = "DCF_FILTER_INJECTED"
 
+#: A mark travels in an event's user data (kCGEventSourceUserData on macOS,
+#: dwExtraInfo on Windows) and fits in 32 bits: Windows hands a low-level
+#: hook only the low 32 bits of a re-sent event's dwExtraInfo (CI measured
+#: it). Its top 20 bits say which of this app's marks it is (one of the kinds
+#: below), so `mark_kind` tells this app's events apart. An event the hook
+#: waits to see come back also carries, in the low MARK_SEQ_BITS, its number
+#: in its button's sequence of re-sends (see GlobalClickFilter._resend), so
+#: the hook knows which one passed. 0 there numbers none: such an event
+#: settles nothing (RESTORE_MARK and TELEPORT_MARK are never waited for).
+MARK_SEQ_BITS = 12
+MARK_SEQ_MASK = (1 << MARK_SEQ_BITS) - 1
+#: The numbers in a mark run from 1 to this and start again. Far more re-sends
+#: than this are never on their way at once: each is given up on within
+#: IN_FLIGHT_MAX_TIMEOUT_S.
+MARK_SEQ_SPAN = MARK_SEQ_MASK
+#: "DC", in the top 16 bits: never pen or touch (PEN_SIGNATURE).
+MARK_SIGNATURE = 0x44430000
+
+
+def _mark(index: int) -> int:
+    return MARK_SIGNATURE | (index << MARK_SEQ_BITS)
+
+
 #: Marks the button events this app re-sends (a held release delivered late,
 #: and the events kept behind one so that apps see them in the order they
 #: happened), so the hook passes them straight through.
-INJECTED_MARK = 0x44434658  # "DCFX"
+INJECTED_MARK = _mark(1)
 
 #: Marks pointer motion this app re-sends, one value per button whose queue it
 #: waited in, so the hook knows which button's re-sends it settles (see
 #: GlobalClickFilter._injected_passed).
-INJECTED_MOTION_MARKS = {INJECTED_MARK + 1 + index: button for index, button in enumerate(Button)}
+INJECTED_MOTION_MARKS = {_mark(2 + index): button for index, button in enumerate(Button)}
 MOTION_MARK_FOR = {button: mark for mark, button in INJECTED_MOTION_MARKS.items()}
 
 #: Marks the pointer motion this app posts to put the pointer back after a
 #: re-sent release pulled it to where the button came up (see _run_macos).
-RESTORE_MARK = max(INJECTED_MOTION_MARKS) + 1
+RESTORE_MARK = _mark(2 + len(Button))
 
 #: Marks the pointer motion that takes the pointer to where a held release
 #: happened, just before the release is re-sent there (Windows; see
 #: WindowsHook). The move back after it carries the button's motion mark.
-TELEPORT_MARK = RESTORE_MARK + 1
-
-#: A mark travels in an event's user data (kCGEventSourceUserData on macOS,
-#: dwExtraInfo on Windows). Its low 32 bits are one of the kinds above, so
-#: `mark & MARK_KIND_MASK` tells this app's events apart. An event the hook
-#: waits to see come back also carries, above them, its number in its
-#: button's sequence of re-sends (see GlobalClickFilter._resend), so the hook
-#: knows which one passed. 0 there numbers none: such an event settles
-#: nothing (RESTORE_MARK and TELEPORT_MARK are never waited for).
-MARK_KIND_MASK = 0xFFFFFFFF
-MARK_SEQ_SHIFT = 32
-#: The numbers in a mark run from 1 to this and start again: 31 bits keep a
-#: mark a positive 64-bit value, which kCGEventSourceUserData is signed.
-MARK_SEQ_SPAN = 0x7FFFFFFF
+TELEPORT_MARK = _mark(3 + len(Button))
 
 
 def make_mark(kind: int, seq: int = 0) -> int:
     """The mark for an event of `kind` that is re-send number `seq` of its
     button (any positive integer), or that numbers none (0)."""
-    return (_seq_field(seq) << MARK_SEQ_SHIFT) | kind if seq else kind
+    return kind | _seq_field(seq) if seq else kind
 
 
 def mark_kind(mark: int) -> int:
-    """Which of this app's marks `mark` is, if any: INJECTED_MARK, ..."""
-    return int(mark) & MARK_KIND_MASK
+    """Which of this app's marks `mark` is, if any: INJECTED_MARK, ...
+    A value with bits above the low 32 is none of them."""
+    return int(mark) & ~MARK_SEQ_MASK
 
 
 def mark_seq(mark: int) -> int:
     """The re-send number in `mark`, as it carries it (see _seq_field); 0
     for none."""
-    return (int(mark) >> MARK_SEQ_SHIFT) & MARK_SEQ_SPAN
+    return int(mark) & MARK_SEQ_MASK
 
 
 def _seq_field(seq: int) -> int:
