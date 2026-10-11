@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.0.1 — 2026-10-12
 
 - **Windows: the pointer no longer moves like a slide show after a click.**
   Moving the mouse right after a click could freeze the pointer for about
@@ -30,9 +30,6 @@
   pointer was catching up, is no longer lost: it goes through as it came.
 - Windows: a pen or touch tap made right after moving the mouse now lands
   where the pen touched, not where the mouse pointer was.
-
-## 1.0.1 — 2026-10-10
-
 - **The settings controls added in 1.0 look like the rest of each system.**
   On macOS, a style setting meant only to keep the panes see-through also
   changed how every control inside them was drawn: the window values showed
