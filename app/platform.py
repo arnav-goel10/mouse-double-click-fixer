@@ -147,13 +147,13 @@ STATIONARY_PX = 4.0
 #: the pointer had moved on by more than this, it is put back again.
 RESTORE_MIN_PX = 0.5
 
-#: A re-sent event passes back through the hook about as late as real events
-#: reach it: a millisecond or two on an idle machine, far longer on a busy
-#: one. If one never does (another app's tap swallowed it, or it was lost),
-#: the events waiting behind it go out once it has been on its way twice as
-#: long as any event in the last two seconds was late (see
-#: core.PeakLateness), but never sooner than the first bound or later than
-#: the second.
+#: A re-sent event passes back through the tap (macOS), or SendInput returns
+#: once it has arrived (Windows), about as late as real events reach the
+#: hook: a millisecond or two on an idle machine, far longer on a busy one.
+#: If one never does (another app's tap swallowed it, or it was lost), the
+#: events waiting behind it go out once it has been on its way twice as long
+#: as any event in the last two seconds was late (see core.PeakLateness), but
+#: never sooner than the first bound or later than the second.
 IN_FLIGHT_TIMEOUT_S = 0.15
 IN_FLIGHT_MAX_TIMEOUT_S = 0.5
 #: How long stop() waits for a thread that is sending to finish, so that

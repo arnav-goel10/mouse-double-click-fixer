@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- **Windows: the pointer no longer moves like a slide show after a click.**
+  Moving the mouse right after a click could freeze the pointer for about
+  150 ms at a time and then make it jump, for as long as the mouse kept
+  moving. Windows passes on only part of the tag the app puts on the input it
+  re-sends, so the app never saw that input arrive and let what waited behind
+  it, your pointer movement included, go only after a time-out. The app now
+  knows its input has arrived as soon as Windows has delivered it, and it no
+  longer re-sends pointer movement at all: a move that has to wait while a
+  click's release goes out waits about a millisecond, and the pointer is then
+  put where your hand has taken it.
+- Windows: movement after a click or a drag no longer goes missing. A
+  re-sent move could land after one of yours and undo it, which left the
+  pointer short of where you moved it, by up to a hundred pixels after a drag
+  let go while moving. A drag let go while moving still drops where you let
+  go of the button.
+
 ## 1.0.1 — 2026-10-10
 
 - **The settings controls added in 1.0 look like the rest of each system.**

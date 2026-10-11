@@ -407,6 +407,29 @@ class WindowsHookLogicTests(unittest.TestCase):
             self.filter._injected_passed(button, seq)
         self.assertEqual(len(self.filter._in_flight[Button.LEFT]), 0)
 
+    def test_motion_held_where_the_pointer_cant_be_put_goes_on_from_where_it_is(self) -> None:
+        # Windows refused to move the pointer (or its place means nothing
+        # now): the held motion is let go, and the hand's moves go straight
+        # through from where the pointer is.
+        for reason in ("refused", "hidden"):
+            with self.subTest(reason=reason):
+                self.setUp()
+                self.click()
+                self.win.move(20, 0)
+                self.win.run()                                        # the up is in; the move held
+                if reason == "refused":
+                    self.win.set_cursor_pos = lambda _x, _y: None
+                else:
+                    self.win.hidden = True
+                self.win.move(5, 0)
+                self.win.run()
+                self.assertEqual(self.win.cursor, (205, 200))
+                self.assertEqual(self.win.seen[-1], ("move", (205, 200), 0), "the hand's own move went through")
+                self.assertFalse(self.win.hook.held())
+                self.assertFalse(self.win.hook.watch[0])
+                self.fire_timers()
+                self.assertEqual(self.win.cursor, (205, 200))
+
     def test_a_press_while_motion_is_held_goes_where_the_hand_is(self) -> None:
         # The hand moved on from a click and pressed again before moving
         # once more: the pointer is put where the hand is from inside the
@@ -1170,6 +1193,26 @@ class InputSenderTests(unittest.TestCase):
         sender.submit([("late", Button.LEFT, 1)])
         self.assertEqual(api.sent, ["late"])
         self.assertEqual(api.threads, [threading.current_thread().name])
+
+    def test_what_went_in_is_settled_once_send_input_returns(self) -> None:
+        # SendInput returns once every hook has seen what went in and it has
+        # arrived: each counted input is settled then, in order, and only
+        # after the send; what didn't go in is settled as lost.
+        api, settled = self.Api(accept=2), []
+        api.send = lambda inputs, send=api.send: settled.append("sent") or send(inputs)
+        batch = [("there", None, 0), ("up", Button.LEFT, 7), ("back", Button.RIGHT, 9)]
+        sent = send_batch(api, batch, lambda *lost: settled.append(("lost", *lost)),
+                          lambda *done: settled.append(("in", *done)))
+        self.assertEqual(sent, 2)
+        self.assertEqual(settled, ["sent", ("lost", Button.RIGHT, 9), ("in", Button.LEFT, 7)])
+
+    def test_the_sender_settles_what_it_sent(self) -> None:
+        api, settled = self.Api(), []
+        sender = InputSender(api, lost=lambda *_lost: None, done=lambda *done: settled.append(done))
+        for index in range(5):
+            sender.submit([(index, Button.LEFT, index + 1)])
+        sender.close()
+        self.assertEqual(settled, [(Button.LEFT, seq) for seq in range(1, 6)])
 
 
 # -- the real hook ------------------------------------------------------------------
