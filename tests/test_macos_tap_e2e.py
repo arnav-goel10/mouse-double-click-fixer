@@ -67,6 +67,7 @@ class Seen(NamedTuple):
     subtype: int = 0  # kCGMouseEventSubtype
     delta: int = 0  # a scroll's kCGScrollWheelEventDeltaAxis1
     continuous: int = 0  # a scroll's kCGScrollWheelEventIsContinuous
+    at: float = 0.0  # time.perf_counter() as it reached the observer
 
 
 class Step(NamedTuple):
@@ -183,6 +184,7 @@ class MacTapEndToEndTests(unittest.TestCase):
                         field(event, Quartz.kCGMouseEventSubtype),
                         field(event, Quartz.kCGScrollWheelEventDeltaAxis1) if name == "scroll" else 0,
                         field(event, Quartz.kCGScrollWheelEventIsContinuous) if name == "scroll" else 0,
+                        time.perf_counter(),
                     )
                 )
             return event
@@ -278,12 +280,14 @@ class MacTapEndToEndTests(unittest.TestCase):
         self.log.clear()
         self.judged.clear()
         start = self.now_ns() + 20_000_000
+        self.posted_at = []
         for index, step in enumerate(steps):
             due = start + int(step.at_ms * 1_000_000)
             while self.now_ns() < due:
                 time.sleep(0)  # lets the taps' threads take the GIL
             event = self.make(step)
             Quartz.CGEventSetTimestamp(event, due)
+            self.posted_at.append(time.perf_counter())
             Quartz.CGEventPost(Quartz.kCGHIDEventTap, event)
             if after and index in after:
                 after[index]()
@@ -625,6 +629,65 @@ class MacTapEndToEndTests(unittest.TestCase):
                     buttons = self.buttons(seen)
                     self.assertEqual([item.kind for item in buttons], ["down", "up"])
                     self.assertEqual([item.clicks for item in buttons], [1, 1])
+
+    def test_motion_after_a_click_reaches_apps_without_stalls(self) -> None:
+        """The Windows hook's 1.0.0 slide show (motion after a click queued
+        behind re-sends the hook never saw come back, and let go only by the
+        in-flight time-out), looked for here: a click, then the hand moving
+        on at 1000 Hz and at 125 Hz, beside the same motion with no click
+        (nothing held: the runner's own lateness). Reports how late each
+        move reached apps and how many the filter re-posted."""
+        from app.core import Button
+        from app.platform import INJECTED_MOTION_MARKS, STATIONARY_PX, mark_kind
+
+        for rate, px in ((1000, 1), (125, 8)):
+            for clicked in (False, True):
+                with self.subTest(rate=rate, clicked=clicked):
+                    interval_ms = 1000 / rate
+                    count = int(400 / interval_ms)
+                    steps = [Step(0, "down", P), Step(70, "up", P)] if clicked else []
+                    steps += [Step(72 + interval_ms * i, "move", self.at(px * i)) for i in range(1, count + 1)]
+                    sent, back = [], set()
+                    inject, passed = self.filter._inject, self.filter._injected_passed
+                    self.filter._inject = lambda b, p, t, n: sent.append((b, n)) or inject(b, p, t, n)
+                    self.filter._injected_passed = lambda b, n: back.add((b, n)) or passed(b, n)
+                    try:
+                        seen = self.play(steps)
+                    finally:
+                        self.filter._inject = inject
+                        del self.filter._injected_passed
+                    posted = self.posted_at[2:] if clicked else self.posted_at
+                    moves = [item for item in seen if item.kind == "move"]
+                    reached, furthest = [None] * count, 0
+                    for item in moves:
+                        index = (item.x - int(P[0])) // px
+                        for k in range(furthest + 1, min(index, count) + 1):
+                            reached[k - 1] = item.at
+                        furthest = max(furthest, index)
+                    late = sorted((at - posted[k]) * 1000 for k, at in enumerate(reached) if at is not None)
+                    times = [item.at for item in moves]
+                    gaps = sorted((b - a) * 1000 for a, b in zip(times, times[1:]))
+                    resent = sum(1 for item in moves if mark_kind(item.mark) in INJECTED_MOTION_MARKS)
+                    never_back = sum(1 for button, seq in sent if (button, seq) not in back)
+                    nan = float("nan")
+                    print(
+                        f"\n[smooth] macOS {'click then ' if clicked else 'no click, '}{rate} Hz: {count} moves, "
+                        f"{len(moves)} updates, late ms p50={late[len(late) // 2] if late else nan:.3f} "
+                        f"p99={late[int(len(late) * 0.99) - 1] if late else nan:.2f} max={late[-1] if late else nan:.2f}; "
+                        f"gap max {gaps[-1] if gaps else nan:.2f} ms; re-posted {resent}; "
+                        f"re-sends {len(sent)}, never seen back {never_back}",
+                        file=sys.stderr, flush=True,
+                    )
+                    with self.explained():
+                        kinds = [item.kind for item in seen]
+                        self.assertNotIn("drag", kinds)
+                        self.assertEqual(furthest, count, "the pointer didn't get where the hand took it")
+                        self.assertEqual(never_back, 0, "a re-sent event was never seen coming back")
+                        self.assertFalse(any(self.filter._in_flight[button] for button in Button))
+                        if clicked:
+                            up = kinds.index("up")
+                            off = [i for i, item in enumerate(seen) if item.kind == "move" and abs(item.x - P[0]) > STATIONARY_PX]
+                            self.assertLess(up, off[0], "the pointer left the click before its release")
 
     def _settled(self) -> list[Seen]:
         """What applications saw once everything after a tap swap is quiet."""
