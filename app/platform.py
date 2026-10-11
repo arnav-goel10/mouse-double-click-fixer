@@ -2295,6 +2295,13 @@ class WindowsTemplate(NamedTuple):
 #: finer_timer); 0 asks for none.
 WINDOWS_TIMER_PERIOD_MS = 1
 
+#: SetProcessInformation's ProcessPowerThrottling class, its state's version,
+#: and the control bit for the timer-resolution request (see
+#: opt_out_of_timer_throttling).
+PROCESS_POWER_THROTTLING_INFO_CLASS = 4
+PROCESS_POWER_THROTTLING_CURRENT_VERSION = 1
+PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION = 0x4
+
 
 class _TimerPeriod:
     """A timer period asked for with timeBeginPeriod, until close()."""
@@ -2326,9 +2333,18 @@ def finer_timer() -> _TimerPeriod:
     times in a callback; Windows rounds each such wait up to its timer tick,
     15.6 ms by default, so every mouse event on the machine could wait about
     45 ms (CI measured it, WindowsMotionSmoothnessTests). A 1 ms period
-    rounds it to about 1 ms. Since Windows 10 2004 the period is this
-    process's own and costs others nothing; it is asked for only while the
-    filter runs."""
+    rounds it to about 1 ms. The period is not strictly private to the
+    process: CI saw one process's 1 ms request shorten another's waits on
+    Windows Server 2025. So the app keeps it only while it is filtering, and
+    close() gives it back.
+
+    On Windows 11 the system may ignore a process's request while none of its
+    windows is visible (the app sits in the tray), so the process also opts
+    out of that power throttling (see opt_out_of_timer_throttling)."""
+    import sys
+
+    if sys.platform != "win32":
+        return _TimerPeriod()
     period = int(WINDOWS_TIMER_PERIOD_MS)
     if period <= 0:
         return _TimerPeriod()
@@ -2342,10 +2358,53 @@ def finer_timer() -> _TimerPeriod:
         winmm.timeEndPeriod.restype = ctypes.c_uint
         if winmm.timeBeginPeriod(period) != 0:  # TIMERR_NOERROR
             return _TimerPeriod()
-        return _TimerPeriod(winmm, period)
+        timer = _TimerPeriod(winmm, period)
     except Exception:  # noqa: BLE001 - the filter works without it, only slower under load
         _log_ignored("asking for a finer timer")
         return _TimerPeriod()
+    opt_out_of_timer_throttling()
+    return timer
+
+
+def opt_out_of_timer_throttling(kernel32=None) -> bool:
+    """Stop Windows 11 from ignoring this process's timer-resolution request
+    while its windows are hidden (the tray), by asking for
+    PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION to be left off throttling:
+    SetProcessInformation(ProcessPowerThrottling) with ControlMask set to that
+    bit and StateMask 0 (the process takes control of the setting and does not
+    want it throttled).
+
+    Returns whether Windows accepted it. Windows 10 before 2004 and earlier
+    have no such call, or refuse it: that is fine, nothing is lost but the
+    tray case, and the failure is ignored. Nothing is restored when the filter
+    stops: the setting only says the process's timer request is honoured, which
+    changes nothing while no request is made, so leaving it set is harmless."""
+    try:
+        import ctypes
+
+        if kernel32 is None:
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+        class ProcessPowerThrottlingState(ctypes.Structure):
+            _fields_ = [("Version", ctypes.c_ulong), ("ControlMask", ctypes.c_ulong), ("StateMask", ctypes.c_ulong)]
+
+        state = ProcessPowerThrottlingState(
+            PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, 0
+        )
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        kernel32.SetProcessInformation.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p, ctypes.c_ulong]
+        kernel32.SetProcessInformation.restype = ctypes.c_int
+        return bool(
+            kernel32.SetProcessInformation(
+                kernel32.GetCurrentProcess(),
+                PROCESS_POWER_THROTTLING_INFO_CLASS,
+                ctypes.byref(state),
+                ctypes.sizeof(state),
+            )
+        )
+    except Exception:  # noqa: BLE001 - no such call before Windows 10 2004
+        _log_ignored("opting out of timer-resolution throttling")
+        return False
 
 
 def windows_event_time(arrival: float, tick_now: int, event_tick: int) -> float:
@@ -2443,9 +2502,13 @@ class WindowsHook:
     - If the hand is still, no callback comes: after CATCH_UP_QUIET_S the
       hook's thread does it between callbacks, unless a call of the hook's
       is already waiting (WindowsApi.input_pending), which then does it.
-      That leaves one way for a step to be lost: a move worked out in the
+      That leaves a rare way to lose ground: a move worked out in the
       moment between that check and the pointer being put, or still with a
-      newer hook of another program's that has not yet passed it on.
+      newer hook of another program's that has not yet passed it on. When
+      that off-callback 15 ms placement or catch-up (_place_quiet,
+      _catch_up_quiet) loses the race, the pointer can end off by the whole
+      held distance, or a drop trip (not just one step), and the window can
+      stretch to the GIL switch interval before the hook's thread gets to run.
     """
 
     LLMHF_INJECTED = 0x00000001

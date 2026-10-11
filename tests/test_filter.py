@@ -37,6 +37,7 @@ from app.platform import (
     GlobalClickFilter,
     HookError,
     _double_click_interval,
+    finer_timer,
     is_supported,
     make_mark,
     mark_kind,
@@ -3074,6 +3075,91 @@ class MacTapTests(unittest.TestCase):
         self.assertIsNone(self.feed(Q.kCGEventLeftMouseDown, 1.055), "filtered again")
         self.filter.stop()
         self.assertEqual(self.front.stopped, 1)
+
+
+class FakeDll:
+    """A stand-in for a ctypes.WinDLL: any function is a recording stub."""
+
+    def __init__(self, **returns) -> None:
+        self.calls = []
+        self._returns = returns
+
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+
+        def call(*args):
+            record = [name, *args]
+            self.calls.append(record)
+            ret = self._returns.get(name, 1)
+            if isinstance(ret, Exception):
+                raise ret
+            return ret
+
+        call.argtypes = call.restype = None
+        setattr(self, name, call)
+        return call
+
+    def names(self):
+        return [c[0] for c in self.calls]
+
+
+class TimerThrottlingTests(unittest.TestCase):
+    """While the filter runs with the finer timer, the process also opts out
+    of Windows 11's timer-resolution power throttling, once, on Windows only."""
+
+    def run_finer_timer(self, platform_name, begin=0, set_info=1):
+        winmm = FakeDll(timeBeginPeriod=begin, timeEndPeriod=0)
+        kernel32 = FakeDll(GetCurrentProcess=-1, SetProcessInformation=set_info)
+        dlls = {"winmm": winmm, "kernel32": kernel32}
+        with mock.patch("sys.platform", platform_name), \
+             mock.patch("ctypes.WinDLL", lambda name, **kw: dlls[name], create=True), \
+             mock.patch("app.platform._log_ignored"):
+            timer = finer_timer()
+        return timer, winmm, kernel32
+
+    def test_opts_out_once_when_the_filter_starts_on_windows(self) -> None:
+        import ctypes
+        seen = []
+        winmm = FakeDll(timeBeginPeriod=0, timeEndPeriod=0)
+        kernel32 = FakeDll(GetCurrentProcess=-1)
+
+        def set_info(process, info_class, state, size):
+            seen.append((process, info_class, state._obj.Version, state._obj.ControlMask,
+                         state._obj.StateMask, size))
+            return 1
+
+        kernel32.SetProcessInformation = set_info
+        dlls = {"winmm": winmm, "kernel32": kernel32}
+        with mock.patch("sys.platform", "win32"), \
+             mock.patch("ctypes.WinDLL", lambda name, **kw: dlls[name], create=True):
+            timer = finer_timer()
+        self.assertEqual(timer.period, 1)
+        self.assertEqual(seen, [(-1, 4, 1, 0x4, 0, ctypes.sizeof(ctypes.c_ulong) * 3)])
+        self.assertEqual(winmm.names(), ["timeBeginPeriod"])
+        timer.close()
+        self.assertEqual(winmm.names(), ["timeBeginPeriod", "timeEndPeriod"])
+        self.assertEqual(len(seen), 1, "nothing is restored when the filter stops")
+
+    def test_never_off_windows(self) -> None:
+        timer, winmm, kernel32 = self.run_finer_timer("darwin")
+        self.assertEqual(timer.period, 0)
+        self.assertEqual(winmm.calls, [])
+        self.assertEqual(kernel32.calls, [])
+
+    def test_no_opt_out_when_the_finer_timer_is_refused(self) -> None:
+        timer, _winmm, kernel32 = self.run_finer_timer("win32", begin=97)  # TIMERR_NOCANDO
+        self.assertEqual(timer.period, 0)
+        self.assertNotIn("SetProcessInformation", kernel32.names())
+
+    def test_a_system_without_the_call_still_gets_the_finer_timer(self) -> None:
+        timer, _winmm, kernel32 = self.run_finer_timer("win32", set_info=AttributeError("no such function"))
+        self.assertEqual(timer.period, 1)
+        self.assertEqual(kernel32.names().count("SetProcessInformation"), 1)
+
+    def test_a_refusal_is_ignored(self) -> None:
+        timer, _winmm, _kernel32 = self.run_finer_timer("win32", set_info=0)
+        self.assertEqual(timer.period, 1)
 
 
 class StopWhileATimerSends(unittest.TestCase):
