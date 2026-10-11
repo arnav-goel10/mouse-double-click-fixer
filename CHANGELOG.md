@@ -1,7 +1,35 @@
 # Changelog
 
-## 1.0.1 — 2026-10-10
+## 1.0.1 — 2026-10-12
 
+- **Windows: the pointer no longer moves like a slide show after a click.**
+  Moving the mouse right after a click could freeze the pointer for about
+  150 ms at a time and then make it jump, for as long as the mouse kept
+  moving. Windows passes on only part of the tag the app puts on the input it
+  re-sends, so the app never saw that input arrive and let what waited behind
+  it, your pointer movement included, go only after a time-out. The app now
+  knows its input has arrived as soon as Windows has delivered it, and it no
+  longer re-sends pointer movement at all: a move that has to wait while a
+  click's release goes out waits about a millisecond, and the pointer is then
+  put where your hand has taken it.
+- Windows: movement after a click or a drag no longer goes missing. A
+  re-sent move could land after one of yours and undo it, which left the
+  pointer short of where you moved it, by up to a hundred pixels after a drag
+  let go while moving. The app now sends no pointer movement at all: it
+  places the pointer itself, at a moment Windows waits for, so none of your
+  movement is lost. A drag let go while moving still drops where you let go
+  of the button.
+- Windows: the pointer keeps up while the app is busy. With another part of
+  the app at work, every mouse event on the computer could wait about 45 ms
+  for the filter; it now waits a few milliseconds, because the app asks
+  Windows for 1 ms timers while the filter is on.
+- Windows: a right click made during a drag, while the pointer was catching
+  up with your hand, now lands where you clicked, not where the pointer had
+  been left.
+- Windows: a click over an app running as administrator, made while the
+  pointer was catching up, is no longer lost: it goes through as it came.
+- Windows: a pen or touch tap made right after moving the mouse now lands
+  where the pen touched, not where the mouse pointer was.
 - **The settings controls added in 1.0 look like the rest of each system.**
   On macOS, a style setting meant only to keep the panes see-through also
   changed how every control inside them was drawn: the window values showed

@@ -201,17 +201,19 @@ next click or by a timer, wherever the pointer is then.
 ## Games
 
 The app doesn't add clicks of its own, but it re-sends some input: a release
-held back for the filter window, whatever comes while that release is on its
-way (a press, another button's click, pointer movement), so that games see
-them in the order they happened, and, after a drag let go while moving, the
-moves that go with its release: on Windows a move to where the button came up
-first, and on both systems a move back to where your hand has taken the
-pointer. Games receive these as software input; on Windows they are marked as
-injected, and games that read raw input see them as injected input rather than
-as coming from your mouse. The app's hook is also in the input path whenever
-the filter is on. Some anti-cheat systems can object to software input or to
-input hooks, and the app can't know what yours accepts. Turn the filter off,
-or quit the app, before playing a game that uses one.
+held back for the filter window, and whatever comes while that release is on
+its way (a press, another button's click, and on macOS pointer movement), so
+that games see them in the order they happened. On Windows the app sends no
+pointer movement at all, only presses and releases: it puts the pointer where
+your hand has taken it, and after a drag let go while moving on the spot where
+the button came up and back, by placing it directly, which isn't input and
+which no input hook sees. Games receive re-sent input as software input; on
+Windows it is marked as injected, and games that read raw input see it as
+injected input rather than as coming from your mouse. The app's hook is also
+in the input path whenever the filter is on. Some anti-cheat systems can
+object to software input or to input hooks, and the app can't know what yours
+accepts. Turn the filter off, or quit the app, before playing a game that uses
+one.
 
 To keep the filter on for everything else, add the game under **Apps**. While
 it is in front nothing is filtered and nothing new is held back, and a
