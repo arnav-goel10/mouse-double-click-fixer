@@ -515,7 +515,9 @@ class WindowsHookLogicTests(unittest.TestCase):
 
     def test_motion_past_the_window_drops_a_drag_where_it_came_up(self) -> None:
         # No timer: the first move stamped past the window settles the
-        # release, which goes out at its spot before that move.
+        # release, which goes out at its spot before that move. The hook
+        # decides it, inside its callback: the pointer is put there at once
+        # (no move is sent), and on where the hand is once the up is in.
         self.win.press()
         self.win.wait(50)
         self.win.move(100, 0)
@@ -527,11 +529,11 @@ class WindowsHookLogicTests(unittest.TestCase):
         self.win.move(10, 0)                                          # past it
         self.win.run()
         self.assertEqual(self.win.buttons()[1][:3], ("up", Button.LEFT, (300, 200)))
-        self.assertEqual(self.win.cursor, (310, 200), "back where it was; the hand's last move is held")
+        self.assertEqual(self.win.cursor, (300, 200), "where the button came up; the hand's last move is held")
         self.fire_timers()
         self.assertEqual(self.win.cursor, (320, 200))
-        marks = [mark_kind(entry[2]) for entry in self.win.seen if entry[0] == "move"][-3:]
-        self.assertEqual(marks, [TELEPORT_MARK, MOTION_MARK_FOR[Button.LEFT], 0], "there, back, then where the hand is")
+        self.assertEqual(self.win.placed, [(300, 200), (320, 200)], "there, then where the hand is")
+        self.assertEqual(self.resent_moves(), [], "no move was sent")
         self.assertFalse(self.win.hook.watch[0])
         self.assertEqual(len(self.win.buttons()), 2, "the timer must not send the up again")
 
@@ -747,7 +749,7 @@ class WindowsHookLogicTests(unittest.TestCase):
         # other program put it, and the hand's steps are taken from there.
         self.win.queue.append(("move", normalized_absolute(600, 600, *self.win.screen), 0))
         # Only 2 px, but 400 px from where the button came up: it leaves the
-        # spot, so the up goes out there (taken to the click and back) and
+        # spot, so the up goes out there (the pointer put on the click) and
         # this step waits behind it.
         self.win.move(2, 0)
         self.win.move(30, 0)                                          # waits behind it too
@@ -755,7 +757,7 @@ class WindowsHookLogicTests(unittest.TestCase):
         self.assertEqual(self.win.buttons()[1][:3], ("up", Button.LEFT, (200, 200)))
         self.fire_timers()
         after_up = [entry[1] for entry in self.win.seen[self.win.seen.index(self.win.buttons()[1]) + 1:]]
-        self.assertEqual(after_up, [(600, 600), (632, 600)], "back, then where the hand's two steps took it")
+        self.assertEqual(after_up, [(632, 600)], "where the hand's two steps took it")
         self.assertEqual(self.win.cursor, (632, 600))
         self.fire_timers()
         self.assertEqual(len(self.win.buttons()), 2, "the up went out once")
@@ -1804,6 +1806,10 @@ class WindowsMotionSmoothnessTests(ProbedWindows):
                     reached[k] = at
                 furthest = index
         latencies = [(seen - sent[k]) * 1000 for k, seen in enumerate(reached) if seen is not None]
+        # How many of the hand's later moves had gone out before each showed:
+        # 0 without the filter; a move held while a click's up goes out shows
+        # with the next one or the one after.
+        waited = [sum(1 for later in sent[k + 1:] if later < seen) for k, seen in enumerate(reached) if seen is not None]
         times = [at for _place, at in samples if at >= sent[0]]
         until = reached[-1] if reached[-1] is not None else times[-1] if times else sent[-1]
         gaps = [(later - earlier) * 1000 for earlier, later in zip(times, times[1:]) if later <= until]
@@ -1821,6 +1827,7 @@ class WindowsMotionSmoothnessTests(ProbedWindows):
             "latency_ms": (
                 round(_quantile(latencies, 0.5), 3), round(_quantile(latencies, 0.99), 2), round(max(latencies or [0]), 2)
             ),
+            "waited": max(waited or [0]),
             # Moves this app sent, as the hook behind it saw them: the hand's
             # re-sent (absolute), and a release's way there and back.
             "resent": sum(1 for entry in moves if mark_kind(entry[2]) in INJECTED_MOTION_MARKS),
@@ -1837,7 +1844,10 @@ class WindowsMotionSmoothnessTests(ProbedWindows):
             off = [at for place, at in samples if not self.api.within_drag_rect(start, place)]
             result["up_first"] = bool(ups) and (not off or ups[0] < off[0])
         elif scenario == "drag":
-            result["ups"] = sum(1 for entry in hooked if entry[0] == WM_LBUTTONUP)
+            ups = [place for message, place, _extra, _at in hooked if message == WM_LBUTTONUP]
+            spot = (start[0] + (count // 4) * step[0], start[1] + (count // 4) * step[1])
+            result["ups"] = len(ups)
+            result["up_on_spot"] = ups == [spot]
         if timings:
             def cost(kind) -> str:
                 values = [seconds * 1000 for message, watched, seconds in timings if kind(message, watched)]
@@ -1878,15 +1888,15 @@ class WindowsMotionSmoothnessTests(ProbedWindows):
                     self.assertTrue(result["up_first"], f"the pointer left the click before its up: {result}")
                     self.assertEqual((result["resent"], result["teleports"]), (0, 0), f"moves were re-sent: {result}")
                 elif scenario == "drag":
-                    self.assertEqual(result["ups"], 1, f"{result}")
-                    # The release is taken to where the button came up and back.
-                    self.assertEqual((result["resent"], result["teleports"]), (1, 1), f"{result}")
+                    self.assertTrue(result["up_on_spot"], f"the drop landed off where the button came up: {result}")
+                    # The pointer is put there from inside the hook: no move is sent.
+                    self.assertEqual((result["resent"], result["teleports"]), (0, 0), f"moves were re-sent: {result}")
                 else:
                     self.assertEqual(result["resends"], 0, f"{result}")
                 # No gap the filter adds beyond twice the hand's interval: no
-                # move of the hand's shows later than that, over the baseline.
-                allowed = 2 * 1000 / rate + baseline["latency_ms"][2]
-                self.assertLessEqual(result["latency_ms"][2], allowed, f"apps waited for the hand's motion: {result}")
+                # move of the hand's shows after more than two of its later
+                # moves have gone out, over what the baseline shows.
+                self.assertLessEqual(result["waited"], 2 + baseline["waited"], f"apps waited for the hand's motion: {result}")
 
 
 @unittest.skipUnless(_run_e2e(), "needs Windows and DCF_E2E=1 (it injects real input)")

@@ -2352,10 +2352,11 @@ class WindowsHook:
     callback: Windows waits for the callback before it takes the next input,
     which then starts from there. A press while motion is held is re-sent
     from there too (see button); if the hand stops instead, the pointer is
-    put there after CATCH_UP_QUIET_S (see set_watch). This app's own batches
-    leave the pointer where they found it, but for a press that has to land
-    where the held motion took the hand (see _batch), so nothing else moves
-    it in between.
+    put there after CATCH_UP_QUIET_S (see set_watch). A button the hook
+    decides to re-send somewhere else than where the pointer is (a release
+    where a drag ended, the hand having moved on) has the pointer put there
+    the same way, inside the callback; one decided off the hook's thread
+    takes the pointer there in its own batch (see _batch).
     """
 
     LLMHF_INJECTED = 0x00000001
@@ -2400,6 +2401,10 @@ class WindowsHook:
         self._placeless = lambda: not api.relocation_allowed()
         # The timer that puts the pointer where the hand stopped (see set_watch).
         self._catch_up_timer: Optional[threading.Timer] = None
+        # The hook's thread while it is in a callback deciding an event: the
+        # only time the pointer can be put somewhere without racing the
+        # mouse (see _batch).
+        self._deciding: Optional[int] = None
 
     # -- watching motion ----------------------------------------------------
     def held(self) -> bool:
@@ -2457,6 +2462,13 @@ class WindowsHook:
         self._owner._update_motion_tap()
         return place is not None
 
+    def _first_on_its_way(self) -> bool:
+        """Whether the re-send being decided is the only one of this app's
+        still on its way: nothing sent before it has yet to arrive."""
+        owner = self._owner
+        with owner._lock:
+            return sum(len(owner._in_flight[button]) for button in Button) <= 1
+
     def _catch_up_quiet(self) -> None:
         """On the hook's thread: the hand stopped while its motion was held
         back, and nothing waits any more (see set_watch). Puts the pointer
@@ -2510,18 +2522,22 @@ class WindowsHook:
         # nothing waits for it any more: the pointer is put where the hand
         # is first, from inside this callback, and the button re-sent there
         # (Windows may already have placed it where the pointer was).
-        resend = self.held() and allow_hold and not owner._waiting() and self._catch_up(at)
-        return not owner._button_event(
-            button,
-            pressed,
-            stamp,
-            WindowsTemplate(int(tick), at[0], at[1], relocate),
-            allow_hold=allow_hold,
-            location=at if relocate else None,
-            passes=passes,
-            device=key,
-            resend=resend,
-        ).accepted
+        self._deciding = threading.get_ident()
+        try:
+            resend = self.held() and allow_hold and not owner._waiting() and self._catch_up(at)
+            return not owner._button_event(
+                button,
+                pressed,
+                stamp,
+                WindowsTemplate(int(tick), at[0], at[1], relocate),
+                allow_hold=allow_hold,
+                location=at if relocate else None,
+                passes=passes,
+                device=key,
+                resend=resend,
+            ).accepted
+        finally:
+            self._deciding = None
 
     def wheel(
         self, axis: int, mouse_data: int, flags: int, extra: int, tick: int, arrival: float, tick_now: int
@@ -2598,11 +2614,15 @@ class WindowsHook:
         stamp = None
         if tick is not None and arrival is not None and tick_now is not None:
             stamp = windows_event_time(arrival, tick_now, tick)
-        if not self._owner._motion(target, target, stamp, self._placeless):
-            self.virtual = target  # held: the pointer stays where it is
-            return True
-        if self.virtual != self.basis and self._catch_up(target):
-            return True
+        self._deciding = threading.get_ident()
+        try:
+            if not self._owner._motion(target, target, stamp, self._placeless):
+                self.virtual = target  # held: the pointer stays where it is
+                return True
+            if self.virtual != self.basis and self._catch_up(target):
+                return True
+        finally:
+            self._deciding = None
         self.basis = self.virtual = self.shown = (x, y)
         return False
 
@@ -2642,6 +2662,17 @@ class WindowsHook:
             # jump), or where the pointer's place means nothing (see button),
             # or where its way there isn't known.
             return [(api.button_input(flags, when, mark, data), button, seq)]
+        if self._deciding == threading.get_ident() and self._first_on_its_way():
+            # Decided by the hook, inside its callback, with nothing sent
+            # before it still on its way: the pointer is put where the button
+            # went down or came up, at once, before Windows takes the next
+            # input (see WindowsHook), and the button goes out there. The
+            # hand's motion from here on is held until it is in.
+            place = api.set_cursor_pos(x, y)
+            if place is not None:
+                with self._owner._motion_tap_lock:
+                    self.basis = self.shown = place
+                return [(api.button_input(flags, when, mark, data), button, seq)]
         if pressed:
             # The hand pressed after moving on, its motion held back: the
             # pointer goes there first and stays, the place the hand's held
@@ -2649,12 +2680,15 @@ class WindowsHook:
             with self._owner._motion_tap_lock:
                 self.shown = (x, y)
             return [(api.move_input(x, y, TELEPORT_MARK), None, 0), (api.button_input(flags, when, mark, data), button, seq)]
-        # The pointer has moved on: take it to where the button came up,
-        # release it there and take it back, in one batch, which Windows
-        # never mixes with other input, so the three arrive together and the
-        # pointer is back where it was for the hand's next move. The release
-        # is waited for until the way back is in: that carries the release's
-        # number, and the release itself none.
+        # The pointer has moved on, and this was decided away from the hook
+        # (its timer: the hand has stopped) or behind something still on its
+        # way: take it to where the button came up, release it there and take
+        # it back, in one batch, so the pointer is back where it was for the
+        # hand's next move. A move of the hand's that Windows places while
+        # the batch is on its way may start from where the batch has the
+        # pointer for a moment (CI measured it), so this is kept for when
+        # the hand is still. The release is waited for until the way back is
+        # in: that carries the release's number, and the release itself none.
         return [
             (api.move_input(x, y, TELEPORT_MARK), None, 0),
             (api.button_input(flags, when, INJECTED_MARK, data), None, 0),
