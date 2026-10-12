@@ -837,6 +837,13 @@ class AppController(QObject):
             watching=self.active,
         )
 
+    def refine_calibration(self, button: Any, calibration: Any) -> Any:
+        """Test and Tune's result for `button`, held up to the bounce gaps
+        History has recorded for it (see health.refine_calibration)."""
+        button = as_button(button)
+        histogram = self.wear.histogram(button, health.SUGGEST_DAYS, self.threshold_for(button))
+        return health.refine_calibration(calibration, histogram)
+
     def apply_suggestion(self, suggestion: health.Suggestion) -> None:
         """Raise the button's window as health() suggested. Only ever
         raises: a window already at or above the suggestion is left alone.

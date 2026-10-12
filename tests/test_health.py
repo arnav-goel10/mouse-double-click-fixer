@@ -19,7 +19,7 @@ from unittest import mock
 
 from app import health, settings
 from app.conflicts import Conflict
-from app.core import Button, ClickEvent
+from app.core import Button, ClickEvent, Calibrator
 from app.health import Suggestion
 from app.wear import Histogram, WearHistory
 
@@ -102,6 +102,66 @@ class SuggestTests(unittest.TestCase):
         self.assertEqual(health.window_cap(None), 60)
         self.assertEqual(health.window_cap(101), 50)
         self.assertEqual(health.window_cap(2000), 200)
+
+
+def calibration(bounce_ms: float, double_ms: float):
+    """What Test and Tune measured: one bounce `bounce_ms` after letting go
+    (twelve plain clicks and five double-clicks `double_ms` apart besides)."""
+    calibrator = Calibrator()
+    for _ in range(12):
+        calibrator.add_single_click(900.0)
+    calibrator.add_single_click(bounce_ms)
+    for _ in range(5):
+        calibrator.add_double_click(double_ms)
+    return calibrator.suggest()
+
+
+class RefineCalibrationTests(unittest.TestCase):
+    """Test and Tune's recommendation is held up to the bounce gaps History
+    has recorded for the button."""
+
+    def test_history_bounces_above_the_measured_value_raise_it(self) -> None:
+        measured = calibration(12.0, 150.0)
+        self.assertEqual(measured.threshold_ms, 27)
+        # p99 of these gaps is 42 ms: the window that puts it at 70% is 60 ms.
+        refined = health.refine_calibration(measured, histogram({10: 70, 40: 30}, 46))
+        self.assertEqual(refined.threshold_ms, 60)
+        self.assertEqual(refined.threshold_ms, health.window_for_gap(42.0))
+        self.assertEqual(refined.headroom_ms, 150.0 - 60)
+        self.assertEqual(refined.confident, measured.confident)
+        self.assertIn("42 ms", refined.note)
+        self.assertIn("Raised from 27 ms", refined.note)
+
+    def test_the_measurement_stands_when_it_is_the_larger(self) -> None:
+        measured = calibration(30.0, 200.0)  # 60 ms
+        self.assertEqual(health.refine_calibration(measured, histogram({10: 100}, 46)), measured)
+
+    def test_too_little_history_changes_nothing(self) -> None:
+        measured = calibration(12.0, 150.0)
+        self.assertIs(health.refine_calibration(measured, histogram({40: 19}, 46)), measured)
+        self.assertIs(health.refine_calibration(measured, histogram({}, 46)), measured)
+
+    def test_the_cap_still_wins(self) -> None:
+        # History calls for 60 ms; half the fastest double-click (130 ms) is 65.
+        measured = calibration(12.0, 130.0)
+        refined = health.refine_calibration(measured, histogram({10: 70, 40: 30}, 46))
+        self.assertEqual(refined.threshold_ms, 60)
+        # With 110 ms the cap is 55: History's 60 ms is not allowed.
+        capped = health.refine_calibration(calibration(12.0, 110.0), histogram({10: 70, 40: 30}, 46))
+        self.assertEqual(capped.threshold_ms, 55)
+        self.assertLessEqual(capped.threshold_ms, 110.0 * 0.5)
+
+    def test_the_conflict_is_said_plainly(self) -> None:
+        refined = health.refine_calibration(calibration(12.0, 110.0), histogram({10: 70, 40: 30}, 46))
+        self.assertFalse(refined.confident)
+        self.assertIn("Some bounces may still get through", refined.note)
+        self.assertIn("test again", refined.note)
+        self.assertIn("55 ms", refined.note)
+        self.assertEqual(refined.headroom_ms, 110.0 - 55)
+
+    def test_no_conflict_note_when_history_fits(self) -> None:
+        refined = health.refine_calibration(calibration(12.0, 200.0), histogram({10: 70, 40: 30}, 46))
+        self.assertNotIn("may still get through", refined.note)
 
 
 class WearCase(unittest.TestCase):
@@ -276,6 +336,14 @@ class ControllerHealthTests(helpers.ControllerCase):
         self.controller.note_double_click_speed(Button.LEFT, 110.4)
         self.assertEqual(self.controller.double_click_speeds(), {Button.LEFT: 110})
         self.assertEqual(self.controller.health().suggestion.to_ms, 55)
+
+    def test_the_controller_reads_the_buttons_own_history(self) -> None:
+        self.bounces(presses=300, gaps=[10] * 70 + [40] * 30)
+        measured = calibration(12.0, 150.0)
+        self.assertEqual(self.controller.refine_calibration(Button.LEFT, measured).threshold_ms, 60)
+        self.assertIs(
+            self.controller.refine_calibration(Button.RIGHT, measured), measured, "another button's History is not its own"
+        )
 
     def test_applying_a_suggestion_in_automatic(self) -> None:
         controller = self.controller

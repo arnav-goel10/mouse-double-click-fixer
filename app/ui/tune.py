@@ -323,6 +323,8 @@ class TuneWindow(QDialog):
     def _finish(self) -> None:
         self.suggestion = self.calibrator.suggest()
         if self.suggestion is not None:
+            # What History has seen on this button can ask for more than the test did.
+            self.suggestion = self.controller.refine_calibration(self.button, self.suggestion)
             self.chosen_ms = self.suggestion.threshold_ms
         self._set_phase("verdict")
         self._render()
@@ -570,6 +572,8 @@ class TuneWindow(QDialog):
             self.verdict_icon.name = "ok"
             self.verdict_row.title.setText(f"No extra clicks in {clicks} clicks")
             self.verdict_row.set_detail("Bounce comes and goes; History shows it when it happens.")
+        if suggestion.note:
+            self.detail.setText(f"{self.detail.text()} {suggestion.note}")
         self.verdict_icon.update()
         kind = "repeat" if side else "double-click"
         self.double_row.title.setText(f"Your fastest {kind}")
@@ -633,6 +637,8 @@ class TuneWindow(QDialog):
         fastest = suggestion.fastest_double_click_ms
         if chosen >= fastest:
             detail = f"Too long: your fastest {kind} ({fastest:.0f} ms apart) would be ignored."
+        elif suggestion.note and chosen == recommended:
+            detail = suggestion.note
         elif not suggestion.confident and chosen == recommended:
             detail = (
                 f"Little room between the extra clicks and your {kind}s. "

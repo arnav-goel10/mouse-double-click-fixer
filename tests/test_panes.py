@@ -499,6 +499,33 @@ class TuneTests(PaneTestCase):
         self.assertTrue(self.controller.is_calibrated(Button.LEFT))
         self.assertIn(f"{suggestion.threshold_ms} ms", tune.result_row.detail.text())
 
+    def note_history_bounces(self, gap_ms=40.0, count=30):
+        from app.core import Button, ClickEvent
+
+        for _ in range(count):
+            self.controller.wear.note_event(ClickEvent(Button.LEFT, True, False, gap_ms, None), 46)
+
+    def test_history_bounces_raise_the_recommendation(self) -> None:
+        tune = self.measure(bounce_ms=12.0)
+        self.assertEqual(tune.suggestion.threshold_ms, 27)
+        tune.restart()
+        self.note_history_bounces()
+        tune = self.measure(bounce_ms=12.0)
+        self.assertEqual(tune.suggestion.threshold_ms, 60, "40 ms bounces seen in History need more than 27 ms")
+        self.assertEqual(tune.chosen_ms, 60)
+        self.assertIn("Raised from 27 ms", tune.detail.text())
+        tune._primary()
+        self.assertIn("Raised from 27 ms", tune.window_row.detail.text())
+        self.assertIn("60 ms (recommended)", tune.window_picker.currentText())
+
+    def test_history_beyond_the_cap_keeps_the_cap_and_says_so(self) -> None:
+        self.note_history_bounces()
+        tune = self.measure(bounce_ms=12.0, double_ms=110.0)
+        self.assertEqual(tune.suggestion.threshold_ms, 55)
+        self.assertIn("Some bounces may still get through", tune.detail.text())
+        tune._primary()
+        self.assertIn("Some bounces may still get through", tune.window_row.detail.text())
+
     def test_without_enough_double_clicks_the_verdict_says_so_and_offers_no_apply(self) -> None:
         tune = self.tune()
         tune._advance()

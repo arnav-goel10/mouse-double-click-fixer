@@ -28,10 +28,10 @@ ever raises a window, and nothing applies one without the user.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Iterable, Optional
 
-from .core import DOUBLE_CLICK_SAFETY_RATIO, MAX_THRESHOLD_MS, Button
+from .core import DOUBLE_CLICK_SAFETY_RATIO, MAX_THRESHOLD_MS, Button, clamp_threshold, window_ceiling_ms
 from .inputs import as_button, button_name
 from .wear import BIN_MS, SHOWN_DAYS, WORSE
 
@@ -111,6 +111,69 @@ def window_cap(fastest_double_click_ms: Optional[float]) -> int:
     return UNKNOWN_DOUBLE_CLICK_CAP_MS
 
 
+def window_for_gap(gap_ms: float) -> int:
+    """The window that puts a bounce gap at SUGGEST_TARGET of it."""
+    # Rounded first: 42 / 0.7 is 60.000000000000004 in floating point.
+    return int(math.ceil(round(gap_ms / SUGGEST_TARGET, 6)))
+
+
+def history_floor_ms(histogram: Any) -> Optional[tuple[float, int]]:
+    """(the SUGGEST_PERCENTILE gap, the window that gives it SUGGEST_TARGET
+    of the window) from a button's recent bounce history, or None when it
+    holds fewer than SUGGEST_MIN_BOUNCES: the statistic suggest() acts on."""
+    if histogram.total < SUGGEST_MIN_BOUNCES:
+        return None
+    gap = percentile_ms(histogram, SUGGEST_PERCENTILE)
+    if gap is None:
+        return None
+    return gap, window_for_gap(gap)
+
+
+def refine_calibration(calibration: Any, histogram: Any) -> Any:
+    """Test and Tune's recommendation, held up to the button's History.
+
+    The recommended window is at least the larger of what the test measured
+    and the window the recent bounce gaps in History call for
+    (history_floor_ms), so a bounce History has already seen is not let
+    through; and still never more than half the fastest double-click
+    measured (core.window_ceiling_ms). When History asks for more than that
+    cap allows, the cap wins and the note says some bounces may get through.
+    Returns `calibration` itself when History changes nothing.
+    """
+    floor = history_floor_ms(histogram)
+    if floor is None:
+        return calibration
+    gap, wanted = floor
+    measured = calibration.threshold_ms
+    if wanted <= measured:
+        return calibration
+    fastest = calibration.fastest_double_click_ms
+    cap = clamp_threshold(window_ceiling_ms(fastest))
+    if wanted <= cap:
+        value = clamp_threshold(wanted)
+        note = (
+            f"Raised from {measured} ms: this button's recent History shows bounces up to about "
+            f"{gap:.0f} ms, and {value} ms catches them with room to spare."
+        )
+        confident = calibration.confident
+    else:
+        value = max(measured, cap)
+        note = (
+            f"This button's recent History shows bounces up to about {gap:.0f} ms, which needs about "
+            f"{wanted} ms, but {value} ms is the most that stays clear of your fastest double-click "
+            f"({fastest:.0f} ms apart). Some bounces may still get through: test again, double-clicking "
+            "a little more slowly."
+        )
+        confident = False
+    return replace(
+        calibration,
+        threshold_ms=value,
+        headroom_ms=fastest - value,
+        confident=confident,
+        note=note,
+    )
+
+
 def suggest(
     button: Any, histogram: Any, window_ms: int, fastest_double_click_ms: Optional[float] = None
 ) -> tuple[Optional[Suggestion], bool]:
@@ -122,8 +185,7 @@ def suggest(
     gap = percentile_ms(histogram, SUGGEST_PERCENTILE)
     if gap is None or gap <= SUGGEST_NEAR * window_ms:
         return None, False
-    # Rounded first: 42 / 0.7 is 60.000000000000004 in floating point.
-    target = min(int(math.ceil(round(gap / SUGGEST_TARGET, 6))), window_cap(fastest_double_click_ms), MAX_THRESHOLD_MS)
+    target = min(window_for_gap(gap), window_cap(fastest_double_click_ms), MAX_THRESHOLD_MS)
     if target < window_ms + SUGGEST_MIN_RAISE_MS:
         return None, True
     name = button_name(button).lower()
