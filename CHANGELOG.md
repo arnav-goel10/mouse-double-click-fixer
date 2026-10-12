@@ -21,9 +21,8 @@
   **About** (updates, **Copy Diagnostics**, the blocked count, privacy,
   **Acknowledgements…**). The window is titled with the pane, sized to it, and
   opens on the pane you last used.
-- **macOS: a Dock menu** with the same actions as the menu bar menu. If the
-  menu bar icon is hidden, by you with **Show in menu bar** or by macOS, the
-  Dock icon stays, and opening the app again opens Settings.
+- **macOS: a Dock menu** with the same actions as the menu bar menu. If you
+  hide the menu bar icon with **Show in menu bar**, the Dock icon stays, and opening the app again opens Settings.
 - **macOS: a first-run window.** It explains the permission in a few words,
   has one **Continue** button that brings up macOS's own request, then shows
   "Waiting for permission…" and "Ready", and offers **Test and Tune…**.
@@ -94,7 +93,7 @@
   caught. When a button's recent bounces come close to its window, History
   suggests a longer one ("Raise the left button to 64 ms?") with an **Apply**
   button. It never goes above half your fastest double-click as Test and Tune
-  measured it, and changes nothing until you choose **Apply**.
+  measured it (60 ms if it hasn't measured one), and changes nothing until you choose **Apply**.
 - **Notes about other mouse utilities.** If Logi Options+, Logitech Options,
   Logitech G HUB, Razer Synapse, Mac Mouse Fix, SteerMouse, LinearMouse,
   BetterMouse, X-Mouse Button Control or DoubleClickFix is running, the app
@@ -103,7 +102,7 @@
   middle button, the wheel, or clicks). It reads only the names of running
   programs, once a minute and when you bring the app forward, and changes
   nothing in the other utility.
-- **A plain status line.** The menus, the tray flyout and the main window say
+- **A plain status line.** The main window and the Windows tray flyout say
   what the filter has done today, for example "Your left button bounced 14
   times today. Every bounce was caught." or "No extra clicks seen yet."
 - **Copy Diagnostics** now also says whether a pause is on, the state of the

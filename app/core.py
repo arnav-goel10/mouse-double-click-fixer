@@ -456,7 +456,7 @@ class Suggestion:
 def window_ceiling_ms(fastest_double_click_ms: float) -> float:
     """The longest window that stays clear of the user's own double-clicks:
     half the fastest one measured, never under the shortest window."""
-    return max(MIN_THRESHOLD_MS, fastest_double_click_ms * DOUBLE_CLICK_SAFETY_RATIO)
+    return max(MIN_THRESHOLD_MS, math.floor(fastest_double_click_ms * DOUBLE_CLICK_SAFETY_RATIO))
 
 
 class Calibrator:

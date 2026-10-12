@@ -158,6 +158,15 @@ class CalibratorTests(unittest.TestCase):
         self.assertEqual(calibrator.double_progress, 1.0)
 
 
+class WindowCeilingTests(unittest.TestCase):
+    def test_the_ceiling_never_exceeds_half_the_fastest_double_click(self) -> None:
+        from app.core import clamp_threshold, window_ceiling_ms
+
+        for fastest in (61.2, 61.9, 75.5, 99.99, 150.0):
+            with self.subTest(fastest=fastest):
+                self.assertLessEqual(clamp_threshold(window_ceiling_ms(fastest)), fastest / 2)
+
+
 class ButtonTests(unittest.TestCase):
     def test_labels(self) -> None:
         self.assertEqual([button.label for button in Button], ["Left", "Right", "Middle", "Back", "Forward"])
