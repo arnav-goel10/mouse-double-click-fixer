@@ -19,7 +19,7 @@ Check **History** first: if a button's bounces come close to its window it
 suggests a longer one ("Raise the left button to 64 ms?"), and **Apply**
 sets it. Otherwise raise that button's window by 10–20 ms under **Strength ›
 Custom** on **General** (**Home**). Bounce is intermittent, so a **Test and
-Tune** run can miss the worst of it, and its recommendation stays well under
+Tune** run can miss the worst of it, and its recommendation is never more than
 half your fastest double-click: you can choose a longer window in its last
 step, and its second pad shows whether a given gap would be ignored. If your
 mouse's own software has a debounce setting, raising it can help too.
@@ -28,7 +28,8 @@ Then check what is switched on:
 
 - Only the left button is filtered until you turn the others on. Right,
   middle, back and forward each have a checkbox under **Buttons**.
-- In **Automatic**, a button Test and Tune hasn't measured uses 46 ms.
+- In **Automatic**, a button that neither Test and Tune nor History's
+  **Apply** has set a window for uses 46 ms.
 - The filter may be paused: the menu says **Resume**, and the status line says
   "Paused until …" or "Paused while … is in front" (see [Pausing](#pausing)).
 - The app in front may be on the **Exceptions › Apps** list, which filters
@@ -161,7 +162,7 @@ longer window could catch your own double-clicks; run **Test and Tune**.
 ## macOS: the filter won't turn on
 
 macOS only lets an approved app block input. Turn on **Bounce Filter**, choose
-**Open System Settings** when asked, and switch **Mouse Double-Click Fixer**
+**Open System Settings…** when asked, and switch **Mouse Double-Click Fixer**
 on under **Privacy & Security › Device Control and Data Access** (on macOS 26
 and earlier, **Privacy & Security › Accessibility**). The app notices within a
 second. Until then the menu bar menu says "Waiting for … permission".
@@ -173,8 +174,9 @@ source or installed before 0.2.0, which was signed differently. Select every
 **Mouse Double-Click Fixer** entry in the list, and any **DoubleClick Fixer**
 one (the app's name before 1.0), and remove it with **−**, then choose
 **Open Settings…** in the app so macOS lists the copy you are running, and
-switch it on. Releases from 0.2.0 on are signed with the same certificate, so
-this only needs doing once.
+switch it on. macOS releases from 0.2.0 on are signed with the same self-signed
+certificate (see [SECURITY.md](../SECURITY.md#macos-hardening)), so this only
+needs doing once. Windows builds are not code-signed.
 
 ## macOS: the permission was turned off
 
@@ -192,8 +194,9 @@ filter off three times within 30 seconds, the app stops filtering rather than
 fight the system, and says "macOS kept switching the filter off"; turn it on
 again with **Filter Bounce** in the menu bar menu.
 
-If the filter couldn't start at all, the menu bar menu's status line and
-**General** say why. A start the app makes by itself, at login or after
+If the filter couldn't start at all, the menu bar menu's status line says only
+the title (for example "Couldn’t start the filter"), and **General** adds the
+detail. A start the app makes by itself, at login or after
 sleep, is tried again 1, 3, 8 and 20 seconds later before it gives up.
 
 ## Windows: it worked, then stopped
@@ -270,8 +273,9 @@ it either. What the check looks for:
   virtual machine windows, the desktop, the lock screen and screen savers
   never count. A game in a browser, or in one of those programs, isn't seen,
   and another full-screen program that isn't a game may be taken for one. A
-  game Windows won't name still counts when Windows says it is exclusive or
-  busy full screen.
+  game Windows won't name still counts when Windows says it is exclusive full
+  screen, or says a full-screen app is busy and the window covers its
+  monitor.
 
 If it pauses when it shouldn't, choose **Resume** in the menu (or press the
 pause shortcut): it won't pause for that program again until the program has
@@ -291,8 +295,9 @@ menu says **Resume** and the status line says when it ends.
   turned off (**General › Pause shortcut** on macOS, **Settings › Pausing**
   on Windows); or another program already holds those keys. **Copy
   Diagnostics** has a `pause shortcut` line that says which: "turned off",
-  "registered", or "unavailable: Another app already uses this shortcut."
-  (Windows: "Another program already uses this shortcut."). The keys can't be
+  "registered", "not registered", or "unavailable: Another app already uses
+  this shortcut." (Windows: "Another program already uses this shortcut.").
+  The keys can't be
   changed. On macOS the key is the one where P is on a US keyboard, so on
   another layout it is the key in that place; on Windows it is the P of your
   layout.
@@ -308,7 +313,8 @@ menu says **Resume** and the status line says when it ends.
 ## Other mouse utilities
 
 The app looks, every minute and when you bring it forward, at the names of the
-running programs for: Logi Options+, Logitech Options, Logitech G HUB and
+running programs (on macOS, their bundle identifiers too) for: Logi Options+,
+Logitech Options, Logitech G HUB and
 Razer Synapse (macOS and Windows); Mac Mouse Fix, SteerMouse, LinearMouse and
 BetterMouse (macOS); X-Mouse Button Control and DoubleClickFix (Windows). If
 it finds one, **General** (**Home**), the **Test and Tune** verdict,
@@ -327,8 +333,8 @@ the app never holds back or re-sends pointer movement. A held release goes out
 once the filter window has passed, with your next click or by a timer,
 wherever the pointer is then; the pointer is never moved. A game that keeps
 the pointer showing, even drawn invisible, doesn't count as hidden: the app
-treats it as an ordinary pointer, and may hold back and re-send its movement
-for a moment after a click.
+treats it as an ordinary pointer, and may hold your movement back for a moment
+after a click, then put the pointer where your hand took it.
 
 ## Open at login doesn't open the app
 
@@ -348,9 +354,10 @@ Spotlight, Applications or the Dock. On Windows, left-click the notification
 area icon and choose **Open** in its flyout, or double-click the icon, or
 choose **Open** in its right-click menu. **Quit Mouse Double-Click Fixer**
 (macOS) or **Exit** (Windows) in that menu stops the filter and closes the
-app. If the menu bar icon is hidden (see **General › Show in menu bar**, and
-**System Settings › Menu Bar** on macOS 26 and later), the Dock icon stays and
-opening the app again opens Settings.
+app. If you hide the menu bar icon with **General › Show in menu bar**, the Dock
+icon stays and opening the app again opens Settings. If the icon disappears
+any other way (see **System Settings › Menu Bar** on macOS 26 and later),
+opening the app again opens Settings too.
 
 ## Updates
 
@@ -365,14 +372,16 @@ What the messages under **Software Update** (Windows: **Updates**) mean:
 
 - **No published releases were found.** The app couldn't read this
   repository's releases, for example because none is published yet.
-- **This update isn't signed, so it can't be installed.** (or its signature
-  isn't valid, or is for another version.) The release doesn't carry a valid
-  signature from the project's keys, so the app won't download it.
+- **This update isn’t signed, so it can’t be installed.** (Or "This update’s
+  signature isn’t valid, so it can’t be installed.", "This update isn’t signed
+  for this version, so it can’t be installed." or "This update’s signature is
+  for another version, so it can’t be installed.") The release doesn't carry a
+  valid signature from the project's keys, so the app won't download it.
 - **Move Mouse Double-Click Fixer to Applications to update it.** The app is
   running from the disk image or from where macOS put a downloaded copy it
   hasn't moved. Drag it to Applications and open it from there.
-- **Your account can't change apps in Applications.** Ask an administrator to
-  update the app.
+- **Your account can’t change apps in Applications. Ask an administrator to
+  update it.**
 - **No permission to replace the app in …** The folder the app runs from
   can't be written by your account. Move the app somewhere you can write, or
   install it again from the latest release.

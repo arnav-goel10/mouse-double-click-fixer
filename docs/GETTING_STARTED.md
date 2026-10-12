@@ -21,14 +21,15 @@ to the taskbar corner so it stays visible, and a **Test and tune** button.
 Open **Test and Tune…** from the mouse icon in the menu bar (macOS), from
 **General**, or from the Dock icon's menu; on Windows, choose **Test and
 tune** on **Home**. It is one task in three steps. It tests the left button
-unless you pick another at the top of the first step.
+unless you pick another at the top of the first step; the button stays as you
+last picked it until the app quits.
 
 **Step 1: click the pad.** Your first click on the pad starts the test, and
 counts.
 
 - **Single clicks:** click once, pause, and repeat until twelve are counted.
   Any extra press the switch adds is recorded as bounce, and the pad tells
-  you ("Extra click caught (12 ms after letting go)").
+  you ("Extra click caught (12 ms after letting go).").
 - **Double-clicks:** double-click five times at your usual speed. This sets
   the limit the filter must stay under. A double-click counts when its second
   click comes within your system's double-click speed, up to a second; a
@@ -58,11 +59,12 @@ Choose **Continue**, or **Test Again**.
 marked "(recommended)". The recommendation aims above the worst bounce the pad
 saw, with some margin, but never higher than half of your fastest
 double-click, so your real double-clicks still count. When the two collide it
-keeps to half your fastest double-click and says there is little room. With no
-bounce seen it is 46 ms, or half your fastest double-click if that is
-smaller. Under the pop-up the app says whether your fastest double-click still
-counts at the window you chose ("Too long" if it wouldn't), and a second pad
-lets you try it: a bounce is marked as ignored, a deliberate double-click as
+keeps to half your fastest double-click, and says "Little room…" if that half
+is under the worst bounce plus 5 ms (when History raised the recommendation,
+History's note shows instead). With no bounce seen it is 46 ms, or half your
+fastest double-click if that is smaller. Under the pop-up the app says whether
+your fastest double-click still counts at the window you chose ("Too long" if
+it wouldn't), and a second pad lets you try it: a bounce is marked as ignored, a deliberate double-click as
 counted. Choose **Apply**.
 
 Applying sets that button's window, marks the button **Calibrated** on
@@ -97,7 +99,8 @@ the drag should hold all the way.
 ## 4. Strength
 
 **Strength** has two settings. **Automatic** uses what Test and Tune measured
-for each button, or 46 ms for a button it hasn't measured. **Custom** shows a
+for each button (or what History's **Apply** raised it to), or 46 ms for a
+button with neither. **Custom** shows a
 window for each filtered button, in milliseconds, for you to set. On Windows
 the windows sit inside the **Strength** card, which expands, and can be
 changed once you choose Custom. Each setting keeps its own windows, so
@@ -115,8 +118,9 @@ notification area (Windows).
   Bounce**, **Pause for 15 Minutes**, **Test and Tune…**, **Settings…** (⌘,)
   and **Quit Mouse Double-Click Fixer**. The Dock icon, shown while Settings
   is open, has the same actions. If you hide the menu bar icon with **General
-  › Show in menu bar**, or macOS hides it, the Dock icon stays, and opening
-  the app again opens Settings.
+  › Show in menu bar**, the Dock icon stays, and opening the app again opens
+  Settings. If the icon disappears any other way, opening the app again opens
+  Settings too.
 - **Windows:** left-click the icon for a flyout with the status, the **Bounce
   filter** switch and **Open**. Right-click it for **Open**, **Pause for 15
   minutes**, **Start with Windows** and **Exit**. The icon may sit under the
@@ -175,8 +179,9 @@ To pause automatically in full-screen games, see [Games](#games).
 Under **Exceptions › Games**, **Pause during full-screen games** is off by
 default. While it is on, the app asks every two seconds whether a full-screen
 game is in front; if so, filtering stops and the status line says "Paused
-while the game is in front" (with the game's name where there is one), until
-the game leaves the front or you choose **Resume**. After **Resume** it won't
+while <game name> is in front" (or "Paused while a full-screen game is in
+front" when Windows won't name it), until the game leaves the front or you
+choose **Resume**. After **Resume** it won't
 pause for that game again until the game has left the front.
 
 - **macOS:** the app in front declares in its own bundle that it is a game (a
@@ -200,8 +205,9 @@ This isn't a promise that a game's anti-cheat accepts the app; see
 At the top, one verdict about your mouse:
 
 - "Your left button double-clicks on its own: caught 14 of 14": the filter
-  ignored the extra clicks of the last 30 days. The count is of bounces the
-  filter caught. A bounce that gets past the window looks like an ordinary
+  ignored the extra clicks of the last 30 days. The count is of the bounces
+  the filter caught and the dropouts it repaired (a button that let go for a
+  moment mid-press). A bounce that gets past the window looks like an ordinary
   click, so the app can't count it, and it watches for the signs of one
   instead (see the suggestion below).
 - "No bounce seen": your mouse may be fine, or it bounces only now and then.
@@ -231,7 +237,7 @@ buttons, the middle button, the wheel, or clicks. That is what the utility can
 be set to do, not what it does on your computer. The app changes nothing in
 it; if side buttons or the wheel act up, check its settings. The app looks
 every minute and whenever you bring it forward, and it reads only the names of
-running programs.
+running programs (on macOS, their bundle identifiers too).
 
 ## Choosing a filter window
 
@@ -243,7 +249,7 @@ For **Custom**.
 | 40–80 ms | Catches severe bounce; fine unless you double-click very fast. |
 | 80 ms + | Only for a badly worn switch; fast double-clicks may be dropped. |
 
-Every release of the left, right and middle buttons waits for the filter
+Every release of a filtered left, right or middle button waits for the filter
 window before apps see it, a little longer on a still mouse, and a click made
 in place goes out as soon as you move the pointer off it. So a shorter window
 also means a quicker click. Presses go straight through; one waits only
