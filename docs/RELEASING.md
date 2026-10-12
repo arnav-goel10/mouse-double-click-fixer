@@ -11,8 +11,8 @@ So CI never publishes. Pushing a tag makes the release workflow build and
 test the release and put it up as a draft. Then, on the Mac where the release
 keys live, `tools/sign_release.py publish` checks the draft against what CI
 built, signs it and publishes it. Copies never see a draft, and a published
-release without a valid signature is refused (General says why), so nothing
-reaches users unsigned.
+release without a valid signature is refused (the About pane, or Settings on
+Windows, says why), so nothing reaches users unsigned.
 
 ## One-time setup
 
