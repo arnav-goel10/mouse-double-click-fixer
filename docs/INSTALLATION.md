@@ -26,7 +26,7 @@ Requires macOS 13 Ventura or later on an Apple silicon Mac (M1 or newer).
 Mouse Double-Click Fixer is a menu bar app: with its window closed it has no
 Dock icon and runs from the mouse icon in the menu bar, which opens a menu
 (**Filter Bounce**, **Pause for 15 Minutes**, **Test and Tune…**,
-**Settings…**, **Quit**). While Settings is open it has a Dock icon too. Once the installed app
+**Settings…**, **Quit Mouse Double-Click Fixer**). While Settings is open it has a Dock icon too. Once the installed app
 starts, it ejects the installer disk image and moves it to the Trash if it is
 in Downloads.
 
@@ -74,7 +74,8 @@ macOS, **Settings › Updates** on Windows), the app looks for a new
 release 20 seconds after it starts and every six hours. With **Install
 updates automatically** on as well, it downloads the update, verifies it,
 installs it and reopens itself, usually within a few seconds. If its window
-is open, it waits and installs when you close it; **Restart Now** (Windows:
+is open, or Test and Tune is measuring, it waits and installs once the
+window is closed and the measuring is over; **Restart Now** (Windows:
 **Restart now**) installs it straight away. On macOS the permission carries
 over.
 

@@ -13,7 +13,8 @@ those steps is yours.
 | Microsoft Store, existing installer (EXE) | The installer installs silently, from a versioned URL. The Python, Qt and Microsoft libraries inside are already signed by their publishers | Every program file must be signed by a trusted CA: our exe and the installer (SignPath), and Inno Setup's uninstaller, which would take a third signing request per release. So this waits on SignPath's acceptance too | [See the checklist](#route-a-the-existing-installer-exe) |
 | Microsoft Store, MSIX | Nothing yet | Packaging work in the app (no blocker outside it) | [See route B](#route-b-msix) |
 
-A sensible order: submit 1.0.0 to winget once it is published. winget
+A sensible order: submit the latest published version (1.0.1, or 1.1.0 once it is out) to
+winget. winget
 needs no signature, and it checks the installer and its URLs, not how well
 known the project is. Apply to SignPath once the project can show that
 people other than you use it: reputation is the condition most likely to
@@ -106,7 +107,7 @@ installer and the installed exe's self-test.
 
 | Condition | This project |
 | --- | --- |
-| **Reputation.** Under "Common misunderstandings" the terms say SignPath won't sign binaries built from code nobody knows, and that for programs people download and run on the strength of its signature, "we require a certain verifiable reputation" (libraries are exempt) | **Not yet, and the condition most likely to stop the application.** The repository was created on 2026-09-17. On 2026-10-10 it had 0 stars, 0 forks, no issues, and pull requests only from you and Dependabot. Its release files showed 187 downloads in all, but 152 of them were of the 0.2.6 and 0.5.3 installers, which CI's install tests fetched on every run until they were cached (`tools/old_installers.py`). The first run on each branch or tag still fetches them, because Actions caches are scoped to a branch and `main` had no run that saved the cache yet. The rest look like one installed copy updating itself (a macOS update archive and a `SHA256SUMS.txt` per release). Nothing yet shows use by anyone else |
+| **Reputation.** Under "Common misunderstandings" the terms say SignPath won't sign binaries built from code nobody knows, and that for programs people download and run on the strength of its signature, "we require a certain verifiable reputation" (libraries are exempt) | **Not yet, and the condition most likely to stop the application.** The repository was created on 2026-09-17. On 2026-10-10 it had 0 stars, 0 forks, no issues, and pull requests only from you and Dependabot. Its release files showed 187 downloads in all, but 152 of them were of the 0.2.6 and 0.5.3 installers, which CI's install tests fetched on every run until they were cached (`tools/old_installers.py`). Since 2026-10-10 `main` holds the cache (key `old-installers-…`, created by a run on `main`), and a run on any other branch or tag restores it instead of downloading. The rest look like one installed copy updating itself (a macOS update archive and a `SHA256SUMS.txt` per release). Nothing yet shows use by anyone else |
 | **OSS license.** The terms: the project "must use an OSI-approved Open Source license without commercial dual-licensing for all components." | MIT. The app bundles Qt through PySide6 (LGPL-3.0), which The Qt Company also sells under a commercial licence. The sentence says "for all components" and doesn't say whether a bundled library's dual licence counts, so it could be read against the project; mention it in the application. SignPath's [project list](https://signpath.org/projects) includes Qt applications, Flameshot and Stellarium among them |
 | No malware or potentially unwanted programs | None. The app filters mouse input and never invents a click |
 | No proprietary components, though System Libraries (as section 1 of the GPL v3 defines them) may be included | Python, Qt/PySide6 and the other bundled packages are open source. The exception is Microsoft's Visual C++ runtime (`VCRUNTIME140.dll`, `VCRUNTIME140_1.dll` and the `MSVCP140*.dll` files), the runtime of the compiler Python and Qt are built with. It is proprietary, shipped unmodified as Microsoft's Distributable Code, and `THIRD_PARTY_NOTICES-windows.md` says so. Python's two copies are signed by Microsoft, and the copies inside PySide6 and shiboken6 by The Qt Company. It fits GPL v3 section 1's System Libraries, which come with a Major Component, and a Major Component includes "a compiler used to produce the work". Name it in the application |
@@ -118,7 +119,7 @@ installer and the installed exe's self-test.
 | Manual approval of every release | Two requests per release, both approved by you |
 | Product name and version enforced by metadata restrictions | Both artifact configurations require product name "Mouse Double-Click Fixer" and the release's version |
 | Only your own code signed | Only the three files built here. The Python and Qt libraries beside the installed exe are never sent to SignPath |
-| Privacy: software that collects user data and transfers it to systems the user didn't name must describe this in a privacy policy, show that policy during installation, and offer an option at install time to turn it off | No telemetry, and nothing about the user is collected. What the app learns on the computer stays there: the executable name of the app in front (kept in memory, to compare with the user's list of excluded apps), the executable names of the apps the user adds to that list and the keys of the mice the user chooses to ignore (both in `settings.json`), the daily counts in `wear.json`, which device sent each Raw Input report and when (kept in memory; no position is used), the names of the running programs, read once a minute to recognise other mouse utilities, and, only if the user turns on the pause for full-screen games, the foreground window's size and program path and Windows' own list of games (kept in memory). The pause shortcut is registered with `RegisterHotKey` and reads no other key. The only network use is the update check and download from the project's GitHub Releases. The check is on by default; it asks GitHub for the latest release, with the app's version in its User-Agent and nothing else beyond what any web request carries (the IP address). **Check for updates automatically** (Settings › Updates on Windows, About › Software Update on macOS) turns it off (README, [Privacy](../README.md#privacy)). Be ready to argue that this isn't user data. If SignPath disagrees, the installer must show the privacy policy and offer a checkbox that turns the automatic check off; that isn't built |
+| Privacy: software that collects user data and transfers it to systems the user didn't name must describe this in a privacy policy, show that policy during installation, and offer an option at install time to turn it off | No telemetry, and nothing about the user is collected. What the app learns on the computer stays there: the executable name of the app in front (kept in memory, to compare with the user's list of excluded apps), the executable names of the apps the user adds to that list and the keys of the mice the user chooses to ignore (both in `settings.json`), the daily counts in `wear.json`, which device sent each Raw Input report and when (kept in memory; no position is used), the double-click speed Test and Tune measures for each button (`double_click_ms` in `settings.json`), the names of the running programs, always read every minute and when the app is brought forward to recognise other mouse utilities (the full list stays in memory; only the names of the known utilities it finds are written to the app's local log), and, only if the user turns on the pause for full-screen games, the foreground window's size and program path (checked every two seconds) and Windows' own list of games (re-read at most once a minute), all kept in memory. The pause shortcut is registered with `RegisterHotKey` and reads no other key. The only network use is the update check and download from the project's GitHub Releases. The check is on by default; it asks GitHub for the latest release, with the app's version in its User-Agent and nothing else beyond what any web request carries (the IP address). **Check for updates automatically** (Settings › Updates on Windows, About › Software Update on macOS) turns it off (README, [Privacy](../README.md#privacy)). Be ready to argue that this isn't user data. If SignPath disagrees, the installer must show the privacy policy and offer a checkbox that turns the automatic check off; that isn't built |
 | System changes announced; an uninstaller | Start at login is off unless chosen. The installer registers an uninstaller; the portable exe is one file to delete |
 | A "Code signing policy" on the home page | **To do once accepted:** add [the section below](#the-code-signing-policy-section) to the README and the release page |
 
@@ -134,9 +135,9 @@ show it:
   ([winget](#2-winget));
 - download counts, once CI's own are taken out. CI's install tests
   downloaded the 0.2.6 and 0.5.3 installers from their release pages on every
-  run until they were cached, and the first run on each branch or tag downloads them
-  again until `main` has a run that saved the cache, so those two releases' counts
-  overstate use, and always will.
+  run until they were cached (since 2026-10-10 `main` holds the cache, and later
+  runs on any branch or tag restore it instead of downloading), so those two
+  releases' counts overstate use, and always will.
 
 Count again before applying:
 
@@ -219,14 +220,16 @@ condition most likely to stop the application.
 > - optionally (off by default) pauses while a full-screen game is in front.
 >   Every two seconds it asks `SHQueryUserNotificationState`, and reads the
 >   foreground window's size and monitor (`GetForegroundWindow`,
->   `GetWindowRect`, `MonitorFromWindow`), the path of its program
->   (`QueryFullProcessImageNameW`) and the list of games Windows keeps under
->   `HKEY_CURRENT_USER\System\GameConfigStore\Children`. Nothing is saved;
-> - once a minute, and when it is brought forward, reads the executable
->   names of the running programs (a Toolhelp snapshot) to say when a known
->   mouse utility (Logitech's, Razer's, X-Mouse Button Control or
->   DoubleClickFix) may be taking over buttons or the wheel. Only names, and
->   they are kept in memory;
+>   `GetWindowRect`, `MonitorFromWindow`) and the path of its program
+>   (`QueryFullProcessImageNameW`); the list of games Windows keeps under
+>   `HKEY_CURRENT_USER\System\GameConfigStore\Children` is re-read at most
+>   once a minute. Nothing is saved;
+> - always, once a minute and when it is brought forward, reads the
+>   executable names of the running programs (a Toolhelp snapshot) to say
+>   when a known mouse utility (Logitech's, Razer's, X-Mouse Button Control
+>   or DoubleClickFix) may be taking over buttons or the wheel. Only names;
+>   the full list stays in memory, and the names of the known utilities it
+>   finds are written to the app's local log. Nothing is sent;
 > - keeps a local wear history, `wear.json` beside the settings: for each
 >   button and day, the presses it saw, the bounces it dropped and a
 >   histogram of the bounces' gaps, plus the wheel ticks seen and
@@ -262,7 +265,7 @@ condition most likely to stop the application.
 > and approver of every signing request. GitHub account protected by
 > two-factor authentication.
 >
-> **Releases so far:** 0.2.0 to 0.5.3 (since 2026-09-19); 1.0.0 is next.
+> **Releases so far:** 0.2.0 to 1.0.1 (since 2026-09-19); 1.1.0 is next.
 > macOS builds are signed separately and aren't part of this request.
 >
 > **One question:** Inno Setup writes the installer's product name and
@@ -553,7 +556,8 @@ The listing needs:
 - Notes for certification, such as: "A tray utility. After install it
   starts in the notification area; open it from the Start menu. It filters
   mouse switch bounce with a low-level mouse hook (SetWindowsHookEx,
-  WH_MOUSE_LL) on the left, right, middle and side buttons, and can drop a
+  WH_MOUSE_LL). It filters the left button by default, and the right, middle
+  or side buttons if the user chooses. It can also drop a
   scroll-wheel tick that reverses within a short window (off by default;
   it judges only a tick that a mouse's Raw Input report carries). A button
   release it held back for that window, and the input that came meanwhile,
@@ -575,9 +579,12 @@ The listing needs:
   were pressed, and the app installs no keyboard hook and reads no other
   key. If the user turns it on, it also pauses while a full-screen game is
   in front, asking SHQueryUserNotificationState and reading the foreground
-  window's size, its program's path and Windows' own list of games every two
-  seconds, and it reads the names of running programs once a minute to say
-  when another mouse utility is running; none of this is saved or sent. It
+  window's size and its program's path every two seconds, and Windows' own
+  list of games at most once a minute; none of this is saved or sent. Whether
+  or not that is on, it reads the names of running programs once a minute to
+  say when another mouse utility is running; it keeps that list in memory,
+  writes the names of the known utilities it finds to its local log, and
+  sends nothing. It
   needs no account or network access to work; its update check, which can
   be turned off, is its only network use."
 

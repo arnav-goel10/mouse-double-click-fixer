@@ -38,18 +38,22 @@ combination with `RegisterEventHotKey` and handles the system's
 no window, on a thread of its own that waits for `WM_HOTKEY`. In both, the
 system matches the keys and tells the app only that the combination was
 pressed. The app installs no keyboard event tap or hook, asks for no Input
-Monitoring permission, and never sees any other key. If another program
-already holds the combination, the shortcut is unavailable and Copy
+Monitoring permission, and never sees keys typed into other apps (its own
+windows get keys while they are in focus). If another program already holds
+the combination (on Windows, any program that has registered it; on macOS,
+only an app that holds it exclusively), the shortcut is unavailable and Copy
 Diagnostics says so. A test (`tests/test_pause.py`) fails if anything in the
 app names a keyboard hook, a keyboard event tap, a key event monitor, raw
 keyboard input or a key-state poll.
 
-**Other mouse utilities.** Every minute, and when the app is brought forward,
-it reads the names of the running programs, to say when a mouse utility that
+**Other mouse utilities.** Always (it is not a setting), every minute and
+when the app is brought forward, it reads the names of the running programs, to say when a mouse utility that
 may take over buttons or the wheel is running: on macOS the bundle
 identifiers from `NSWorkspace` and the process names from `libproc`, on
 Windows the executable names from a Toolhelp snapshot. It reads nothing else
-about them, needs no permission for it, and changes nothing in them.
+about them, needs no permission for it, and changes nothing in them. The full
+list stays in memory; the names of the known utilities it finds go to the
+app's local log, and nothing is sent.
 
 **Full-screen games.** Only if you turn on **Pause during full-screen games**,
 the app asks every two seconds whether a game is in front. On macOS it reads
@@ -62,9 +66,9 @@ games Windows keeps under `HKEY_CURRENT_USER\System\GameConfigStore\Children`,
 at most once a minute. None of it is saved.
 
 It stores settings, which include the strength, whether the pause shortcut and
-the game pause are on, the apps you listed and the devices you chose not to
-filter; a count of the bounces it blocked; a history of daily
-counts, in `wear.json`, never the time or place of a click: for each button
+the game pause are on, the apps you listed, the devices you chose not to
+filter and the double-click speed Test and Tune measured for each button;
+a count of the bounces it blocked; a history of daily counts, in `wear.json`, never the time or place of a click: for each button
 the presses, bounces, repaired dropouts, how long after a release each bounce
 came and the filter window in use, and for the scroll wheel the notches judged
 and reversals dropped; and a log of start-up, the filter starting and
@@ -192,7 +196,8 @@ over those it never holds a release back.
   runtime and the cleared environment stop code being loaded from outside the
   app, not changes to the app itself. Notarization would close this.
 - The macOS code-signing certificate is self-signed, so macOS can't vouch for
-  the publisher, and the first launch needs **Open Anyway**.
+  the publisher, and the first launch needs **Open Anyway** (macOS 15 and later; on macOS 13 and 14,
+  Control-click the app and choose **Open**).
 
 ## Supported versions
 

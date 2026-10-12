@@ -7,8 +7,9 @@ Thanks for helping. Bug reports, fixes and improvements are all welcome.
 [Open an issue](https://github.com/arnav-goel10/mouse-double-click-fixer/issues/new/choose)
 using the bug template, and paste what **About › Troubleshooting › Copy
 Diagnostics** (Windows: **Settings › Troubleshooting › Copy diagnostics**)
-gives you: it has the app version, OS, the filter's state, the settings and
-the app's recent log. Your mouse model and what **Test and Tune** says help
+gives you: it has the app version, OS, the filter's state, the settings,
+the names of the mice it has seen and the ones you ignore, and the app's
+recent log. Your mouse model and what **Test and Tune** says help
 too. Security issues go
 through [SECURITY.md](SECURITY.md) instead.
 
@@ -74,6 +75,12 @@ Some tests touch the system on purpose, and only in CI:
   starts the real event tap, moves the pointer and posts real clicks. Never
   set it on your own computer. CI runs them on its Windows machines and on
   macOS 14 and 26.
+- `tests.test_pause.RealShortcutTests` also needs `DCF_E2E=1`: it registers
+  the real global shortcut and posts the real key combination. Never set it
+  on your own computer; CI runs it on its macOS and Windows machines.
+- The UI screenshots job (macos-26 and windows-latest, also run by the
+  release workflow) opens the real window and captures every pane; it needs
+  no flag, since it posts no input.
 - The macOS test also runs only where `GITHUB_ACTIONS=true` (CI sets it) or
   `DCF_E2E_ALLOW_LOCAL=1`; never set either on your own Mac. Asked for with
   `DCF_E2E=1` where it can't run, it fails instead of skipping.

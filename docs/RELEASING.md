@@ -416,6 +416,13 @@ workflow runs it in full before it puts up a draft:
   receive (`tests/test_macos_tap_e2e.py`, `DCF_E2E=1`).
 - **Windows hook end-to-end** sends real clicks and moves through the real
   low-level hook (`DCF_E2E=1`).
+- **The real pause shortcut** (`tests.test_pause.RealShortcutTests`, in the
+  macOS and Windows end-to-end jobs) registers the real global shortcut and
+  posts the real key combination. It runs only with `DCF_E2E=1`, which you
+  must never set on your own computer.
+- **UI screenshots** on macos-26 and windows-latest capture every pane in a
+  real window, light and dark (`tools/screenshots.py --live`). The job runs in
+  the release workflow too.
 - **Windows install, quit and update end-to-end** installs 0.2.6 and 0.5.3,
   leaves each running and installs the new build over it, opens it twice,
   quits it while it is starting, runs a full signed in-app update with CI's
