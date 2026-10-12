@@ -118,7 +118,7 @@ installer and the installed exe's self-test.
 | Manual approval of every release | Two requests per release, both approved by you |
 | Product name and version enforced by metadata restrictions | Both artifact configurations require product name "Mouse Double-Click Fixer" and the release's version |
 | Only your own code signed | Only the three files built here. The Python and Qt libraries beside the installed exe are never sent to SignPath |
-| Privacy: software that collects user data and transfers it to systems the user didn't name must describe this in a privacy policy, show that policy during installation, and offer an option at install time to turn it off | No telemetry, and nothing about the user is collected. What the app learns on the computer stays there: the executable name of the app in front (kept in memory, to compare with the user's list of excluded apps), the executable names of the apps the user adds to that list and the keys of the mice the user chooses to ignore (both in `settings.json`), the daily counts in `wear.json`, and which device sent each Raw Input report and when (kept in memory; no position is used). The only network use is the update check and download from the project's GitHub Releases. The check is on by default; it asks GitHub for the latest release, with the app's version in its User-Agent and nothing else beyond what any web request carries (the IP address). **General › Check for updates automatically** turns it off (README, [Privacy](../README.md#privacy)). Be ready to argue that this isn't user data. If SignPath disagrees, the installer must show the privacy policy and offer a checkbox that turns the automatic check off; that isn't built |
+| Privacy: software that collects user data and transfers it to systems the user didn't name must describe this in a privacy policy, show that policy during installation, and offer an option at install time to turn it off | No telemetry, and nothing about the user is collected. What the app learns on the computer stays there: the executable name of the app in front (kept in memory, to compare with the user's list of excluded apps), the executable names of the apps the user adds to that list and the keys of the mice the user chooses to ignore (both in `settings.json`), the daily counts in `wear.json`, which device sent each Raw Input report and when (kept in memory; no position is used), the names of the running programs, read once a minute to recognise other mouse utilities, and, only if the user turns on the pause for full-screen games, the foreground window's size and program path and Windows' own list of games (kept in memory). The pause shortcut is registered with `RegisterHotKey` and reads no other key. The only network use is the update check and download from the project's GitHub Releases. The check is on by default; it asks GitHub for the latest release, with the app's version in its User-Agent and nothing else beyond what any web request carries (the IP address). **Check for updates automatically** (Settings › Updates on Windows, About › Software Update on macOS) turns it off (README, [Privacy](../README.md#privacy)). Be ready to argue that this isn't user data. If SignPath disagrees, the installer must show the privacy policy and offer a checkbox that turns the automatic check off; that isn't built |
 | System changes announced; an uninstaller | Start at login is off unless chosen. The installer registers an uninstaller; the portable exe is one file to delete |
 | A "Code signing policy" on the home page | **To do once accepted:** add [the section below](#the-code-signing-policy-section) to the README and the release page |
 
@@ -211,6 +211,22 @@ condition most likely to stop the application.
 >   name of the foreground window's process and compares it with that list;
 >   the name is kept in memory only. The picker for that list shows the
 >   programs that have a window open;
+> - pauses when asked: a "Pause for 15 minutes" item in its tray menu, and
+>   a global shortcut, Ctrl+Alt+Shift+P (on unless the user turns it off),
+>   registered with `RegisterHotKey` with no window, by a thread of its own
+>   that waits for `WM_HOTKEY`. Windows tells the app only that those keys
+>   were pressed. It installs no keyboard hook and reads no other key;
+> - optionally (off by default) pauses while a full-screen game is in front.
+>   Every two seconds it asks `SHQueryUserNotificationState`, and reads the
+>   foreground window's size and monitor (`GetForegroundWindow`,
+>   `GetWindowRect`, `MonitorFromWindow`), the path of its program
+>   (`QueryFullProcessImageNameW`) and the list of games Windows keeps under
+>   `HKEY_CURRENT_USER\System\GameConfigStore\Children`. Nothing is saved;
+> - once a minute, and when it is brought forward, reads the executable
+>   names of the running programs (a Toolhelp snapshot) to say when a known
+>   mouse utility (Logitech's, Razer's, X-Mouse Button Control or
+>   DoubleClickFix) may be taking over buttons or the wheel. Only names, and
+>   they are kept in memory;
 > - keeps a local wear history, `wear.json` beside the settings: for each
 >   button and day, the presses it saw, the bounces it dropped and a
 >   histogram of the bounces' gaps, plus the wheel ticks seen and
@@ -554,8 +570,16 @@ The listing needs:
   program's executable name with the user's list; the name is kept in
   memory only. It keeps daily counts of presses, bounces and wheel ticks
   in wear.json in its settings folder, which is never sent anywhere. It
-  reads no keyboard input and needs no account or network access to work;
-  its update check, which can be turned off, is its only network use."
+  has one global shortcut, Ctrl+Alt+Shift+P, which pauses filtering; it is
+  registered with RegisterHotKey, which tells the app only that those keys
+  were pressed, and the app installs no keyboard hook and reads no other
+  key. If the user turns it on, it also pauses while a full-screen game is
+  in front, asking SHQueryUserNotificationState and reading the foreground
+  window's size, its program's path and Windows' own list of games every two
+  seconds, and it reads the names of running programs once a minute to say
+  when another mouse utility is running; none of this is saved or sent. It
+  needs no account or network access to work; its update check, which can
+  be turned off, is its only network use."
 
 Copies installed from the Store update themselves through the app's own
 updater, like any installed copy. Each new release also needs a Partner
