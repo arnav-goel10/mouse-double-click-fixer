@@ -8,14 +8,15 @@ low-level mouse hook on Windows.
 
 - **macOS:** the event tap asks for mouse button events and pointer movement,
   through one tap so they stay in order, and for scroll-wheel events only
-  while the scroll-wheel fix is on. It never asks for keystrokes. macOS
-  allows such a tap only for apps the user has allowed under **Privacy &
-  Security › Device Control and Data Access** (**Accessibility** on macOS 26
-  and earlier).
+  while the scroll-wheel fix is on. It never asks for keystrokes (the pause
+  shortcut is separate; see below). macOS allows such a tap only for apps the
+  user has allowed under **Privacy & Security › Device Control and Data
+  Access** (**Accessibility** on macOS 26 and earlier).
 - **Windows:** a low-level mouse hook is given every mouse event and nothing
-  from the keyboard. The app acts on button events, looks at wheel notches
-  only while the scroll-wheel fix is on, and looks at pointer movement only
-  while it is holding a release back or re-sending input. To learn which
+  from the keyboard (the pause shortcut is separate; see below). The app acts
+  on button events, looks at wheel notches only while the scroll-wheel fix is
+  on, and looks at pointer movement only while it is holding a release back or
+  re-sending input. To learn which
   device a click or wheel notch came from, it also takes Raw Input from mice,
   precision touchpads and touchscreens, never keyboards. Windows hands the app
   every report from those devices, pointer movement included, whether or not
@@ -30,14 +31,50 @@ macOS, its program's file name on Windows), and the apps that are running when
 you open the add menu. To tell your pointing devices apart it reads each one's
 name, vendor and product IDs and serial number, on macOS through IOKit.
 
-It stores settings, which include the apps you listed and the devices you
-chose not to filter; a count of the bounces it blocked; a history of daily
-counts, in `wear.json`, never the time or place of a click: for each button
+**The pause shortcut** (⌃⌥⌘P on macOS, Ctrl+Alt+Shift+P on Windows, on unless
+turned off) does not read the keyboard. On macOS the app registers the
+combination with `RegisterEventHotKey` and handles the system's
+`kEventHotKeyPressed` event for it; on Windows it calls `RegisterHotKey`, with
+no window, on a thread of its own that waits for `WM_HOTKEY`. In both, the
+system matches the keys and tells the app only that the combination was
+pressed. The app installs no keyboard event tap or hook, asks for no Input
+Monitoring permission, and never sees keys typed into other apps (its own
+windows get keys while they are in focus). If another program already holds
+the combination (on Windows, any program that has registered it; on macOS,
+only an app that holds it exclusively), the shortcut is unavailable and Copy
+Diagnostics says so. A test (`tests/test_pause.py`) fails if anything in the
+app names a keyboard hook, a keyboard event tap, a key event monitor, raw
+keyboard input or a key-state poll.
+
+**Other mouse utilities.** Always (it is not a setting), every minute and
+when the app is brought forward, it reads the names of the running programs, to say when a mouse utility that
+may take over buttons or the wheel is running: on macOS the bundle
+identifiers from `NSWorkspace` and the process names from `libproc`, on
+Windows the executable names from a Toolhelp snapshot. It reads nothing else
+about them, needs no permission for it, and changes nothing in them. The full
+list stays in memory; the names of the known utilities it finds go to the
+app's local log, and nothing is sent.
+
+**Full-screen games.** Only if you turn on **Pause during full-screen games**,
+the app asks every two seconds whether a game is in front. On macOS it reads
+the front app's `Info.plist` category (or Game Mode key) and the bounds of its
+on-screen windows from `CGWindowListCopyWindowInfo`, which needs no permission;
+window titles and contents are not read. On Windows it reads the front window's
+bounds and monitor, asks `SHQueryUserNotificationState`, reads the path of the
+front window's program (`QueryFullProcessImageNameW`), and reads the list of
+games Windows keeps under `HKEY_CURRENT_USER\System\GameConfigStore\Children`,
+at most once a minute. None of it is saved.
+
+It stores settings, which include the strength, whether the pause shortcut and
+the game pause are on, the apps you listed, the devices you chose not to
+filter and the double-click speed Test and Tune measured for each button;
+a count of the bounces it blocked; a history of daily counts, in `wear.json`, never the time or place of a click: for each button
 the presses, bounces, repaired dropouts, how long after a release each bounce
 came and the filter window in use, and for the scroll wheel the notches judged
 and reversals dropped; and a log of start-up, the filter starting and
-stopping, permission changes, waking from sleep and switching users, the TLS
-library in use, failures and updates, never clicks. It sends no telemetry. Its
+stopping, pauses, whether the pause shortcut registered, the other mouse
+utilities found, permission changes, waking from sleep and switching users,
+the TLS library in use, failures and updates, never clicks. It sends no telemetry. Its
 only network use is the update check to this repository's GitHub releases and
 downloading an update from there; turning off **Check for updates
 automatically** stops the background checks.
@@ -64,7 +101,8 @@ and `SHA256SUMS.txt.minisig` and checks that:
   so a signed older release can't be passed off under a newer tag;
 - that version is newer than the one running.
 
-A release that fails is never downloaded, and General says why. The download
+A release that fails is never downloaded, and the About pane (Windows:
+Settings) says why. The download
 itself must then match the signed checksum. On macOS the unpacked app must
 also carry a valid code signature, report the release's version, and have the
 same designated requirement as the installed app: that is what macOS ties the
@@ -158,7 +196,8 @@ over those it never holds a release back.
   runtime and the cleared environment stop code being loaded from outside the
   app, not changes to the app itself. Notarization would close this.
 - The macOS code-signing certificate is self-signed, so macOS can't vouch for
-  the publisher, and the first launch needs **Open Anyway**.
+  the publisher, and the first launch needs **Open Anyway** (macOS 15 and later; on macOS 13 and 14,
+  Control-click the app and choose **Open**).
 
 ## Supported versions
 

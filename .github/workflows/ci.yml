@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, modern-ui]
+    branches: [main]
   pull_request:
   workflow_dispatch:
     inputs:
@@ -93,6 +93,12 @@ jobs:
         run: python -m unittest tests.test_macos_tap_e2e -v
         env:
           DCF_E2E: "1"
+      - name: Press the real pause shortcut
+        # Carbon's hot key, registered for real, and the keys posted: the
+        # system hands the app the one combination, with no keyboard tap.
+        run: python -m unittest tests.test_pause.RealShortcutTests -v
+        env:
+          DCF_E2E: "1"
 
   windows-hook:
     if: ${{ !inputs.screenshots_only }}
@@ -109,6 +115,12 @@ jobs:
           python -m pip install --require-hashes --only-binary :all: -r requirements-build.txt
       - name: Inject clicks through the real low-level hook
         run: python -m unittest tests.test_windows_hook -v
+        env:
+          DCF_E2E: "1"
+      - name: Press the real pause shortcut
+        # RegisterHotKey for real, and the keys sent with SendInput: WM_HOTKEY
+        # arrives, with no keyboard hook.
+        run: python -m unittest tests.test_pause.RealShortcutTests -v
         env:
           DCF_E2E: "1"
 

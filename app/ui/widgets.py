@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
     QAbstractButton,
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QComboBox,
     QFrame,
     QHBoxLayout,
@@ -409,6 +410,56 @@ class Row(QWidget):
         self.setMinimumHeight(lk.row_height if text else (36 if IS_MAC else 52))
 
 
+class CheckRow(QWidget):
+    """A checkbox row: the box and its label leading, with an optional line
+    of detail under the label and a value or control trailing
+    ("Calibrated"), as one line of a grouped box (macOS) or a card
+    (Windows)."""
+
+    def __init__(
+        self,
+        text: str,
+        accessible_name: str = "",
+        value: str = "",
+        trailing: Optional[QWidget] = None,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setMinimumHeight(36 if IS_MAC else 48)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(12, 6, 12, 6) if IS_MAC else layout.setContentsMargins(16, 8, 16, 8)
+        layout.setSpacing(10 if IS_MAC else 14)
+        self.separator_inset = 12
+        column = QVBoxLayout()
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(1)
+        self.check = QCheckBox(text)
+        if accessible_name:
+            self.check.setAccessibleName(accessible_name)
+        column.addWidget(self.check)
+        self.detail = TextLabel("", "caption", "secondary")
+        self.detail.setWordWrap(True)
+        # Under the label, past the box.
+        self.detail.setContentsMargins(22 if IS_MAC else 28, 0, 0, 0)
+        self.detail.setVisible(False)
+        column.addWidget(self.detail)
+        layout.addLayout(column, 1)
+        self.value = ValueLabel(value)
+        self.value.setVisible(bool(value))
+        layout.addWidget(self.value, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.trailing = trailing
+        if trailing is not None:
+            layout.addWidget(trailing, 0, Qt.AlignmentFlag.AlignVCenter)
+
+    def set_value(self, text: str) -> None:
+        self.value.setText(text)
+        self.value.setVisible(bool(text))
+
+    def set_detail(self, text: str) -> None:
+        self.detail.setText(text)
+        self.detail.setVisible(bool(text))
+
+
 class ValueLabel(TextLabel):
     """Right-aligned secondary text, as used for read-only values in a row."""
 
@@ -578,6 +629,17 @@ class Sidebar(QListWidget):
             finally:
                 self._emit = True
 
+    def clear_current(self) -> None:
+        """Select nothing, without a signal: the other list of a navigation
+        pane holds the current page."""
+        self._emit = False
+        try:
+            self.clearSelection()
+            self.setCurrentRow(-1)
+        finally:
+            self._emit = True
+        self.viewport().update()
+
     def set_window_active(self, active: bool) -> None:
         """macOS greys the icons of a window in the background."""
         self.window_active = active
@@ -680,6 +742,8 @@ class ClickPad(QWidget):
     def set_text(self, headline: str, caption: str) -> None:
         self._headline = headline
         self._caption = caption
+        # What the pad asks for, for VoiceOver and Narrator too.
+        self.setAccessibleDescription(f"{headline}. {caption}".strip(". ") if caption else headline)
         self.update()
 
     def reset(self) -> None:
@@ -762,73 +826,3 @@ class ClickPad(QWidget):
         if self._caption:
             painter.setFont(font("caption"))
             painter.drawText(rect.adjusted(0, 24, 0, 24), Qt.AlignmentFlag.AlignCenter, self._caption)
-
-
-class GapTimeline(QWidget):
-    """Recent release-to-press gaps, newest on the right."""
-
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
-        super().__init__(parent)
-        self._gaps: list[tuple[float, bool]] = []
-        self._threshold = 60.0
-        self.setMinimumHeight(96)
-        self.setMaximumHeight(120)
-        self.setAccessibleName("Recent click gaps")
-
-    def set_threshold(self, threshold_ms: float) -> None:
-        self._threshold = float(threshold_ms)
-        self.update()
-
-    def add(self, gap_ms: float, bounce: bool) -> None:
-        self._gaps.append((float(gap_ms), bool(bounce)))
-        del self._gaps[:-48]
-        self.update()
-
-    def clear(self) -> None:
-        self._gaps.clear()
-        self.update()
-
-    def paintEvent(self, _event) -> None:  # noqa: N802
-        lk = look()
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setFont(font("caption"))
-        width = float(self.width())
-        baseline = self.height() - 8.0
-        top = 10.0
-
-        if not self._gaps:
-            painter.setPen(lk.secondary)
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "No clicks yet")
-            return
-
-        label = f"{self._threshold:.0f} ms"
-        label_width = painter.fontMetrics().horizontalAdvance(label) + 10
-        plot_width = width - label_width
-        ceiling = max(self._threshold * 4, max(gap for gap, _ in self._gaps), 120.0)
-
-        def y_for(value: float) -> float:
-            return baseline - (min(value, ceiling) / ceiling) ** 0.5 * (baseline - top)
-
-        threshold_y = y_for(self._threshold)
-        pen = QPen(with_alpha(lk.accent, 0.9), 1, Qt.PenStyle.DashLine)
-        pen.setDashPattern([3, 3])
-        painter.setPen(pen)
-        painter.drawLine(QPointF(0, threshold_y), QPointF(plot_width - 4, threshold_y))
-        painter.setPen(lk.secondary)
-        painter.drawText(
-            QRectF(plot_width, threshold_y - 8, label_width, 16),
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-            label,
-        )
-
-        slot = plot_width / 48
-        bar = max(3.0, min(slot * 0.55, 8.0))
-        painter.setPen(Qt.PenStyle.NoPen)
-        for index, (gap, bounce) in enumerate(reversed(self._gaps)):
-            x = plot_width - 4 - (index + 1) * slot + (slot - bar) / 2
-            if x < 0:
-                break
-            y = min(y_for(gap), baseline - 3)
-            painter.setBrush(lk.red if bounce else with_alpha(lk.green, 0.9))
-            painter.drawRoundedRect(QRectF(x, y, bar, baseline - y), bar / 2, bar / 2)

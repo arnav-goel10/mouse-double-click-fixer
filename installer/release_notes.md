@@ -7,7 +7,7 @@
 
 __UPDATES__
 
-**First launch on macOS.** Open the app from Applications. On macOS 15 and later, macOS says it can't verify it: choose **Done**, then **Open Anyway** in **System Settings › Privacy & Security**, and confirm. On macOS 13 and 14, Control-click the app and choose **Open**. When you turn on Bounce Filter, allow the app under **Privacy & Security › Device Control and Data Access** (**Accessibility** on macOS 26 and earlier).
+**First launch on macOS.** Open the app from Applications. On macOS 15 and later, macOS says it can't verify it: choose **Done**, then **Open Anyway** in **System Settings › Privacy & Security**, and confirm. On macOS 13 and 14, Control-click the app and choose **Open**. The first window explains the permission; choose **Continue**, then allow the app under **Privacy & Security › Device Control and Data Access** (**Accessibility** on macOS 26 and earlier).
 
 **First launch on Windows.** If SmartScreen appears, choose **More info › Run anyway**. Smart App Control, where it is on, blocks unsigned apps with no way to run them anyway; see [Installation](https://github.com/__REPO__/blob/main/docs/INSTALLATION.md#smart-app-control).
 

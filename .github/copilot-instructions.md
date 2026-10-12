@@ -26,6 +26,17 @@
   no UI calls. Windows silently drops a low-level hook that takes too long, and
   macOS disables a slow tap. Log through `logging` (written from a queue),
   never per click. On Windows, never send input from the hook's own thread.
+- The interface (1.1): on macOS a menu bar menu (status line, Filter Bounce,
+  Pause for 15 Minutes, Test and Tune…, Settings…, Quit) and a Settings
+  window with toolbar panes General, Exceptions, History and About; on Windows
+  a tray flyout and right-click menu and a window with navigation Home,
+  Exceptions, History and Settings. Windows wording is sentence case. The
+  shared wording lives in `app/ui/menus.py`.
+- Never add a keyboard hook, a keyboard event tap or a key poll. The pause
+  shortcut uses `RegisterEventHotKey` (macOS) and `RegisterHotKey` (Windows),
+  which tell the app only when that one combination is pressed; the README's
+  privacy text rests on it, and `tests/test_pause.py` checks it. A pause lives
+  in memory only and never survives a restart.
 - Filtering is defined by the gap between a release and the next press. Do not
   reintroduce press-to-press timing; it cannot separate bounce from a fast
   double-click.

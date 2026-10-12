@@ -36,6 +36,22 @@ SYMBOLS = {
     "copy": ("doc.on.clipboard", "", "#8e8e93"),
     "info": ("info.circle", "\ue946", "#8e8e93"),
     "wheel": ("scroll", "\uec8f", "#8e8e93"),
+    # 1.1: the panes and the controls they add.
+    "home": ("house", "\ue80f", "#0a84ff"),
+    "exceptions": ("hand.raised", "\ue733", "#ff9500"),
+    "about": ("info.circle", "\ue946", "#8e8e93"),
+    "settings": ("gearshape", "\ue713", "#8e8e93"),
+    "pause": ("pause.circle", "\ue769", "#8e8e93"),
+    "keyboard": ("keyboard", "\ue765", "#8e8e93"),
+    "game": ("gamecontroller", "\ue7fc", "#8e8e93"),
+    "privacy": ("lock", "\ue72e", "#8e8e93"),
+    "reset": ("arrow.counterclockwise", "\ue777", "#8e8e93"),
+    "tune": ("slider.horizontal.3", "\ue9e9", "#8e8e93"),
+    "pin": ("pin", "\ue718", "#8e8e93"),
+    "chevron_down": ("chevron.down", "\ue70d", "#8e8e93"),
+    "chevron_up": ("chevron.up", "\ue70e", "#8e8e93"),
+    "close": ("xmark", "\ue711", "#8e8e93"),
+    "download": ("arrow.down.circle", "\ue896", "#8e8e93"),
 }
 
 

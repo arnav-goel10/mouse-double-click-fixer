@@ -1,5 +1,124 @@
 # Changelog
 
+## 1.1.0 — 2026-10-12
+
+### Redesign
+
+- **A simpler layout on both systems.** Most people need one thing: the filter
+  on, and a way to know it works. That is now the first thing on screen, and
+  the rest is one level down. The filter itself and its timing are
+  unchanged, and your settings carry over.
+- **macOS: the menu bar icon opens a menu.** From the top: a status line
+  ("Filtering · 1,981 bounces blocked"), **Filter Bounce** with a checkmark,
+  **Pause for 15 Minutes** (**Resume** while paused), **Test and Tune…**,
+  **Settings…** (⌘,) and **Quit Mouse Double-Click Fixer**. The menu no longer
+  has update items; updates are under **About**, and **Check for Updates…**
+  stays in the app's own menu.
+- **macOS: Settings has four panes in a toolbar.** **General** (the filter's
+  switch and status, **Buttons**, **Strength**, **Test and Tune…**, **Other
+  Fixes**, the pause shortcut, **Open at login**, **Show in menu bar**),
+  **Exceptions** (**Apps**, **Games**, **Devices**), **History** and
+  **About** (updates, **Copy Diagnostics**, the blocked count, privacy,
+  **Acknowledgements…**). The window is titled with the pane, sized to it, and
+  opens on the pane you last used.
+- **macOS: a Dock menu** with the same actions as the menu bar menu. If you
+  hide the menu bar icon with **Show in menu bar**, the Dock icon stays, and opening the app again opens Settings.
+- **macOS: a first-run window.** It explains the permission in a few words,
+  has one **Continue** button that brings up macOS's own request, then shows
+  "Waiting for permission…" and "Ready", and offers **Test and Tune…**.
+- **Windows: the notification area icon has a flyout and a short menu.** A left
+  click opens a flyout with the status, the **Bounce filter** switch and
+  **Open**; it closes when you click elsewhere. A right click opens **Open**,
+  **Pause for 15 minutes** (**Resume** while paused), **Start with Windows**
+  and **Exit**. The tooltip reads "Mouse Double-Click Fixer: on". The menu no
+  longer has update items; updates are under **Settings**.
+- **Windows: the window has navigation on the left.** **Home** (the switch and
+  status, **Test and tune**, **Buttons**, **Strength**, **Other fixes**),
+  **Exceptions** (**Apps**, **Games**, **Devices**), **History**, and
+  **Settings** at the bottom (**Start with Windows**, pause shortcut, updates,
+  **Copy diagnostics**, the blocked count, about and **Acknowledgements…**).
+  Changes apply as you make them. The first time, a note on **Home** says how
+  to pin the icon next to the clock.
+- **The Test and Calibrate panes are now one task, Test and Tune.** See New.
+- **Each button's filter window moved.** A button is now a checkbox under
+  **Buttons**, marked **Calibrated** once Test and Tune has measured it. The
+  windows themselves are under **Strength**. Nothing about a window changes
+  when you update: every window you had is kept (see Strength below).
+- **Apps and Devices are now halves of Exceptions**, with the new **Games**
+  switch between them. Updates, **Copy Diagnostics**, the blocked count and
+  **Acknowledgements…** are under **About** (Windows: **Settings**).
+
+### New
+
+- **Strength: Automatic or Custom.** **Automatic** uses what Test and Tune
+  measured for each button, or 46 ms where it hasn't measured one. **Custom**
+  shows a window for each filtered button, in milliseconds, for you to set.
+  Each keeps its own windows, so switching back finds them as you left them.
+  From 1.0, you start in Custom only if a button you filter has a window you
+  set by hand; otherwise in Automatic. Every window is kept either way.
+- **Test and Tune.** One window (macOS) or dialog (Windows), opened from the
+  menu bar menu, **General** (**Home**) or the first-run window. Step 1: click
+  a pad, once at a time and then in double-clicks, for any of the five
+  buttons. Step 2: a verdict in plain words, "Your left button double-clicks
+  on its own" or "No bounce seen", with your fastest double-click, what the
+  filter has caught in everyday use, and any other mouse utility that may be
+  in the way. Step 3: choose a window (a recommended one is marked) and try it
+  on a second pad. **Apply** sets that button's window, marks it
+  **Calibrated** and starts filtering it. Filtering pauses only while step 1
+  is measuring with its window in front.
+- **Pause for 15 minutes.** From the menu bar menu and Dock menu (macOS) or the
+  notification area icon's right-click menu (Windows), or with a shortcut,
+  ⌃⌥⌘P on macOS and Ctrl+Alt+Shift+P on Windows, which also resumes. The
+  status line says when it ends. A pause is not saved: quitting or restarting
+  ends it. The shortcut can be turned off (**General › Pause shortcut** on
+  macOS, **Settings › Pausing** on Windows). It reads no keystrokes: the app
+  asks the system to say when that one combination is pressed
+  (`RegisterEventHotKey` on macOS, `RegisterHotKey` on Windows), installs no
+  keyboard hook or tap, and macOS needs no Input Monitoring permission for it.
+- **Pause during full-screen games**, under **Exceptions › Games**. Off by
+  default. Every two seconds it asks whether a full-screen game is in front;
+  if so, the filter stops, and it starts again when the game leaves the front.
+  **Resume** puts it back sooner. On macOS a game is a front app whose bundle
+  says it is one (a Games category or a Game Mode request) with a window that
+  covers a display. On Windows it is a full-screen exclusive Direct3D app, or
+  a window that covers its monitor and either Windows says a full-screen app
+  is running or the program is on Windows' own list of games; browsers, video
+  players, slide shows, meetings, remote desktop and virtual machine windows
+  and Windows' own screens never count. It can miss a game or take another
+  full-screen program for one, and it is not a promise that a game's
+  anti-cheat accepts the app.
+- **A health check in History.** The top of **History** says in plain words
+  whether your mouse is bouncing ("Your left button double-clicks on its own:
+  caught 14 of 14", or "No bounce seen"). The count is of bounces the filter
+  caught. When a button's recent bounces come close to its window, History
+  suggests a longer one ("Raise the left button to 64 ms?") with an **Apply**
+  button. It never goes above half your fastest double-click as Test and Tune
+  measured it (60 ms if it hasn't measured one), and changes nothing until you choose **Apply**.
+- **Notes about other mouse utilities.** If Logi Options+, Logitech Options,
+  Logitech G HUB, Razer Synapse, Mac Mouse Fix, SteerMouse, LinearMouse,
+  BetterMouse, X-Mouse Button Control or DoubleClickFix is running, the app
+  says so on **General** (**Home**), in Test and Tune, in History and in Copy
+  Diagnostics, and says what that utility may take over (side buttons, the
+  middle button, the wheel, or clicks). It reads only the names of running
+  programs, once a minute and when you bring the app forward, and changes
+  nothing in the other utility.
+- **A plain status line.** The main window and the Windows tray flyout say
+  what the filter has done today, for example "Your left button bounced 14
+  times today. Every bounce was caught." or "No extra clicks seen yet."
+- **Copy Diagnostics** now also says whether a pause is on, the state of the
+  pause shortcut and of the game pause, the strength, and any other mouse
+  utility found.
+- **A new small file, `window.json`,** beside the settings remembers which
+  Settings pane you last had open on macOS. Uninstalling removes it with the
+  rest of the folder.
+
+### Fixes
+
+- **macOS: a hidden menu bar icon no longer leaves the app out of reach.**
+  Closing the window used to remove the Dock icon whether or not the menu bar
+  icon was showing. Now, with the menu bar icon hidden, the Dock icon stays,
+  and its menu has the menu bar menu's actions.
+
 ## 1.0.1 — 2026-10-12
 
 - **Windows: the pointer no longer moves like a slide show after a click.**

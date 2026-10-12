@@ -15,14 +15,18 @@ Requires macOS 13 Ventura or later on an Apple silicon Mac (M1 or newer).
      you tried to open the app; if it's gone, open the app again first.
    - **macOS 13 and 14:** Control-click (or right-click) the app in
      Applications, choose **Open**, then **Open** again.
-4. Turn on **Bounce Filter**. macOS asks for permission: choose **Open System
-   Settings** and switch **Mouse Double-Click Fixer** on under **Privacy &
-   Security › Device Control and Data Access** (on macOS 26 and earlier the
-   list is called **Accessibility**). The app notices within a second and
-   starts filtering.
+4. The first window explains why the app needs permission. Choose
+   **Continue**. macOS asks: choose **Open System Settings** and switch
+   **Mouse Double-Click Fixer** on under **Privacy & Security › Device
+   Control and Data Access** (on macOS 26 and earlier the list is called
+   **Accessibility**). The window notices within a second, says **Bounce
+   Filter is on** and starts filtering. It then offers **Test and Tune…**
+   (see [Getting started](GETTING_STARTED.md#2-test-and-tune)).
 
 Mouse Double-Click Fixer is a menu bar app: with its window closed it has no
-Dock icon and runs from the mouse icon in the menu bar. Once the installed app
+Dock icon and runs from the mouse icon in the menu bar, which opens a menu
+(**Filter Bounce**, **Pause for 15 Minutes**, **Test and Tune…**,
+**Settings…**, **Quit Mouse Double-Click Fixer**). While Settings is open it has a Dock icon too. Once the installed app
 starts, it ejects the installer disk image and moves it to the Trash if it is
 in Downloads.
 
@@ -39,10 +43,13 @@ Requires 64-bit (x64) Windows 10 version 1809 or later, or Windows 11.
    **More info › Run anyway**.
 2. Choose whether to start Mouse Double-Click Fixer when you sign in, and
    whether to add a desktop shortcut.
-3. Open it from the Start menu and turn on **Bounce Filter**.
+3. Open it from the Start menu and turn on **Bounce filter** on **Home**.
 
 With the window closed, the app runs from its icon in the notification area
-(it may be under the **^** overflow arrow).
+(it may be under the **^** overflow arrow; drag it next to the clock to keep
+it in view). Left-click the icon for a small flyout with the **Bounce filter**
+switch and **Open**; right-click it for **Open**, **Pause for 15 minutes**,
+**Start with Windows** and **Exit**.
 
 The [portable DoubleClickFixer.exe](https://github.com/arnav-goel10/mouse-double-click-fixer/releases/latest/download/DoubleClickFixer.exe)
 is the same app without an installer. It unpacks itself each time it starts,
@@ -62,11 +69,13 @@ Windows.
 
 ## Updates
 
-With **General › Check for updates automatically** on, the app looks for a new
+With **Check for updates automatically** on (**About › Software Update** on
+macOS, **Settings › Updates** on Windows), the app looks for a new
 release 20 seconds after it starts and every six hours. With **Install
 updates automatically** on as well, it downloads the update, verifies it,
 installs it and reopens itself, usually within a few seconds. If its window
-is open, it waits and installs when you close it; **Restart Now** (Windows:
+is open, or Test and Tune is measuring, it waits and installs once the
+window is closed and the measuring is over; **Restart Now** (Windows:
 **Restart now**) installs it straight away. On macOS the permission carries
 over.
 
@@ -86,8 +95,9 @@ release's checksums (on macOS, plus the code-signature check) for the update
 that brings them to 1.0.
 
 To update by hand, turn off **Install updates automatically** and use
-**Check Now** (Windows: **Check now**), or choose **Check for Updates…**
-(Windows: **Check for updates…**) in the menu bar or notification area menu.
+**Check Now** (Windows: **Check now**) in the same place. On macOS, **Check for
+Updates…** in the app menu (the menu named for the app, in the menu bar while
+Settings is open) does the same.
 
 Going back to 0.5.3 works, with two losses. It has one window for every button
 and takes the left button's. It doesn't know the back and forward buttons, so
@@ -96,8 +106,8 @@ rest of its settings again.
 
 ## Uninstall
 
-- **macOS:** turn off **General › Open at login**, quit the app from its menu
-  bar icon, then drag it from Applications to the Trash (a copy updated from
+- **macOS:** turn off **General › Open at login**, quit the app with **Quit
+  Mouse Double-Click Fixer** in its menu bar icon's menu, then drag it from Applications to the Trash (a copy updated from
   0.5.3 or earlier may still be called DoubleClick Fixer there). Remove **Mouse
   Double-Click Fixer** from **Privacy & Security › Device Control and Data
   Access** (**Accessibility** on macOS 26 and earlier) with the **−** button.
@@ -110,8 +120,9 @@ rest of its settings again.
 - **Windows:** **Settings › Apps › Installed apps › Mouse Double-Click Fixer ›
   Uninstall**. This closes the app if it is running, then removes it, its
   shortcuts, the startup entry, its settings, history and log. For the
-  portable exe, turn off **General › Open at login** if you turned it on, then
-  choose **Exit** from its notification area icon, then delete the file and
+  portable exe, turn off **Settings › Startup › Start with Windows** if you
+  turned it on, then choose **Exit** from its notification area icon's
+  right-click menu, then delete the file and
   `%APPDATA%\DoubleClickFixer`.
 
 ## From source

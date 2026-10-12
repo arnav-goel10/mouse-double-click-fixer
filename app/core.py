@@ -448,6 +448,15 @@ class Suggestion:
     headroom_ms: float
     confident: bool
     summary: str
+    #: Said plainly under the verdict when History moved the recommendation
+    #: (health.refine_calibration); empty when it did not.
+    note: str = ""
+
+
+def window_ceiling_ms(fastest_double_click_ms: float) -> float:
+    """The longest window that stays clear of the user's own double-clicks:
+    half the fastest one measured, never under the shortest window."""
+    return max(MIN_THRESHOLD_MS, math.floor(fastest_double_click_ms * DOUBLE_CLICK_SAFETY_RATIO))
 
 
 class Calibrator:
@@ -510,7 +519,7 @@ class Calibrator:
 
         fastest_double = min(self.double_gaps_ms)
         # Never allow a threshold that could eat the user's own double-click.
-        ceiling = max(MIN_THRESHOLD_MS, fastest_double * DOUBLE_CLICK_SAFETY_RATIO)
+        ceiling = window_ceiling_ms(fastest_double)
         worst_bounce = max(self.single_gaps_ms) if self.single_gaps_ms else None
 
         if worst_bounce is None:

@@ -17,10 +17,10 @@ from PySide6.QtWidgets import QApplication, QMenuBar, QMessageBox, QSystemTrayIc
 from . import DISPLAY_NAME, __version__, diagnostics
 from .controller import AppController
 from .updater import Updater
-from .ui import dock, icons
+from .ui import dock, first_run, icons
 from .ui import tray as tray_module
 from .ui.theme import application_font
-from .ui.window import MainWindow
+from .ui.window import MainWindow, updates_page_key
 
 # A suffix only the test suite sets (tests/_isolation.py), so tests can never
 # reach, or quit, a copy of the app that is running for real.
@@ -263,22 +263,34 @@ class Application:
         self.window = MainWindow(self.controller, self.updater)
         self.updater.window_visible = self.window.isVisible
         self.updater.quit_requested.connect(self.quit)
+        self.first_run: Optional[first_run.FirstRunWindow] = None
         self.tray = None
         if QSystemTrayIcon.isSystemTrayAvailable():
             self.tray = tray_module.create(
                 self.controller,
                 on_open=self.show_window,
-                on_calibrate=self.show_calibration,
+                on_settings=self.show_window,
+                on_tune=self.show_tune,
                 on_quit=self.quit,
                 on_toggle=self.window.request_filter,
-                updater=self.updater,
-                on_check_updates=self.check_for_updates,
-                on_install_update=self.install_update,
                 parent=self.window,
             )
-            self.tray.show()
+            if platform.system() != "Darwin":
+                # macOS restores the item, shown or hidden as the user left
+                # it (Settings › Show in menu bar), under its autosave name.
+                self.tray.show()
+        self.dock_menu = None
+        if platform.system() == "Darwin":
+            from .ui.menu_bar_mac import DockMenu
+
+            self.dock_menu = DockMenu(
+                self.controller, on_settings=self.show_window, on_tune=self.show_tune,
+                on_toggle=self.window.request_filter,
+            )
+        self.window.menu_bar_toggled.connect(self._show_in_menu_bar)
 
         self.window.closed_to_tray.connect(self._note_hidden)
+        self.window.tune.closed.connect(self._window_closed)
         # A background update waits while the window is open; closing it is
         # the moment to finish.
         self.window.closed_to_tray.connect(self.updater.apply_if_ready)
@@ -336,25 +348,33 @@ class Application:
         settings = QAction("Settings…", menu)
         settings.setMenuRole(QAction.MenuRole.PreferencesRole)
         settings.setShortcut(QKeySequence.StandardKey.Preferences)
-        settings.triggered.connect(lambda: (self.show_window(), self.window.show_page("general")))
+        settings.triggered.connect(self.show_window)
         quit_action = QAction(f"Quit {DISPLAY_NAME}", menu)
         quit_action.setMenuRole(QAction.MenuRole.QuitRole)
         quit_action.triggered.connect(self.quit)
         menu.addActions([about, updates, settings, quit_action])
-        # The standard Window menu: Minimize (⌘M) and Zoom, as in every Mac app.
+        # The standard Window menu: Minimize (⌘M) and Zoom, as in every Mac
+        # app, for whichever window is in front (Settings or Test and Tune).
         window_menu = bar.addMenu("Window")
         minimize = QAction("Minimize", window_menu)
         minimize.setShortcut(QKeySequence("Ctrl+M"))  # Qt's Ctrl is ⌘ on macOS
-        minimize.triggered.connect(self.window.showMinimized)
+        minimize.triggered.connect(lambda: self._front_window().showMinimized())
         zoom = QAction("Zoom", window_menu)
         zoom.triggered.connect(self._zoom)
+        # Every window sizes itself to what it shows, so none has a zoom.
+        zoom.setEnabled(False)
         close = QAction("Close", window_menu)
         close.setShortcut(QKeySequence.StandardKey.Close)
-        close.triggered.connect(self.window.close)
+        close.triggered.connect(lambda: self._front_window().close())
         window_menu.addActions([minimize, zoom])
         window_menu.addSeparator()
         window_menu.addAction(close)
         return bar
+
+    def _front_window(self):
+        """The app's window in front, or Settings when none is."""
+        active = self.qt.activeWindow()
+        return active if active is not None else self.window
 
     def _zoom(self) -> None:
         if self.window.isMaximized():
@@ -364,20 +384,16 @@ class Application:
 
     def _on_theme_changed(self) -> None:
         self.window.apply_look()
+        if self.first_run is not None:
+            self.first_run.apply_look()
         if self.tray is not None:
-            self.tray.refresh()  # the Windows tray glyph follows the taskbar
+            # The Windows tray glyph follows the taskbar; its flyout the theme.
+            getattr(self.tray, "restyle", self.tray.refresh)()
 
     def check_for_updates(self) -> None:
         self.show_window()
-        self.window.show_page("general")
+        self.window.show_page(updates_page_key())
         self.updater.check(user_initiated=True)
-
-    def install_update(self) -> None:
-        """The menu's "Update to X": install with General on screen, where
-        the progress, and any failure, shows."""
-        self.show_window()
-        self.window.show_page("general")
-        self.updater.install()
 
     def _about(self) -> None:
         QMessageBox.about(
@@ -389,6 +405,8 @@ class Application:
     # -- window ------------------------------------------------------------
     def show_window(self) -> None:
         dock.set_visible(True)
+        if self.tray is not None and hasattr(self.tray, "is_shown"):
+            self.window.set_menu_bar_shown(self.tray.is_shown())
         # showNormal() would also undo a maximized window; only a minimized
         # one needs it.
         if self.window.isMinimized():
@@ -398,13 +416,52 @@ class Application:
         self.window.raise_()
         self.window.activateWindow()
 
-    def show_calibration(self) -> None:
-        self.show_window()
-        self.window.show_calibration()
+    def show_tune(self) -> None:
+        """Test and Tune, in its own window."""
+        dock.set_visible(True)
+        self.window.show_tune()
+
+    def show_first_run(self) -> None:
+        """macOS without the permission: the one window that asks for it."""
+        if self.first_run is None:
+            self.first_run = first_run.FirstRunWindow(self.controller)
+            # The window that keeps the filter running waits for access.
+            self.first_run.filter_requested.connect(lambda: self.window.request_filter(True, prompt=False))
+            self.first_run.tune_requested.connect(self.show_tune)
+            self.first_run.closed.connect(self._window_closed)
+        dock.set_visible(True)
+        self.first_run.show()
+        self.first_run.raise_()
+        self.first_run.activateWindow()
+
+    def _show_in_menu_bar(self, shown: bool) -> None:
+        """Settings' "Show in menu bar". Without the icon the app keeps its
+        Dock icon, whose menu has the same actions."""
+        if self.tray is not None and hasattr(self.tray, "set_shown"):
+            self.tray.set_shown(shown)
+        if shown:
+            self._window_closed()
+        else:
+            dock.set_visible(True)
+
+    def _menu_bar_icon_shown(self) -> bool:
+        if self.tray is None:
+            return False
+        return bool(self.tray.is_shown()) if hasattr(self.tray, "is_shown") else True
+
+    def _windows(self) -> list:
+        return [window for window in (self.window, self.window.tune, self.first_run) if window is not None]
+
+    def _window_closed(self) -> None:
+        """A window closed: with none left open, the app carries on from the
+        menu bar alone, without a Dock icon. With the menu bar icon hidden,
+        the Dock icon stays: its menu is the way in."""
+        if not any(window.isVisible() for window in self._windows()) and self._menu_bar_icon_shown():
+            dock.set_visible(False)
 
     def _note_hidden(self) -> None:
         # The window is closed; the app carries on from the menu bar alone.
-        dock.set_visible(False)
+        self._window_closed()
         # A one-time hint on Windows, where tray icons hide in the overflow:
         # once ever, not once per sign-in. macOS apps don't announce this;
         # the menu bar icon speaks for itself.
@@ -415,7 +472,7 @@ class Application:
             f"{DISPLAY_NAME} is still running",
             "It keeps filtering from the notification area."
             if self.controller.active
-            else "Bounce Filter is off. Turn it on from the icon in the notification area.",
+            else "Bounce filter is off. Turn it on from the icon in the notification area.",
             icons.app_icon(),
             4000,
         )
@@ -447,9 +504,13 @@ class Application:
         if self.tray is None:
             minimized = False
         if not minimized:
-            self.show_window()
+            if first_run.needed():
+                self.show_first_run()
+            else:
+                self.show_window()
         else:
-            dock.set_visible(False)
+            # In the menu bar only, unless its icon is hidden there.
+            dock.set_visible(not self._menu_bar_icon_shown())
 
         if self.controller.settings["fix_enabled"] and self.controller.supported():
             # Restore the filter after the UI is up, so any failure has a
@@ -461,6 +522,9 @@ class Application:
 
         self.updater.note_relaunch(self.controller.take_update_result(__version__))
         self.updater.start()
+        # The pause shortcut, the game check and the look for other mouse
+        # utilities: only a running app has them, never a test's controller.
+        self.controller.start_services()
         from . import install_cleanup
 
         install_cleanup.start()

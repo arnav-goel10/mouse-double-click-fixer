@@ -5,10 +5,12 @@ Thanks for helping. Bug reports, fixes and improvements are all welcome.
 ## Reporting bugs
 
 [Open an issue](https://github.com/arnav-goel10/mouse-double-click-fixer/issues/new/choose)
-using the bug template, and paste what **General › Troubleshooting › Copy
-Diagnostics** (Windows: **Copy diagnostics**) gives you: it has the app
-version, OS, the filter's state, the settings and the app's recent log. Your
-mouse model and what the **Test** pane shows help too. Security issues go
+using the bug template, and paste what **About › Troubleshooting › Copy
+Diagnostics** (Windows: **Settings › Troubleshooting › Copy diagnostics**)
+gives you: it has the app version, OS, the filter's state, the settings,
+the names of the mice it has seen and the ones you ignore, and the app's
+recent log. Your mouse model and what **Test and Tune** says help
+too. Security issues go
 through [SECURITY.md](SECURITY.md) instead.
 
 ## Development setup
@@ -73,6 +75,12 @@ Some tests touch the system on purpose, and only in CI:
   starts the real event tap, moves the pointer and posts real clicks. Never
   set it on your own computer. CI runs them on its Windows machines and on
   macOS 14 and 26.
+- `tests.test_pause.RealShortcutTests` also needs `DCF_E2E=1`: it registers
+  the real global shortcut and posts the real key combination. Never set it
+  on your own computer; CI runs it on its macOS and Windows machines.
+- The UI screenshots job (macos-26 and windows-latest, also run by the
+  release workflow) opens the real window and captures every pane; it needs
+  no flag, since it posts no input.
 - The macOS test also runs only where `GITHUB_ACTIONS=true` (CI sets it) or
   `DCF_E2E_ALLOW_LOCAL=1`; never set either on your own Mac. Asked for with
   `DCF_E2E=1` where it can't run, it fails instead of skipping.
@@ -96,7 +104,9 @@ any input of its own. Where the permission isn't there, they skip.
 | `app/frontmost.py`, `app/app_keys.py` | Which app is in front, and how the Apps list names an app. |
 | `app/controller.py` | App state; the UI talks to this, never to the hook directly. |
 | `app/wear.py` | The History's daily counts, and `wear.json`. |
-| `app/ui/` | The window and its panes, menu bar and tray, and platform styling. |
+| `app/health.py`, `app/conflicts.py` | The plain-words verdict on the mouse and its suggested window (History, Test and Tune), and the other mouse utilities that may take over buttons or the wheel. |
+| `app/pause.py`, `app/gamemode.py` | The pause shortcut (`RegisterEventHotKey` on macOS, `RegisterHotKey` on Windows; it never reads the keyboard, and `tests/test_pause.py` checks that nothing in the app uses a keyboard hook or tap), and whether a full-screen game is in front. |
+| `app/ui/` | The menu bar menu, Dock menu and tray (`menu_bar_mac.py`, `tray.py`, `menus.py`); the Settings window on macOS (toolbar of panes: General, Exceptions, History, About) and the app window on Windows (Home, Exceptions, History, Settings) (`window.py`, `panes.py`, `toolbar_mac.py`); Test and Tune (`tune.py`); and platform styling. |
 | `app/updater.py`, `app/update_signature.py` | Updates from GitHub Releases, and the minisign check every update must pass. |
 | `app/permissions.py`, `app/startup.py`, `app/settings.py` | The macOS permission, open at login, and the settings file. |
 | `app/diagnostics.py` | The log, crash.log and the Copy Diagnostics report. |

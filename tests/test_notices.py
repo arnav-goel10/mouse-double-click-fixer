@@ -489,15 +489,19 @@ class AcknowledgementsButtonTests(unittest.TestCase):
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
-        from app.controller import AppController
-        from app.ui.window import GeneralPage
+        from app.ui.window import AboutPage
 
-        controller = AppController()
+        try:
+            from _contract_standin import controller_class
+        except ImportError:  # run as tests.<module> from the repository root
+            from tests._contract_standin import controller_class
+
+        controller = controller_class()()
         self.addCleanup(controller.shutdown)  # before the patches are undone
-        self.page = GeneralPage(controller)
+        self.page = AboutPage(controller)
         self.addCleanup(self.page.deleteLater)
 
-    def test_general_has_an_acknowledgements_button(self) -> None:
+    def test_about_has_an_acknowledgements_button(self) -> None:
         button = self.page.acknowledgements_button
         self.assertTrue(button.text().startswith("Acknowledgements"))
         self.assertTrue(self.page.isAncestorOf(button))
