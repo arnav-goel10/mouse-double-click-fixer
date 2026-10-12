@@ -128,8 +128,8 @@ class FirstRunWindow(QWidget):
             self.title.setText(f"Let {DISPLAY_NAME} see your clicks")
             self.body.setText(
                 "To ignore the extra click a worn mouse switch sends, the app has to see each click "
-                "before other apps do. macOS asks you to allow this next. It only looks at mouse "
-                "buttons and the scroll wheel, and nothing you do leaves this Mac."
+                "before other apps do. macOS asks you to allow this next. It looks only at the mouse "
+                "(its buttons, wheel and movement), never at what you type, and nothing you do leaves this Mac."
             )
             self.status.setVisible(False)
             self.secondary_button.setVisible(False)
