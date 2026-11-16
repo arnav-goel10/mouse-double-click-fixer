@@ -32,7 +32,7 @@ Python and Qt for Python (PySide6). The filter sits in each system's own input p
 - **macOS event tap end-to-end** (`macos-tap`): GitHub's Macs let a job create a real event tap, so clicks are posted through the real filter in the real event stream ([`tests/test_macos_tap_e2e.py`](tests/test_macos_tap_e2e.py)).
 - **Windows hook end-to-end** (`windows-hook`): clicks are injected through the real low-level hook ([`tests/test_windows_hook.py`](tests/test_windows_hook.py)). Both end-to-end jobs also press the real pause shortcut and check it arrives with no keyboard hook.
 - **Windows install, quit and update end-to-end** (`windows-install`): builds the installer, installs it over running copies of two older releases, installs an update signed for that run, refuses an unsigned one, and uninstalls ([`tools/windows_install_e2e.ps1`](tools/windows_install_e2e.ps1)).
-- **Signed updates:** each release's `SHA256SUMS.txt` is signed with minisign on the maintainer's computer, and the app checks that signature in pure Python before it installs anything ([`app/update_signature.py`](app/update_signature.py)).
+- **Signed updates:** each release's `SHA256SUMS.txt` is signed in minisign format on the maintainer's computer, and the app checks that signature in pure Python before it installs anything ([`app/update_signature.py`](app/update_signature.py)).
 - **Pinned builds:** every Python package is installed with `--require-hashes` from [`requirements-build.txt`](requirements-build.txt), and every action is pinned to a commit. [`release.yml`](.github/workflows/release.yml) builds from the tag, runs all of CI first, and only ever puts up a draft.
 
 ## The problem
