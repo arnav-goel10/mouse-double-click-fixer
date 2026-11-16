@@ -2,9 +2,7 @@ name: CI
 
 on:
   push:
-    # improve-nov16 is here only so that branch's work runs in CI; take it
-    # out before merging.
-    branches: [main, improve-nov16]
+    branches: [main]
   pull_request:
   workflow_dispatch:
     inputs:
