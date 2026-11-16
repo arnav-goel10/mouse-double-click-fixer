@@ -1,7 +1,8 @@
-"""The old installers CI upgrades from: fetched once, cached, and checked
-against their SHA-256 whether they came from the cache or from a download
-(tools/old_installers.py). The cache must not make the install test any
-weaker, and a warm run must not download anything."""
+"""The old installers CI upgrades from: kept in a cache and an artifact, and
+checked against their SHA-256 whether they came from the cache, the artifact
+or a download (tools/old_installers.py). Neither must make the install test
+any weaker, and a run that finds them in either must not touch the release
+page, whose downloads count in the public numbers."""
 
 try:
     import _isolation  # noqa: F401  (first: keeps tests off the real machine)
@@ -16,11 +17,14 @@ import shutil
 import tempfile
 import unittest
 import urllib.error
+import zipfile
+from datetime import datetime, timedelta, timezone
+from email.message import Message
 from pathlib import Path
 from unittest import mock
 
 from tools import old_installers
-from tools.old_installers import INSTALLER, FetchError, Installer, fetch, load, sha256_of
+from tools.old_installers import ARTIFACT, INSTALLER, ArtifactSource, FetchError, Installer, fetch, load, sha256_of
 
 ROOT = Path(__file__).resolve().parents[1]
 REPOSITORY_URL = "https://github.com/arnav-goel10/mouse-double-click-fixer/releases/download"
@@ -173,15 +177,158 @@ class DownloadTests(unittest.TestCase):
         self.assertEqual(len(waits), old_installers.ATTEMPTS - 1)
 
 
+NOW = datetime(2026, 11, 16, tzinfo=timezone.utc)
+
+
+class FakeResponse(io.BytesIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+
+class FakeOpener:
+    """The Actions API: a listing, and a redirect for each archive URL."""
+
+    def __init__(self, artifacts, fail_listing=False) -> None:
+        self.artifacts, self.fail_listing = artifacts, fail_listing
+        self.requests: list = []
+
+    def open(self, request, timeout):
+        self.requests.append(request)
+        url = request.full_url
+        if "/actions/artifacts?" in url:
+            if self.fail_listing:
+                raise urllib.error.HTTPError(url, 403, "Resource not accessible by integration", Message(), None)
+            return FakeResponse(json.dumps({"artifacts": self.artifacts}).encode())
+        headers = Message()
+        headers["Location"] = "https://storage.example.test/" + url.rsplit("/", 2)[-2] + ".zip"
+        raise urllib.error.HTTPError(url, 302, "Found", headers, None)
+
+
+class ArtifactTests(unittest.TestCase):
+    BODIES = FetchTests.BODIES
+
+    def setUp(self) -> None:
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.folder = self.root / "old"
+        self.work = self.root / "work"
+        self.work.mkdir()
+        self.installers = [installer_for(version, body) for version, body in self.BODIES.items()]
+        self.zips: dict = {}
+        self.storage_gets: list = []
+        self.release_gets: list = []
+        self.said: list = []
+
+    def artifact(self, number: int, members: dict, created: datetime, expires: datetime, expired=False) -> dict:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            for name, body in members.items():
+                archive.writestr(name, body)
+        self.zips[f"https://storage.example.test/{number}.zip"] = buffer.getvalue()
+        return {"id": number, "name": ARTIFACT, "expired": expired, "created_at": created.isoformat(),
+                "expires_at": expires.isoformat().replace("+00:00", "Z"),
+                "archive_download_url": f"https://api.github.test/repos/o/r/actions/artifacts/{number}/zip"}
+
+    def full(self) -> dict:
+        return {f"{version}/{INSTALLER}": body for version, body in self.BODIES.items()}
+
+    def storage_get(self, url: str, target: Path) -> None:
+        self.storage_gets.append(url)
+        target.write_bytes(self.zips[url])
+
+    def release_get(self, url: str, target: Path) -> None:
+        self.release_gets.append(url)
+        version = re.search(r"/v([\d.]+)/", url).group(1)
+        target.write_bytes(self.BODIES[version])
+
+    def source(self, opener) -> ArtifactSource:
+        source = ArtifactSource("o/r", "token", self.work, now=lambda: NOW, opener=opener, get=self.storage_get,
+                                say=self.said.append)
+        self.addCleanup(source.close)
+        return source
+
+    def run_fetch(self, source):
+        return fetch(self.folder, self.installers, get=self.release_get, say=self.said.append, source=source)
+
+    def test_a_cold_cache_takes_both_from_the_newest_artifact_and_never_the_release_page(self) -> None:
+        older = self.artifact(1, {}, NOW - timedelta(days=20), NOW + timedelta(days=70))
+        newer = self.artifact(2, self.full(), NOW - timedelta(days=5), NOW + timedelta(days=85))
+        opener = FakeOpener([older, newer])
+        source = self.source(opener)
+        paths = self.run_fetch(source)
+        self.assertEqual(self.release_gets, [])
+        self.assertEqual(self.storage_gets, ["https://storage.example.test/2.zip"], "one zip, the newest")
+        for path, installer in zip(paths, self.installers):
+            self.assertEqual(sha256_of(path), installer.sha256)
+        self.assertFalse(source.needs_refresh())
+        storage = [r for r in opener.requests if "storage" in r.full_url]
+        self.assertEqual(storage, [], "the token never goes to the storage host")
+        self.assertTrue(all(r.get_header("Authorization") == "Bearer token" for r in opener.requests))
+
+    def test_a_warm_cache_downloads_no_zip(self) -> None:
+        self.run_fetch(None)
+        self.release_gets.clear()
+        opener = FakeOpener([self.artifact(2, self.full(), NOW, NOW + timedelta(days=85))])
+        self.run_fetch(self.source(opener))
+        self.assertEqual(self.storage_gets, [])
+        self.assertEqual(self.release_gets, [])
+
+    def test_a_tampered_artifact_falls_back_to_the_release_page_and_asks_for_a_fresh_one(self) -> None:
+        members = {**self.full(), f"0.5.3/{INSTALLER}": b"tampered with"}
+        source = self.source(FakeOpener([self.artifact(2, members, NOW, NOW + timedelta(days=85))]))
+        paths = self.run_fetch(source)
+        self.assertEqual(self.release_gets, [self.installers[1].url], "only the bad one")
+        self.assertEqual(sha256_of(paths[1]), self.installers[1].sha256)
+        self.assertTrue(any("the artifact's file has SHA-256" in line for line in self.said), self.said)
+        self.assertEqual([p.name for p in self.folder.rglob("*") if p.is_file()], [INSTALLER, INSTALLER])
+
+    def test_no_artifact_means_the_release_page_and_an_upload(self) -> None:
+        expired = self.artifact(1, self.full(), NOW - timedelta(days=100), NOW - timedelta(days=10), expired=True)
+        source = self.source(FakeOpener([expired]))
+        self.run_fetch(source)
+        self.assertEqual(self.release_gets, [installer.url for installer in self.installers])
+        self.assertEqual(self.storage_gets, [], "an expired artifact isn't fetched")
+        self.assertTrue(source.needs_refresh())
+
+    def test_an_artifact_close_to_expiry_asks_for_a_fresh_one(self) -> None:
+        source = self.source(FakeOpener([self.artifact(2, self.full(), NOW, NOW + timedelta(days=10))]))
+        self.assertTrue(source.needs_refresh())
+
+    def test_an_unreadable_listing_falls_back_and_asks_for_no_upload(self) -> None:
+        source = self.source(FakeOpener([], fail_listing=True))
+        self.run_fetch(source)
+        self.assertEqual(self.release_gets, [installer.url for installer in self.installers])
+        self.assertFalse(source.needs_refresh(), "a run that can't read artifacts mustn't upload on every run")
+
+
 class CommandLineTests(unittest.TestCase):
     def test_main_fetches_into_the_folder_and_reports_a_failure_as_exit_status_1(self) -> None:
         folder = Path(tempfile.mkdtemp()) / "old"
         self.addCleanup(shutil.rmtree, folder.parent, True)
-        with mock.patch.object(old_installers, "fetch") as fetching:
-            self.assertEqual(old_installers.main(["fetch", str(folder)]), 0)
-        fetching.assert_called_once_with(folder, load())
-        with mock.patch.object(old_installers, "fetch", side_effect=FetchError("bad")):
-            self.assertEqual(old_installers.main(["fetch", str(folder)]), 1)
+        clean = {key: value for key, value in old_installers.os.environ.items() if key not in ("GITHUB_TOKEN", "GITHUB_OUTPUT")}
+        with mock.patch.dict(old_installers.os.environ, clean, clear=True):
+            with mock.patch.object(old_installers, "fetch") as fetching:
+                self.assertEqual(old_installers.main(["fetch", str(folder)]), 0)
+            fetching.assert_called_once()
+            self.assertEqual(fetching.call_args.args, (folder, load()))
+            self.assertIsNone(fetching.call_args.kwargs["source"], "no token, no artifact")
+            with mock.patch.object(old_installers, "fetch", side_effect=FetchError("bad")):
+                self.assertEqual(old_installers.main(["fetch", str(folder)]), 1)
+
+    def test_with_a_token_it_reads_the_artifact_and_sets_the_upload_output(self) -> None:
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        output = root / "output"
+        env = {"GITHUB_TOKEN": "token", "GITHUB_REPOSITORY": "o/r", "GITHUB_OUTPUT": str(output)}
+        with mock.patch.dict(old_installers.os.environ, env), \
+                mock.patch.object(old_installers, "fetch") as fetching, \
+                mock.patch.object(old_installers.ArtifactSource, "needs_refresh", return_value=False):
+            self.assertEqual(old_installers.main(["fetch", str(root / "old")]), 0)
+        self.assertIsInstance(fetching.call_args.kwargs["source"], ArtifactSource)
+        self.assertEqual(output.read_text(encoding="utf-8"), "upload=false\n")
 
 
 if __name__ == "__main__":

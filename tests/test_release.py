@@ -446,6 +446,19 @@ class WorkflowTests(unittest.TestCase):
                 "actions/setup-python@", "Restore the old installers", "Fetch the old installers", "tools\\windows_install_e2e.ps1")]
             self.assertEqual(order, sorted(order), name)
         self.assertEqual(len(pins), 1, "both jobs use the same commit of the cache action")
+        # ci.yml's job also reads, and keeps, the old-installers artifact, so a
+        # cold cache needn't go to the release page. That needs actions: read,
+        # which release.yml must pass on when it calls ci.yml.
+        install = job(self.workflow("ci.yml"), "windows-install")
+        self.assertIn("    permissions:\n      contents: read\n      actions: read\n", install)
+        fetch = step(install, "Fetch the old installers")
+        self.assertIn("        id: old\n", fetch)
+        self.assertIn("          GITHUB_TOKEN: ${{ github.token }}\n", fetch)
+        keep = step(install, "Keep the old installers")
+        self.assertIn("        if: steps.old.outputs.upload == 'true'\n", keep)
+        self.assertIn(f"          name: {old_installers.ARTIFACT}\n", keep)
+        self.assertIn("          path: old/\n", keep)
+        self.assertIn("    permissions:\n      contents: read\n      actions: read\n", job(self.workflow("release.yml"), "checks"))
 
     def test_ci_and_releases_use_the_same_inno_setup(self) -> None:
         versions = {re.search(r'INNO_SETUP_VERSION: "([\d.]+)"', self.workflow(name)).group(1) for name in ("ci.yml", "release.yml")}
