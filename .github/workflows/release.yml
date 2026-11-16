@@ -43,6 +43,11 @@ jobs:
 
   checks:
     uses: ./.github/workflows/ci.yml
+    # ci.yml's install test reads the old-installers artifact, which needs
+    # actions: read; a called workflow gets no more than it is given here.
+    permissions:
+      contents: read
+      actions: read
 
   windows:
     name: Windows build

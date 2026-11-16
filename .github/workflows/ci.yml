@@ -181,6 +181,11 @@ jobs:
     name: Windows install, quit and update end-to-end
     runs-on: windows-latest
     timeout-minutes: 40
+    # actions: read lets tools/old_installers.py read the old-installers
+    # artifact an earlier run kept, instead of the release page.
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -248,19 +253,33 @@ jobs:
         # 0.2.6: the oldest still in use, before --quit (taskkill closes it).
         # 0.5.3: the last one-file release, the upgrade every current user
         # takes; its own --quit closes the running copy. Downloading them from
-        # the project's Releases on every run would count in its public
-        # download numbers, so they are cached. The key is a hash of the file
-        # that lists their URLs and SHA-256s, so a change to either starts a
-        # new cache.
+        # the project's Releases would count in its public download numbers,
+        # so they are cached, and kept as an artifact for when the cache is
+        # gone. The key is a hash of the file that lists their URLs and
+        # SHA-256s, so a change to either starts a new cache.
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: old
           key: old-installers-${{ hashFiles('tools/old_installers.json') }}
       - name: Fetch the old installers the cache lacks, and check each one's SHA-256
-        # Downloads only on a cache miss; a cached file is checked all the
-        # same, and one that doesn't match is fetched again.
+        # On a cache miss it takes them from the newest old-installers
+        # artifact, and from the release page only if no artifact has a file
+        # that matches. Every file is checked, wherever it came from.
+        id: old
         shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: python tools/old_installers.py fetch old
+      - name: Keep the old installers as an artifact for later runs
+        # Only when none will last another 30 days, or anything came from the
+        # release page (tools/old_installers.py sets the output).
+        if: steps.old.outputs.upload == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: old-installers
+          path: old/
+          retention-days: 90
+          if-no-files-found: error
       - name: Install over running copies, quit, update, uninstall
         shell: pwsh
         run: .\tools\windows_install_e2e.ps1 -OldSetup old\0.2.6\DoubleClickFixer-Setup.exe,old\0.5.3\DoubleClickFixer-Setup.exe -NewSetup installer\Output\DoubleClickFixer-Setup.exe -SigningKey "$env:RUNNER_TEMP\dcf-ci-key\dcf-ci-update-key.key"
